@@ -352,8 +352,7 @@ struct AddGpuMemoryCopiesPass
           ancestor = ancestor->getParentOp();
           if (!ancestor) {
             safeToDeallocEarly = false;
-            llvm::errs() << "Unsafe dealloc: ancestor null for user " << *userOp
-                         << "\n";
+
             break;
           }
         }
@@ -364,20 +363,18 @@ struct AddGpuMemoryCopiesPass
         // current last user
         if (!lastUser || lastUser->isBeforeInBlock(ancestor)) {
           lastUser = ancestor;
-          llvm::errs() << "  Updated lastUser to: " << *lastUser << "\n";
+
         }
       }
 
       if (safeToDeallocEarly && lastUser) {
-        llvm::errs() << "Deallocating early after: " << *lastUser << "\n";
+
         OpBuilder builder(lastUser->getBlock(),
                           std::next(Block::iterator(lastUser)));
         builder.create<gpu::DeallocOp>(lastUser->getLoc(), ValueRange{},
                                        buffer);
       } else {
-        llvm::errs() << "Fallback dealloc for buffer. Safe: "
-                     << safeToDeallocEarly
-                     << ", LastUser: " << (lastUser ? "found" : "null") << "\n";
+
         // Fallback: Deallocate at return ops
         func.walk([&](func::ReturnOp returnOp) {
           OpBuilder builder(returnOp);
@@ -393,6 +390,19 @@ struct AddGpuMemoryCopiesPass
     for (auto val : promotedAllocsToDealloc) {
       deallocBuffer(val);
     }
+
+    // Hybrid Strategy: Unregister host memory
+    // Host registration must persist until all GPU operations using it are complete.
+    // The simplest safe point is at function return.
+    if (!registeredHostMem.empty()) {
+        func.walk([&](func::ReturnOp returnOp) {
+            OpBuilder builder(returnOp);
+            for (auto pair : registeredHostMem) {
+                builder.create<gpu::HostUnregisterOp>(returnOp.getLoc(), pair.second);
+            }
+        });
+    }
+
     // 5. Optimize existing deallocations
     func.walk([&](Operation *op) {
       Value buffer;
