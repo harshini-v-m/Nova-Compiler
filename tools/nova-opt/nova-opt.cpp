@@ -57,8 +57,15 @@ namespace nova {
 } 
 }
 
+#include "Compiler/Transforms/AddGpuMemoryCopies.h"
+
 int main(int argc, char **argv) {
   mlir::registerAllPasses();
+
+  // Register the AddGpuMemoryCopies pass
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::nova::createAddGpuMemoryCopiesPass();
+  });
 
   // Register the ViewOpGraph pass specifically
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {

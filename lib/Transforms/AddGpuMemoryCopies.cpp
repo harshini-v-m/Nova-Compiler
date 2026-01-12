@@ -103,6 +103,35 @@ struct AddGpuMemoryCopiesPass
     return false;
   }
 
+  // Helper to decide if we should register/pin host memory for faster transfers
+  bool shouldRegisterHostMemory(Value val) {
+    auto memRefType = llvm::dyn_cast<MemRefType>(val.getType());
+    if (!memRefType)
+      return false;
+
+    // Static size check
+    if (memRefType.hasStaticShape()) {
+      int64_t numElements = memRefType.getNumElements();
+      int64_t eltSizeInBits = memRefType.getElementTypeBitWidth();
+      int64_t totalSizeInBytes = (numElements * eltSizeInBits) / 8;
+
+      // Heuristic:
+      // Minimum: 4KB (4096 bytes) to justify overhead
+      // Maximum: 12GB (12 * 1024^3 bytes) safety limit
+      const int64_t minSize = 4096;
+      const int64_t maxSize = 12LL * 1024 * 1024 * 1024;
+
+      if (totalSizeInBytes > minSize && totalSizeInBytes < maxSize) {
+        return true;
+      }
+      return false;
+    }
+
+    // Dynamic shapes: Be conservative or assume user knows best?
+    // For now, let's SKIP dynamic shapes to be safe, or we'd need runtime checks.
+    return false;
+  }
+
   void runOnOperation() override {
     func::FuncOp func = getOperation();
     // Only process host functions calling kernels
@@ -150,6 +179,7 @@ struct AddGpuMemoryCopiesPass
 
     // 2. Find all host memrefs used in GPU regions that need shadowing
     llvm::MapVector<Value, Value> hostToDeviceMap;
+    llvm::MapVector<Value, Value> registeredHostMem; // Original -> Casted/Registered Value
     func.walk([&](gpu::LaunchOp launchOp) {
       launchOp.getRegion().walk([&](Operation *op) {
         for (unsigned i = 0; i < op->getNumOperands(); ++i) {
@@ -170,15 +200,39 @@ struct AddGpuMemoryCopiesPass
             if (hostToDeviceMap.count(val)) {
               operand.set(hostToDeviceMap[val]);
             } else {
-              // Create shadow
+              // Create builder and loc first
               OpBuilder builder(func.getBody().front().getTerminator());
               if (auto defOp = val.getDefiningOp()) {
                 builder.setInsertionPointAfter(defOp);
               } else {
                 builder.setInsertionPointToStart(&func.getBody().front());
               }
-
               Location loc = val.getLoc();
+
+              // Hybrid Strategy: Register Host Memory if optimal
+              bool doRegister = shouldRegisterHostMemory(val);
+              Value hostMemForCopy = val;
+              Value registeredMem = nullptr; // Token to unregister later
+
+              if (doRegister) {
+                // To register, we often need to cast to unranked or appropriate type depending on op
+                // But gpu.host_register takes a memref.
+                // We cast to unranked memref<*xT> usually for generic handling, 
+                // but let's check the op definition. gpu.host_register takes `AnyMemRef`.
+                
+                // We create a UnrankedMemRef cast for flexibility if needed, 
+                // but usually we can register the ranked one directly if the op supports it.
+                // Let's stick to casting to unranked to match common patterns if needed,
+                // or just register 'val'. The issue is `val` might be a block arg or op result.
+                
+                // Let's create an unranked cast for the registration op to be safe/generic
+                auto unrankedType = UnrankedMemRefType::get(llvm::cast<MemRefType>(hostMemForCopy.getType()).getElementType(), 0);
+                auto castOp = builder.create<memref::CastOp>(loc, unrankedType, hostMemForCopy);
+                builder.create<gpu::HostRegisterOp>(loc, castOp);
+                registeredMem = castOp;
+              }
+
+              // Create shadow
               MemRefType hostType = llvm::cast<MemRefType>(val.getType());
               MemRefType deviceType = MemRefType::get(
                   hostType.getShape(), hostType.getElementType(),
@@ -202,6 +256,38 @@ struct AddGpuMemoryCopiesPass
               // Copy Host to Device
               builder.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{},
                                             deviceMem, val);
+
+              // Store for unregistering later
+              if (doRegister && registeredMem) {
+                  // We need to unregister this 'registeredMem' at the end.
+                  // We can piggyback on the 'hostToDeviceMap' or create a separate map.
+                  // Since 'hostToDeviceMap' maps Value->Value, let's just make a separate tracking structure
+                  // or attach it to the map value? No, cleaner to have a separate map.
+                  // Implementation detail: We need to access this in the cleanup block.
+                  // For now, let's hack: The cleanup block iterates hostToDeviceMap.
+                  // We can't easily add it there.
+                  
+                  // Let's handle it by adding a deferred cleanup list?
+                  // Issue: 'runOnOperation' is one giant function.
+                  // But we are inside a lambda 'func.walk'.
+                  // We need to store 'registeredMem' effectively.
+                  // 
+                  // Problem: We need to unregister `registeredMem`, but we are inside a nested walk.
+                  // We need a map at the function level: `llvm::MapVector<Value, Value> memToUnregister;`
+                  
+                  // Re-architect slightly:
+                  // We need to declare `memToUnregister` alongside `hostToDeviceMap` (Step 152).
+                  // But I can't preserve state across chunks easily with multi_replace unless I edit line 152 too.
+                  
+                  // Alternative: In the cleanup loop (Step 253), we can re-create the cast and unregister?
+                  // No, that's messy.
+                  // 
+                  // Correct fix: I will add `memToUnregister` map in a separate chunk at line 152.
+              }
+
+              if (doRegister && registeredMem) {
+                  registeredHostMem[val] = registeredMem;
+              }
 
               operand.set(deviceMem);
             }
@@ -259,6 +345,10 @@ struct AddGpuMemoryCopiesPass
         }
         for (auto val : promotedAllocsToDealloc) {
           builder.create<gpu::DeallocOp>(returnOp.getLoc(), ValueRange{}, val);
+        }
+        // Hybrid Strategy: Unregister host memory
+        for (auto pair : registeredHostMem) {
+            builder.create<gpu::HostUnregisterOp>(returnOp.getLoc(), pair.second);
         }
       });
     }
