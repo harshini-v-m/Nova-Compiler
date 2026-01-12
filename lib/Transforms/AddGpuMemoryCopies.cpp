@@ -7,7 +7,6 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/SymbolTable.h"
-#include "llvm/ADT/MapVector.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/MapVector.h"
 
@@ -249,19 +248,120 @@ struct AddGpuMemoryCopiesPass
       }
     });
 
-    // 4. Deallocate shadows and promoted allocs at the end of the function
-    if (!hostToDeviceMap.empty() || !promotedAllocsToDealloc.empty()) {
-      func.walk([&](func::ReturnOp returnOp) {
-        OpBuilder builder(returnOp);
-        for (auto pair : hostToDeviceMap) {
+    // 4. Deallocate shadows and promoted allocs after their last use
+    auto deallocBuffer = [&](Value buffer) {
+      if (!buffer)
+        return;
+
+      Block *allocBlock = buffer.getParentBlock();
+      Operation *lastUser = nullptr;
+      bool safeToDeallocEarly = true;
+
+      for (auto &use : buffer.getUses()) {
+        Operation *userOp = use.getOwner();
+
+        // Find ancestor of userOp that is in allocBlock
+        Operation *ancestor = userOp;
+        while (ancestor->getBlock() != allocBlock) {
+          ancestor = ancestor->getParentOp();
+          if (!ancestor) {
+            safeToDeallocEarly = false;
+            llvm::errs() << "Unsafe dealloc: ancestor null for user " << *userOp
+                         << "\n";
+            break;
+          }
+        }
+        if (!safeToDeallocEarly)
+          break;
+
+        // If we haven't found a last user yet, or if this ancestor is after the
+        // current last user
+        if (!lastUser || lastUser->isBeforeInBlock(ancestor)) {
+          lastUser = ancestor;
+          llvm::errs() << "  Updated lastUser to: " << *lastUser << "\n";
+        }
+      }
+
+      if (safeToDeallocEarly && lastUser) {
+        llvm::errs() << "Deallocating early after: " << *lastUser << "\n";
+        OpBuilder builder(lastUser->getBlock(),
+                          std::next(Block::iterator(lastUser)));
+        builder.create<gpu::DeallocOp>(lastUser->getLoc(), ValueRange{},
+                                       buffer);
+      } else {
+        llvm::errs() << "Fallback dealloc for buffer. Safe: "
+                     << safeToDeallocEarly
+                     << ", LastUser: " << (lastUser ? "found" : "null") << "\n";
+        // Fallback: Deallocate at return ops
+        func.walk([&](func::ReturnOp returnOp) {
+          OpBuilder builder(returnOp);
           builder.create<gpu::DeallocOp>(returnOp.getLoc(), ValueRange{},
-                                         pair.second);
-        }
-        for (auto val : promotedAllocsToDealloc) {
-          builder.create<gpu::DeallocOp>(returnOp.getLoc(), ValueRange{}, val);
-        }
-      });
+                                         buffer);
+        });
+      }
+    };
+
+    for (auto pair : hostToDeviceMap) {
+      deallocBuffer(pair.second);
     }
+    for (auto val : promotedAllocsToDealloc) {
+      deallocBuffer(val);
+    }
+    // 5. Optimize existing deallocations
+    func.walk([&](Operation *op) {
+      Value buffer;
+      if (auto allocOp = dyn_cast<gpu::AllocOp>(op)) {
+        buffer = allocOp.getResult(0);
+      } else if (auto allocOp = dyn_cast<memref::AllocOp>(op)) {
+        buffer = allocOp.getResult();
+      } else {
+        return;
+      }
+
+      Operation *existingDealloc = nullptr;
+
+      // Find existing dealloc
+      for (auto &use : buffer.getUses()) {
+        Operation *owner = use.getOwner();
+        if (isa<memref::DeallocOp>(owner) || isa<gpu::DeallocOp>(owner)) {
+          existingDealloc = owner;
+          break;
+        }
+      }
+
+      if (existingDealloc) {
+        // Find last user (excluding the dealloc itself)
+        Block *allocBlock = buffer.getParentBlock();
+        Operation *lastUser = nullptr;
+        bool safeToMove = true;
+
+        for (auto &use : buffer.getUses()) {
+          Operation *userOp = use.getOwner();
+          if (userOp == existingDealloc)
+            continue;
+
+          Operation *ancestor = userOp;
+          while (ancestor->getBlock() != allocBlock) {
+            ancestor = ancestor->getParentOp();
+            if (!ancestor) {
+              safeToMove = false;
+              break;
+            }
+          }
+          if (!safeToMove)
+            break;
+
+          if (!lastUser || lastUser->isBeforeInBlock(ancestor)) {
+            lastUser = ancestor;
+          }
+        }
+
+        if (safeToMove && lastUser) {
+          // Move dealloc to after lastUser
+          existingDealloc->moveAfter(lastUser);
+        }
+      }
+    });
   }
 
   StringRef getArgument() const final { return "add-gpu-memory-copies"; }
