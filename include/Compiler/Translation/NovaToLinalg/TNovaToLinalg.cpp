@@ -151,19 +151,19 @@ namespace mlir
         auto rhsbw = frhstype.getWidth();
         if (lhsbw == rhsbw)
         {
-          v = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
+          v = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
           return opdispatcher(op, v, args[1], builder);
         }
         else if (lhsbw > rhsbw)
         {
           v = builder->create<arith::ExtFOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
-          auto lhs = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(lhsbw, builder), args[0]);
+          auto lhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), args[0]);
           return opdispatcher(op, lhs, v, builder);
         }
         else
         {
           v = builder->create<arith::ExtSIOp>(op.getLoc(), getinttype(rhsbw, builder), args[0]);
-          auto lhs = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(rhsbw, builder), v);
+          auto lhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), v);
           return opdispatcher(op, lhs, args[1], builder);
         }
       }
@@ -174,19 +174,19 @@ namespace mlir
         auto rhsbw = irhstype.getWidth();
         if (lhsbw == rhsbw)
         {
-          v = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
+          v = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
           return opdispatcher(op, args[0], v, builder);
         }
         else if (lhsbw > rhsbw)
         {
           v = builder->create<arith::ExtSIOp>(op.getLoc(), getinttype(lhsbw, builder), args[1]);
-          auto rhs = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(lhsbw, builder), v);
+          auto rhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), v);
           return opdispatcher(op, args[0], rhs, builder);
         }
         else
         {
           v = builder->create<arith::ExtFOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
-          auto rhs = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(rhsbw, builder), args[1]);
+          auto rhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), args[1]);
           return opdispatcher(op, v, rhs, builder);
         }
       }
@@ -1418,7 +1418,7 @@ namespace mlir
         target.addIllegalOp<nova::AcosOp>();
         target.addIllegalOp<nova::AdamOp>();
         target.addIllegalOp<nova::AcoshOp>();
-        target.addIllegalOp<nova::AddOp>();
+        // target.addIllegalOp<nova::AddOp>();
         target.addIllegalOp<nova::AsinOp>();
         target.addIllegalOp<nova::AsinhOp>();
         target.addIllegalOp<nova::AtanOp>();
@@ -1451,7 +1451,7 @@ namespace mlir
         target.addIllegalOp<nova::SinhOp>();
         target.addIllegalOp<nova::SqrtOp>();
         target.addIllegalOp<nova::SquareOp>();
-        target.addIllegalOp<nova::SubOp>();
+        // target.addIllegalOp<nova::SubOp>();
         target.addIllegalOp<nova::TanOp>();
         target.addIllegalOp<nova::TanhOp>();
         target.addIllegalOp<nova::TransposeOp>();
@@ -1523,8 +1523,6 @@ namespace mlir
           NovaToLinalgElementwiseConverter<nova::AtanhOp>,
           NovaToLinalgElementwiseConverter<nova::CompareOp>,
           NovaToLinalgElementwiseConverter<nova::SignOp>,
-          ArgMinConverter,
-          ArgMaxConverter,
           ArgMinConverter,
           ArgMaxConverter,
           ReduceOpConverter,

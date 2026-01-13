@@ -23,6 +23,16 @@ module {
     %min_d0 = nova.reduce<min> %arg0 dimension = [0]
       : tensor<4x8xf32, #nova.device<"1">>
     
+    %product = nova.reduce<product> %arg0
+      : tensor<4x8xf32, #nova.device<"1">>
+
+    %all = nova.reduce<all> %arg0
+      : tensor<4x8xf32, #nova.device<"1">>
+    
+    %any = nova.reduce<any> %arg0
+      : tensor<4x8xf32, #nova.device<"1">>
+
+    
     // Argmax along dimension 1 → returns indices
     %argmax_d1 = nova.argmax %arg0 dimension = 1
       : tensor<4x8xf32, #nova.device<"1">>

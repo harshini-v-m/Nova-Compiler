@@ -151,4 +151,4 @@ void populateNovaToTosaTemplatePatterns(mlir::RewritePatternSet &patterns) {
       patterns.getContext());
 }
 } // namespace nova
-} // namespace mli
+} // namespace mlir

@@ -127,7 +127,6 @@ struct AddGpuMemoryCopiesPass
     }
 
     // Dynamic shapes: Be conservative or assume user knows best?
-    // For now, let's SKIP dynamic shapes to be safe, or we'd need runtime checks.
     return false;
   }
 
@@ -214,17 +213,7 @@ struct AddGpuMemoryCopiesPass
               Value registeredMem = nullptr; // Token to unregister later
 
               if (doRegister) {
-                // To register, we often need to cast to unranked or appropriate type depending on op
-                // But gpu.host_register takes a memref.
-                // We cast to unranked memref<*xT> usually for generic handling, 
-                // but let's check the op definition. gpu.host_register takes `AnyMemRef`.
-                
-                // We create a UnrankedMemRef cast for flexibility if needed, 
-                // but usually we can register the ranked one directly if the op supports it.
-                // Let's stick to casting to unranked to match common patterns if needed,
-                // or just register 'val'. The issue is `val` might be a block arg or op result.
-                
-                // Let's create an unranked cast for the registration op to be safe/generic
+
                 auto unrankedType = UnrankedMemRefType::get(llvm::cast<MemRefType>(hostMemForCopy.getType()).getElementType(), 0);
                 auto castOp = builder.create<memref::CastOp>(loc, unrankedType, hostMemForCopy);
                 builder.create<gpu::HostRegisterOp>(loc, castOp);
@@ -257,33 +246,6 @@ struct AddGpuMemoryCopiesPass
                                             deviceMem, val);
 
               // Store for unregistering later
-              if (doRegister && registeredMem) {
-                  // We need to unregister this 'registeredMem' at the end.
-                  // We can piggyback on the 'hostToDeviceMap' or create a separate map.
-                  // Since 'hostToDeviceMap' maps Value->Value, let's just make a separate tracking structure
-                  // or attach it to the map value? No, cleaner to have a separate map.
-                  // Implementation detail: We need to access this in the cleanup block.
-                  // For now, let's hack: The cleanup block iterates hostToDeviceMap.
-                  // We can't easily add it there.
-                  
-                  // Let's handle it by adding a deferred cleanup list?
-                  // Issue: 'runOnOperation' is one giant function.
-                  // But we are inside a lambda 'func.walk'.
-                  // We need to store 'registeredMem' effectively.
-                  // 
-                  // Problem: We need to unregister `registeredMem`, but we are inside a nested walk.
-                  // We need a map at the function level: `llvm::MapVector<Value, Value> memToUnregister;`
-                  
-                  // Re-architect slightly:
-                  // We need to declare `memToUnregister` alongside `hostToDeviceMap` (Step 152).
-                  // But I can't preserve state across chunks easily with multi_replace unless I edit line 152 too.
-                  
-                  // Alternative: In the cleanup loop (Step 253), we can re-create the cast and unregister?
-                  // No, that's messy.
-                  // 
-                  // Correct fix: I will add `memToUnregister` map in a separate chunk at line 152.
-              }
-
               if (doRegister && registeredMem) {
                   registeredHostMem[val] = registeredMem;
               }
