@@ -112,7 +112,7 @@ struct NovaMatmulOpLoweringgeneric
         loc, rewriter.getZeroAttr(resultType.getElementType()));
     Value empty = rewriter.create<tensor::EmptyOp>(
         loc, shape, resultType.getElementType(), resultType.getEncoding());
-    Value out = rewriter.create<linalg::FillOp>(loc, zero, empty).getResult(0);
+    Value out = rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{empty}).getResult(0);
 
     // 2. Define Iteration Space and Indexing Maps
     SmallVector<AffineMap> maps;

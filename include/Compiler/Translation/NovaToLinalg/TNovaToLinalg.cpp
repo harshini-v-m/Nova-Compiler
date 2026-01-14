@@ -280,19 +280,19 @@ namespace mlir
           auto rhsbw = frhstype.getWidth();
           if (lhsbw == rhsbw)
           {
-            v = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
+            v = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
             return builder->create<arith::DivFOp>(op.getLoc(), v, args[1]);
           }
           else if (lhsbw > rhsbw)
           {
             v = builder->create<arith::ExtFOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
-            auto lhs = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(lhsbw, builder), args[0]);
+            auto lhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), args[0]);
             return builder->create<arith::DivFOp>(op.getLoc(), lhs, v);
           }
           else
           {
             v = builder->create<arith::ExtSIOp>(op.getLoc(), getinttype(rhsbw, builder), args[0]);
-            auto lhs = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(rhsbw, builder), v);
+            auto lhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), v);
             return builder->create<arith::DivFOp>(op.getLoc(), lhs, args[1]);
           }
         }
@@ -303,19 +303,19 @@ namespace mlir
           auto rhsbw = irhstype.getWidth();
           if (lhsbw == rhsbw)
           {
-            v = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
+            v = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
             return builder->create<arith::DivFOp>(op.getLoc(), args[0], v);
           }
           else if (lhsbw > rhsbw)
           {
             v = builder->create<arith::ExtSIOp>(op.getLoc(), getinttype(lhsbw, builder), args[1]);
-            auto rhs = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(lhsbw, builder), v);
+            auto rhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), v);
             return builder->create<arith::DivFOp>(op.getLoc(), args[0], rhs);
           }
           else
           {
             v = builder->create<arith::ExtFOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
-            auto rhs = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(rhsbw, builder), args[1]);
+            auto rhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), args[1]);
             return builder->create<arith::DivFOp>(op.getLoc(), v, rhs);
           }
         }
@@ -326,24 +326,24 @@ namespace mlir
           auto rhsbw = irhstype.getWidth();
           if (lhsbw == rhsbw)
           {
-            v = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
-            auto w = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
+            v = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
+            auto w = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
             return builder->create<arith::DivFOp>(op.getLoc(), v, w);
           }
 
           else if (lhsbw > rhsbw)
           {
             v = builder->create<arith::ExtSIOp>(op.getLoc(), getinttype(lhsbw, builder), args[1]);
-            auto r = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(lhsbw, builder), args[0]);
-            auto w = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(lhsbw, builder), v);
+            auto r = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), args[0]);
+            auto w = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), v);
             return builder->create<arith::DivFOp>(op.getLoc(), r, w);
           }
 
           else
           {
             v = builder->create<arith::ExtSIOp>(op.getLoc(), getinttype(rhsbw, builder), args[0]);
-            auto r = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(rhsbw, builder), v);
-            auto w = builder->create<arith::BitcastOp>(op.getLoc(), getfloattype(rhsbw, builder), args[1]);
+            auto r = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), v);
+            auto w = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), args[1]);
             return builder->create<arith::DivFOp>(op.getLoc(), r, w);
           }
         }
@@ -734,12 +734,12 @@ namespace mlir
           mlir::Value greaterThanZero = builder->create<mlir::arith::CmpFOp>(
               loc, mlir::arith::CmpFPredicate::OGT, input, zeroF);
 
-          mlir::Value signPos = builder->create<mlir::arith::UIToFPOp>(loc, resultType, greaterThanZero);
+          mlir::Value signPos = builder->create<mlir::arith::SIToFPOp>(loc, resultType, greaterThanZero);
 
           mlir::Value lessThanZero = builder->create<mlir::arith::CmpFOp>(
               loc, mlir::arith::CmpFPredicate::OLT, input, zeroF);
 
-          mlir::Value signNeg = builder->create<mlir::arith::UIToFPOp>(loc, resultType, lessThanZero);
+          mlir::Value signNeg = builder->create<mlir::arith::SIToFPOp>(loc, resultType, lessThanZero);
 
           return builder->create<mlir::arith::SubFOp>(loc, signPos, signNeg);
         }
@@ -750,10 +750,10 @@ namespace mlir
               loc, intType, builder->getIntegerAttr(intType, 0));
           mlir::Value greaterThanZero = builder->create<mlir::arith::CmpIOp>(
               loc, mlir::arith::CmpIPredicate::sgt, input, zero);
-          mlir::Value signPos = builder->create<mlir::arith::UIToFPOp>(loc, resultType, greaterThanZero);
+          mlir::Value signPos = builder->create<mlir::arith::SIToFPOp>(loc, resultType, greaterThanZero);
           mlir::Value lessThanZero = builder->create<mlir::arith::CmpIOp>(
               loc, mlir::arith::CmpIPredicate::slt, input, zero);
-          mlir::Value signNeg = builder->create<mlir::arith::UIToFPOp>(loc, resultType, lessThanZero);
+          mlir::Value signNeg = builder->create<mlir::arith::SIToFPOp>(loc, resultType, lessThanZero);
 
           return builder->create<mlir::arith::SubFOp>(loc, signPos, signNeg);
         }
