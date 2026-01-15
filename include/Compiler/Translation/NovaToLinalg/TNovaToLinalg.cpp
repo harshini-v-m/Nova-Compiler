@@ -1074,151 +1074,137 @@ namespace mlir
                                     PatternRewriter &rewriter) const final
       {
         Location loc = op.getLoc();
-        Value v = op.getInput();
-        auto inputType = cast<RankedTensorType>(v.getType());
-        auto resultRankedType = cast<RankedTensorType>(op.getType());
+        Value input = op.getInput();
+        auto inputType = cast<RankedTensorType>(input.getType());
+        auto resultType = cast<RankedTensorType>(op.getType());
         Type elemType = inputType.getElementType();
         int64_t rank = inputType.getRank();
 
+        nova::ReductionKind kind = op.getKind();
+
+        // Collect reduction axes
         SmallVector<int64_t> axes;
         if (auto dims = op.getDimension()) {
             for (auto attr : *dims) {
-            int64_t axis = cast<IntegerAttr>(attr).getInt();
-            if (axis < 0) axis += rank;
-            axes.push_back(axis);
+                int64_t axis = cast<IntegerAttr>(attr).getInt();
+                if (axis < 0) axis += rank;
+                axes.push_back(axis);
             }
         } else {
+            // Reduce all dimensions
             for (int64_t i = 0; i < rank; ++i) axes.push_back(i);
         }
 
-        Value current = v;
+        // Sort axes in descending order so we can reduce from higher dims first
+        // (this prevents axis index shifting issues)
+        llvm::sort(axes, std::greater<int64_t>());
 
-        // Helper to get initial value
-        auto getInitVal = [&](nova::ReductionKind kind, Type type) -> Value {
-            if (kind == nova::ReductionKind::SUM || kind == nova::ReductionKind::MEAN) {
-            return rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(type));
-            } else if (kind == nova::ReductionKind::PRODUCT) {
-            if (auto floatType = llvm::dyn_cast<FloatType>(type))
-                return rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(type, 1.0));
-            return rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(type, 1));
-            } else if (kind == nova::ReductionKind::MAX) {
-            if (auto floatType = llvm::dyn_cast<FloatType>(type))
-                return rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(type, APFloat::getInf(floatType.getFloatSemantics(), true))); // Neg Inf
-            return rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(type, llvm::APInt::getSignedMinValue(type.getIntOrFloatBitWidth())));
-            } else if (kind == nova::ReductionKind::MIN) {
-            if (auto floatType = llvm::dyn_cast<FloatType>(type))
-                return rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(type, APFloat::getInf(floatType.getFloatSemantics(), false))); // Pos Inf
-            return rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(type, llvm::APInt::getSignedMaxValue(type.getIntOrFloatBitWidth())));
-            }
-            return nullptr;
-        };
+        Value current = input;
+        int64_t totalReducedElements = 1;
 
-        // Perform reduction for each axis
+        // Reduce each axis using TOSA reduce ops
         for (int64_t axis : axes) {
-            auto currentRankedType = cast<RankedTensorType>(current.getType());
-            SmallVector<int64_t> nextShape = llvm::to_vector(currentRankedType.getShape());
-            nextShape[axis] = 1;
-
-            auto nextType = RankedTensorType::get(nextShape, elemType, inputType.getEncoding());
-            Value init = getInitVal(op.getKind(), elemType);
-            Value empty = rewriter.create<tensor::EmptyOp>(loc, nextShape, elemType, inputType.getEncoding());
-            Value out = rewriter.create<linalg::FillOp>(loc, init, empty).getResult(0);
-
-            SmallVector<utils::IteratorType> iteratorTypes(currentRankedType.getRank(), utils::IteratorType::parallel);
-            iteratorTypes[axis] = utils::IteratorType::reduction;
-
-            auto identityMap = rewriter.getMultiDimIdentityMap(currentRankedType.getRank());
-            SmallVector<AffineExpr> exprs;
-            for (int64_t i = 0; i < currentRankedType.getRank(); ++i) {
-            if (i != axis) exprs.push_back(rewriter.getAffineDimExpr(i));
-            else exprs.push_back(rewriter.getAffineConstantExpr(0));
-            }
-            auto reductionMap = AffineMap::get(currentRankedType.getRank(), 0, exprs, rewriter.getContext());
-            SmallVector<AffineMap> indexingMaps = {identityMap, reductionMap};
-
-            current = rewriter.create<linalg::GenericOp>(
-                loc, TypeRange{nextType}, current, out, indexingMaps, iteratorTypes,
-                [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
-                Value reduced;
-                switch (op.getKind()) {
-                    case nova::ReductionKind::SUM:
-                    case nova::ReductionKind::MEAN:
-                    if (llvm::isa<FloatType>(elemType)) reduced = b.create<arith::AddFOp>(nestedLoc, args[0], args[1]);
-                    else reduced = b.create<arith::AddIOp>(nestedLoc, args[0], args[1]);
+            auto currentType = cast<RankedTensorType>(current.getType());
+            Type currentElemType = currentType.getElementType();
+            
+            // Compute intermediate result shape (reduced axis becomes 1)
+            SmallVector<int64_t> resultShape = llvm::to_vector(currentType.getShape());
+            totalReducedElements *= resultShape[axis];
+            resultShape[axis] = 1;
+            
+            auto axisAttr = rewriter.getI32IntegerAttr(axis);
+            
+            switch (kind) {
+                case nova::ReductionKind::SUM:
+                case nova::ReductionKind::MEAN: {
+                    auto intermediateType = RankedTensorType::get(resultShape, currentElemType, inputType.getEncoding());
+                    current = rewriter.create<tosa::ReduceSumOp>(loc, intermediateType, current, axisAttr);
                     break;
-                    case nova::ReductionKind::MAX:
-                    if (llvm::isa<FloatType>(elemType)) reduced = b.create<arith::MaximumFOp>(nestedLoc, args[0], args[1]);
-                    else reduced = b.create<arith::MaxSIOp>(nestedLoc, args[0], args[1]);
-                    break;
-                    case nova::ReductionKind::MIN:
-                    if (llvm::isa<FloatType>(elemType)) reduced = b.create<arith::MinimumFOp>(nestedLoc, args[0], args[1]);
-                    else reduced = b.create<arith::MinSIOp>(nestedLoc, args[0], args[1]);
-                    break;
-                    case nova::ReductionKind::PRODUCT:
-                    if (llvm::isa<FloatType>(elemType)) reduced = b.create<arith::MulFOp>(nestedLoc, args[0], args[1]);
-                    else reduced = b.create<arith::MulIOp>(nestedLoc, args[0], args[1]);
-                    break;
-                    default: reduced = args[0]; break;
                 }
-                b.create<linalg::YieldOp>(nestedLoc, reduced);
-                }).getResult(0);
+                case nova::ReductionKind::MAX: {
+                    auto intermediateType = RankedTensorType::get(resultShape, currentElemType, inputType.getEncoding());
+                    current = rewriter.create<tosa::ReduceMaxOp>(loc, intermediateType, current, axisAttr);
+                    break;
+                }
+                case nova::ReductionKind::MIN: {
+                    auto intermediateType = RankedTensorType::get(resultShape, currentElemType, inputType.getEncoding());
+                    current = rewriter.create<tosa::ReduceMinOp>(loc, intermediateType, current, axisAttr);
+                    break;
+                }
+                case nova::ReductionKind::PRODUCT: {
+                    auto intermediateType = RankedTensorType::get(resultShape, currentElemType, inputType.getEncoding());
+                    current = rewriter.create<tosa::ReduceProductOp>(loc, intermediateType, current, axisAttr);
+                    break;
+                }
+                case nova::ReductionKind::ALL: {
+                    // ALL requires boolean input - cast to i1 if needed
+                    Type i1Type = rewriter.getI1Type();
+                    if (currentElemType != i1Type) {
+                        auto boolType = RankedTensorType::get(currentType.getShape(), i1Type, inputType.getEncoding());
+                        current = rewriter.create<tosa::CastOp>(loc, boolType, current);
+                    }
+                    auto intermediateType = RankedTensorType::get(resultShape, i1Type, inputType.getEncoding());
+                    current = rewriter.create<tosa::ReduceAllOp>(loc, intermediateType, current, axisAttr);
+                    break;
+                }
+                case nova::ReductionKind::ANY: {
+                    // ANY requires boolean input - cast to i1 if needed
+                    Type i1Type = rewriter.getI1Type();
+                    if (currentElemType != i1Type) {
+                        auto boolType = RankedTensorType::get(currentType.getShape(), i1Type, inputType.getEncoding());
+                        current = rewriter.create<tosa::CastOp>(loc, boolType, current);
+                    }
+                    auto intermediateType = RankedTensorType::get(resultShape, i1Type, inputType.getEncoding());
+                    current = rewriter.create<tosa::ReduceAnyOp>(loc, intermediateType, current, axisAttr);
+                    break;
+                }
+                default:
+                    return failure();
+            }
         }
 
-        // Handle MEAN separately (divide by product of reduced dimensions)
-        if (op.getKind() == nova::ReductionKind::MEAN) {
-            int64_t totalReducedElements = 1;
-            for (int64_t axis : axes) totalReducedElements *= inputType.getShape()[axis];
+        // Handle MEAN: divide by product of reduced dimensions
+        if (kind == nova::ReductionKind::MEAN) {
+            auto currentType = cast<RankedTensorType>(current.getType());
             
-            auto currentRankedType = cast<RankedTensorType>(current.getType());
-            SmallVector<int64_t> divisorShape(currentRankedType.getRank(), 1);
+            // Create scalar divisor with shape [1, 1, ...] matching current rank
+            SmallVector<int64_t> divisorShape(currentType.getRank(), 1);
             auto divisorType = RankedTensorType::get(divisorShape, elemType, inputType.getEncoding());
             
             Value divisor;
-            if (auto floatType = llvm::dyn_cast<FloatType>(elemType)) {
-            auto attr = DenseElementsAttr::get(divisorType, rewriter.getFloatAttr(elemType, (double)totalReducedElements));
-            divisor = rewriter.create<tosa::ConstOp>(loc, divisorType, attr);
+            if (llvm::isa<FloatType>(elemType)) {
+                auto attr = DenseElementsAttr::get(divisorType, rewriter.getFloatAttr(elemType, (double)totalReducedElements));
+                divisor = rewriter.create<tosa::ConstOp>(loc, divisorType, attr);
             } else {
-            auto attr = DenseElementsAttr::get(divisorType, rewriter.getIntegerAttr(elemType, totalReducedElements));
-            divisor = rewriter.create<tosa::ConstOp>(loc, divisorType, attr);
+                auto attr = DenseElementsAttr::get(divisorType, rewriter.getIntegerAttr(elemType, totalReducedElements));
+                divisor = rewriter.create<tosa::ConstOp>(loc, divisorType, attr);
             }
             
+            // Use tosa.reciprocal + tosa.mul instead of division for better performance
+            auto reciprocal = rewriter.create<tosa::ReciprocalOp>(loc, divisorType, divisor);
             
-             Value divOut = rewriter.create<tensor::EmptyOp>(loc, currentRankedType.getShape(), elemType, inputType.getEncoding());
-             AffineMap divIdentity = rewriter.getMultiDimIdentityMap(currentRankedType.getRank()); 
-             // Divisor map must supply (0,0...). Since divisor is (1,1...) it works by default broadcasting? 
-             // Wait, if divisor is (1,1,1), and we use Identity Map, index (i,j,k) accesses (i,j,k). That is Out of Bounds if i>0.
-             // We need map (i,j,k) -> (0,0,0).
-             SmallVector<AffineExpr> zeros(currentRankedType.getRank(), rewriter.getAffineConstantExpr(0));
-             AffineMap zeroMap = AffineMap::get(currentRankedType.getRank(), 0, zeros, rewriter.getContext());
-             
-             current = rewriter.create<linalg::GenericOp>(
-                 loc, TypeRange{divOut.getType()}, ValueRange{current, divisor}, divOut,
-                 ArrayRef<AffineMap>{divIdentity, zeroMap, divIdentity},
-                 getNParallelLoopsAttrs(currentRankedType.getRank()),
-                 [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
-                     Value val = args[0];
-                     Value div = args[1];
-                     Value res;
-                     if (llvm::isa<FloatType>(elemType)) res = b.create<arith::DivFOp>(nestedLoc, val, div);
-                     else res = b.create<arith::DivSIOp>(nestedLoc, val, div);
-                     b.create<linalg::YieldOp>(nestedLoc, res);
-                 }
-             ).getResult(0);
+            // Create shift tensor for mul
+            auto shiftType = RankedTensorType::get({1}, rewriter.getI8Type());
+            auto shiftAttr = DenseElementsAttr::get(shiftType, rewriter.getI8IntegerAttr(0));
+            auto shift = rewriter.create<tosa::ConstOp>(loc, shiftType, shiftAttr);
+            
+            current = rewriter.create<tosa::MulOp>(loc, currentType, current, reciprocal, shift);
         }
 
-        if (!op.getKeepdims()) {
-            auto finalType = resultRankedType;
-            auto shapeType = RankedTensorType::get({finalType.getRank()}, rewriter.getIndexType());
-            auto shapeAttr = DenseIntElementsAttr::get(shapeType, finalType.getShape());
+        // Reshape to final result shape if needed
+        // If keepdims=false, we need to drop the size-1 dimensions
+        auto currentType = cast<RankedTensorType>(current.getType());
+        if (currentType.getShape() != resultType.getShape()) {
+            auto shapeType = RankedTensorType::get({resultType.getRank()}, rewriter.getIndexType());
+            auto shapeAttr = DenseIntElementsAttr::get(shapeType, resultType.getShape());
             auto shapeConst = rewriter.create<tosa::ConstShapeOp>(
-                loc, mlir::tosa::shapeType::get(rewriter.getContext(), finalType.getRank()),
+                loc, mlir::tosa::shapeType::get(rewriter.getContext(), resultType.getRank()),
                 shapeAttr);
-            current = rewriter.create<tosa::ReshapeOp>(loc, finalType, current, shapeConst);
+            current = rewriter.create<tosa::ReshapeOp>(loc, resultType, current, shapeConst);
         }
 
         rewriter.replaceOp(op, current);
         return success();
-
       }
     };
     

@@ -123,11 +123,11 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
   funcPM.addPass(mlir::createCanonicalizerPass());
   funcPM.addPass(mlir::createCSEPass());
   funcPM.addPass(mlir::math::createMathUpliftToFMA());  
- 
+ /*
   mlir::affine::AffineVectorizeOptions vectorOptions;
   vectorOptions.vectorSizes = {8};
   funcPM.addPass(mlir::affine::createAffineVectorize(vectorOptions));
-
+*/
   funcPM.addPass(mlir::createCanonicalizerPass());
 
   // Lower affine to standard control flow
