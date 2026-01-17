@@ -309,7 +309,7 @@ bool NovaCompilerSystemAPI::compileToObject(const std::string &inputFile,
   }
   
   // Then compile to object file
-  std::string cmd = "llc " + tempLL + "-relocation-model=pic -filetype=obj -o " + outputFile;
+  std::string cmd = "llc " + tempLL + " -relocation-model=pic -filetype=obj -o " + outputFile;
   int result = system(cmd.c_str());
   
   // Clean up temp file

@@ -6,6 +6,7 @@
 #include "Compiler/Transforms/FuseMatmulBias.h"
 #include "Compiler/Transforms/FixGpuLaunch.h"
 #include "Compiler/Transforms/FastmathFlag.h"
+#include "Compiler/Transforms/GenerateDynamicWrapper.h"
 
 namespace mlir {
 namespace nova {

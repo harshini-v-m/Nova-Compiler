@@ -7,6 +7,7 @@ add_mlir_library(CompilerTransforms
   FastmathFlag.cpp
   FixGpuLaunch.cpp
   ParallelizeOuterLoops.cpp
+  GenerateDynamicWrapper.cpp
 
   LINK_LIBS PUBLIC
   MLIRIR
