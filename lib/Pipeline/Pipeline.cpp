@@ -42,6 +42,7 @@
 #include "Compiler/Transforms/FastmathFlag.h"
 #include "Compiler/Transforms/ParallelizeOuterLoops.h"
 #include "Compiler/Transforms/FuseMatmulBias.h"
+#include "Compiler/Transforms/GenerateDynamicWrapper.h"
 
 //lowering passes
 #include "Compiler/Translation/NovaToArith/NovaToArith.h"
@@ -123,11 +124,11 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
   funcPM.addPass(mlir::createCanonicalizerPass());
   funcPM.addPass(mlir::createCSEPass());
   funcPM.addPass(mlir::math::createMathUpliftToFMA());  
- 
+ /*
   mlir::affine::AffineVectorizeOptions vectorOptions;
   vectorOptions.vectorSizes = {8};
   funcPM.addPass(mlir::affine::createAffineVectorize(vectorOptions));
-
+*/
   funcPM.addPass(mlir::createCanonicalizerPass());
 
   // Lower affine to standard control flow
@@ -151,6 +152,9 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
   pm.addPass(createArithToLLVMConversionPass());
   pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
   pm.addPass(createConvertFuncToLLVMPass()); // Convert functions lastly
+  
+  // Generate dynamic wrapper for unlimited args (after C interface is created)
+  pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
   
   pm.addPass(mlir::createUBToLLVMConversionPass());
   // reconcile unrealized casts
