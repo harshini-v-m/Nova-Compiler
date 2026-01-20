@@ -32,6 +32,9 @@ struct CompilerOptions {
   
   // Enable verbose output
   bool verbose = false;
+  
+  // Target device: "cpu" or "gpu"
+  std::string device = "cpu";
 };
 
 // Result of compilation

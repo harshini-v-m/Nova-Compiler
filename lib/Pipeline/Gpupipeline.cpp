@@ -60,6 +60,7 @@
 #include "Compiler/Translation/NovaToArith/NovaToArith.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 #include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
+#include "Compiler/Transforms/GenerateDynamicWrapper.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/PatternMatch.h"
 
@@ -178,6 +179,8 @@ namespace mlir
             pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
             pm.addPass(mlir::nova::createGpuRuntimeLoweringPass());
             pm.addPass(mlir::createConvertFuncToLLVMPass());
+            // Generate dynamic wrapper for unlimited args (after C interface is created)
+            pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());

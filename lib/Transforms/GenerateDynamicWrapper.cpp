@@ -47,8 +47,8 @@ struct GenerateDynamicWrapperPass
     // Get the number of arguments
     size_t numArgs = cifaceFunc.getNumArguments();
     
-    // If already has 2 args (result, args_array), we're done
-    if (numArgs <= 2) {
+    // if arg greater than 1 other wise it will give garbage values in the ABI
+    if (numArgs <= 1) {
       return;
     }
     
@@ -58,16 +58,16 @@ struct GenerateDynamicWrapperPass
     auto i64Type = builder.getI64Type();
     auto voidType = LLVM::LLVMVoidType::get(module.getContext());
     
-    // Step 1: Rename existing ciface to _mlir_ciface_main_impl
+    // Rename existing ciface to _mlir_ciface_main_impl
     cifaceFunc.setName("_mlir_ciface_main_impl");
     
-    // Step 2: Create new wrapper: _mlir_ciface_main(result_ptr, args_array)
+    // Create new wrapper: _mlir_ciface_main(result_ptr, args_array)
     auto wrapperFuncType = LLVM::LLVMFunctionType::get(voidType, {ptrType, ptrType});
     
     builder.setInsertionPointAfter(cifaceFunc);
     auto wrapperFunc = builder.create<LLVM::LLVMFuncOp>(loc, "_mlir_ciface_main", wrapperFuncType);
     
-    // Step 3: Create wrapper body
+    // Create wrapper body
     Block *entryBlock = wrapperFunc.addEntryBlock(builder);
     builder.setInsertionPointToStart(entryBlock);
     
@@ -78,7 +78,7 @@ struct GenerateDynamicWrapperPass
     SmallVector<Value> implArgs;
     implArgs.push_back(resultPtr); // First arg is always result struct pointer
     
-    // Load remaining args from the array (indices 0..numArgs-2)
+    // Load remaining args from the array
     for (size_t i = 1; i < numArgs; ++i) {
       Value idx = builder.create<LLVM::ConstantOp>(loc, i64Type, 
                                                    builder.getI64IntegerAttr(i - 1));
