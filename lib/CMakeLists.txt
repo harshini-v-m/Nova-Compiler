@@ -19,7 +19,7 @@ install(
         MLIRNovaToLinalgTransforms
         MLIRNovaToTosaTransforms
         NovaCompilerAPI
-        NovaRuntimeCore
+        #NovaRuntimeCore
     EXPORT mlir-compilerTargets  # Name the export set
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
