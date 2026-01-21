@@ -354,8 +354,6 @@ void populateNovaToLinalgPatterns(RewritePatternSet &patterns) {
   patterns.add<NovaMatmulOpLoweringgeneric, NovaBroadcastInDimOpLowering,
                NovaTransposeOpLowering, NovaToDeviceOpLowering,
                NovaScatterAddOpLowering,NovaGatherOpLowering
-               //  NovaDivopLowering
-               //    ,NovaSquareOpLowering
                >(patterns.getContext());
 }
 } // namespace nova

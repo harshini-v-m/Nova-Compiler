@@ -1006,7 +1006,6 @@ struct NovaToTosaLoweringPass
     target.addIllegalOp<nova::SoftmaxOp>();
     target.addIllegalOp<nova::BceOp>();
     target.addIllegalOp<nova::SceOp>();
-    // target.addIllegalOp<nova::MatmulOp>();
     target.addIllegalOp<nova::AddOp>();
     target.addIllegalOp<nova::MaeOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
