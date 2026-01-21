@@ -843,6 +843,215 @@ namespace mlir
     //----------------------------------------------------------------
     //                          ReduceOp
     //----------------------------------------------------------------
+        // Helper to get identity value for reduction operations
+    static TypedAttr getReduceIdentity(nova::ReductionKind kind, Type elemType,
+                                       PatternRewriter &rewriter) {
+      if (auto floatType = dyn_cast<FloatType>(elemType)) {
+        switch (kind) {
+          case nova::ReductionKind::SUM:
+          case nova::ReductionKind::MEAN:
+            return rewriter.getFloatAttr(elemType, 0.0);
+          case nova::ReductionKind::PRODUCT:
+            return rewriter.getFloatAttr(elemType, 1.0);
+          case nova::ReductionKind::MAX:
+            return rewriter.getFloatAttr(
+                elemType, APFloat::getInf(floatType.getFloatSemantics(), /*neg=*/true));
+          case nova::ReductionKind::MIN:
+            return rewriter.getFloatAttr(
+                elemType, APFloat::getInf(floatType.getFloatSemantics(), /*neg=*/false));
+          default: return {};
+        }
+      } else if (auto intType = dyn_cast<IntegerType>(elemType)) {
+        unsigned bw = intType.getWidth();
+        switch (kind) {
+          case nova::ReductionKind::SUM:
+          case nova::ReductionKind::MEAN:
+            return rewriter.getIntegerAttr(elemType, 0);
+          case nova::ReductionKind::PRODUCT:
+            return rewriter.getIntegerAttr(elemType, 1);
+          case nova::ReductionKind::MAX:
+            return rewriter.getIntegerAttr(elemType, APInt::getSignedMinValue(bw));
+          case nova::ReductionKind::MIN:
+            return rewriter.getIntegerAttr(elemType, APInt::getSignedMaxValue(bw));
+          case nova::ReductionKind::ALL:
+            return rewriter.getIntegerAttr(elemType, 1);
+          case nova::ReductionKind::ANY:
+            return rewriter.getIntegerAttr(elemType, 0);
+          default: return {};
+        }
+      }
+      return {};
+    }
+
+    // Helper to create reduction combiner operation
+    static Value createReduceCombiner(OpBuilder &b, Location loc, 
+                                      nova::ReductionKind kind, Value lhs, Value rhs,
+                                      Type elemType) {
+      switch (kind) {
+        case nova::ReductionKind::SUM:
+        case nova::ReductionKind::MEAN:
+          return isa<FloatType>(elemType) ? 
+                 b.create<arith::AddFOp>(loc, lhs, rhs).getResult() :
+                 b.create<arith::AddIOp>(loc, lhs, rhs).getResult();
+        case nova::ReductionKind::PRODUCT:
+          return isa<FloatType>(elemType) ?
+                 b.create<arith::MulFOp>(loc, lhs, rhs).getResult() :
+                 b.create<arith::MulIOp>(loc, lhs, rhs).getResult();
+        case nova::ReductionKind::MAX:
+          return isa<FloatType>(elemType) ?
+                 b.create<arith::MaximumFOp>(loc, lhs, rhs).getResult() :
+                 b.create<arith::MaxSIOp>(loc, lhs, rhs).getResult();
+        case nova::ReductionKind::MIN:
+          return isa<FloatType>(elemType) ?
+                 b.create<arith::MinimumFOp>(loc, lhs, rhs).getResult() :
+                 b.create<arith::MinSIOp>(loc, lhs, rhs).getResult();
+        case nova::ReductionKind::ALL:
+          return b.create<arith::AndIOp>(loc, lhs, rhs).getResult();
+        case nova::ReductionKind::ANY:
+          return b.create<arith::OrIOp>(loc, lhs, rhs).getResult();
+        default:
+          return lhs;
+      }
+    }
+
+    // Linalg.generic based lowering for keepdims=true (preserves encoding)
+    static LogicalResult lowerWithLinalgGeneric(
+        nova::ReduceOp op, PatternRewriter &rewriter, Location loc,
+        Value input, RankedTensorType inputType, RankedTensorType resultType,
+        Type elemType, int64_t rank, nova::ReductionKind kind,
+        SmallVector<int64_t> &axes) {
+      
+      Attribute encoding = inputType.getEncoding();
+      llvm::sort(axes);
+      llvm::SmallDenseSet<int64_t> axisSet(axes.begin(), axes.end());
+
+      // Handle ALL/ANY: cast to i1 first
+      Type reductionElemType = elemType;
+      Value current = input;
+      if (kind == nova::ReductionKind::ALL || kind == nova::ReductionKind::ANY) {
+        reductionElemType = rewriter.getI1Type();
+        if (elemType != reductionElemType) {
+          auto boolType = RankedTensorType::get(inputType.getShape(), reductionElemType, encoding);
+          current = rewriter.create<tosa::CastOp>(loc, boolType, current);
+        }
+      }
+
+      // Compute total reduced elements for MEAN
+      int64_t totalReducedElements = 1;
+      for (int64_t axis : axes) {
+        totalReducedElements *= inputType.getDimSize(axis);
+      }
+
+      // Get identity value
+      auto identityAttr = getReduceIdentity(kind, reductionElemType, rewriter);
+      if (!identityAttr)
+        return rewriter.notifyMatchFailure(op, "unsupported reduction kind");
+      Value identity = rewriter.create<arith::ConstantOp>(loc, identityAttr);
+
+      // Compute keepdims output shape (reduced dims become 1)
+      SmallVector<int64_t> keepdimsShape;
+      for (int64_t i = 0; i < rank; ++i) {
+        keepdimsShape.push_back(axisSet.contains(i) ? 1 : inputType.getDimSize(i));
+      }
+      
+      // Create output tensor with keepdims shape and encoding
+      auto keepdimsType = RankedTensorType::get(keepdimsShape, reductionElemType, encoding);
+      Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+          loc, keepdimsShape, reductionElemType, ValueRange{}, encoding);
+      Value filledTensor = rewriter.create<linalg::FillOp>(loc, identity, emptyTensor).result();
+      
+      // Build expanded input shape: for each reduced axis, split [size] -> [1, size]
+      SmallVector<int64_t> expandedInputShape;
+      SmallVector<ReassociationIndices> inputReassociation;
+      int64_t expandedDim = 0;
+      
+      for (int64_t i = 0; i < rank; ++i) {
+        if (axisSet.contains(i)) {
+          expandedInputShape.push_back(1);
+          expandedInputShape.push_back(inputType.getDimSize(i));
+          inputReassociation.push_back({expandedDim, expandedDim + 1});
+          expandedDim += 2;
+        } else {
+          expandedInputShape.push_back(inputType.getDimSize(i));
+          inputReassociation.push_back({expandedDim});
+          expandedDim += 1;
+        }
+      }
+      
+      auto expandedInputType = RankedTensorType::get(expandedInputShape, reductionElemType, encoding);
+      Value expandedInput = rewriter.create<tensor::ExpandShapeOp>(
+          loc, expandedInputType, current, inputReassociation);
+      
+      // Build indexing maps for linalg.generic
+      int64_t expandedRank = expandedInputShape.size();
+      SmallVector<AffineExpr> inputExprs, outputExprs;
+      SmallVector<utils::IteratorType> iteratorTypes;
+      
+      int64_t dimIdx = 0;
+      for (int64_t i = 0; i < rank; ++i) {
+        if (axisSet.contains(i)) {
+          // Reduced dimension: [1, original_size] -> parallel, reduction
+          inputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
+          inputExprs.push_back(rewriter.getAffineDimExpr(dimIdx + 1));
+          outputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
+          iteratorTypes.push_back(utils::IteratorType::parallel);
+          iteratorTypes.push_back(utils::IteratorType::reduction);
+          dimIdx += 2;
+        } else {
+          inputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
+          outputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
+          iteratorTypes.push_back(utils::IteratorType::parallel);
+          dimIdx += 1;
+        }
+      }
+      
+      auto inputMap = AffineMap::get(expandedRank, 0, inputExprs, rewriter.getContext());
+      auto outputMap = AffineMap::get(expandedRank, 0, outputExprs, rewriter.getContext());
+      
+      auto genericOp = rewriter.create<linalg::GenericOp>(
+          loc, keepdimsType, expandedInput, filledTensor,
+          SmallVector<AffineMap>{inputMap, outputMap}, iteratorTypes,
+          [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
+            Value result = createReduceCombiner(b, nestedLoc, kind, args[0], args[1], reductionElemType);
+            b.create<linalg::YieldOp>(nestedLoc, result);
+          });
+      
+      Value reduced = genericOp.getResult(0);
+
+      // Handle MEAN: divide by total reduced elements
+      if (kind == nova::ReductionKind::MEAN && isa<FloatType>(reductionElemType)) {
+        double divisor = static_cast<double>(totalReducedElements);
+        Value divisorVal = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getFloatAttr(reductionElemType, divisor));
+
+        Value divisorTensor = rewriter.create<tensor::EmptyOp>(
+            loc, keepdimsShape, reductionElemType, ValueRange{}, encoding);
+        Value filledDivisor = rewriter.create<linalg::FillOp>(loc, divisorVal, divisorTensor).result();
+
+        SmallVector<AffineMap> maps(3, rewriter.getMultiDimIdentityMap(rank));
+        Value outputTensor = rewriter.create<tensor::EmptyOp>(
+            loc, keepdimsShape, reductionElemType, ValueRange{}, encoding);
+
+        auto divOp = rewriter.create<linalg::GenericOp>(
+            loc, keepdimsType, ValueRange{reduced, filledDivisor}, outputTensor, maps,
+            getNParallelLoopsAttrs(rank),
+            [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
+              Value result = b.create<arith::DivFOp>(nestedLoc, args[0], args[1]);
+              b.create<linalg::YieldOp>(nestedLoc, result);
+            });
+        reduced = divOp.getResult(0);
+      }
+
+      // Final type cast if needed
+      if (cast<RankedTensorType>(reduced.getType()) != resultType) {
+        reduced = rewriter.create<tensor::CastOp>(loc, resultType, reduced);
+      }
+
+      rewriter.replaceOp(op, reduced);
+      return success();
+    }
+
+
     class ReduceOpConverter : public OpRewritePattern<nova::ReduceOp>
     {
     public:
@@ -871,6 +1080,13 @@ namespace mlir
         } else {
             // Reduce all dimensions
             for (int64_t i = 0; i < rank; ++i) axes.push_back(i);
+        }
+        
+        // Check if keepdims is true - use linalg.generic path to preserve encoding
+        bool keepDims = op.getKeepdims();
+        if (keepDims) {
+            return lowerWithLinalgGeneric(op, rewriter, loc, input, inputType, resultType, 
+                                          elemType, rank, kind, axes);
         }
 
         // Sort axes in descending order so we can reduce from higher dims first
