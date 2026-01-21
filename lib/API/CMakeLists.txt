@@ -12,4 +12,17 @@ add_mlir_library(NovaCompilerAPI
   
   MLIRNova
   NovaPipelines
+  MLIRArithToLLVM
+  MLIRControlFlowToLLVM
+  MLIRComplexToLLVM
+  MLIRFuncToLLVM
+  MLIRIndexToLLVM
+  MLIRMathToLLVM
+  MLIRMemRefToLLVM
+  MLIRUBToLLVM
+  MLIRVectorToLLVM
+  MLIROpenMPToLLVM
+  MLIRGPUToGPURuntimeTransforms
+  MLIRNVVMToLLVM
+  MLIRNVVMTarget
 )

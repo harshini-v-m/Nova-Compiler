@@ -15,11 +15,11 @@ using namespace mlir;
 namespace mlir {
 namespace nova {
 
-static bool isMemorySpaceOne(Attribute memorySpace) {
+static bool isDeviceAddressSpace(Attribute memorySpace) {
   if (!memorySpace)
     return false;
   if (auto intAttr = llvm::dyn_cast<IntegerAttr>(memorySpace)) {
-    return intAttr.getInt() == 1;
+    return intAttr.getInt() != 0;
   }
   return false;
 }
@@ -31,7 +31,7 @@ public:
   LogicalResult matchAndRewrite(memref::AllocOp op,
                                 PatternRewriter &rewriter) const override {
     MemRefType type = op.getType();
-    if (!isMemorySpaceOne(type.getMemorySpace()))
+    if (!isDeviceAddressSpace(type.getMemorySpace()))
       return failure();
 
     rewriter.replaceOpWithNewOp<gpu::AllocOp>(
@@ -49,7 +49,7 @@ public:
                                 PatternRewriter &rewriter) const override {
     Value memref = op.getMemref();
     MemRefType type = llvm::dyn_cast<MemRefType>(memref.getType());
-    if (!type || !isMemorySpaceOne(type.getMemorySpace()))
+    if (!type || !isDeviceAddressSpace(type.getMemorySpace()))
       return failure();
 
     rewriter.replaceOpWithNewOp<gpu::DeallocOp>(op, TypeRange{}, ValueRange{},
@@ -71,8 +71,8 @@ public:
 
     // Convert to gpu.memcpy if either source or destination is in memory space
     // 1
-    if (isMemorySpaceOne(srcType.getMemorySpace()) ||
-        isMemorySpaceOne(dstType.getMemorySpace())) {
+    if (isDeviceAddressSpace(srcType.getMemorySpace()) ||
+        isDeviceAddressSpace(dstType.getMemorySpace())) {
       // Synchronous memcpy (no async token)
       rewriter.replaceOpWithNewOp<gpu::MemcpyOp>(
           op, std::nullopt, ValueRange{}, op.getTarget(), op.getSource());
@@ -99,9 +99,9 @@ struct ConvertMemRefToGpuPass
     AttrTypeReplacer replacer;
     replacer.addReplacement(
         [&](nova::NovaDeviceAttr attr) -> std::optional<Attribute> {
-          if (attr.getValue().getValue() == "1")
-            return IntegerAttr::get(IntegerType::get(ctx, 32), 1);
-          return IntegerAttr::get(IntegerType::get(ctx, 32), 0);
+          // Any #nova.device attribute is considered to be on a device.
+          // For now, we map all to memory space 1 (generic GPU memory).
+          return IntegerAttr::get(IntegerType::get(ctx, 32), 1);
         });
 
     replacer.addReplacement([&](MemRefType type) -> std::optional<Type> {

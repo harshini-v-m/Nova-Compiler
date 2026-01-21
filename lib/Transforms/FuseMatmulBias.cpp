@@ -122,13 +122,10 @@ struct FuseMatmulBiasPattern : public OpRewritePattern<GenericOp> {
         currentVal = activeReshapes[i]->getResult(0); 
     }
 
-    llvm::errs() << "Found fusible matmul + add pattern (with " << activeReshapes.size() << " reshapes)!\n";
-      
     // Get matmul inputs
     Value A = matmulOp.getDpsInputOperand(0)->get();
     Value B = matmulOp.getDpsInputOperand(1)->get();
-    // Value adda=addOp.getDpsInputOperand(0)->get();
-    // Value addb=addOp.getDpsInputOperand(1)->get();
+
     // The bias currently matches the 'add' output shape (which is reshaped from matmul)
     // We need to apply the INVERSE reshapes to the bias to make it match the matmul output.
     Value transformedBias = bias;
@@ -164,8 +161,7 @@ struct FuseMatmulBiasPattern : public OpRewritePattern<GenericOp> {
         
         SmallVector<AffineMap> maps = {
             rewriter.getMultiDimIdentityMap(biasType.getRank()), // Input
-            rewriter.getMultiDimIdentityMap(biasType.getRank()),//input2
-         //   rewriter.getMultiDimIdentityMap(biasType.getRank())  // Output
+            rewriter.getMultiDimIdentityMap(biasType.getRank())  // Input2
         };
         
         SmallVector<utils::IteratorType> iterators(biasType.getRank(), utils::IteratorType::parallel);
@@ -374,7 +370,6 @@ struct FuseMatmulBiasPattern : public OpRewritePattern<GenericOp> {
         }
     }
 
-    llvm::errs() << "Successfully fused matmul + bias into single operation (thru reshapes)!\n";
 
     // Replace the original add operation with the new fused (and reshaped) operation
     rewriter.replaceOp(addOp, fusedResult);
@@ -384,10 +379,10 @@ struct FuseMatmulBiasPattern : public OpRewritePattern<GenericOp> {
 
 private:
   bool isElementwise(GenericOp op) const {
-    //check if the operatiopn has two inputs
+    // Check if the operation has two inputs
     if (op.getNumDpsInputs() != 2)
       return false;
-    //return true for only add operation
+    // Return true for only add operation
     Operation *definingOp = op.getBody()->getTerminator()->getOperand(0).getDefiningOp();
     return definingOp && (isa<arith::AddFOp>(definingOp) || isa<arith::AddIOp>(definingOp));
   }
@@ -424,8 +419,6 @@ struct FuseMatmulBiasPass
   void runOnOperation() override {
     auto func = getOperation();
 
-    llvm::errs() << "=== Running FuseMatmulBias Pass ===\n";
-
     // Apply the pattern
     RewritePatternSet patterns(&getContext());
     patterns.add<FuseMatmulBiasPattern>(&getContext());
@@ -433,8 +426,6 @@ struct FuseMatmulBiasPass
     if (failed(applyPatternsGreedily(func, std::move(patterns)))) {
       signalPassFailure();
     }
-
-    llvm::errs() << "=== FuseMatmulBias Pass Complete ===\n";
   }
 
   StringRef getArgument() const final { return "fuse-matmul-bias"; }

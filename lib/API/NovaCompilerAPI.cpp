@@ -1,14 +1,32 @@
 #include "Compiler/API/NovaCompilerAPI.h"
 #include "Compiler/Pipeline/Pipeline.h"
+#include "Compiler/Pipeline/Gpupipeline.h"
 #include "Compiler/Dialect/nova/NovaDialect.h"
 #include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Transforms/Passes.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/GPUToNVVM/GPUToNVVM.h"
+#include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
+#include "mlir/Conversion/GPUCommon/GPUToLLVM.h"
+#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h"
+#include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
+#include "mlir/Target/LLVM/NVVM/Target.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 
 #include "mlir/Parser/Parser.h"
@@ -31,9 +49,13 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <cstdlib>
 #include <array>
+#include <iostream>
+#include <vector>
+#include <string>
 #include <memory>
 #include <sstream>
 #include <fstream>
@@ -48,14 +70,17 @@ using namespace mlir::nova;
 NovaCompilerAPI::NovaCompilerAPI() {
   // Register all MLIR passes globally so they can be parsed from strings
   // Register specific passes needed for parsed pipelines
+  // mlir::registerAllPasses();
   mlir::affine::registerAffinePasses();
   mlir::registerCanonicalizerPass();
   mlir::registerCSEPass();
-
-  context = std::make_unique<MLIRContext>();
   
-  // Create and populate dialect registry first
+  // Register all translations to LLVM IR
   DialectRegistry registry;
+  mlir::registerAllToLLVMIRTranslations(registry);
+  mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
+
+  context = std::make_unique<MLIRContext>(registry);
   
   // Register necessary dialects
   registry.insert<mlir::nova::NovaDialect,
@@ -67,13 +92,29 @@ NovaCompilerAPI::NovaCompilerAPI() {
                  mlir::tosa::TosaDialect,
                  mlir::memref::MemRefDialect,
                  mlir::vector::VectorDialect,
-                 mlir::bufferization::BufferizationDialect>();
+                 mlir::bufferization::BufferizationDialect,
+                 mlir::gpu::GPUDialect,
+                 mlir::NVVM::NVVMDialect,
+                 mlir::nvgpu::NVGPUDialect>();
   
   mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::vector::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::vector::registerConvertVectorToLLVMInterface(registry);
+  mlir::arith::registerConvertArithToLLVMInterface(registry);
+  mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
+  mlir::registerConvertFuncToLLVMInterface(registry);
+  mlir::index::registerConvertIndexToLLVMInterface(registry);
+  mlir::registerConvertMathToLLVMInterface(registry);
+  mlir::registerConvertMemRefToLLVMInterface(registry);
+  mlir::ub::registerConvertUBToLLVMInterface(registry);
+  mlir::gpu::registerConvertGpuToLLVMInterface(registry);
+  mlir::registerConvertNVVMToLLVMInterface(registry);
+  mlir::registerConvertOpenMPToLLVMInterface(registry);
+  mlir::registerConvertComplexToLLVMInterface(registry);
+  mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
   mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
 
   // Register LLVM IR translation
@@ -189,8 +230,12 @@ LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module,
   }
   
   if (options.runFullPipeline) {
-    // Add the Nova optimization pipeline
-    createNovaPipelines(pm);
+    // Add the Nova optimization pipeline based on target device
+    if (options.device == "gpu") {
+      createNovaGPUPipelines(pm);
+    } else {
+      createNovaPipelines(pm);
+    }
   }
   
   // Run custom pipeline if specified
@@ -200,7 +245,11 @@ LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module,
     }
   }
   
-  return pm.run(module);
+  LogicalResult result = pm.run(module);
+  if (failed(result)) {
+    llvm::errs() << "Error: NovaCompilerAPI pipeline run failed\n";
+  }
+  return result;
 }
 
 std::string NovaCompilerAPI::translateToLLVMIR(ModuleOp module) {
@@ -287,8 +336,30 @@ bool NovaCompilerSystemAPI::compileToLLVMIR(const std::string &inputFile,
           "mlir-translate --mlir-to-llvmir > " + outputFile;
   }
   else if(device == "gpu") {
-    cmd = novaOpt + " " + inputFile + " --nova-gpu-pipeline | " +
-          "mlir-translate --mlir-to-llvmir > " + outputFile;
+    std::string tmp1 = inputFile + ".gpu_stage1.mlir";
+    std::string tmp2 = inputFile + ".gpu_stage2.mlir";
+    
+    // Stage 1: Full Nova GPU Pipeline
+    std::string stage1Cmd = novaOpt + " " + inputFile + " --nova-gpu-pipeline -o " + tmp1;
+    int ret1 = std::system(stage1Cmd.c_str());
+    if (ret1 != 0) return false;
+    
+    // Stage 2: Explicit GPU Binary Generation with ISA format (Matching manual script)
+    std::string stage2Cmd = novaOpt + " " + tmp1 + " --gpu-module-to-binary=\"format=isa\" -o " + tmp2;
+    int ret2 = std::system(stage2Cmd.c_str());
+    if (ret2 != 0) {
+        // std::remove(tmp1.c_str());
+        return false;
+    }
+    
+    // Stage 3: Translate to LLVM IR (mlir-translate handles gpu.launch_func -> mgpu)
+    std::string stage3Cmd = "mlir-translate --mlir-to-llvmir " + tmp2 + " > " + outputFile;
+    int ret3 = std::system(stage3Cmd.c_str());
+    
+    // Clean up (Disabled for debugging)
+    std::remove(tmp1.c_str());
+    std::remove(tmp2.c_str());
+    return ret3 == 0;
   }
   else {
     return false; // Invalid device type
@@ -302,9 +373,11 @@ bool NovaCompilerSystemAPI::compileToObject(const std::string &inputFile,
                                             const std::string &outputFile,
                                             const std::string &novaOptPath,
                                             const std::string &device) {
+  std::cout << "[NovaCompilerAPI] compileToObject: " << inputFile << " -> " << outputFile << " (device=" << device << ")" << std::endl;
   // First compile to LLVM IR
   std::string tempLL = outputFile + ".tmp.ll";
   if (!compileToLLVMIR(inputFile, tempLL, novaOptPath, device)) {
+    std::cout << "[NovaCompilerAPI] compileToLLVMIR failed" << std::endl;
     return false;
   }
   

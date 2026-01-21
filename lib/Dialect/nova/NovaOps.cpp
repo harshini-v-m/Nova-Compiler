@@ -16,18 +16,16 @@ using namespace mlir::nova;
 
 // Helper Functions
 
-// Helper to determine result encoding for binary operations
 static Attribute getBinaryResultEncoding(Attribute lhsEncoding,
                                          Attribute rhsEncoding,
                                          MLIRContext *context) {
-  auto lhsAttr = llvm::dyn_cast_or_null<NovaDeviceAttr>(lhsEncoding);
-  auto rhsAttr = llvm::dyn_cast_or_null<NovaDeviceAttr>(rhsEncoding);
-
-  if ((lhsAttr && lhsAttr.getValue() == "1") ||
-      (rhsAttr && rhsAttr.getValue() == "1"))
-    return NovaDeviceAttr::get(context, StringAttr::get(context, "1"));
-
-  return Attribute();
+  if (lhsEncoding && rhsEncoding) {
+    if (lhsEncoding == rhsEncoding)
+      return lhsEncoding;
+    // If they differ, pick one (usually they should be same in cgadimpl)
+    return lhsEncoding;
+  }
+  return lhsEncoding ? lhsEncoding : rhsEncoding;
 }
 
 // Helper to determine result encoding for unary operations

@@ -25,10 +25,10 @@ struct AddGpuMemoryCopiesPass
     if (!memorySpace)
       return false;
     if (auto intAttr = llvm::dyn_cast<IntegerAttr>(memorySpace)) {
-      return intAttr.getInt() == 1;
+      return intAttr.getInt() != 0;
     }
-    if (auto deviceAttr = llvm::dyn_cast<nova::NovaDeviceAttr>(memorySpace)) {
-      return deviceAttr.getValue().getValue() == "1";
+    if (llvm::isa<nova::NovaDeviceAttr>(memorySpace)) {
+      return true;
     }
     return false;
   }
@@ -48,8 +48,7 @@ struct AddGpuMemoryCopiesPass
       Operation *op = current.getDefiningOp();
 
       if (!op)
-        continue; // Block Argument? Assume properly allocated/writable or
-                  // handled elsewhere.
+        continue;
       if (!visited.insert(op).second)
         continue;
 
@@ -77,26 +76,8 @@ struct AddGpuMemoryCopiesPass
       }
       if (auto getGlobal = dyn_cast<memref::GetGlobalOp>(op)) {
         auto global = symbolTable.lookup<memref::GlobalOp>(getGlobal.getName());
-        if (global && global.getConstant())
-          return true; // checking memref global constant
-        // Memref global doesn't have 'constant' method on Op directly?
-        // It has 'constant' attribute? NO, memref.global has type and
-        // initial_value. Inspecting definition:
-        if (global) {
-          // MemRef global is constant if it has `constant` keyword in assembly?
-          // `isConstant()` method exists on MemRefGlobalOp?
-          // Let's assume yes or check attribute.
-          // Actually, `memref::GlobalOp` has `getConstant()`.
-          // Wait, verifying API...
-          // Use generic check:
-          if (global->hasAttr("constant"))
-            return true; // crude
-          // `memref::GlobalOp` stores constant-ness.
-          // Let's assume if we found it, and it's a global input data, it IS
-          // constant in this test context. But to be safe, we can try to rely
-          // on LLVM lowering which we saw used Constants.
-          return true; // Conservatively assume globals are RO?
-        }
+        if (global && global->hasAttr("constant"))
+          return true;
       }
     }
     return false;
@@ -106,6 +87,10 @@ struct AddGpuMemoryCopiesPass
   bool shouldRegisterHostMemory(Value val) {
     auto memRefType = llvm::dyn_cast<MemRefType>(val.getType());
     if (!memRefType)
+      return false;
+
+    // NEVER register memory that is already on a device
+    if (isDeviceMemorySpace(memRefType.getMemorySpace()))
       return false;
 
     // Static size check
@@ -126,7 +111,7 @@ struct AddGpuMemoryCopiesPass
       return false;
     }
 
-    // Dynamic shapes: Be conservative or assume user knows best?
+    // Dynamic shapes: Be conservative
     return false;
   }
 
@@ -185,9 +170,8 @@ struct AddGpuMemoryCopiesPass
           Value val = operand.get();
           if (auto memRefType = llvm::dyn_cast<MemRefType>(val.getType())) {
             if (isDeviceMemorySpace(memRefType.getMemorySpace())) {
-              // If it's a constant global, we still need to shadow it to ensure it's actually on the device
-              if (!isReadOnly(val, symbolTable))
-                continue;
+              // If it's already in a device memory space, don't shadow it.
+              continue;
             }
 
             // It's a host memref used in GPU. Check if it's defined outside
@@ -222,9 +206,15 @@ struct AddGpuMemoryCopiesPass
 
               // Create shadow
               MemRefType hostType = llvm::cast<MemRefType>(val.getType());
+              
+              // Determine the target device space. 
+              // If it's already a NovaDeviceAttr, we extraction the index if possible,
+              // but for now we default to 1 as the generic GPU space in this pass.
+              Attribute deviceSpace = builder.getI32IntegerAttr(1);
+              
               MemRefType deviceType = MemRefType::get(
                   hostType.getShape(), hostType.getElementType(),
-                  hostType.getLayout(), builder.getI32IntegerAttr(1));
+                  hostType.getLayout(), deviceSpace);
 
               // Dynamic dim handling
               SmallVector<Value> dynamicSizes;
@@ -365,61 +355,6 @@ struct AddGpuMemoryCopiesPass
         });
     }
 
-    // 5. Optimize existing deallocations
-    func.walk([&](Operation *op) {
-      Value buffer;
-      if (auto allocOp = dyn_cast<gpu::AllocOp>(op)) {
-        buffer = allocOp.getResult(0);
-      } else if (auto allocOp = dyn_cast<memref::AllocOp>(op)) {
-        buffer = allocOp.getResult();
-      } else {
-        return;
-      }
-
-      Operation *existingDealloc = nullptr;
-
-      // Find existing dealloc
-      for (auto &use : buffer.getUses()) {
-        Operation *owner = use.getOwner();
-        if (isa<memref::DeallocOp>(owner) || isa<gpu::DeallocOp>(owner)) {
-          existingDealloc = owner;
-          break;
-        }
-      }
-
-      if (existingDealloc) {
-        // Find last user (excluding the dealloc itself)
-        Block *allocBlock = buffer.getParentBlock();
-        Operation *lastUser = nullptr;
-        bool safeToMove = true;
-
-        for (auto &use : buffer.getUses()) {
-          Operation *userOp = use.getOwner();
-          if (userOp == existingDealloc)
-            continue;
-
-          Operation *ancestor = userOp;
-          while (ancestor->getBlock() != allocBlock) {
-            ancestor = ancestor->getParentOp();
-            if (!ancestor) {
-              safeToMove = false;
-              break;
-            }
-          }
-          if (!safeToMove)
-            break;
-
-          if (!lastUser || lastUser->isBeforeInBlock(ancestor)) {
-            lastUser = ancestor;
-          }
-        }
-
-        if (safeToMove && lastUser) {
-          // Move dealloc to after lastUser
-          existingDealloc->moveAfter(lastUser);
-        }
-      }
-    });
   }
 
   StringRef getArgument() const final { return "add-gpu-memory-copies"; }

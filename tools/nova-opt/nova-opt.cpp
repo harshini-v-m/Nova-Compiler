@@ -24,11 +24,7 @@
 #include "Compiler/Dialect/nova/NovaDialect.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
 #include "Compiler/Transforms/Passes.h"
-#include "Compiler/Transforms/CleanupPass.h"
-#include "Compiler/Transforms/Affine/AffineFullUnroll.h"
 #include "Compiler/Transforms/FuseMatmulBias.h"
-#include "Compiler/Transforms/FastmathFlag.h"
-#include "Compiler/Transforms/ParallelizeOuterLoops.h"
 
 #include "Compiler/Translation/NovaToArith/NovaToArith.h"
 #include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
@@ -67,14 +63,14 @@ int main(int argc, char **argv) {
     return mlir::nova::createAddGpuMemoryCopiesPass();
   });
 
+  // Register custom passes (ConvertMemRefToGpu, FuseMatmulBias, etc.)
+  mlir::nova::registerAffinePasses();
+
   // Register the ViewOpGraph pass specifically
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::createPrintOpGraphPass();
   });
 
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
-    return mlir::compiler::createCleanupPass();
-  });
 
   mlir::DialectRegistry registry;
   
@@ -96,7 +92,6 @@ int main(int argc, char **argv) {
 
   mlir::nova::registerNovaPipelines();
    mlir::nova::registerNovaGPUPipelines();
-  mlir::nova::registerAffinePasses();
   
   mlir::nova::registerNovaToArithLoweringPass();
   mlir::nova::registerNovaToTosaLoweringPass();

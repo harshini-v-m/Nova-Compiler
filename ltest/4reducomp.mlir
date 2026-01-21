@@ -5,7 +5,7 @@ module {
   // Function 1: Reduction Operations
   func.func @reduction_ops(
     %arg0: tensor<4x8xf32, #nova.device<"1">>
-  ) -> (tensor<8xf32, #nova.device<"1">>, tensor<4x1xf32, #nova.device<"1">>, tensor<f32, #nova.device<"1">>, tensor<4xi32, #nova.device<"1">>, tensor<8xi32, #nova.device<"1">>) {
+  ) -> (tensor<8xf32, #nova.device<"1">>, tensor<f32, #nova.device<"1">>, tensor<4xi32, #nova.device<"1">>, tensor<8xi32, #nova.device<"1">>) {
     
     // Sum reduction along dimension 0 → shape: 8
     %sum_d0 = nova.reduce<sum> %arg0 dimension = [0]
@@ -41,8 +41,8 @@ module {
     %argmin_d0 = nova.argmin %arg0 dimension = 0
       : tensor<4x8xf32, #nova.device<"1">>
     
-    return %sum_d0, %max_d1_keep, %mean_all, %argmax_d1, %argmin_d0
-      : tensor<8xf32, #nova.device<"1">>, tensor<4x1xf32, #nova.device<"1">>, tensor<f32, #nova.device<"1">>, tensor<4xi32, #nova.device<"1">>, tensor<8xi32, #nova.device<"1">>
+    return %sum_d0, %mean_all, %argmax_d1, %argmin_d0
+      : tensor<8xf32, #nova.device<"1">>, tensor<f32, #nova.device<"1">>, tensor<4xi32, #nova.device<"1">>, tensor<8xi32, #nova.device<"1">>
   }
 
   // Function 2: Comparison Operations

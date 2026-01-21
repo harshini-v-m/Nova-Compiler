@@ -39,18 +39,12 @@ struct GenerateDynamicWrapperPass
       }
     });
     
-    if (!cifaceFunc) {
-      // No C interface function found, nothing to do
+    if (!cifaceFunc || module.lookupSymbol<LLVM::LLVMFuncOp>("_mlir_ciface_main_impl")) {
+      // No C interface function found or already wrapped
       return;
     }
     
-    // Get the number of arguments
     size_t numArgs = cifaceFunc.getNumArguments();
-    
-    // If already has 2 args (result, args_array), we're done
-    if (numArgs <= 2) {
-      return;
-    }
     
     OpBuilder builder(module.getContext());
     auto loc = cifaceFunc.getLoc();
@@ -78,7 +72,7 @@ struct GenerateDynamicWrapperPass
     SmallVector<Value> implArgs;
     implArgs.push_back(resultPtr); // First arg is always result struct pointer
     
-    // Load remaining args from the array (indices 0..numArgs-2)
+    // Load all remaining args from the single array
     for (size_t i = 1; i < numArgs; ++i) {
       Value idx = builder.create<LLVM::ConstantOp>(loc, i64Type, 
                                                    builder.getI64IntegerAttr(i - 1));

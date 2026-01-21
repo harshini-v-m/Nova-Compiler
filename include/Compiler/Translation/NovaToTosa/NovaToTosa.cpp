@@ -435,7 +435,7 @@ struct NovaOpTosaOp {
     auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType = mlir::RankedTensorType::get(
+   auto newVType = mlir::RankedTensorType::get(
         v_type.getShape(), targetElemType, v_type.getEncoding());
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
     auto w_type = cast<mlir::RankedTensorType>(input[1].getType());
