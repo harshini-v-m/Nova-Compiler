@@ -75,7 +75,7 @@ public:
         isMemorySpaceOne(dstType.getMemorySpace())) {
       // Synchronous memcpy (no async token)
       rewriter.replaceOpWithNewOp<gpu::MemcpyOp>(
-          op, std::nullopt, ValueRange{}, op.getTarget(), op.getSource());
+          op,TypeRange{}, ValueRange{}, op.getTarget(), op.getSource());
       return success();
     }
     return failure();

@@ -987,7 +987,6 @@ struct NovaToTosaLoweringPass
     target.addIllegalOp<nova::MaxOp>();
     target.addIllegalOp<nova::MinOp>();
     target.addIllegalOp<nova::SubOp>();
-    target.addIllegalOp<nova::MulOp>();
     target.addIllegalOp<nova::PowOp>();
     target.addIllegalOp<nova::SqrtOp>();
     target.addIllegalOp<nova::SquareOp>();
@@ -1032,32 +1031,29 @@ struct NovaToTosaLoweringPass
 void populateNovaToTosaConversionPatterns(RewritePatternSet &patterns) {
   patterns.add<NovaReluOpLowering, NovaGeluOpLowering,
                NovaSoftmaxLoweringPattern, NovaConstantToTosaConstPattern,
-               NovaToTosaLoweringTemplate<nova::MaxOp>,
-               NovaToTosaLoweringTemplate<nova::LogOp>,
-               NovaToTosaLoweringTemplate<nova::AbsOp>,
-               NovaToTosaLoweringTemplate<nova::ExpOp>,
-               NovaToTosaLoweringTemplate<nova::MinOp>,
-               NovaToTosaLoweringTemplate<nova::AndOp>,
-               NovaToTosaLoweringTemplate<nova::SinOp>,
-               NovaToTosaLoweringTemplate<nova::CosOp>,
-               NovaToTosaLoweringTemplate<nova::TanhOp>,
-               NovaToTosaLoweringTemplate<nova::OrOp>,
-               NovaToTosaLoweringTemplate<nova::XorOp>,
-               NovaToTosaLoweringTemplate<nova::NotOp>,
-               NovaToTosaLoweringTemplate<nova::NegOp>,
-               NovaToTosaLoweringTemplate<nova::ReciprocalOp>,
-               NovaToTosaLoweringTemplate<nova::MaeOp>,
-               NovaToTosaLoweringTemplate<nova::MseOp>,
-               NovaToTosaLoweringTemplate<nova::CceOp>,
-               NovaToTosaLoweringTemplate<nova::BceOp>,
-               NovaToTosaLoweringTemplate<nova::SceOp>,
-               NovaToTosaLoweringTemplate<nova::SigmoidOp>>(
-      patterns.getContext());
-
-  patterns.add<NovaToTosaLoweringTemplate<nova::SquareOp>>(
-      patterns.getContext(), 10);
-  patterns.add<NovaToTosaLoweringTemplate<nova::SqrtOp>>(patterns.getContext(),
-                                                         10);
+               NovaToTosaLoweringTemplate<nova::MaxOp>, 
+               NovaToTosaLoweringTemplate<nova::LogOp>, 
+               NovaToTosaLoweringTemplate<nova::AbsOp>, 
+               NovaToTosaLoweringTemplate<nova::ExpOp>, 
+               NovaToTosaLoweringTemplate<nova::MinOp>, 
+               NovaToTosaLoweringTemplate<nova::AndOp>, 
+               NovaToTosaLoweringTemplate<nova::SinOp>, 
+               NovaToTosaLoweringTemplate<nova::CosOp>, 
+               NovaToTosaLoweringTemplate<nova::TanhOp>, 
+               NovaToTosaLoweringTemplate<nova::OrOp>, 
+               NovaToTosaLoweringTemplate<nova::XorOp>, 
+               NovaToTosaLoweringTemplate<nova::NotOp>, 
+               NovaToTosaLoweringTemplate<nova::NegOp>, 
+               NovaToTosaLoweringTemplate<nova::ReciprocalOp>, 
+               NovaToTosaLoweringTemplate<nova::MaeOp>, 
+               NovaToTosaLoweringTemplate<nova::MseOp>, 
+               NovaToTosaLoweringTemplate<nova::CceOp>, 
+               NovaToTosaLoweringTemplate<nova::BceOp>, 
+               NovaToTosaLoweringTemplate<nova::SceOp>, 
+               NovaToTosaLoweringTemplate<nova::SigmoidOp>, 
+               NovaToTosaLoweringTemplate<nova::SquareOp>, 
+               NovaToTosaLoweringTemplate<nova::SqrtOp> 
+               >(patterns.getContext());
 }
 
 // creating a pointer for this pass

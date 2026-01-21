@@ -66,26 +66,26 @@ private:
     return nullptr;
   }
 
-  static Value mapOpImpl(nova::AddOp op, Type resultType, ValueRange args,
-                         Value init, OpBuilder &builder) {
-    auto linalgop = builder.create<linalg::AddOp>(
-        op.getLoc(), 
-        resultType,
-        ValueRange{args[0], args[1]},
-        ValueRange{init});
+  // static Value mapOpImpl(nova::AddOp op, Type resultType, ValueRange args,
+  //                        Value init, OpBuilder &builder) {
+  //   auto linalgop = builder.create<linalg::AddOp>(
+  //       op.getLoc(), 
+  //       resultType,
+  //       ValueRange{args[0], args[1]},
+  //       ValueRange{init});
 
-    return linalgop.getResult(0);
-  }
-    static Value mapOpImpl(nova::SubOp op, Type resultType, ValueRange args,
-                         Value init, OpBuilder &builder) {
-    auto linalgop = builder.create<linalg::SubOp>(
-        op.getLoc(), 
-        resultType,
-        ValueRange{args[0], args[1]},
-        ValueRange{init});
+  //   return linalgop.getResult(0);
+  // }
+  //   static Value mapOpImpl(nova::SubOp op, Type resultType, ValueRange args,
+  //                        Value init, OpBuilder &builder) {
+  //   auto linalgop = builder.create<linalg::SubOp>(
+  //       op.getLoc(), 
+  //       resultType,
+  //       ValueRange{args[0], args[1]},
+  //       ValueRange{init});
 
-    return linalgop.getResult(0);
-  }
+  //   return linalgop.getResult(0);
+  // }
     static Value mapOpImpl(nova::MulOp op, Type resultType, ValueRange args,
                          Value init, OpBuilder &builder) {
     auto linalgop = builder.create<linalg::MulOp>(
@@ -106,97 +106,97 @@ private:
 
     return linalgop.getResult(0);
   }
-        static Value mapOpImpl(nova::PowOp op, Type resultType, ValueRange args,
-                         Value init, OpBuilder &builder) {
-    Location loc = op.getLoc();
-    RankedTensorType resultTensorType = dyn_cast<RankedTensorType>(resultType);
+    //     static Value mapOpImpl(nova::PowOp op, Type resultType, ValueRange args,
+    //                      Value init, OpBuilder &builder) {
+    // Location loc = op.getLoc();
+    // RankedTensorType resultTensorType = dyn_cast<RankedTensorType>(resultType);
     
-    if (!resultTensorType) {
-        op.emitOpError("PowOp expects ranked tensor result type.");
-        return nullptr;
-    }
+    // if (!resultTensorType) {
+    //     op.emitOpError("PowOp expects ranked tensor result type.");
+    //     return nullptr;
+    // }
 
-    Type targetFloatType = builder.getF32Type();
-    Value lhs = args[0];
-    Value rhs = args[1];
+//     Type targetFloatType = builder.getF32Type();
+//     Value lhs = args[0];
+//     Value rhs = args[1];
 
-    if(isa<IntegerType>(lhs.getType())){
-        lhs = createIntToFloatCast(lhs, targetFloatType, builder, loc);
-    }
-    if(isa<IntegerType>(rhs.getType())){
-        rhs = createIntToFloatCast(rhs, targetFloatType, builder, loc);
-    }
+//     if(isa<IntegerType>(lhs.getType())){
+//         lhs = createIntToFloatCast(lhs, targetFloatType, builder, loc);
+//     }
+//     if(isa<IntegerType>(rhs.getType())){
+//         rhs = createIntToFloatCast(rhs, targetFloatType, builder, loc);
+//     }
 
-    auto linalgop = builder.create<linalg::PowFOp>(
-        loc, 
-        resultType,
-        ValueRange{lhs, rhs},
-        ValueRange{init}
-    );
+//     auto linalgop = builder.create<linalg::PowFOp>(
+//         loc, 
+//         resultType,
+//         ValueRange{lhs, rhs},
+//         ValueRange{init}
+//     );
 
-    return linalgop.getResult(0);
-}
-  static Value mapOpImpl(nova::SquareOp op, Type resultType, ValueRange args,
-                         Value init, OpBuilder &builder) {
-    auto linalgop = builder.create<linalg::SquareOp>(
-        op.getLoc(), 
-        resultType,
-        ValueRange{args[0]},
-        ValueRange{init});
+//     return linalgop.getResult(0);
+// }
+  // static Value mapOpImpl(nova::SquareOp op, Type resultType, ValueRange args,
+  //                        Value init, OpBuilder &builder) {
+  //   auto linalgop = builder.create<linalg::SquareOp>(
+  //       op.getLoc(), 
+  //       resultType,
+  //       ValueRange{args[0]},
+  //       ValueRange{init});
 
-    return linalgop.getResult(0);
-  }
-    static Value mapOpImpl(nova::SqrtOp op, Type resultType, ValueRange args,
-                         Value init, OpBuilder &builder) {
-    auto linalgop = builder.create<linalg::SqrtOp>(
-        op.getLoc(), 
-        resultType,
-        ValueRange{args[0]},
-        ValueRange{init});
+  //   return linalgop.getResult(0);
+  // }
+  //   static Value mapOpImpl(nova::SqrtOp op, Type resultType, ValueRange args,
+  //                        Value init, OpBuilder &builder) {
+  //   auto linalgop = builder.create<linalg::SqrtOp>(
+  //       op.getLoc(), 
+  //       resultType,
+  //       ValueRange{args[0]},
+  //       ValueRange{init});
 
-    return linalgop.getResult(0);
-  }
-    static Value mapOpImpl(nova::ReciprocalOp op, Type resultType, ValueRange args,
-                         Value init, OpBuilder &builder) {
-    auto linalgop = builder.create<linalg::ReciprocalOp>(
-        op.getLoc(), 
-        resultType,
-        ValueRange{args[0]},
-        ValueRange{init});
+  //   return linalgop.getResult(0);
+  // }
+  //   static Value mapOpImpl(nova::ReciprocalOp op, Type resultType, ValueRange args,
+  //                        Value init, OpBuilder &builder) {
+  //   auto linalgop = builder.create<linalg::ReciprocalOp>(
+  //       op.getLoc(), 
+  //       resultType,
+  //       ValueRange{args[0]},
+  //       ValueRange{init});
 
-    return linalgop.getResult(0);
-  }
-      static Value mapOpImpl(nova::ExpOp op, Type resultType, ValueRange args,
-                         Value init, OpBuilder &builder) {
-    auto linalgop = builder.create<linalg::ExpOp>(
-        op.getLoc(), 
-        resultType,
-        ValueRange{args[0]},
-        ValueRange{init});
+  //   return linalgop.getResult(0);
+  // }
+  //     static Value mapOpImpl(nova::ExpOp op, Type resultType, ValueRange args,
+  //                        Value init, OpBuilder &builder) {
+  //   auto linalgop = builder.create<linalg::ExpOp>(
+  //       op.getLoc(), 
+  //       resultType,
+  //       ValueRange{args[0]},
+  //       ValueRange{init});
 
-    return linalgop.getResult(0);
-  }
-    static Value mapOpImpl(nova::LogOp op, Type resultType, ValueRange args,
-                         Value init, OpBuilder &builder) {
-    auto linalgop = builder.create<linalg::LogOp>(
-        op.getLoc(), 
-        resultType,
-        ValueRange{args[0]},
-        ValueRange{init});
+  //   return linalgop.getResult(0);
+  // }
+  //   static Value mapOpImpl(nova::LogOp op, Type resultType, ValueRange args,
+  //                        Value init, OpBuilder &builder) {
+  //   auto linalgop = builder.create<linalg::LogOp>(
+  //       op.getLoc(), 
+  //       resultType,
+  //       ValueRange{args[0]},
+  //       ValueRange{init});
 
-    return linalgop.getResult(0);
-  }
+  //   return linalgop.getResult(0);
+  // }
     
-      static Value mapOpImpl(nova::TanhOp op, Type resultType, ValueRange args,
-                         Value init, OpBuilder &builder) {
-    auto linalgop = builder.create<linalg::TanhOp>(
-        op.getLoc(), 
-        resultType,
-        ValueRange{args[0]},
-        ValueRange{init});
+  //     static Value mapOpImpl(nova::TanhOp op, Type resultType, ValueRange args,
+  //                        Value init, OpBuilder &builder) {
+  //   auto linalgop = builder.create<linalg::TanhOp>(
+  //       op.getLoc(), 
+  //       resultType,
+  //       ValueRange{args[0]},
+  //       ValueRange{init});
 
-    return linalgop.getResult(0);
-  }
+  //   return linalgop.getResult(0);
+  // }
 static Value mapOpImpl(nova::Rndm2DOp op, Type resultType, ValueRange args,
                          Value init, OpBuilder &builder) {
 auto loc=op.getLoc();
@@ -246,18 +246,18 @@ public:
 };
 void populateNovaToLinalgNamedPatterns(RewritePatternSet &patterns) {
   patterns.add<
-            NovaToLinalgNamedopsConverter<nova::MulOp>,
-             NovaToLinalgNamedopsConverter<nova::DivOp>,
-            NovaToLinalgNamedopsConverter<nova::SqrtOp>,
-             NovaToLinalgNamedopsConverter<nova::ExpOp>,
-             NovaToLinalgNamedopsConverter<nova::LogOp>,
-             NovaToLinalgNamedopsConverter<nova::TanhOp>,
-             NovaToLinalgNamedopsConverter<nova::PowOp>,
-             NovaToLinalgNamedopsConverter<nova::MinOp>,
-             NovaToLinalgNamedopsConverter<nova::MaxOp>,
-             NovaToLinalgNamedopsConverter<nova::ReciprocalOp>,
-            NovaToLinalgNamedopsConverter<nova::SquareOp>,
-            NovaToLinalgNamedopsConverter<nova::Rndm2DOp>
+            NovaToLinalgNamedopsConverter<nova::MulOp>, 
+             NovaToLinalgNamedopsConverter<nova::DivOp>, 
+            // NovaToLinalgNamedopsConverter<nova::SqrtOp>,
+           //  NovaToLinalgNamedopsConverter<nova::ExpOp>,
+            // NovaToLinalgNamedopsConverter<nova::LogOp>,
+             //NovaToLinalgNamedopsConverter<nova::TanhOp>,
+           //  NovaToLinalgNamedopsConverter<nova::PowOp>,
+          //   NovaToLinalgNamedopsConverter<nova::MinOp>,
+           //   NovaToLinalgNamedopsConverter<nova::MaxOp>,
+           //  NovaToLinalgNamedopsConverter<nova::ReciprocalOp>,
+            //NovaToLinalgNamedopsConverter<nova::SquareOp>,
+            NovaToLinalgNamedopsConverter<nova::Rndm2DOp> 
 
   >(patterns.getContext());
 }

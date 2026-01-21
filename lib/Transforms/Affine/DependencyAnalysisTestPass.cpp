@@ -345,7 +345,7 @@ void DependencyAnalysisTestPass::analyzeLoop(affine::AffineForOp forOp) {
   DependencyAnalysis depAnalysis(forOp, memAnalysis);
 
   // Check if this is a reduction pattern
-  bool isReduction = isReductionPattern(forOp);
+ // bool isReduction = isReductionPattern(forOp);
   
 
 

@@ -17,8 +17,7 @@ namespace nova {
 //===-------------------------------------------------------------------------===//
 
 /// Create a pass to lower Nova dialect operations to Arith dialect operations.
-/// This pass converts:
-///   - nova.add -> arith.addi/arith.addf
+
 std::unique_ptr<Pass> createNovaToArithLoweringPass();
 
 /// Register the Nova to Arith lowering pass.
@@ -26,7 +25,6 @@ void registerNovaToArithLoweringPass();
 
 
 /// Populate the given pattern set with patterns that convert Nova ops to Arith ops.
-/// This is useful if you want to integrate these patterns into a larger conversion pass.
 void populateNovaToArithConversionPatterns(RewritePatternSet &patterns);
 
 
