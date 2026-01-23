@@ -239,118 +239,6 @@ namespace mlir
       {
         return nullptr;
       }
-
-      // div operation
-      static Value mapOpImpl(nova::DivOp op, Type resultType, ArrayRef<Value> args, OpBuilder *builder)
-      {
-        //if complex directly lower it
-        if(isa<ComplexType>(args[0].getType())){
-          return builder->create<complex::DivOp>(op.getLoc(),args[0],args[1]);
-        }
-        // 1..fiding dtype
-        auto flhstype = dyn_cast<mlir::FloatType>(args[0].getType());
-        auto frhstype = dyn_cast<mlir::FloatType>(args[1].getType());
-        auto ilhstype = dyn_cast<mlir::IntegerType>(args[0].getType());
-        auto irhstype = dyn_cast<mlir::IntegerType>(args[1].getType());
-        Value v;
-        // checking if lhs and rhs are same
-        if (isa<FloatType>(args[0].getType()) && isa<FloatType>(args[1].getType()))
-        {
-          // check both bitwidth
-          auto lhsbw = flhstype.getWidth();
-          auto rhsbw = frhstype.getWidth();
-          // selecting bigger one
-          if (lhsbw == rhsbw)
-            return builder->create<arith::DivFOp>(op.getLoc(), args[0], args[1]);
-          else if (lhsbw > rhsbw)
-          {
-            v = builder->create<arith::ExtFOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
-            return builder->create<arith::DivFOp>(op.getLoc(), args[0], v);
-          }
-          else
-          {
-            v = builder->create<arith::ExtFOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
-            return builder->create<arith::DivFOp>(op.getLoc(), v, args[1]);
-          }
-        }
-        else if (isa<IntegerType>(args[0].getType()) && isa<FloatType>(args[1].getType()))
-        {
-
-          auto lhsbw = ilhstype.getWidth();
-          auto rhsbw = frhstype.getWidth();
-          if (lhsbw == rhsbw)
-          {
-            v = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
-            return builder->create<arith::DivFOp>(op.getLoc(), v, args[1]);
-          }
-          else if (lhsbw > rhsbw)
-          {
-            v = builder->create<arith::ExtFOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
-            auto lhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), args[0]);
-            return builder->create<arith::DivFOp>(op.getLoc(), lhs, v);
-          }
-          else
-          {
-            v = builder->create<arith::ExtSIOp>(op.getLoc(), getinttype(rhsbw, builder), args[0]);
-            auto lhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), v);
-            return builder->create<arith::DivFOp>(op.getLoc(), lhs, args[1]);
-          }
-        }
-        // lhs if float and rhs is int
-        else if (isa<FloatType>(args[0].getType()) && isa<IntegerType>(args[1].getType()))
-        {
-          auto lhsbw = flhstype.getWidth();
-          auto rhsbw = irhstype.getWidth();
-          if (lhsbw == rhsbw)
-          {
-            v = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
-            return builder->create<arith::DivFOp>(op.getLoc(), args[0], v);
-          }
-          else if (lhsbw > rhsbw)
-          {
-            v = builder->create<arith::ExtSIOp>(op.getLoc(), getinttype(lhsbw, builder), args[1]);
-            auto rhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), v);
-            return builder->create<arith::DivFOp>(op.getLoc(), args[0], rhs);
-          }
-          else
-          {
-            v = builder->create<arith::ExtFOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
-            auto rhs = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), args[1]);
-            return builder->create<arith::DivFOp>(op.getLoc(), v, rhs);
-          }
-        }
-
-        else if (isa<IntegerType>(args[0].getType()) && isa<IntegerType>(args[1].getType()))
-        {
-          auto lhsbw = ilhstype.getWidth();
-          auto rhsbw = irhstype.getWidth();
-          if (lhsbw == rhsbw)
-          {
-            v = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), args[0]);
-            auto w = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), args[1]);
-            return builder->create<arith::DivFOp>(op.getLoc(), v, w);
-          }
-
-          else if (lhsbw > rhsbw)
-          {
-            v = builder->create<arith::ExtSIOp>(op.getLoc(), getinttype(lhsbw, builder), args[1]);
-            auto r = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), args[0]);
-            auto w = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(lhsbw, builder), v);
-            return builder->create<arith::DivFOp>(op.getLoc(), r, w);
-          }
-
-          else
-          {
-            v = builder->create<arith::ExtSIOp>(op.getLoc(), getinttype(rhsbw, builder), args[0]);
-            auto r = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), v);
-            auto w = builder->create<arith::SIToFPOp>(op.getLoc(), getfloattype(rhsbw, builder), args[1]);
-            return builder->create<arith::DivFOp>(op.getLoc(), r, w);
-          }
-        }
-
-        return nullptr;
-      }
-
       // mod operation
       static Value mapOpImpl(nova::ModOp op, Type resultType, ArrayRef<Value> args, OpBuilder *builder)
       {
@@ -456,62 +344,10 @@ namespace mlir
         }
         return nullptr;
       }
-      //and operation
-       //only integer type
-       static Value mapOpImpl(nova::AndOp op,Type resultType,ArrayRef<Value> args,OpBuilder* builder){
-         if(isa<IntegerType>(resultType))
-         return builder ->create<arith::AndIOp>(op.getLoc(),args[0],args[1]);
-         return nullptr;
-       }
-       // //or operation
-         static Value mapOpImpl(nova::OrOp op,Type resultType,ArrayRef<Value> args,OpBuilder* builder){
-         if(isa<IntegerType>(resultType))
-         return builder ->create<arith::OrIOp>(op.getLoc(),args[0],args[1]);
-         return nullptr;
-       }
-       // //xor operation
-         static Value mapOpImpl(nova::XorOp op,Type resultType,ArrayRef<Value> args,OpBuilder* builder){
-         if(isa<IntegerType>(resultType))
-         return builder ->create<arith::XOrIOp>(op.getLoc(),args[0],args[1]);
-         return nullptr;
-       }
- // The input is always the first operand in the args array.
-  static Value mapOpImpl(nova::NotOp op,Type resultType,ArrayRef<Value> args,OpBuilder* builder){
-  Value input = args[0];
-  Location loc = op.getLoc();
-  Type inputType = input.getType();
-
-   if (auto integerType = dyn_cast<IntegerType>(inputType)) {
-    Value zero = builder->create<arith::ConstantIntOp>(loc, 0, integerType.getWidth());
-    return builder->create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                          input, zero);
-    
-  } else if (auto floatType = dyn_cast<FloatType>(inputType)) {
-    APFloat zeroVal(floatType.getFloatSemantics(), 0); 
-    Value zeroConstant = builder->create<arith::ConstantFloatOp>(loc, floatType,zeroVal );
-    return builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::OEQ, 
-                                          input, zeroConstant);
-  }
-  return nullptr;
-       }
-
       //--------------------------------------------------------
       // EXPONENTS
       //-----------------------------------------------------------
-      // exp operaton
-      // static Value mapOpImpl(nova::ExpOp op, Type resultType, ArrayRef<Value> args,
-      //                        OpBuilder *builder)
-      // {
-      //   if (isa<FloatType>(args[0].getType()))
-      //     return builder->create<math::ExpOp>(op.getLoc(), args[0]);
-      //   if (isa<IntegerType>(args[0].getType()))
-      //     return builder->create<math::ExpOp>(op.getLoc(),
-      //                                         builder->create<arith::SIToFPOp>(op.getLoc(), builder->getF32Type(), args[0]));
-      //   if(isa<ComplexType>(args[0].getType())){
-      //     return builder->create<complex::ExpOp>(op.getLoc(),args[0]);
-      //   }
-      //   return nullptr;
-      // }
+
       // exp2 operaton
       static Value mapOpImpl(nova::Exp2Op op, Type resultType, ArrayRef<Value> args,
                              OpBuilder *builder)
@@ -523,20 +359,7 @@ namespace mlir
                                                builder->create<arith::SIToFPOp>(op.getLoc(), builder->getF32Type(), args[0]));
         return nullptr;
       }
-      // log operaton
-      // static Value mapOpImpl(nova::LogOp op, Type resultType, ArrayRef<Value> args,
-      //                        OpBuilder *builder)
-      // {
-      //   if (isa<FloatType>(args[0].getType()))
-      //     return builder->create<math::LogOp>(op.getLoc(), args[0]);
-      //   if (isa<IntegerType>(args[0].getType()))
-      //     return builder->create<math::LogOp>(op.getLoc(),
-      //                                         builder->create<arith::SIToFPOp>(op.getLoc(), builder->getF32Type(), args[0]));
-      //   if(isa<ComplexType>(args[0].getType())){
-      //     return builder->create<complex::LogOp>(op.getLoc(),args[0]);
-      //   }
-      //   return nullptr;
-      // }
+
       //----------------------------------------------------------------
       // log2 operaton
       static Value mapOpImpl(nova::Log2Op op, Type resultType, ArrayRef<Value> args,
@@ -558,37 +381,6 @@ namespace mlir
         if (isa<IntegerType>(args[0].getType()))
           return builder->create<math::Log10Op>(op.getLoc(),
                                                 builder->create<arith::SIToFPOp>(op.getLoc(), builder->getF32Type(), args[0]));
-        return nullptr;
-      }
-      //----------------------------------------------------
-      // TRIGNOMENTARY OPERATIONS
-      //--------------------------------------------------------------------
-      // sin operaton
-      static Value mapOpImpl(nova::SinOp op, Type resultType, ArrayRef<Value> args,
-                             OpBuilder *builder)
-      {
-        if (isa<FloatType>(args[0].getType()))
-          return builder->create<math::SinOp>(op.getLoc(), args[0]);
-        if (isa<IntegerType>(args[0].getType()))
-          return builder->create<math::SinOp>(op.getLoc(),
-                                              builder->create<arith::SIToFPOp>(op.getLoc(), builder->getF32Type(), args[0]));
-        if (isa<ComplexType>(args[0].getType()))
-          return builder->create<complex::SinOp>(op.getLoc(), args[0]);
-        return nullptr;
-      }
-
-      // cos operation
-      static Value mapOpImpl(nova::CosOp op, Type resultType, ArrayRef<Value> args,
-                             OpBuilder *builder)
-      {
-        if (isa<FloatType>(args[0].getType()))
-          return builder->create<math::CosOp>(op.getLoc(), args[0]);
-        if (isa<IntegerType>(args[0].getType()))
-          return builder->create<math::CosOp>(op.getLoc(),
-                                              builder->create<arith::SIToFPOp>(op.getLoc(), builder->getF32Type(), args[0]));
-        if (isa<ComplexType>(args[0].getType()))
-          return builder->create<complex::CosOp>(op.getLoc(), args[0]);
-
         return nullptr;
       }
 
@@ -663,19 +455,7 @@ namespace mlir
                                                builder->create<arith::SIToFPOp>(op.getLoc(), builder->getF32Type(), args[0]));
         return nullptr;
       }
-      // tanh operation
-      // static Value mapOpImpl(nova::TanhOp op, Type resultType, ArrayRef<Value> args,
-      //                        OpBuilder *builder)
-      // {
-      //   if (isa<FloatType>(args[0].getType()))
-      //     return builder->create<math::TanhOp>(op.getLoc(), args[0]);
-      //   if (isa<IntegerType>(args[0].getType()))
-      //     return builder->create<math::TanhOp>(op.getLoc(),
-      //                                          builder->create<arith::SIToFPOp>(op.getLoc(), builder->getF32Type(), args[0]));
-      //   if (isa<ComplexType>(args[0].getType()))
-      //     return builder->create<complex::TanhOp>(op.getLoc(), args[0]);
-      //   return nullptr;
-      // }
+
       // asinh operation
       static Value mapOpImpl(nova::AsinhOp op, Type resultType, ArrayRef<Value> args,
                              OpBuilder *builder)
@@ -717,8 +497,6 @@ namespace mlir
         // assume example  if compareType is eq of nova dialect them arthpred will be eq of arith dialect
         return TypePromotionLowering(op, resultType, args, builder);
       }
-
-      // Reduction Operation(mean)
 
       // sign operation
       static Value mapOpImpl(nova::SignOp op, Type resultType, ArrayRef<Value> args, OpBuilder *builder)
@@ -1065,6 +843,215 @@ namespace mlir
     //----------------------------------------------------------------
     //                          ReduceOp
     //----------------------------------------------------------------
+        // Helper to get identity value for reduction operations
+    static TypedAttr getReduceIdentity(nova::ReductionKind kind, Type elemType,
+                                       PatternRewriter &rewriter) {
+      if (auto floatType = dyn_cast<FloatType>(elemType)) {
+        switch (kind) {
+          case nova::ReductionKind::SUM:
+          case nova::ReductionKind::MEAN:
+            return rewriter.getFloatAttr(elemType, 0.0);
+          case nova::ReductionKind::PRODUCT:
+            return rewriter.getFloatAttr(elemType, 1.0);
+          case nova::ReductionKind::MAX:
+            return rewriter.getFloatAttr(
+                elemType, APFloat::getInf(floatType.getFloatSemantics(), /*neg=*/true));
+          case nova::ReductionKind::MIN:
+            return rewriter.getFloatAttr(
+                elemType, APFloat::getInf(floatType.getFloatSemantics(), /*neg=*/false));
+          default: return {};
+        }
+      } else if (auto intType = dyn_cast<IntegerType>(elemType)) {
+        unsigned bw = intType.getWidth();
+        switch (kind) {
+          case nova::ReductionKind::SUM:
+          case nova::ReductionKind::MEAN:
+            return rewriter.getIntegerAttr(elemType, 0);
+          case nova::ReductionKind::PRODUCT:
+            return rewriter.getIntegerAttr(elemType, 1);
+          case nova::ReductionKind::MAX:
+            return rewriter.getIntegerAttr(elemType, APInt::getSignedMinValue(bw));
+          case nova::ReductionKind::MIN:
+            return rewriter.getIntegerAttr(elemType, APInt::getSignedMaxValue(bw));
+          case nova::ReductionKind::ALL:
+            return rewriter.getIntegerAttr(elemType, 1);
+          case nova::ReductionKind::ANY:
+            return rewriter.getIntegerAttr(elemType, 0);
+          default: return {};
+        }
+      }
+      return {};
+    }
+
+    // Helper to create reduction combiner operation
+    static Value createReduceCombiner(OpBuilder &b, Location loc, 
+                                      nova::ReductionKind kind, Value lhs, Value rhs,
+                                      Type elemType) {
+      switch (kind) {
+        case nova::ReductionKind::SUM:
+        case nova::ReductionKind::MEAN:
+          return isa<FloatType>(elemType) ? 
+                 b.create<arith::AddFOp>(loc, lhs, rhs).getResult() :
+                 b.create<arith::AddIOp>(loc, lhs, rhs).getResult();
+        case nova::ReductionKind::PRODUCT:
+          return isa<FloatType>(elemType) ?
+                 b.create<arith::MulFOp>(loc, lhs, rhs).getResult() :
+                 b.create<arith::MulIOp>(loc, lhs, rhs).getResult();
+        case nova::ReductionKind::MAX:
+          return isa<FloatType>(elemType) ?
+                 b.create<arith::MaximumFOp>(loc, lhs, rhs).getResult() :
+                 b.create<arith::MaxSIOp>(loc, lhs, rhs).getResult();
+        case nova::ReductionKind::MIN:
+          return isa<FloatType>(elemType) ?
+                 b.create<arith::MinimumFOp>(loc, lhs, rhs).getResult() :
+                 b.create<arith::MinSIOp>(loc, lhs, rhs).getResult();
+        case nova::ReductionKind::ALL:
+          return b.create<arith::AndIOp>(loc, lhs, rhs).getResult();
+        case nova::ReductionKind::ANY:
+          return b.create<arith::OrIOp>(loc, lhs, rhs).getResult();
+        default:
+          return lhs;
+      }
+    }
+
+    // Linalg.generic based lowering for keepdims=true (preserves encoding)
+    static LogicalResult lowerWithLinalgGeneric(
+        nova::ReduceOp op, PatternRewriter &rewriter, Location loc,
+        Value input, RankedTensorType inputType, RankedTensorType resultType,
+        Type elemType, int64_t rank, nova::ReductionKind kind,
+        SmallVector<int64_t> &axes) {
+      
+      Attribute encoding = inputType.getEncoding();
+      llvm::sort(axes);
+      llvm::SmallDenseSet<int64_t> axisSet(axes.begin(), axes.end());
+
+      // Handle ALL/ANY: cast to i1 first
+      Type reductionElemType = elemType;
+      Value current = input;
+      if (kind == nova::ReductionKind::ALL || kind == nova::ReductionKind::ANY) {
+        reductionElemType = rewriter.getI1Type();
+        if (elemType != reductionElemType) {
+          auto boolType = RankedTensorType::get(inputType.getShape(), reductionElemType, encoding);
+          current = rewriter.create<tosa::CastOp>(loc, boolType, current);
+        }
+      }
+
+      // Compute total reduced elements for MEAN
+      int64_t totalReducedElements = 1;
+      for (int64_t axis : axes) {
+        totalReducedElements *= inputType.getDimSize(axis);
+      }
+
+      // Get identity value
+      auto identityAttr = getReduceIdentity(kind, reductionElemType, rewriter);
+      if (!identityAttr)
+        return rewriter.notifyMatchFailure(op, "unsupported reduction kind");
+      Value identity = rewriter.create<arith::ConstantOp>(loc, identityAttr);
+
+      // Compute keepdims output shape (reduced dims become 1)
+      SmallVector<int64_t> keepdimsShape;
+      for (int64_t i = 0; i < rank; ++i) {
+        keepdimsShape.push_back(axisSet.contains(i) ? 1 : inputType.getDimSize(i));
+      }
+      
+      // Create output tensor with keepdims shape and encoding
+      auto keepdimsType = RankedTensorType::get(keepdimsShape, reductionElemType, encoding);
+      Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+          loc, keepdimsShape, reductionElemType, ValueRange{}, encoding);
+      Value filledTensor = rewriter.create<linalg::FillOp>(loc, identity, emptyTensor).result();
+      
+      // Build expanded input shape: for each reduced axis, split [size] -> [1, size]
+      SmallVector<int64_t> expandedInputShape;
+      SmallVector<ReassociationIndices> inputReassociation;
+      int64_t expandedDim = 0;
+      
+      for (int64_t i = 0; i < rank; ++i) {
+        if (axisSet.contains(i)) {
+          expandedInputShape.push_back(1);
+          expandedInputShape.push_back(inputType.getDimSize(i));
+          inputReassociation.push_back({expandedDim, expandedDim + 1});
+          expandedDim += 2;
+        } else {
+          expandedInputShape.push_back(inputType.getDimSize(i));
+          inputReassociation.push_back({expandedDim});
+          expandedDim += 1;
+        }
+      }
+      
+      auto expandedInputType = RankedTensorType::get(expandedInputShape, reductionElemType, encoding);
+      Value expandedInput = rewriter.create<tensor::ExpandShapeOp>(
+          loc, expandedInputType, current, inputReassociation);
+      
+      // Build indexing maps for linalg.generic
+      int64_t expandedRank = expandedInputShape.size();
+      SmallVector<AffineExpr> inputExprs, outputExprs;
+      SmallVector<utils::IteratorType> iteratorTypes;
+      
+      int64_t dimIdx = 0;
+      for (int64_t i = 0; i < rank; ++i) {
+        if (axisSet.contains(i)) {
+          // Reduced dimension: [1, original_size] -> parallel, reduction
+          inputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
+          inputExprs.push_back(rewriter.getAffineDimExpr(dimIdx + 1));
+          outputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
+          iteratorTypes.push_back(utils::IteratorType::parallel);
+          iteratorTypes.push_back(utils::IteratorType::reduction);
+          dimIdx += 2;
+        } else {
+          inputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
+          outputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
+          iteratorTypes.push_back(utils::IteratorType::parallel);
+          dimIdx += 1;
+        }
+      }
+      
+      auto inputMap = AffineMap::get(expandedRank, 0, inputExprs, rewriter.getContext());
+      auto outputMap = AffineMap::get(expandedRank, 0, outputExprs, rewriter.getContext());
+      
+      auto genericOp = rewriter.create<linalg::GenericOp>(
+          loc, keepdimsType, expandedInput, filledTensor,
+          SmallVector<AffineMap>{inputMap, outputMap}, iteratorTypes,
+          [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
+            Value result = createReduceCombiner(b, nestedLoc, kind, args[0], args[1], reductionElemType);
+            b.create<linalg::YieldOp>(nestedLoc, result);
+          });
+      
+      Value reduced = genericOp.getResult(0);
+
+      // Handle MEAN: divide by total reduced elements
+      if (kind == nova::ReductionKind::MEAN && isa<FloatType>(reductionElemType)) {
+        double divisor = static_cast<double>(totalReducedElements);
+        Value divisorVal = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getFloatAttr(reductionElemType, divisor));
+
+        Value divisorTensor = rewriter.create<tensor::EmptyOp>(
+            loc, keepdimsShape, reductionElemType, ValueRange{}, encoding);
+        Value filledDivisor = rewriter.create<linalg::FillOp>(loc, divisorVal, divisorTensor).result();
+
+        SmallVector<AffineMap> maps(3, rewriter.getMultiDimIdentityMap(rank));
+        Value outputTensor = rewriter.create<tensor::EmptyOp>(
+            loc, keepdimsShape, reductionElemType, ValueRange{}, encoding);
+
+        auto divOp = rewriter.create<linalg::GenericOp>(
+            loc, keepdimsType, ValueRange{reduced, filledDivisor}, outputTensor, maps,
+            getNParallelLoopsAttrs(rank),
+            [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
+              Value result = b.create<arith::DivFOp>(nestedLoc, args[0], args[1]);
+              b.create<linalg::YieldOp>(nestedLoc, result);
+            });
+        reduced = divOp.getResult(0);
+      }
+
+      // Final type cast if needed
+      if (cast<RankedTensorType>(reduced.getType()) != resultType) {
+        reduced = rewriter.create<tensor::CastOp>(loc, resultType, reduced);
+      }
+
+      rewriter.replaceOp(op, reduced);
+      return success();
+    }
+
+
     class ReduceOpConverter : public OpRewritePattern<nova::ReduceOp>
     {
     public:
@@ -1093,6 +1080,13 @@ namespace mlir
         } else {
             // Reduce all dimensions
             for (int64_t i = 0; i < rank; ++i) axes.push_back(i);
+        }
+        
+        // Check if keepdims is true - use linalg.generic path to preserve encoding
+        bool keepDims = op.getKeepdims();
+        if (keepDims) {
+            return lowerWithLinalgGeneric(op, rewriter, loc, input, inputType, resultType, 
+                                          elemType, rank, kind, axes);
         }
 
         // Sort axes in descending order so we can reduce from higher dims first
@@ -1158,8 +1152,6 @@ namespace mlir
                     current = rewriter.create<tosa::ReduceAnyOp>(loc, intermediateType, current, axisAttr);
                     break;
                 }
-                default:
-                    return failure();
             }
         }
 
@@ -1319,8 +1311,6 @@ namespace mlir
           return rewriter.notifyMatchFailure(op, "expected ranked tensor result");
         // each element type
         auto resultDataType = resultType.getElementType();
-        // casting
-
         // Create output tensor
         Value out = rewriter.create<tensor::EmptyOp>(
             op.getLoc(), resultType.getShape(), resultDataType,resultType.getEncoding());
@@ -1401,51 +1391,7 @@ namespace mlir
         target.addLegalDialect<arith::ArithDialect>();
         target.addLegalDialect<func::FuncDialect>();
         target.addLegalDialect<math::MathDialect>();
-        target.addIllegalOp<nova::AcosOp>();
-        target.addIllegalOp<nova::AdamOp>();
-        target.addIllegalOp<nova::AcoshOp>();
-        // target.addIllegalOp<nova::AddOp>();
-        target.addIllegalOp<nova::AsinOp>();
-        target.addIllegalOp<nova::AsinhOp>();
-        target.addIllegalOp<nova::AtanOp>();
-        target.addIllegalOp<nova::AtanhOp>();
-        target.addIllegalOp<nova::AbsOp>();
-        target.addIllegalOp<nova::BroadcastInDimOp>();
-        target.addIllegalOp<nova::CompareOp>();
-        target.addIllegalOp<nova::CosOp>();
-        target.addIllegalOp<nova::CoshOp>();
-        target.addIllegalOp<nova::DivOp>();
-        target.addIllegalOp<nova::ExpOp>();
-        target.addIllegalOp<nova::Exp2Op>();
-        target.addIllegalOp<nova::LogOp>();
-        target.addIllegalOp<nova::Log10Op>();
-        target.addIllegalOp<nova::Log2Op>();
-        target.addIllegalOp<nova::MatmulOp>();
-        target.addIllegalOp<nova::ArgmaxOp>();
-        target.addIllegalOp<nova::ArgMinOp>();
-        target.addIllegalOp<nova::ReduceOp>();
-        target.addIllegalOp<nova::ModOp>();
-        target.addIllegalOp<nova::MaxOp>();
-        target.addIllegalOp<nova::MinOp>();
-        target.addIllegalOp<nova::MulOp>();
-        target.addIllegalOp<nova::NegOp>();
-        target.addIllegalOp<nova::NotOp>();
-        target.addIllegalOp<nova::PowOp>();
-        target.addIllegalOp<nova::ReciprocalOp>();
-        target.addIllegalOp<nova::SignOp>();
-        target.addIllegalOp<nova::SinOp>();
-        target.addIllegalOp<nova::SinhOp>();
-        target.addIllegalOp<nova::SqrtOp>();
-        target.addIllegalOp<nova::SquareOp>();
-        // target.addIllegalOp<nova::SubOp>();
-        target.addIllegalOp<nova::TanOp>();
-        target.addIllegalOp<nova::TanhOp>();
-        target.addIllegalOp<nova::TransposeOp>();
-        target.addIllegalOp<nova::Rndm2DOp>();
-        target.addIllegalOp<nova::ToDeviceOp>();
-        target.addIllegalOp<nova::GatherOp>();
-        target.addIllegalOp<nova::ScatterAddOp>();
-
+        target.addIllegalDialect<nova::NovaDialect>();
         target.markUnknownOpDynamicallyLegal([](Operation *)
                                              { return true; });
         RewritePatternSet patterns(context);
@@ -1478,40 +1424,24 @@ namespace mlir
     {
       // Use generic converters for pointwise ops
       patterns.add<
-          //  NovaToLinalgElementwiseConverter<nova::AddOp>,
-          // NovaToLinalgElementwiseConverter<nova::SubOp>,
-          // NovaToLinalgElementwiseConverter<nova::MulOp>,
-          //  NovaToLinalgElementwiseConverter<nova::PowOp>,
-          //  NovaToLinalgElementwiseConverter<nova::AbsOp>,
-          NovaToLinalgElementwiseConverter<nova::DivOp>,
           NovaToLinalgElementwiseConverter<nova::ModOp>,
-          //     NovaToLinalgElementwiseConverter<nova::SquareOp>,
-          //     NovaToLinalgElementwiseConverter<nova::SqrtOp>,
-          //   NovaToLinalgElementwiseConverter<nova::LogOp>,
-          //  NovaToLinalgElementwiseConverter<nova::ExpOp>,
-          NovaToLinalgElementwiseConverter<nova::AndOp>,
-          NovaToLinalgElementwiseConverter<nova::OrOp>,
-          NovaToLinalgElementwiseConverter<nova::XorOp>,
-          NovaToLinalgElementwiseConverter<nova::Exp2Op>,
-          NovaToLinalgElementwiseConverter<nova::Log2Op>,
+          NovaToLinalgElementwiseConverter<nova::Exp2Op>, 
+          NovaToLinalgElementwiseConverter<nova::Log2Op>, 
           NovaToLinalgElementwiseConverter<nova::Log10Op>,
-          NovaToLinalgElementwiseConverter<nova::SinOp>,
-          NovaToLinalgElementwiseConverter<nova::CosOp>,
-          NovaToLinalgElementwiseConverter<nova::TanOp>,
-          NovaToLinalgElementwiseConverter<nova::AsinOp>,
-          NovaToLinalgElementwiseConverter<nova::AcosOp>,
-          NovaToLinalgElementwiseConverter<nova::AtanOp>,
-          NovaToLinalgElementwiseConverter<nova::SinhOp>,
+          NovaToLinalgElementwiseConverter<nova::TanOp>, 
+          NovaToLinalgElementwiseConverter<nova::AsinOp>, 
+          NovaToLinalgElementwiseConverter<nova::AcosOp>, 
+          NovaToLinalgElementwiseConverter<nova::AtanOp>, 
+          NovaToLinalgElementwiseConverter<nova::SinhOp>, 
           NovaToLinalgElementwiseConverter<nova::CoshOp>,
-          NovaToLinalgElementwiseConverter<nova::NotOp>,
-          NovaToLinalgElementwiseConverter<nova::AsinhOp>,
-          NovaToLinalgElementwiseConverter<nova::AcoshOp>,
-          NovaToLinalgElementwiseConverter<nova::AtanhOp>,
-          NovaToLinalgElementwiseConverter<nova::CompareOp>,
-          NovaToLinalgElementwiseConverter<nova::SignOp>,
-          ArgMinConverter,
-          ArgMaxConverter,
-          ReduceOpConverter,
+          NovaToLinalgElementwiseConverter<nova::AsinhOp>, 
+          NovaToLinalgElementwiseConverter<nova::AcoshOp>, 
+          NovaToLinalgElementwiseConverter<nova::AtanhOp>, 
+          NovaToLinalgElementwiseConverter<nova::CompareOp>, 
+          NovaToLinalgElementwiseConverter<nova::SignOp>, 
+          ArgMinConverter, 
+          ArgMaxConverter, 
+          ReduceOpConverter, 
           AdamOpConverter
         >(patterns.getContext());
     }

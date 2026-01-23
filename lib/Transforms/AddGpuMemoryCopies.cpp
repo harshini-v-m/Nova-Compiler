@@ -208,8 +208,6 @@ struct AddGpuMemoryCopiesPass
               MemRefType hostType = llvm::cast<MemRefType>(val.getType());
               
               // Determine the target device space. 
-              // If it's already a NovaDeviceAttr, we extraction the index if possible,
-              // but for now we default to 1 as the generic GPU space in this pass.
               Attribute deviceSpace = builder.getI32IntegerAttr(1);
               
               MemRefType deviceType = MemRefType::get(
@@ -247,13 +245,89 @@ struct AddGpuMemoryCopiesPass
       });
     });
 
+    // 2.5. Batch Memory Bridging: Find device memrefs used in host regions (D-to-H shadowing)
+    llvm::MapVector<Value, Value> deviceToHostMap;
+    llvm::MapVector<Value, Value> hostToOriginalDeviceMap; 
+    func.walk([&](Operation *op) {
+      // Skip if inside a GPU launch
+      if (op->getParentOfType<gpu::LaunchOp>())
+        return;
+      // Skip GPU dialect operations themselves
+      if (isa<gpu::LaunchOp>(op) || isa<gpu::MemcpyOp>(op) || isa<gpu::AllocOp>(op) || isa<gpu::DeallocOp>(op))
+        return;
+      // Skip view-like operations that don't actually consume the data on host
+      if (isa<memref::ExpandShapeOp>(op) || isa<memref::CollapseShapeOp>(op) || 
+          isa<memref::SubViewOp>(op) || isa<memref::CastOp>(op) || 
+          isa<memref::ViewOp>(op) || isa<memref::ReinterpretCastOp>(op))
+        return;
+
+      for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+        Value val = op->getOperand(i);
+        auto memRefType = llvm::dyn_cast<MemRefType>(val.getType());
+        if (!memRefType || !isDeviceMemorySpace(memRefType.getMemorySpace()))
+          continue;
+
+        if (deviceToHostMap.count(val)) {
+          op->setOperand(i, deviceToHostMap[val]);
+        } else {
+          OpBuilder builder(func.getBody().front().getTerminator());
+          if (auto defOp = val.getDefiningOp()) {
+            builder.setInsertionPointAfter(defOp);
+          } else {
+            builder.setInsertionPointToStart(&func.getBody().front());
+          }
+          Location loc = val.getLoc();
+
+          MemRefType deviceType = memRefType;
+          MemRefType hostType = MemRefType::get(
+              deviceType.getShape(), deviceType.getElementType(),
+              deviceType.getLayout(), Attribute());
+
+          // Dynamic dim handling
+          SmallVector<Value> dynamicSizes;
+          for (int j = 0; j < deviceType.getRank(); ++j) {
+            if (deviceType.isDynamicDim(j)) {
+              Value idx = builder.create<arith::ConstantIndexOp>(loc, j);
+              Value dim = builder.create<memref::DimOp>(loc, val, idx);
+              dynamicSizes.push_back(dim);
+            }
+          }
+
+          Value hostMem = builder.create<memref::AllocOp>(loc, hostType, dynamicSizes);
+          deviceToHostMap[val] = hostMem;
+          hostToOriginalDeviceMap[hostMem] = val;
+
+          // Copy Device to Host BEFORE use
+          builder.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{}, hostMem, val);
+
+          op->setOperand(i, hostMem);
+        }
+      }
+    });
+
     func.walk([&](func::ReturnOp returnOp) {
       OpBuilder builder(returnOp);
       for (unsigned i = 0; i < returnOp->getNumOperands(); ++i) {
         OpOperand &operand = returnOp->getOpOperand(i);
         Value val = operand.get();
         if (auto memRefType = llvm::dyn_cast<MemRefType>(val.getType())) {
-          // If we are returning a device memref but the function expects host
+          // Case A: host shadow of a device memref needs to be synced back
+          if (hostToOriginalDeviceMap.count(val)) {
+             Value originalDeviceMem = hostToOriginalDeviceMap[val];
+             // If function expects device memory, copy back and return original
+             auto expectedType = func.getResultTypes()[i];
+             if (auto expectedMemRef = llvm::dyn_cast<MemRefType>(expectedType)) {
+                 if (isDeviceMemorySpace(expectedMemRef.getMemorySpace())) {
+                    builder.create<gpu::MemcpyOp>(returnOp.getLoc(), TypeRange{}, ValueRange{}, originalDeviceMem, val);
+                    operand.set(originalDeviceMem);
+                    continue;
+                 }
+             }
+             // Even if returning host, sync back to device for consistency of original
+             builder.create<gpu::MemcpyOp>(returnOp.getLoc(), TypeRange{}, ValueRange{}, originalDeviceMem, val);
+          }
+
+          // Case B: If we are returning a device memref but the function expects host
           if (isDeviceMemorySpace(memRefType.getMemorySpace())) {
             // Check if the function signature actually expects a host memref
             auto expectedType = func.getResultTypes()[i];
@@ -271,13 +345,23 @@ struct AddGpuMemoryCopiesPass
                 memRefType.getShape(), memRefType.getElementType(),
                 memRefType.getLayout(), Attribute());
 
+            // Dynamic dim handling
+            SmallVector<Value> dynamicSizes;
+            for (int k = 0; k < memRefType.getRank(); ++k) {
+              if (memRefType.isDynamicDim(k)) {
+                Value idx = builder.create<arith::ConstantIndexOp>(loc, k);
+                Value dim = builder.create<memref::DimOp>(loc, val, idx);
+                dynamicSizes.push_back(dim);
+              }
+            }
+
             // Create host alloc
-            auto hostAlloc = builder.create<memref::AllocOp>(loc, hostType);
+            auto hostAlloc = builder.create<memref::AllocOp>(loc, hostType, dynamicSizes);
             builder.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{},
                                           hostAlloc, val);
             operand.set(hostAlloc);
           } else if (hostToDeviceMap.count(val)) {
-            // Returning a host memref that has a device shadow
+            // Returning a host memref that has a device shadow (H-to-D case)
             Value deviceMem = hostToDeviceMap[val];
             builder.create<gpu::MemcpyOp>(returnOp.getLoc(), TypeRange{},
                                           ValueRange{}, val, deviceMem);
@@ -337,6 +421,9 @@ struct AddGpuMemoryCopiesPass
     };
 
     for (auto pair : hostToDeviceMap) {
+      deallocBuffer(pair.second);
+    }
+    for (auto pair : deviceToHostMap) {
       deallocBuffer(pair.second);
     }
     for (auto val : promotedAllocsToDealloc) {
