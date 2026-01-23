@@ -107,6 +107,24 @@ public:
         }
         desc = rewriter.create<LLVM::InsertValueOp>(loc, desc, sizesArray, ArrayRef<int64_t>{3});
         Value stridesArray = rewriter.create<LLVM::UndefOp>(loc, elemTypes[4]);
+        
+        // Compute row-major strides: stride[i] = product(dim[j] for j > i)
+        Value currentStride = rewriter.create<LLVM::ConstantOp>(loc, int64Ty, rewriter.getI64IntegerAttr(1));
+        for (int i = memRefType.getRank() - 1; i >= 0; --i) {
+            stridesArray = rewriter.create<LLVM::InsertValueOp>(loc, stridesArray, currentStride, ArrayRef<int64_t>{i});
+            
+            Value dimSize;
+            if (memRefType.isDynamicDim(i)) {
+                // Re-extract or use the one we have
+                unsigned dIdx = 0;
+                for(int j=0; j<i; ++j) if(memRefType.isDynamicDim(j)) dIdx++;
+                Value dynSize = dynamicSizes[dIdx];
+                dimSize = rewriter.create<UnrealizedConversionCastOp>(loc, int64Ty, dynSize).getResult(0);
+            } else {
+                dimSize = rewriter.create<LLVM::ConstantOp>(loc, int64Ty, rewriter.getI64IntegerAttr(memRefType.getDimSize(i)));
+            }
+            currentStride = rewriter.create<LLVM::MulOp>(loc, currentStride, dimSize);
+        }
         desc = rewriter.create<LLVM::InsertValueOp>(loc, desc, stridesArray, ArrayRef<int64_t>{4});
     }
 
@@ -254,6 +272,96 @@ public:
   }
 };
 
+class FixHostGpuAccess : public OpRewritePattern<LLVM::LoadOp> {
+public:
+  using OpRewritePattern<LLVM::LoadOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LLVM::LoadOp op, PatternRewriter &rewriter) const override {
+    auto ptr = op.getAddr();
+    auto ptrType = llvm::dyn_cast<LLVM::LLVMPointerType>(ptr.getType());
+    if (!ptrType || ptrType.getAddressSpace() != 1)
+      return failure();
+
+    // Found a host-side load from GPU memory!
+    auto loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto ctx = op.getContext();
+    auto genericPtrTy = LLVM::LLVMPointerType::get(ctx);
+    auto int64Ty = IntegerType::get(ctx, 64);
+    auto int32Ty = IntegerType::get(ctx, 32);
+
+    auto cudaMemcpy = getOrDeclareFunc(module, rewriter, "cudaMemcpy", int32Ty, {genericPtrTy, genericPtrTy, int64Ty, int32Ty});
+
+    // Create a temporary host buffer
+    Type elemTy = op.getType();
+    Value one = rewriter.create<LLVM::ConstantOp>(loc, int32Ty, rewriter.getI32IntegerAttr(1));
+    Value hostPtrVar = rewriter.create<LLVM::AllocaOp>(loc, LLVM::LLVMPointerType::get(ctx), elemTy, one, 8);
+
+    // Prepare pointers for cudaMemcpy
+    Value dstPtr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy, hostPtrVar);
+    Value srcPtr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy, ptr);
+    
+    int64_t elementSize = elemTy.getIntOrFloatBitWidth() / 8;
+    if (elementSize == 0) elementSize = 4; // Default to 4 for float/int32 if unknown
+    Value sizeBytes = rewriter.create<LLVM::ConstantOp>(loc, int64Ty, rewriter.getI64IntegerAttr(elementSize));
+    
+    Value kind = rewriter.create<LLVM::ConstantOp>(loc, int32Ty, rewriter.getI32IntegerAttr(2)); // DeviceToHost = 2
+    
+    rewriter.create<LLVM::CallOp>(loc, cudaMemcpy, ValueRange{dstPtr, srcPtr, sizeBytes, kind});
+    
+    // Load from host buffer instead
+    Value hostVal = rewriter.create<LLVM::LoadOp>(loc, elemTy, hostPtrVar);
+    rewriter.replaceOp(op, hostVal);
+    
+    return success();
+  }
+};
+
+class FixHostGpuStore : public OpRewritePattern<LLVM::StoreOp> {
+public:
+  using OpRewritePattern<LLVM::StoreOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LLVM::StoreOp op, PatternRewriter &rewriter) const override {
+    auto ptr = op.getAddr();
+    auto ptrType = llvm::dyn_cast<LLVM::LLVMPointerType>(ptr.getType());
+    if (!ptrType || ptrType.getAddressSpace() != 1)
+      return failure();
+
+    // Found a host-side store to GPU memory!
+    auto loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto ctx = op.getContext();
+    auto genericPtrTy = LLVM::LLVMPointerType::get(ctx);
+    auto int64Ty = IntegerType::get(ctx, 64);
+    auto int32Ty = IntegerType::get(ctx, 32);
+
+    auto cudaMemcpy = getOrDeclareFunc(module, rewriter, "cudaMemcpy", int32Ty, {genericPtrTy, genericPtrTy, int64Ty, int32Ty});
+
+    Value value = op.getValue();
+    Type elemTy = value.getType();
+    Value one = rewriter.create<LLVM::ConstantOp>(loc, int32Ty, rewriter.getI32IntegerAttr(1));
+    Value hostPtrVar = rewriter.create<LLVM::AllocaOp>(loc, LLVM::LLVMPointerType::get(ctx), elemTy, one, 8);
+
+    // Store value to host buffer
+    rewriter.create<LLVM::StoreOp>(loc, value, hostPtrVar);
+
+    // Prepare pointers for cudaMemcpy
+    Value dstPtr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy, ptr);
+    Value srcPtr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy, hostPtrVar);
+    
+    int64_t elementSize = elemTy.getIntOrFloatBitWidth() / 8;
+    if (elementSize == 0) elementSize = 4;
+    Value sizeBytes = rewriter.create<LLVM::ConstantOp>(loc, int64Ty, rewriter.getI64IntegerAttr(elementSize));
+    
+    Value kind = rewriter.create<LLVM::ConstantOp>(loc, int32Ty, rewriter.getI32IntegerAttr(1)); // HostToDevice = 1
+    
+    rewriter.create<LLVM::CallOp>(loc, cudaMemcpy, ValueRange{dstPtr, srcPtr, sizeBytes, kind});
+    
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 class GpuRuntimeLoweringPass : public PassWrapper<GpuRuntimeLoweringPass, OperationPass<ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(GpuRuntimeLoweringPass)
@@ -265,6 +373,8 @@ public:
     patterns.add<ConvertGpuAllocToCall>(module.getContext());
     patterns.add<ConvertGpuMemcpyToCall>(module.getContext());
     patterns.add<ConvertGpuDeallocToCall>(module.getContext());
+    patterns.add<FixHostGpuAccess>(module.getContext());
+    patterns.add<FixHostGpuStore>(module.getContext());
     
     if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
       signalPassFailure();

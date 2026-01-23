@@ -60,7 +60,6 @@
 #include "Compiler/Translation/NovaToArith/NovaToArith.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 #include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
-#include "Compiler/Transforms/GenerateDynamicWrapper.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/PatternMatch.h"
 
@@ -92,9 +91,9 @@ namespace mlir
             // pm.addPass(mlir::createSparseTensorConversionPass());
 
             // 3. TOSA TO ARITH/TENSOR/SCF
-            pm.addPass(mlir::createTosaToArithPass());
-            pm.addPass(mlir::createTosaToTensorPass());
-            pm.addPass(mlir::createTosaToSCFPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createTosaToArithPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createTosaToTensorPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createTosaToSCFPass());
 
             // 4. NOVA TRANSFORMS & LINALG OPT
             pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createFuseMatmulBiasPass());
@@ -124,16 +123,16 @@ namespace mlir
             pm.addPass(mlir::createCanonicalizerPass());
 
             // Map Linalg to Parallel Loops
-            pm.addPass(mlir::createConvertLinalgToParallelLoopsPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertLinalgToParallelLoopsPass());
             // Apply Tiling HERE on the parallel loops
-            pm.addPass(mlir::createParallelLoopTilingPass({32, 32, 1}));
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createParallelLoopTilingPass({32, 32, 1}));
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createParallelLoopFusionPass());
             pm.addPass(mlir::createCanonicalizerPass());
             // 8. GPU MAPPINGcreateParallelLoopFusionPass
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
-            pm.addPass(mlir::createGpuMapParallelLoopsPass());
-            pm.addPass(mlir::createConvertParallelLoopToGpuPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createGpuMapParallelLoopsPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertParallelLoopToGpuPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
 
@@ -153,6 +152,7 @@ namespace mlir
             gpuPm.addPass(mlir::createLowerAffinePass());
             gpuPm.addPass(mlir::createSCFToControlFlowPass());
             mlir::ConvertGpuOpsToNVVMOpsOptions nvvmOptions;
+            // nvvmOptions.useBarePtrCallConv = true; // Disabled to match dynamic wrapper
             gpuPm.addPass(mlir::createConvertGpuOpsToNVVMOps(nvvmOptions));
             gpuPm.addPass(mlir::createConvertIndexToLLVMPass());
             gpuPm.addPass(mlir::createArithToLLVMConversionPass());
@@ -164,22 +164,24 @@ namespace mlir
             // Binary generation (Stage 2)
             mlir::GpuModuleToBinaryPassOptions binaryOptions;
             binaryOptions.toolkitPath = "/usr/local/cuda-13.0";
+            binaryOptions.compilationTarget = "isa"; 
             pm.addPass(mlir::createGpuModuleToBinaryPass(binaryOptions));
 
             // MAIN LOWERING: gpu.launch_func -> runtime calls
             mlir::GpuToLLVMConversionPassOptions hostOptions;
+            // hostOptions.kernelBarePtrCallConv = true; // Disabled to match dynamic wrapper
             pm.addPass(mlir::createGpuToLLVMConversionPass(hostOptions));
+            pm.addPass(mlir::createReconcileUnrealizedCastsPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
             pm.addPass(mlir::createSCFToControlFlowPass());
             pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-
             pm.addPass(mlir::createArithToLLVMConversionPass());
+            
             pm.addPass(mlir::memref::createExpandStridedMetadataPass());
             pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
             pm.addPass(mlir::nova::createGpuRuntimeLoweringPass());
             pm.addPass(mlir::createConvertFuncToLLVMPass());
-            // Generate dynamic wrapper for unlimited args (after C interface is created)
             pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
             pm.addPass(mlir::createCanonicalizerPass());
