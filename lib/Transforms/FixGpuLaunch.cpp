@@ -271,7 +271,9 @@ public:
     return success();
   }
 };
-
+class GpuRuntimeLoweringPass : public PassWrapper<GpuRuntimeLoweringPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(GpuRuntimeLoweringPass)
   void runOnOperation() override {
     ModuleOp module = getOperation();
     
