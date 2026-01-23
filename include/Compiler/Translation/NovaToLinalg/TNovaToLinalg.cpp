@@ -21,11 +21,6 @@ namespace mlir
   {
 
     // Helper Utilities
-    inline bool isScalar(Value v)
-    {
-      auto type = dyn_cast<RankedTensorType>(v.getType());
-      return !type || type.getRank() == 0;
-    }
 
     inline SmallVector<utils::IteratorType> getNParallelLoopsAttrs(unsigned n)
     {
@@ -58,8 +53,7 @@ namespace mlir
       }
       return nullptr;
     }
-    static std::optional<arith::CmpIPredicate>
-    getArithCmpiPredicate(nova::ComparisonType type)
+    static std::optional<arith::CmpIPredicate> getArithCmpiPredicate(nova::ComparisonType type)
     {
       switch (type)
       {
@@ -116,7 +110,7 @@ namespace mlir
     }
     // TYPE PROMOTION LOWERING
     template <typename top>
-    static Value TypePromotionLowering(top op, Type resultType, ArrayRef<Value> args, OpBuilder *builder)
+    static Value CompareTypePromotionLowering(top op, Type resultType, ArrayRef<Value> args, OpBuilder *builder)
     { // need to find parameters
       // 1..fiding dtype
       auto flhstype = dyn_cast<mlir::FloatType>(args[0].getType());
@@ -495,7 +489,7 @@ namespace mlir
                              OpBuilder *builder)
       {
         // assume example  if compareType is eq of nova dialect them arthpred will be eq of arith dialect
-        return TypePromotionLowering(op, resultType, args, builder);
+        return CompareTypePromotionLowering(op, resultType, args, builder);
       }
 
       // sign operation
@@ -1397,7 +1391,6 @@ namespace mlir
         RewritePatternSet patterns(context);
         populateNovaToLinalgPatterns(patterns);
         populateNovaToLinalgPatternsTemplate(patterns);
-        populateNovaToLinalgNamedPatterns(patterns);
         if (failed(applyPartialConversion(funcOp, target, std::move(patterns))))
         {
           signalPassFailure();

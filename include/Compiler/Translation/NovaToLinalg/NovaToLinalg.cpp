@@ -1,6 +1,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -321,7 +322,7 @@ struct NovaToDeviceOpLowering : public OpConversionPattern<nova::ToDeviceOp> {
   LogicalResult
   matchAndRewrite(nova::ToDeviceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto resultType = llvm::dyn_cast<RankedTensorType>(op.getType());
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
     if (!resultType)
       return failure();
 
@@ -349,11 +350,64 @@ struct NovaToDeviceOpLowering : public OpConversionPattern<nova::ToDeviceOp> {
     return success();
   }
 };
+struct NovaDivOpLowering : public OpConversionPattern<nova::DivOp>{
+using OpConversionPattern<nova::DivOp>::OpConversionPattern;
+LogicalResult matchAndRewrite(nova::DivOp op,OpAdaptor adaptor,ConversionPatternRewriter &rewriter)const override{
+ RankedTensorType resulttype=op.getResult().getType()  ;
+ ValueRange input=op.getOperands();
 
+ auto output=rewriter.create<tensor::EmptyOp>(op.getLoc(),resulttype.getShape(),resulttype.getElementType(),resulttype.getEncoding());
+ auto divop=rewriter.create<linalg::DivOp>(op.getLoc(), resulttype,input,ValueRange{output});
+ rewriter.replaceOp(op,divop.getResults());
+ return success();
+}
+};
+struct NovaMulOpLowering :public OpConversionPattern<nova::MulOp>{
+using OpConversionPattern<nova::MulOp>::OpConversionPattern;
+LogicalResult matchAndRewrite(nova::MulOp op,OpAdaptor adaptor,ConversionPatternRewriter &rewriter)const override{
+  ValueRange inputs=op.getOperands();
+  RankedTensorType resulttype=cast<mlir::RankedTensorType>(op.getType());
+  if(!resulttype){
+    return failure();
+  }
+  auto output=rewriter.create<tensor::EmptyOp>(op.getLoc(),resulttype.getShape(),resulttype.getElementType(),resulttype.getEncoding());
+  auto mulop=rewriter.create<linalg::MulOp>(op.getLoc(),resulttype,inputs,ValueRange{output});
+  rewriter.replaceOp(op,mulop);
+  return success();
+}};
+struct NovaRandomOpLowering :public OpConversionPattern<nova::Rndm2DOp >{
+using OpConversionPattern<nova::Rndm2DOp>::OpConversionPattern;
+LogicalResult matchAndRewrite(nova::Rndm2DOp op,OpAdaptor adaptor,ConversionPatternRewriter &rewriter)const override{
+  RankedTensorType resulttype=cast<mlir::RankedTensorType>(op.getType());
+  if(!resulttype){
+    return failure();
+  }
+auto loc=op.getLoc();
+  auto output=rewriter.create<tensor::EmptyOp>(op.getLoc(),resulttype.getShape(),resulttype.getElementType(),resulttype.getEncoding());
+ValueRange args=op.getOperands();
+// seed= (min+max)^max
+    Value sum = rewriter.create<arith::AddFOp>(loc, args[0], args[1]);
+    Value mySeed = rewriter.create<math::PowFOp>(loc, sum, args[1]);
+    Value seedVal = rewriter.create<arith::FPToSIOp>(loc, rewriter.getI32Type(), mySeed);
+
+    auto linalgop = rewriter.create<linalg::FillRng2DOp>(
+    loc,
+    ValueRange{args[0],args[1],seedVal},
+    ValueRange{output}
+);
+
+    rewriter.replaceOp(op,linalgop);
+    return success();
+}};
 void populateNovaToLinalgPatterns(RewritePatternSet &patterns) {
-  patterns.add<NovaMatmulOpLoweringgeneric, NovaBroadcastInDimOpLowering,
-               NovaTransposeOpLowering, NovaToDeviceOpLowering,
-               NovaScatterAddOpLowering,NovaGatherOpLowering
+  patterns.add<NovaMatmulOpLoweringgeneric, 
+               NovaBroadcastInDimOpLowering,
+               NovaTransposeOpLowering, 
+               NovaToDeviceOpLowering,
+               NovaScatterAddOpLowering,
+               NovaGatherOpLowering,
+               NovaDivOpLowering,
+               NovaMulOpLowering
                >(patterns.getContext());
 }
 } // namespace nova

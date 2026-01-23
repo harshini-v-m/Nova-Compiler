@@ -11,7 +11,6 @@ namespace mlir{
         std::unique_ptr<Pass> createNovaToLinalgLoweringPass();
         void regsiterNovaToLinalgLoweringTemplatePass();
         void populateNovaToLinalgPatterns(RewritePatternSet &patterns);
-        void populateNovaToLinalgNamedPatterns(RewritePatternSet &patterns);
         void populateNovaToLinalgPatternsTemplate(RewritePatternSet &patterns);
 
     }

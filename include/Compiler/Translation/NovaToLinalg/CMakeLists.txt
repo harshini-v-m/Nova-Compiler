@@ -3,7 +3,6 @@
 add_mlir_library(MLIRNovaToLinalgTransforms
   NovaToLinalg.cpp
   TNovaToLinalg.cpp
-  NovaToLinNamed.cpp
   NovaToLinalg.h
 
   DEPENDS

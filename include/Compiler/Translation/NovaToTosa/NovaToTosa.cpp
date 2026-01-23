@@ -41,28 +41,7 @@ struct NovaOpTosaOp {
     }
     return newshape;
   }
-  static SmallVector<int64_t> shapeFindargmax(Type currType, int64_t axis) {
-    SmallVector<int64_t>
-        newshape; // paramters=>inputshape(auto) and axis(int32)
-    auto rankedType = cast<RankedTensorType>(currType);
-    for (int64_t i = 0; i < rankedType.getRank(); ++i) {
-      if (i == axis) {
-        // newshape.push_back(1); // TOSA keeps reduced dimension as size 1
-      } else {
-        newshape.push_back(rankedType.getDimSize(i));
-      }
-    }
-    return newshape;
-  }
 
-  static int64_t shapeFindforargmax(Type currType) {
-    int64_t newshape = 1; // paramters=>inputshape(auto) and axis(int32)
-    auto rankedType = cast<RankedTensorType>(currType);
-    for (int64_t i = 0; i < rankedType.getRank(); ++i) {
-      newshape *= rankedType.getDimSize(i);
-    }
-    return newshape;
-  }
   static Value mappingtosa(nova::MaxOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
 
@@ -232,9 +211,9 @@ struct NovaOpTosaOp {
   }
   static Value mappingtosa(nova::XorOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
-    auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
-    auto v = builder->create<tosa::CastOp>(op.getLoc(), restensor, input[0]);
-    auto w = builder->create<tosa::CastOp>(op.getLoc(), restensor, input[1]);
+   // auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
+    auto v = builder->create<tosa::CastOp>(op.getLoc(), resultType, input[0]);
+    auto w = builder->create<tosa::CastOp>(op.getLoc(), resultType, input[1]);
 
     return builder->create<tosa::LogicalXorOp>(op.getLoc(), resultType, v, w);
   }
