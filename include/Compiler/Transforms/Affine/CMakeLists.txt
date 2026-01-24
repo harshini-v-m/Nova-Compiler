@@ -1,7 +1,6 @@
 #===- CMakeLists.txt - Affine Transform Passes ------------------*- CMake -*-===#
 
 add_mlir_dialect_library(MLIRAffineTransformPasses
-  AffineFullUnroll.cpp
   ${PROJECT_SOURCE_DIR}/lib/Transforms/Affine/DependencyAnalysis.cpp
   ${PROJECT_SOURCE_DIR}/lib/Transforms/Affine/DependencyAnalysisTestPass.cpp
   ${PROJECT_SOURCE_DIR}/lib/Transforms/Affine/MemoryAccessAnalysis.cpp
@@ -33,7 +32,6 @@ target_include_directories(MLIRAffineTransformPasses PRIVATE
 )
 
 install(FILES
-  ${PROJECT_SOURCE_DIR}/include/Compiler/Transforms/Affine/AffineFullUnroll.h
   ${PROJECT_SOURCE_DIR}/include/Compiler/Transforms/Affine/DependencyAnalysis.h
   ${PROJECT_SOURCE_DIR}/include/Compiler/Transforms/Affine/DependencyAnalysisTestPass.h
   ${PROJECT_SOURCE_DIR}/include/Compiler/Transforms/Affine/MemoryAccessAnalysis.h

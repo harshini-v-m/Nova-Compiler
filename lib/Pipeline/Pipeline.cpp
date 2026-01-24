@@ -37,10 +37,6 @@
 #include "Compiler/Dialect/nova/NovaOps.h"
 
 //optimization passes includes
-#include "Compiler/Transforms/CleanupPass.h"
-#include "Compiler/Transforms/Affine/AffineFullUnroll.h"
-#include "Compiler/Transforms/FastmathFlag.h"
-#include "Compiler/Transforms/ParallelizeOuterLoops.h"
 #include "Compiler/Transforms/FuseMatmulBias.h"
 #include "Compiler/Transforms/GenerateDynamicWrapper.h"
 

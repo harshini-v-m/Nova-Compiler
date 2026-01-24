@@ -24,11 +24,7 @@
 #include "Compiler/Dialect/nova/NovaDialect.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
 #include "Compiler/Transforms/Passes.h"
-#include "Compiler/Transforms/CleanupPass.h"
-#include "Compiler/Transforms/Affine/AffineFullUnroll.h"
 #include "Compiler/Transforms/FuseMatmulBias.h"
-#include "Compiler/Transforms/FastmathFlag.h"
-#include "Compiler/Transforms/ParallelizeOuterLoops.h"
 
 #include "Compiler/Translation/NovaToArith/NovaToArith.h"
 #include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
@@ -72,9 +68,6 @@ int main(int argc, char **argv) {
     return mlir::createPrintOpGraphPass();
   });
 
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
-    return mlir::compiler::createCleanupPass();
-  });
 
   mlir::DialectRegistry registry;
   
