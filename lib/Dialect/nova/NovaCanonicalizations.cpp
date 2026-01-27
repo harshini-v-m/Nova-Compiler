@@ -577,16 +577,30 @@ struct SimplifyMinSelf : public OpRewritePattern<MinOp> {
     return success();
   }
 };
+/// Simplify neg(neg(A)) -> A
+struct IdentityNeg : public OpRewritePattern<NegOp> {
+  using OpRewritePattern<NegOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(NegOp op,
+                                PatternRewriter &rewriter) const override {
+    Value input = op.getOperand();
+    NegOp innerNeg = input.getDefiningOp<NegOp>();
+    if (!innerNeg) {
+      return failure();
+    }
+    rewriter.replaceOp(op, innerNeg.getOperand());
+    return success();
+  }
+};
 
 } // namespace
-
 
 //===----------------------------------------------------------------------===//
 // Populate Canonicalization Patterns (called from each Op)
 //===----------------------------------------------------------------------===//
 
 void AddOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                                    MLIRContext *context) {
+                                        MLIRContext *context) {
   results.add<InsertBroadcastPattern<AddOp>>(context);
   results.add<EliminateAddZero>(context);
   results.add<CombineAddConstants>(context);
@@ -649,4 +663,8 @@ void OrOp::getCanonicalizationPatterns(RewritePatternSet &results,
 void XorOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<XorOp>>(context);
+}
+void NegOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                        MLIRContext *context) {
+  results.add<IdentityNeg>(context);
 }

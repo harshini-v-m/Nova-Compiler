@@ -492,9 +492,9 @@ LogicalResult nova::SqrtOp::inferReturnTypes(
   // Integer → f32
   if (isa<IntegerType>(elemTy)) {
     outElemTy = Float32Type::get(context);
-  }
-  // Float → same float
-  else if (isa<FloatType>(elemTy)) {
+  } else if (isa<FloatType>(elemTy)) {
+    outElemTy = elemTy;
+  } else if (isa<ComplexType>(elemTy)) {
     outElemTy = elemTy;
   } else {
     return failure();
@@ -1543,6 +1543,7 @@ INFER_RETURN_TYPE_COMPONENTS_FROM_OPERANDS(AtanhOp);
 INFER_RETURN_TYPE_COMPONENTS_FROM_OPERANDS(GeluOp);
 INFER_RETURN_TYPE_COMPONENTS_FROM_OPERANDS(SoftmaxOp);
 INFER_RETURN_TYPE_COMPONENTS_FROM_OPERANDS(SignOp);
+INFER_RETURN_TYPE_COMPONENTS_FROM_OPERANDS(SigmoidOp);
 
 void SoftmaxOp::build(OpBuilder &builder, OperationState &state,
                       ReductionKind kind, Value input, Type resultType,
@@ -1554,24 +1555,71 @@ void SoftmaxOp::build(OpBuilder &builder, OperationState &state,
   state.addTypes(resultType);
 }
 // losses
+// finding high heirarchy bitwidth and datatype
+// if both are float return higher bitwidth float
+// if one is int and other is float return float with higher bitwidth
+// (i64,f32)->f64 if both are int return higher bitwidth int
+static Type getHigherHierarchyType(Type t1, Type t2, MLIRContext *context) {
+  unsigned b1 = 0, b2 = 0;
+  bool isFloat1 = false, isFloat2 = false;
+
+  if (auto f1 = dyn_cast<FloatType>(t1)) {
+    b1 = f1.getWidth();
+    isFloat1 = true;
+  } else if (auto i1 = dyn_cast<IntegerType>(t1)) {
+    b1 = i1.getWidth();
+  }
+
+  if (auto f2 = dyn_cast<FloatType>(t2)) {
+    b2 = f2.getWidth();
+    isFloat2 = true;
+  } else if (auto i2 = dyn_cast<IntegerType>(t2)) {
+    b2 = i2.getWidth();
+  }
+
+  unsigned maxBitwidth = std::max(b1, b2);
+  bool resultIsFloat = isFloat1 || isFloat2;
+
+  Builder builder(context);
+  if (resultIsFloat) {
+    if (maxBitwidth == 64)
+      return builder.getF64Type();
+    return builder.getF32Type();
+  }
+
+  // Both are integers
+  if (maxBitwidth == 64)
+    return builder.getI64Type();
+  if (maxBitwidth == 32)
+    return builder.getI32Type();
+  if (maxBitwidth == 16)
+    return builder.getI16Type();
+  return builder.getI8Type();
+}
 LogicalResult
 SceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                         ValueRange operands, DictionaryAttr attributes,
                         OpaqueProperties properties, RegionRange regions,
                         llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
   auto logitsType = dyn_cast<RankedTensorType>(operands[0].getType());
-  if (!logitsType)
+  auto targetsType = dyn_cast<RankedTensorType>(operands[1].getType());
+  if (!logitsType || !targetsType)
     return failure();
 
-  // Always return f32 scalar for sparse cross entropy loss
-  Type outElemTy = Float32Type::get(context);
+  Type outElemTy = getHigherHierarchyType(
+      logitsType.getElementType(), targetsType.getElementType(), context);
+
+  if (auto itype = dyn_cast<IntegerType>(outElemTy)) {
+    if (itype.getWidth() == 64)
+      outElemTy = Float64Type::get(context);
+    else
+      outElemTy = Float32Type::get(context);
+  }
 
   auto outType = RankedTensorType::get(
       {}, outElemTy,
-      getBinaryResultEncoding(
-          logitsType.getEncoding(),
-          llvm::cast<RankedTensorType>(operands[1].getType()).getEncoding(),
-          context));
+      getBinaryResultEncoding(logitsType.getEncoding(),
+                              targetsType.getEncoding(), context));
 
   inferredReturnTypes.push_back(outType);
   return success();
@@ -1581,30 +1629,25 @@ MaeOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                         ValueRange operands, DictionaryAttr attributes,
                         OpaqueProperties properties, RegionRange regions,
                         llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
-  auto inputType = dyn_cast<RankedTensorType>(operands[0].getType());
-  if (!inputType)
+  auto lhsType = dyn_cast<RankedTensorType>(operands[0].getType());
+  auto rhsType = dyn_cast<RankedTensorType>(operands[1].getType());
+  if (!lhsType || !rhsType)
     return failure();
 
-  auto elemTy = inputType.getElementType();
+  Type outElemTy = getHigherHierarchyType(lhsType.getElementType(),
+                                          rhsType.getElementType(), context);
 
-  Type outElemTy;
+  if (auto itype = dyn_cast<IntegerType>(outElemTy)) {
+    if (itype.getWidth() == 64)
+      outElemTy = Float64Type::get(context);
+    else
+      outElemTy = Float32Type::get(context);
+  }
 
-  // Integer → f32
-  if (isa<IntegerType>(elemTy)) {
-    outElemTy = Float32Type::get(context);
-  }
-  // Float → same float
-  else if (isa<FloatType>(elemTy)) {
-    outElemTy = elemTy;
-  } else {
-    return failure();
-  }
   auto outType = RankedTensorType::get(
       {}, outElemTy,
-      getBinaryResultEncoding(
-          inputType.getEncoding(),
-          llvm::cast<RankedTensorType>(operands[1].getType()).getEncoding(),
-          context));
+      getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
+                              context));
 
   inferredReturnTypes.push_back(outType);
   return success();
@@ -1614,30 +1657,25 @@ MseOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                         ValueRange operands, DictionaryAttr attributes,
                         OpaqueProperties properties, RegionRange regions,
                         llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
-  auto inputType = dyn_cast<RankedTensorType>(operands[0].getType());
-  if (!inputType)
+  auto lhsType = dyn_cast<RankedTensorType>(operands[0].getType());
+  auto rhsType = dyn_cast<RankedTensorType>(operands[1].getType());
+  if (!lhsType || !rhsType)
     return failure();
 
-  auto elemTy = inputType.getElementType();
+  Type outElemTy = getHigherHierarchyType(lhsType.getElementType(),
+                                          rhsType.getElementType(), context);
 
-  Type outElemTy;
+  if (auto itype = dyn_cast<IntegerType>(outElemTy)) {
+    if (itype.getWidth() == 64)
+      outElemTy = Float64Type::get(context);
+    else
+      outElemTy = Float32Type::get(context);
+  }
 
-  // Integer → f32
-  if (isa<IntegerType>(elemTy)) {
-    outElemTy = Float32Type::get(context);
-  }
-  // Float → same float
-  else if (isa<FloatType>(elemTy)) {
-    outElemTy = elemTy;
-  } else {
-    return failure();
-  }
   auto outType = RankedTensorType::get(
       {}, outElemTy,
-      getBinaryResultEncoding(
-          inputType.getEncoding(),
-          llvm::cast<RankedTensorType>(operands[1].getType()).getEncoding(),
-          context));
+      getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
+                              context));
 
   inferredReturnTypes.push_back(outType);
   return success();
@@ -1647,30 +1685,25 @@ CceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                         ValueRange operands, DictionaryAttr attributes,
                         OpaqueProperties properties, RegionRange regions,
                         llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
-  auto inputType = dyn_cast<RankedTensorType>(operands[0].getType());
-  if (!inputType)
+  auto lhsType = dyn_cast<RankedTensorType>(operands[0].getType());
+  auto rhsType = dyn_cast<RankedTensorType>(operands[1].getType());
+  if (!lhsType || !rhsType)
     return failure();
 
-  auto elemTy = inputType.getElementType();
+  Type outElemTy = getHigherHierarchyType(lhsType.getElementType(),
+                                          rhsType.getElementType(), context);
 
-  Type outElemTy;
+  if (auto itype = dyn_cast<IntegerType>(outElemTy)) {
+    if (itype.getWidth() == 64)
+      outElemTy = Float64Type::get(context);
+    else
+      outElemTy = Float32Type::get(context);
+  }
 
-  // Integer → f32
-  if (isa<IntegerType>(elemTy)) {
-    outElemTy = Float32Type::get(context);
-  }
-  // Float → same float
-  else if (isa<FloatType>(elemTy)) {
-    outElemTy = elemTy;
-  } else {
-    return failure();
-  }
   auto outType = RankedTensorType::get(
       {}, outElemTy,
-      getBinaryResultEncoding(
-          inputType.getEncoding(),
-          llvm::cast<RankedTensorType>(operands[1].getType()).getEncoding(),
-          context));
+      getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
+                              context));
 
   inferredReturnTypes.push_back(outType);
   return success();
@@ -1680,45 +1713,42 @@ BceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                         ValueRange operands, DictionaryAttr attributes,
                         OpaqueProperties properties, RegionRange regions,
                         llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
-  auto inputType = dyn_cast<RankedTensorType>(operands[0].getType());
-  if (!inputType)
+  auto lhsType = dyn_cast<RankedTensorType>(operands[0].getType());
+  auto rhsType = dyn_cast<RankedTensorType>(operands[1].getType());
+  if (!lhsType || !rhsType)
     return failure();
 
-  auto elemTy = inputType.getElementType();
+  Type outElemTy = getHigherHierarchyType(lhsType.getElementType(),
+                                          rhsType.getElementType(), context);
 
-  Type outElemTy;
+  if (auto itype = dyn_cast<IntegerType>(outElemTy)) {
+    if (itype.getWidth() == 64)
+      outElemTy = Float64Type::get(context);
+    else
+      outElemTy = Float32Type::get(context);
+  }
 
-  // Integer → f32
-  if (isa<IntegerType>(elemTy)) {
-    outElemTy = Float32Type::get(context);
-  }
-  // Float → same float
-  else if (isa<FloatType>(elemTy)) {
-    outElemTy = elemTy;
-  } else {
-    return failure();
-  }
   auto outType = RankedTensorType::get(
       {}, outElemTy,
-      getBinaryResultEncoding(
-          inputType.getEncoding(),
-          llvm::cast<RankedTensorType>(operands[1].getType()).getEncoding(),
-          context));
+      getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
+                              context));
 
   inferredReturnTypes.push_back(outType);
   return success();
 }
-LogicalResult GatherOp::inferReturnTypes(
-    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
-    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+LogicalResult
+GatherOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
+                           ValueRange operands, DictionaryAttr attributes,
+                           OpaqueProperties properties, RegionRange regions,
+                           llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
   auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
   auto indexType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
   if (!inputType || !indexType)
     return failure();
 
-  inferredReturnTypes.push_back(RankedTensorType::get(
-      indexType.getShape(), inputType.getElementType(), inputType.getEncoding()));
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(indexType.getShape(), inputType.getElementType(),
+                            inputType.getEncoding()));
   return success();
 }
 
@@ -1734,27 +1764,27 @@ LogicalResult ScatterAddOp::inferReturnTypes(
   return success();
 }
 
-LogicalResult AdamOp::inferReturnTypes(
-  MLIRContext *context, std::optional<Location> loc,
-                        ValueRange operands, DictionaryAttr attributes,
-                        OpaqueProperties properties, RegionRange regions,
-                        llvm::SmallVectorImpl<Type> &inferredReturnTypes
-){
-  //get inputs 
-  auto paramType =cast<RankedTensorType>(operands[0].getType());
-  auto mType= cast<RankedTensorType>(operands[1].getType());
-  auto vType= cast<RankedTensorType>(operands[2].getType());
-  auto gradType= cast<RankedTensorType>(operands[3].getType());
+LogicalResult
+AdamOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
+                         ValueRange operands, DictionaryAttr attributes,
+                         OpaqueProperties properties, RegionRange regions,
+                         llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+  // get inputs
+  auto paramType = cast<RankedTensorType>(operands[0].getType());
+  auto mType = cast<RankedTensorType>(operands[1].getType());
+  auto vType = cast<RankedTensorType>(operands[2].getType());
+  auto gradType = cast<RankedTensorType>(operands[3].getType());
 
-  //verification
+  // verification
 
-  if(paramType.getShape() != mType.getShape() || 
-      paramType.getShape() != vType.getShape() || 
-      paramType.getShape() != gradType.getShape()){
-        return emitOptionalError(loc,"All inputs (param,m,v,grad) must have the same shape");
-      }
+  if (paramType.getShape() != mType.getShape() ||
+      paramType.getShape() != vType.getShape() ||
+      paramType.getShape() != gradType.getShape()) {
+    return emitOptionalError(
+        loc, "All inputs (param,m,v,grad) must have the same shape");
+  }
 
-  inferredReturnTypes.assign({paramType,mType,vType});
+  inferredReturnTypes.assign({paramType, mType, vType});
   return success();
 }
 
@@ -1773,7 +1803,6 @@ OpFoldResult ToDeviceOp::fold(FoldAdaptor adaptor) {
 
   return {};
 }
-
 
 LogicalResult ToDeviceOp::verify() {
   auto inputType = cast<RankedTensorType>(getInput().getType());

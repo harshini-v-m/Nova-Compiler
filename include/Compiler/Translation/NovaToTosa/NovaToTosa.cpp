@@ -77,7 +77,7 @@ struct NovaOpTosaOp {
   // log op
   static Value mappingtosa(nova::LogOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
-    // if complex type use complex.exp
+    // if complex type use complex.log
 
     auto tensorTy = llvm::dyn_cast<RankedTensorType>(input[0].getType());
     if (isa<ComplexType>(tensorTy.getElementType())) {
@@ -164,6 +164,33 @@ struct NovaOpTosaOp {
   // sqrt op
   static Value mappingtosa(nova::SqrtOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
+    // if complex type use complex.sqrt
+    auto tensorTy = llvm::dyn_cast<RankedTensorType>(input[0].getType());
+    if (isa<ComplexType>(tensorTy.getElementType())) {
+      // Need to use linalg.generic to apply complex.sqrt element-wise
+      auto loc = op.getLoc();
+      auto resultTensorType = llvm::cast<RankedTensorType>(resultType);
+
+      Value emptyTensor = builder->create<tensor::EmptyOp>(
+          loc, resultTensorType.getShape(), resultTensorType.getElementType(),
+          resultTensorType.getEncoding());
+
+      auto identityMap =
+          builder->getMultiDimIdentityMap(resultTensorType.getRank());
+      SmallVector<AffineMap> indexingMaps = {identityMap, identityMap};
+      SmallVector<utils::IteratorType> iteratorTypes(
+          resultTensorType.getRank(), utils::IteratorType::parallel);
+
+      auto genericOp = builder->create<linalg::GenericOp>(
+          loc, TypeRange{resultType}, input[0], emptyTensor, indexingMaps,
+          iteratorTypes, [&](OpBuilder &b, Location loc, ValueRange args) {
+            Value sqrt = b.create<complex::SqrtOp>(loc, args[0]);
+            b.create<linalg::YieldOp>(loc, sqrt);
+          });
+
+      return genericOp.getResult(0);
+    }
+
     auto restensor = dyn_cast<RankedTensorType>(resultType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), restensor, input[0]);
 
@@ -211,7 +238,7 @@ struct NovaOpTosaOp {
   }
   static Value mappingtosa(nova::XorOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
-   // auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
+   //auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), resultType, input[0]);
     auto w = builder->create<tosa::CastOp>(op.getLoc(), resultType, input[1]);
 
@@ -257,7 +284,7 @@ struct NovaOpTosaOp {
   // sin op
   static Value mappingtosa(nova::SinOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
-    // if complex type use complex.exp
+    // if complex type use complex.sin
 
     auto tensorTy = llvm::dyn_cast<RankedTensorType>(input[0].getType());
     if (isa<ComplexType>(tensorTy.getElementType())) {
@@ -293,7 +320,7 @@ struct NovaOpTosaOp {
   }
   static Value mappingtosa(nova::CosOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
-    // if complex type use complex.exp
+    // if complex type use complex.cos
 
     auto tensorTy = llvm::dyn_cast<RankedTensorType>(input[0].getType());
     if (isa<ComplexType>(tensorTy.getElementType())) {
@@ -330,7 +357,7 @@ struct NovaOpTosaOp {
   // tanh
   static Value mappingtosa(nova::TanhOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
-    // if complex type use complex.exp
+    // if complex type use complex.tanh
     auto tensorTy = llvm::dyn_cast<RankedTensorType>(input[0].getType());
     if (isa<ComplexType>(tensorTy.getElementType())) {
       // Need to use linalg.generic to apply complex.exp element-wise
@@ -376,7 +403,13 @@ struct NovaOpTosaOp {
   }
   static Value mappingtosa(nova::SigmoidOp op, Type resultType,
                            ValueRange input, OpBuilder *builder) {
-    return builder->create<tosa::SigmoidOp>(op.getLoc(), resultType, input[0]);
+    auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
+    auto targetElemType = restensor.getElementType();
+    auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
+    auto newVType = mlir::RankedTensorType::get(
+        v_type.getShape(), targetElemType, v_type.getEncoding());
+    auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
+    return builder->create<tosa::SigmoidOp>(op.getLoc(), resultType, v);
   }
 
   // MAE lowering pattern
@@ -422,11 +455,10 @@ struct NovaOpTosaOp {
         w_type.getShape(), targetElemType, w_type.getEncoding());
     auto w = builder->create<tosa::CastOp>(op.getLoc(), newWType, input[1]);
     auto sub = builder->create<tosa::SubOp>(op.getLoc(), newVType, v, w);
-
     mlir::RankedTensorType constType = mlir::RankedTensorType::get(
-        v_type.getShape(), builder->getF32Type(), v_type.getEncoding());
-    mlir::DenseElementsAttr constAttr =
-        mlir::DenseElementsAttr::get(constType, llvm::ArrayRef<float_t>(2));
+        v_type.getShape(), targetElemType, v_type.getEncoding());
+    mlir::DenseElementsAttr constAttr = mlir::DenseElementsAttr::get(
+        constType, builder->getFloatAttr(targetElemType, 2.0));
     auto constTwo =
         builder->create<tosa::ConstOp>(op.getLoc(), constType, constAttr);
     auto abs =
@@ -461,12 +493,14 @@ struct NovaOpTosaOp {
     // step1:creating 1x10^-7  tensor constant
     auto hostVType = mlir::RankedTensorType::get(
         newVType.getShape(), targetElemType, v_type.getEncoding());
-    auto epiAttr =
-        DenseElementsAttr::get(hostVType, builder->getF32FloatAttr(0.0000001f));
+
+    auto epiAttr = DenseElementsAttr::get(
+        hostVType, builder->getFloatAttr(targetElemType, 1e-7));
     Value epi = builder->create<tosa::ConstOp>(op.getLoc(), hostVType, epiAttr);
+
     // step2: creating one minus epsilon constant
-    auto oneminusepiAttr =
-        DenseElementsAttr::get(hostVType, builder->getF32FloatAttr(1.0f));
+    auto oneminusepiAttr = DenseElementsAttr::get(
+        hostVType, builder->getFloatAttr(targetElemType, 1.0));
     Value ones =
         builder->create<tosa::ConstOp>(op.getLoc(), hostVType, oneminusepiAttr);
     Value oneminusepi = builder->create<nova::SubOp>(op.getLoc(), ones, epi);
@@ -493,8 +527,8 @@ struct NovaOpTosaOp {
     // step6:create -1 constant tensor (scalar)
     auto constType =
         mlir::RankedTensorType::get({}, targetElemType, v_type.getEncoding());
-    auto minus1Attr =
-        DenseElementsAttr::get(constType, builder->getF32FloatAttr(-1.0));
+    auto minus1Attr = DenseElementsAttr::get(
+        constType, builder->getFloatAttr(targetElemType, -1.0));
     Value minus1 =
         builder->create<tosa::ConstOp>(op.getLoc(), constType, minus1Attr);
     // step 7 :reducesum(log result) along expect 0
@@ -530,22 +564,23 @@ struct NovaOpTosaOp {
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
     auto newVType = mlir::RankedTensorType::get(
         v_type.getShape(), targetElemType, v_type.getEncoding());
-    //  auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType,input[0]);
-    auto v = input[0];
-    auto w = input[1];
+    auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
     auto w_type = cast<mlir::RankedTensorType>(input[1].getType());
-    [[maybe_unused]] auto newWType = mlir::RankedTensorType::get(
+    auto newWType = mlir::RankedTensorType::get(
         w_type.getShape(), targetElemType, w_type.getEncoding());
-    // auto w = builder->create<tosa::CastOp>(op.getLoc(), newVType,input[1]);
+    auto w = builder->create<tosa::CastOp>(op.getLoc(), newWType, input[1]);
+
     // step1:creating 1x10^-7  tensor constant
     auto hostVType = mlir::RankedTensorType::get(
         newVType.getShape(), targetElemType, v_type.getEncoding());
-    auto epiAttr =
-        DenseElementsAttr::get(hostVType, builder->getF32FloatAttr(0.0000001f));
+
+    auto epiAttr = DenseElementsAttr::get(
+        hostVType, builder->getFloatAttr(targetElemType, 1e-7));
     Value epi = builder->create<tosa::ConstOp>(op.getLoc(), hostVType, epiAttr);
+
     // step2: creating one minus epsilon constant
-    auto oneminusepiAttr =
-        DenseElementsAttr::get(hostVType, builder->getF32FloatAttr(1.0f));
+    auto oneminusepiAttr = DenseElementsAttr::get(
+        hostVType, builder->getFloatAttr(targetElemType, 1.0));
     Value ones =
         builder->create<tosa::ConstOp>(op.getLoc(), hostVType, oneminusepiAttr);
     Value oneminusepi = builder->create<nova::SubOp>(op.getLoc(), ones, epi);
@@ -594,8 +629,8 @@ struct NovaOpTosaOp {
     // step9:create -1 constant tensor (scalar)
     auto constType =
         mlir::RankedTensorType::get({}, targetElemType, v_type.getEncoding());
-    auto minus1Attr =
-        DenseElementsAttr::get(constType, builder->getF32FloatAttr(-1.0));
+    auto minus1Attr = DenseElementsAttr::get(
+        constType, builder->getFloatAttr(targetElemType, -1.0));
     Value minus1 =
         builder->create<tosa::ConstOp>(op.getLoc(), constType, minus1Attr);
     // final step: mul reduce result and -1
@@ -945,6 +980,10 @@ struct NovaToTosaLoweringPass
     registry.insert<tosa::TosaDialect>();
     registry.insert<func::FuncDialect>();
     registry.insert<nova::NovaDialect>();
+    registry.insert<linalg::LinalgDialect>();
+    registry.insert<tensor::TensorDialect>();
+    registry.insert<complex::ComplexDialect>();
+    registry.insert<arith::ArithDialect>();
   }
 
   StringRef getArgument() const final { return "convert-nova-to-tosa"; }
@@ -958,6 +997,8 @@ struct NovaToTosaLoweringPass
     ConversionTarget target(getContext());
 
     target.addLegalDialect<tosa::TosaDialect, func::FuncDialect>();
+    target.addLegalDialect<linalg::LinalgDialect, tensor::TensorDialect,
+                           complex::ComplexDialect, arith::ArithDialect>();
     target.addIllegalOp<nova::ConstantOp>();
     target.addIllegalOp<nova::ReluOp>();
     target.addIllegalOp<nova::ExpOp>();
