@@ -926,60 +926,50 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
   Value filledTensor =
       rewriter.create<linalg::FillOp>(loc, identity, emptyTensor).result();
 
-  // Build expanded input shape: for each reduced axis, split [size] -> [1,
-  // size]
-  SmallVector<int64_t> expandedInputShape;
-  SmallVector<ReassociationIndices> inputReassociation;
-  int64_t expandedDim = 0;
+  // Build indexing maps
+  // We want iterators: [parallel_0, ..., parallel_M, reduction_0, ...,
+  // reduction_K]
+  SmallVector<int64_t> parallelAxes;
+  SmallVector<int64_t> reductionAxes;
+  for (int64_t i = 0; i < rank; ++i) {
+    if (axisSet.contains(i))
+      reductionAxes.push_back(i);
+    else
+      parallelAxes.push_back(i);
+  }
 
+  // logicalToLoop[logical_dim] = generic_loop_index
+  SmallVector<int64_t> logicalToLoop(rank);
+  for (size_t i = 0; i < parallelAxes.size(); ++i)
+    logicalToLoop[parallelAxes[i]] = i;
+  for (size_t i = 0; i < reductionAxes.size(); ++i)
+    logicalToLoop[reductionAxes[i]] = parallelAxes.size() + i;
+
+  SmallVector<AffineExpr> inputExprs;
+  for (int64_t i = 0; i < rank; ++i) {
+    inputExprs.push_back(rewriter.getAffineDimExpr(logicalToLoop[i]));
+  }
+
+  SmallVector<AffineExpr> outputExprs;
   for (int64_t i = 0; i < rank; ++i) {
     if (axisSet.contains(i)) {
-      expandedInputShape.push_back(1);
-      expandedInputShape.push_back(inputType.getDimSize(i));
-      inputReassociation.push_back({expandedDim, expandedDim + 1});
-      expandedDim += 2;
+      outputExprs.push_back(rewriter.getAffineConstantExpr(0));
     } else {
-      expandedInputShape.push_back(inputType.getDimSize(i));
-      inputReassociation.push_back({expandedDim});
-      expandedDim += 1;
+      outputExprs.push_back(rewriter.getAffineDimExpr(logicalToLoop[i]));
     }
   }
 
-  auto expandedInputType =
-      RankedTensorType::get(expandedInputShape, reductionElemType, encoding);
-  Value expandedInput = rewriter.create<tensor::ExpandShapeOp>(
-      loc, expandedInputType, current, inputReassociation);
-
-  // Build indexing maps for linalg.generic
-  int64_t expandedRank = expandedInputShape.size();
-  SmallVector<AffineExpr> inputExprs, outputExprs;
   SmallVector<utils::IteratorType> iteratorTypes;
+  for (size_t i = 0; i < parallelAxes.size(); ++i)
+    iteratorTypes.push_back(utils::IteratorType::parallel);
+  for (size_t i = 0; i < reductionAxes.size(); ++i)
+    iteratorTypes.push_back(utils::IteratorType::reduction);
 
-  int64_t dimIdx = 0;
-  for (int64_t i = 0; i < rank; ++i) {
-    if (axisSet.contains(i)) {
-      // Reduced dimension: [1, original_size] -> parallel, reduction
-      inputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
-      inputExprs.push_back(rewriter.getAffineDimExpr(dimIdx + 1));
-      outputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
-      iteratorTypes.push_back(utils::IteratorType::parallel);
-      iteratorTypes.push_back(utils::IteratorType::reduction);
-      dimIdx += 2;
-    } else {
-      inputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
-      outputExprs.push_back(rewriter.getAffineDimExpr(dimIdx));
-      iteratorTypes.push_back(utils::IteratorType::parallel);
-      dimIdx += 1;
-    }
-  }
-
-  auto inputMap =
-      AffineMap::get(expandedRank, 0, inputExprs, rewriter.getContext());
-  auto outputMap =
-      AffineMap::get(expandedRank, 0, outputExprs, rewriter.getContext());
+  auto inputMap = AffineMap::get(rank, 0, inputExprs, rewriter.getContext());
+  auto outputMap = AffineMap::get(rank, 0, outputExprs, rewriter.getContext());
 
   auto genericOp = rewriter.create<linalg::GenericOp>(
-      loc, keepdimsType, expandedInput, filledTensor,
+      loc, keepdimsType, current, filledTensor,
       SmallVector<AffineMap>{inputMap, outputMap}, iteratorTypes,
       [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
         Value result = createReduceCombiner(b, nestedLoc, kind, args[0],
@@ -1015,9 +1005,24 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
     reduced = divOp.getResult(0);
   }
 
-  // Final type cast if needed
+  // Final type cast/reshape if needed
   if (cast<RankedTensorType>(reduced.getType()) != resultType) {
-    reduced = rewriter.create<tensor::CastOp>(loc, resultType, reduced);
+    auto reducedType = cast<RankedTensorType>(reduced.getType());
+    if (reducedType.getRank() != resultType.getRank()) {
+      auto shapeType = RankedTensorType::get({resultType.getRank()},
+                                             rewriter.getIndexType());
+      auto shapeAttr =
+          DenseIntElementsAttr::get(shapeType, resultType.getShape());
+      auto shapeConst = rewriter.create<tosa::ConstShapeOp>(
+          loc,
+          mlir::tosa::shapeType::get(rewriter.getContext(),
+                                     resultType.getRank()),
+          shapeAttr);
+      reduced = rewriter.create<tosa::ReshapeOp>(loc, resultType, reduced,
+                                                 shapeConst);
+    } else {
+      reduced = rewriter.create<tensor::CastOp>(loc, resultType, reduced);
+    }
   }
 
   rewriter.replaceOp(op, reduced);
@@ -1054,12 +1059,9 @@ public:
         axes.push_back(i);
     }
 
-    // Check if keepdims is true - use linalg.generic path to preserve encoding
-    bool keepDims = op.getKeepdims();
-    if (keepDims) {
-      return lowerWithLinalgGeneric(op, rewriter, loc, input, inputType,
-                                    resultType, elemType, rank, kind, axes);
-    }
+    // Use linalg.generic path to preserve encoding and avoid host-side loops
+    return lowerWithLinalgGeneric(op, rewriter, loc, input, inputType,
+                                  resultType, elemType, rank, kind, axes);
 
     // Sort axes in descending order so we can reduce from higher dims first
     // (this prevents axis index shifting issues)
@@ -1399,6 +1401,7 @@ struct NovaToLinalgLoweringPassTemplate
     target.addLegalDialect<arith::ArithDialect>();
     target.addLegalDialect<func::FuncDialect>();
     target.addLegalDialect<math::MathDialect>();
+    target.addLegalDialect<tosa::TosaDialect>();
     target.addIllegalDialect<nova::NovaDialect>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     RewritePatternSet patterns(context);
