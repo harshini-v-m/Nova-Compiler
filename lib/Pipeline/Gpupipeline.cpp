@@ -186,6 +186,7 @@ namespace mlir
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
+
         }
         void registerNovaGPUPipelines()
         {

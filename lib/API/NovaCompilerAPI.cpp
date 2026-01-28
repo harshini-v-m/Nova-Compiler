@@ -2,6 +2,9 @@
 #include "Compiler/Pipeline/Pipeline.h"
 #include "Compiler/Pipeline/Gpupipeline.h"
 #include "Compiler/Dialect/nova/NovaDialect.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -120,18 +123,14 @@ NovaCompilerAPI::NovaCompilerAPI() {
 
 NovaCompilerAPI::~NovaCompilerAPI() = default;
 
-CompilationResult NovaCompilerAPI::compileFile(const std::string &inputFile,
-                                               const std::string &outputFile,
+std::unique_ptr<llvm::Module> NovaCompilerAPI::compileFile(const std::string &inputFile,
+                                               llvm::LLVMContext &llvmContext,
                                                const CompilerOptions &options) {
-  CompilationResult result;
-  
   // Parse the input file
-  std::string errorMessage;
   auto fileOrErr = llvm::MemoryBuffer::getFile(inputFile);
   if (std::error_code ec = fileOrErr.getError()) {
-    result.success = false;
-    result.errorMessage = "Failed to open file: " + ec.message();
-    return result;
+    llvm::errs() << "Failed to open file: " << ec.message() << "\n";
+    return nullptr;
   }
   
   llvm::SourceMgr sourceMgr;
@@ -139,88 +138,98 @@ CompilationResult NovaCompilerAPI::compileFile(const std::string &inputFile,
   
   OwningOpRef<ModuleOp> module = parseSourceFile<ModuleOp>(sourceMgr, context.get());
   if (!module) {
-    result.success = false;
-    result.errorMessage = "Failed to parse MLIR file";
-    return result;
+    llvm::errs() << "Failed to parse MLIR file\n";
+    return nullptr;
   }
   
-  return compileModule(*module, outputFile, options);
+  return compileToLLVMModule(*module, llvmContext, options);
 }
 
-CompilationResult NovaCompilerAPI::compileString(const std::string &mlirSource,
-                                                 const std::string &outputFile,
-                                                 const CompilerOptions &options) {
-  CompilationResult result;
+
+
+//---------------------------------------------------------------------------------------------------
+// IMPORTANT 
+//---------------------------------------------------------------------------------------------------
+
+void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
+  // Register necessary dialects
+  registry.insert<mlir::nova::NovaDialect,
+                 mlir::func::FuncDialect,
+                 mlir::affine::AffineDialect,
+                 mlir::arith::ArithDialect,
+                 mlir::math::MathDialect,
+                 mlir::tensor::TensorDialect,
+                 mlir::linalg::LinalgDialect,
+                 mlir::scf::SCFDialect,
+                 mlir::tosa::TosaDialect,
+                 mlir::memref::MemRefDialect,
+                 mlir::vector::VectorDialect,
+                 mlir::bufferization::BufferizationDialect,
+                 mlir::gpu::GPUDialect,
+                 mlir::NVVM::NVVMDialect,
+                 mlir::nvgpu::NVGPUDialect,
+                 mlir::LLVM::LLVMDialect>();
+
+  // Register external models and conversion interfaces
+  mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::vector::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+
+  mlir::vector::registerConvertVectorToLLVMInterface(registry);
+  mlir::arith::registerConvertArithToLLVMInterface(registry);
+  mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
+  mlir::registerConvertFuncToLLVMInterface(registry);
+  mlir::index::registerConvertIndexToLLVMInterface(registry);
+  mlir::registerConvertMathToLLVMInterface(registry);
+  mlir::registerConvertMemRefToLLVMInterface(registry);
+  mlir::ub::registerConvertUBToLLVMInterface(registry);
+  mlir::gpu::registerConvertGpuToLLVMInterface(registry);
+  mlir::registerConvertNVVMToLLVMInterface(registry);
+  mlir::registerConvertOpenMPToLLVMInterface(registry);
+  mlir::registerConvertComplexToLLVMInterface(registry);
+  mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
   
-  // Parse the MLIR string
-  OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(mlirSource, context.get());
-  if (!module) {
-    result.success = false;
-    result.errorMessage = "Failed to parse MLIR string";
-    return result;
-  }
-  
-  return compileModule(*module, outputFile, options);
+  registerLLVMDialectTranslation(registry);
+  registerAllToLLVMIRTranslations(registry);
 }
 
-CompilationResult NovaCompilerAPI::compileModule(ModuleOp module,
-                                                 const std::string &outputFile,
-                                                 const CompilerOptions &options) {
-  CompilationResult result;
+std::unique_ptr<llvm::Module> NovaCompilerAPI::compileToLLVMModule(
+    ModuleOp module,
+    llvm::LLVMContext& llvmContext,
+    const CompilerOptions &options) {
   
-  // Verify the module
+  // Register required dialect interfaces on the module's context
+  // This is necessary because the module may have been created by a different context
+  mlir::MLIRContext* ctx = module.getContext();
+  DialectRegistry registry;
+  registerAllDialects(registry);
+  
+  ctx->appendDialectRegistry(registry);
+  ctx->loadAllAvailableDialects();
+  
   if (failed(verify(module))) {
-    result.success = false;
-    result.errorMessage = "Module verification failed";
-    return result;
+    llvm::errs() << "Module verification failed\n";
+    return nullptr;
   }
   
-  // Run the pipeline
   if (failed(runPipeline(module, options))) {
-    result.success = false;
-    result.errorMessage = "Pipeline execution failed";
-    return result;
+    llvm::errs() << "Pipeline execution failed\n";
+    return nullptr;
   }
   
-  // Generate output
-  std::string output;
-  if (options.outputLLVMIR) {
-    output = translateToLLVMIR(module);
-    if (output.empty()) {
-      result.success = false;
-      result.errorMessage = "LLVM IR translation failed";
-      return result;
-    }
-  } else {
-    output = moduleToString(module);
-  }
-  
-  // Write to file or return string
-  if (!outputFile.empty()) {
-    std::error_code ec;
-    llvm::raw_fd_ostream outFile(outputFile, ec);
-    if (ec) {
-      result.success = false;
-      result.errorMessage = "Failed to open output file: " + ec.message();
-      return result;
-    }
-    outFile << output;
-    outFile.flush();
-  }
-  
-  result.success = true;
-  result.output = output;
-  return result;
+  auto llvmModule = translateModuleToLLVMIR(module, llvmContext);
+  return llvmModule;
 }
 
 LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module, 
                                            const CompilerOptions &options) {
   // Create a PassManager that operates on ModuleOp
-  PassManager pm(context.get());
+  // IMPORTANT: Use the module's own context, not our internal context
+  PassManager pm(module.getContext());
   
-  if (options.verbose) {
-    pm.enableIRPrinting();
-  }
   
   if (options.runFullPipeline) {
     // Add the Nova optimization pipeline based on target device
@@ -241,20 +250,6 @@ LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module,
   return pm.run(module);
 }
 
-std::string NovaCompilerAPI::translateToLLVMIR(ModuleOp module) {
-  llvm::LLVMContext llvmContext;
-  auto llvmModule = translateModuleToLLVMIR(module, llvmContext);
-  if (!llvmModule) {
-    return "";
-  }
-  
-  std::string output;
-  llvm::raw_string_ostream os(output);
-  llvmModule->print(os, nullptr);
-  os.flush();
-  
-  return output;
-}
 
 std::string NovaCompilerAPI::moduleToString(ModuleOp module) {
   std::string output;
@@ -312,49 +307,7 @@ std::string NovaCompilerSystemAPI::findNovaOpt(const std::string &hint) {
   return "nova-opt";  // Fallback to PATH
 }
 
-bool NovaCompilerSystemAPI::compileToLLVMIR(const std::string &inputFile,
-                                            const std::string &outputFile,
-                                            const std::string &novaOptPath,
-                                            const std::string &device) {
-  std::string novaOpt = findNovaOpt(novaOptPath);
-  
-  // Build command: nova-opt | mlir-translate
-  std::string cmd;
-  if(device == "cpu") {
-    cmd = novaOpt + " " + inputFile + " --nova-opt-pipeline | " +
-          "mlir-translate --mlir-to-llvmir > " + outputFile;
-  }
-  else if(device == "gpu") {
-    cmd = novaOpt + " " + inputFile + " --nova-gpu-pipeline | " +
-          "mlir-translate --mlir-to-llvmir > " + outputFile;
-  }
-  else {
-    return false; // Invalid device type
-  }
-  
-  int result = system(cmd.c_str());
-  return result == 0;
-}
 
-bool NovaCompilerSystemAPI::compileToObject(const std::string &inputFile,
-                                            const std::string &outputFile,
-                                            const std::string &novaOptPath,
-                                            const std::string &device) {
-  // First compile to LLVM IR
-  std::string tempLL = outputFile + ".tmp.ll";
-  if (!compileToLLVMIR(inputFile, tempLL, novaOptPath, device)) {
-    return false;
-  }
-  
-  // Then compile to object file
-  std::string cmd = "llc " + tempLL + " -relocation-model=pic -filetype=obj -o " + outputFile;
-  int result = system(cmd.c_str());
-  
-  // Clean up temp file
-  std::remove(tempLL.c_str());
-  
-  return result == 0;
-}
 
 std::string NovaCompilerSystemAPI::getLLVMIR(const std::string &inputFile,
                                              const std::string &novaOptPath,

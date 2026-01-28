@@ -122,7 +122,6 @@ struct FuseMatmulBiasPattern : public OpRewritePattern<GenericOp> {
         currentVal = activeReshapes[i]->getResult(0); 
     }
 
-    llvm::errs() << "Found fusible matmul + add pattern (with " << activeReshapes.size() << " reshapes)!\n";
       
     // Get matmul inputs
     Value A = matmulOp.getDpsInputOperand(0)->get();
@@ -374,7 +373,6 @@ struct FuseMatmulBiasPattern : public OpRewritePattern<GenericOp> {
         }
     }
 
-    llvm::errs() << "Successfully fused matmul + bias into single operation (thru reshapes)!\n";
 
     // Replace the original add operation with the new fused (and reshaped) operation
     rewriter.replaceOp(addOp, fusedResult);
@@ -424,7 +422,6 @@ struct FuseMatmulBiasPass
   void runOnOperation() override {
     auto func = getOperation();
 
-    llvm::errs() << "=== Running FuseMatmulBias Pass ===\n";
 
     // Apply the pattern
     RewritePatternSet patterns(&getContext());
@@ -434,7 +431,6 @@ struct FuseMatmulBiasPass
       signalPassFailure();
     }
 
-    llvm::errs() << "=== FuseMatmulBias Pass Complete ===\n";
   }
 
   StringRef getArgument() const final { return "fuse-matmul-bias"; }

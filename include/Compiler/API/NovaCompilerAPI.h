@@ -13,6 +13,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/Module.h"
 #include <string>
 #include <memory>
 
@@ -58,27 +59,23 @@ public:
   // Destructor
   ~NovaCompilerAPI();
   
-  // Compile MLIR file to LLVM IR or LLVM dialect
+  // Compile MLIR file to LLVM Module (in-memory)
   // inputFile Path to input .mlir file
-  // outputFile Path to output file 
-  CompilationResult compileFile(const std::string &inputFile,
-                                const std::string &outputFile = "",
-                                const CompilerOptions &options = CompilerOptions());
+  // llvmContext LLVM context for the module
+  std::unique_ptr<llvm::Module> compileFile(const std::string &inputFile,
+                                            llvm::LLVMContext &llvmContext,
+                                            const CompilerOptions &options = CompilerOptions());
   
-  // Compile MLIR string to LLVM IR or LLVM dialect
-  // mlirSource MLIR source code as string
-  // outputFile Path to output file 
-  CompilationResult compileString(const std::string &mlirSource,
-                                  const std::string &outputFile = "",
-                                  const CompilerOptions &options = CompilerOptions());
+  // Ensure all necessary dialects and interfaces are registered in the context
+  static void registerAllDialects(mlir::DialectRegistry &registry);
   
   // Compile MLIR module to LLVM IR or LLVM dialect
   // module MLIR module operation
   // outputFile Path to output file 
-  CompilationResult compileModule(mlir::ModuleOp module,
-                                  const std::string &outputFile = "",
-                                  const CompilerOptions &options = CompilerOptions());
-
+  std::unique_ptr<llvm::Module> compileToLLVMModule(
+    mlir::ModuleOp module,
+    llvm::LLVMContext& llvmContext,
+    const CompilerOptions &options = CompilerOptions());
 private:
   // MLIR context
   std::unique_ptr<mlir::MLIRContext> context;
@@ -86,9 +83,6 @@ private:
   // Run the Nova optimization pipeline
   mlir::LogicalResult runPipeline(mlir::ModuleOp module, 
                                   const CompilerOptions &options);
-  
-  // Translate MLIR to LLVM IR
-  std::string translateToLLVMIR(mlir::ModuleOp module);
   
   // Convert module to string
   std::string moduleToString(mlir::ModuleOp module);
@@ -110,10 +104,6 @@ public:
   // inputFile Path to input .mlir file
   // outputFile Path to output .o file
   // novaOptPath Path to nova-opt 
-  static bool compileToObject(const std::string &inputFile,
-                              const std::string &outputFile,
-                              const std::string &novaOptPath = "",
-                              const std::string &device = "cpu");
   
   // Get LLVM IR as string
   // inputFile Path to input .mlir file
