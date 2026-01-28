@@ -592,6 +592,216 @@ struct IdentityNeg : public OpRewritePattern<NegOp> {
     return success();
   }
 };
+struct Reciprocalsquare : public OpRewritePattern<DivOp> {
+  using OpRewritePattern<DivOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(DivOp op,
+                                PatternRewriter &rewriter) const override {
+    Value lhs = op.getLhs();
+    Value rhs = op.getRhs();
+
+    // x / sqrt(y) -> x * rsqrt(y)
+    if (auto innersqrt = rhs.getDefiningOp<SqrtOp>()) {
+      Value rsqrt = rewriter.create<RsqrtOp>(op.getLoc(), innersqrt.getInput());
+      rewriter.replaceOpWithNewOp<MulOp>(op, op.getType(), lhs, rsqrt);
+      return success();
+    }
+    return failure();
+  }
+};
+
+/// Simplify abs(neg(x)) -> abs(x)
+struct SimplifyAbsNeg : public OpRewritePattern<AbsOp> {
+  using OpRewritePattern<AbsOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(AbsOp op,
+                                PatternRewriter &rewriter) const override {
+    Value input = op.getInput();
+    if (auto negOp = input.getDefiningOp<NegOp>()) {
+      rewriter.replaceOpWithNewOp<AbsOp>(op, op.getType(), negOp.getInput());
+      return success();
+    }
+    return failure();
+  }
+};
+
+/// Simplify abs(abs(x)) -> abs(x)
+struct SimplifyAbsAbs : public OpRewritePattern<AbsOp> {
+  using OpRewritePattern<AbsOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(AbsOp op,
+                                PatternRewriter &rewriter) const override {
+    Value input = op.getInput();
+    if (auto innerAbs = input.getDefiningOp<AbsOp>()) {
+      rewriter.replaceOp(op, input);
+      return success();
+    }
+    return failure();
+  }
+};
+
+/// Simplify 0 - x -> neg(x)
+struct SimplifySubZeroLhs : public OpRewritePattern<SubOp> {
+  using OpRewritePattern<SubOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(SubOp op,
+                                PatternRewriter &rewriter) const override {
+    auto lhsConst = op.getLhs().getDefiningOp<nova::ConstantOp>();
+    if (!lhsConst)
+      return failure();
+
+    auto lhsAttr = dyn_cast<DenseElementsAttr>(lhsConst.getValue());
+    if (!lhsAttr || !lhsAttr.isSplat())
+      return failure();
+
+    auto elementType = lhsAttr.getElementType();
+    if (isa<FloatType>(elementType)) {
+      if (!lhsAttr.getSplatValue<APFloat>().isZero())
+        return failure();
+    } else if (isa<IntegerType>(elementType)) {
+      if (!lhsAttr.getSplatValue<APInt>().isZero())
+        return failure();
+    } else {
+      return failure();
+    }
+
+    rewriter.replaceOpWithNewOp<NegOp>(op, op.getType(), op.getRhs());
+    return success();
+  }
+};
+
+/// Simplify div(x, x) -> 1
+struct SimplifyDivSelf : public OpRewritePattern<DivOp> {
+  using OpRewritePattern<DivOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(DivOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getLhs() != op.getRhs())
+      return failure();
+
+    auto resType = cast<ShapedType>(op.getType());
+    auto elementType = resType.getElementType();
+
+    TypedAttr oneAttr;
+    if (isa<FloatType>(elementType)) {
+      oneAttr = rewriter.getFloatAttr(elementType, 1.0);
+    } else if (isa<IntegerType>(elementType)) {
+      oneAttr = rewriter.getIntegerAttr(elementType, 1);
+    } else {
+      return failure();
+    }
+
+    auto denseOneAttr = DenseElementsAttr::get(resType, oneAttr);
+    rewriter.replaceOpWithNewOp<nova::ConstantOp>(op, denseOneAttr, resType);
+    return success();
+  }
+};
+
+/// Simplify log(exp(x)) -> x
+struct IdentityLogExp : public OpRewritePattern<LogOp> {
+  using OpRewritePattern<LogOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LogOp op,
+                                PatternRewriter &rewriter) const override {
+    Value input = op.getInput();
+    if (auto expOp = input.getDefiningOp<ExpOp>()) {
+      rewriter.replaceOp(op, expOp.getInput());
+      return success();
+    }
+    return failure();
+  }
+};
+
+/// Simplify exp(log(x)) -> x
+struct IdentityExpLog : public OpRewritePattern<ExpOp> {
+  using OpRewritePattern<ExpOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ExpOp op,
+                                PatternRewriter &rewriter) const override {
+    Value input = op.getInput();
+    if (auto logOp = input.getDefiningOp<LogOp>()) {
+      rewriter.replaceOp(op, logOp.getInput());
+      return success();
+    }
+    return failure();
+  }
+};
+
+/// Simplify reciprocal(reciprocal(x)) -> x
+struct SimplifyReciprocalReciprocal : public OpRewritePattern<ReciprocalOp> {
+  using OpRewritePattern<ReciprocalOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ReciprocalOp op,
+                                PatternRewriter &rewriter) const override {
+    Value input = op.getInput();
+    if (auto innerReciprocal = input.getDefiningOp<ReciprocalOp>()) {
+      rewriter.replaceOp(op, innerReciprocal.getInput());
+      return success();
+    }
+    return failure();
+  }
+};
+
+/// Simplify Pow patterns:
+/// pow(x, 1) -> x
+/// pow(x, 0) -> 1
+/// pow(x, 0.5) -> sqrt(x)
+/// pow(x, -0.5) -> rsqrt(x)
+/// pow(x, 2) -> square(x)
+struct SimplifyPowConstant : public OpRewritePattern<PowOp> {
+  using OpRewritePattern<PowOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(PowOp op,
+                                PatternRewriter &rewriter) const override {
+    auto rhsConst = op.getRhs().getDefiningOp<nova::ConstantOp>();
+    if (!rhsConst)
+      return failure();
+
+    auto rhsAttr = dyn_cast<DenseElementsAttr>(rhsConst.getValue());
+    if (!rhsAttr || !rhsAttr.isSplat())
+      return failure();
+
+    auto elementType = rhsAttr.getElementType();
+    if (!isa<FloatType>(elementType))
+      return failure();
+
+    APFloat val = rhsAttr.getSplatValue<APFloat>();
+
+    // pow(x, 1) -> x
+    if (val.isExactlyValue(1.0)) {
+      rewriter.replaceOp(op, op.getLhs());
+      return success();
+    }
+
+    // pow(x, 0) -> 1
+    if (val.isZero()) {
+      auto resType = cast<ShapedType>(op.getType());
+      TypedAttr oneAttr = rewriter.getFloatAttr(elementType, 1.0);
+      auto denseOneAttr = DenseElementsAttr::get(resType, oneAttr);
+      rewriter.replaceOpWithNewOp<nova::ConstantOp>(op, denseOneAttr, resType);
+      return success();
+    }
+
+    // pow(x, 0.5) -> sqrt(x)
+    if (val.isExactlyValue(0.5)) {
+      rewriter.replaceOpWithNewOp<SqrtOp>(op, op.getLhs());
+      return success();
+    }
+
+    // pow(x, -0.5) -> rsqrt(x)
+    if (val.isExactlyValue(-0.5)) {
+      rewriter.replaceOpWithNewOp<RsqrtOp>(op, op.getLhs());
+      return success();
+    }
+
+    // pow(x, 2) -> square(x)
+    if (val.isExactlyValue(2.0)) {
+      rewriter.replaceOpWithNewOp<SquareOp>(op, op.getLhs());
+      return success();
+    }
+
+    return failure();
+  }
+};
 
 } // namespace
 
@@ -612,6 +822,7 @@ void SubOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.add<InsertBroadcastPattern<SubOp>>(context);
   results.add<EliminateSubZero>(context);
   results.add<EliminateSubSelf>(context);
+  results.add<SimplifySubZeroLhs>(context);
 }
 
 void MulOp::getCanonicalizationPatterns(RewritePatternSet &results,
@@ -626,6 +837,8 @@ void DivOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<DivOp>>(context);
   results.add<EliminateDivOne>(context);
+  results.add<Reciprocalsquare>(context);
+  results.add<SimplifyDivSelf>(context);
 }
 
 void ModOp::getCanonicalizationPatterns(RewritePatternSet &results,
@@ -636,6 +849,7 @@ void ModOp::getCanonicalizationPatterns(RewritePatternSet &results,
 void PowOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<PowOp>>(context);
+  results.add<SimplifyPowConstant>(context);
 }
 
 void MaxOp::getCanonicalizationPatterns(RewritePatternSet &results,
@@ -667,4 +881,25 @@ void XorOp::getCanonicalizationPatterns(RewritePatternSet &results,
 void NegOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<IdentityNeg>(context);
+}
+
+void AbsOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                        MLIRContext *context) {
+  results.add<SimplifyAbsNeg>(context);
+  results.add<SimplifyAbsAbs>(context);
+}
+
+void ExpOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                        MLIRContext *context) {
+  results.add<IdentityExpLog>(context);
+}
+
+void LogOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                        MLIRContext *context) {
+  results.add<IdentityLogExp>(context);
+}
+
+void ReciprocalOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                               MLIRContext *context) {
+  results.add<SimplifyReciprocalReciprocal>(context);
 }

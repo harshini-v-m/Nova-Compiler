@@ -238,7 +238,7 @@ struct NovaOpTosaOp {
   }
   static Value mappingtosa(nova::XorOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
-   //auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
+    // auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), resultType, input[0]);
     auto w = builder->create<tosa::CastOp>(op.getLoc(), resultType, input[1]);
 
@@ -668,7 +668,45 @@ struct NovaOpTosaOp {
           builder->create<tosa::CastOp>(op.getLoc(), newLogitsType, logits);
       logitsType = newLogitsType;
     }
+    // 3D logits [B, T, C] -> flatten to [B*T, C]
+    if (logitsType.getRank() == 3) {
+      int64_t B = logitsType.getDimSize(0);
+      int64_t T = logitsType.getDimSize(1);
+      int64_t C = logitsType.getDimSize(2);
+      auto newLogitsType = mlir::RankedTensorType::get(
+          {B * T, C}, builder->getF32Type(), logitsType.getEncoding());
 
+      // Create shape constant for TOSA Reshape
+      auto shapeVal = llvm::SmallVector<int64_t, 2>{B * T, C};
+      auto shapeType = RankedTensorType::get({2}, builder->getIndexType());
+      auto shapeAttr = DenseIntElementsAttr::get(shapeType, shapeVal);
+      Value shapeConst = builder->create<tosa::ConstShapeOp>(
+          op.getLoc(), tosa::shapeType::get(builder->getContext(), 2),
+          shapeAttr);
+
+      logits = builder->create<tosa::ReshapeOp>(op.getLoc(), newLogitsType,
+                                                logits, shapeConst);
+      logitsType = newLogitsType;
+    }
+    // Flatten targets [B, T] -> [B*T] if needed
+    if (targetsType.getRank() == 2) {
+      int64_t B = targetsType.getDimSize(0);
+      int64_t T = targetsType.getDimSize(1);
+      auto newTargetsType = mlir::RankedTensorType::get(
+          {B * T}, builder->getI32Type(), targetsType.getEncoding());
+
+      // Create shape constant for TOSA Reshape
+      auto shapeVal = llvm::SmallVector<int64_t, 1>{B * T};
+      auto shapeType = RankedTensorType::get({1}, builder->getIndexType());
+      auto shapeAttr = DenseIntElementsAttr::get(shapeType, shapeVal);
+      Value shapeConst = builder->create<tosa::ConstShapeOp>(
+          op.getLoc(), tosa::shapeType::get(builder->getContext(), 1),
+          shapeAttr);
+
+      targets = builder->create<tosa::ReshapeOp>(op.getLoc(), newTargetsType,
+                                                 targets, shapeConst);
+      targetsType = newTargetsType;
+    }
     // Step 1: max_val = reduce_max(logits, dim=-1, keepdims=true)
     int64_t rank = logitsType.getRank();
     int64_t lastDim = rank - 1;
@@ -1050,29 +1088,28 @@ struct NovaToTosaLoweringPass
 void populateNovaToTosaConversionPatterns(RewritePatternSet &patterns) {
   patterns.add<NovaReluOpLowering, NovaGeluOpLowering,
                NovaSoftmaxLoweringPattern, NovaConstantToTosaConstPattern,
-               NovaToTosaLoweringTemplate<nova::MaxOp>, 
-               NovaToTosaLoweringTemplate<nova::LogOp>, 
-               NovaToTosaLoweringTemplate<nova::AbsOp>, 
-               NovaToTosaLoweringTemplate<nova::ExpOp>, 
-               NovaToTosaLoweringTemplate<nova::MinOp>, 
-               NovaToTosaLoweringTemplate<nova::AndOp>, 
-               NovaToTosaLoweringTemplate<nova::SinOp>, 
-               NovaToTosaLoweringTemplate<nova::CosOp>, 
-               NovaToTosaLoweringTemplate<nova::TanhOp>, 
-               NovaToTosaLoweringTemplate<nova::OrOp>, 
-               NovaToTosaLoweringTemplate<nova::XorOp>, 
-               NovaToTosaLoweringTemplate<nova::NotOp>, 
-               NovaToTosaLoweringTemplate<nova::NegOp>, 
-               NovaToTosaLoweringTemplate<nova::ReciprocalOp>, 
-               NovaToTosaLoweringTemplate<nova::MaeOp>, 
-               NovaToTosaLoweringTemplate<nova::MseOp>, 
-               NovaToTosaLoweringTemplate<nova::CceOp>, 
-               NovaToTosaLoweringTemplate<nova::BceOp>, 
-               NovaToTosaLoweringTemplate<nova::SceOp>, 
-               NovaToTosaLoweringTemplate<nova::SigmoidOp>, 
-               NovaToTosaLoweringTemplate<nova::SquareOp>, 
-               NovaToTosaLoweringTemplate<nova::SqrtOp> 
-               >(patterns.getContext());
+               NovaToTosaLoweringTemplate<nova::MaxOp>,
+               NovaToTosaLoweringTemplate<nova::LogOp>,
+               NovaToTosaLoweringTemplate<nova::AbsOp>,
+               NovaToTosaLoweringTemplate<nova::ExpOp>,
+               NovaToTosaLoweringTemplate<nova::MinOp>,
+               NovaToTosaLoweringTemplate<nova::AndOp>,
+               NovaToTosaLoweringTemplate<nova::SinOp>,
+               NovaToTosaLoweringTemplate<nova::CosOp>,
+               NovaToTosaLoweringTemplate<nova::TanhOp>,
+               NovaToTosaLoweringTemplate<nova::OrOp>,
+               NovaToTosaLoweringTemplate<nova::XorOp>,
+               NovaToTosaLoweringTemplate<nova::NotOp>,
+               NovaToTosaLoweringTemplate<nova::NegOp>,
+               NovaToTosaLoweringTemplate<nova::ReciprocalOp>,
+               NovaToTosaLoweringTemplate<nova::MaeOp>,
+               NovaToTosaLoweringTemplate<nova::MseOp>,
+               NovaToTosaLoweringTemplate<nova::CceOp>,
+               NovaToTosaLoweringTemplate<nova::BceOp>,
+               NovaToTosaLoweringTemplate<nova::SceOp>,
+               NovaToTosaLoweringTemplate<nova::SigmoidOp>,
+               NovaToTosaLoweringTemplate<nova::SquareOp>,
+               NovaToTosaLoweringTemplate<nova::SqrtOp>>(patterns.getContext());
 }
 
 // creating a pointer for this pass

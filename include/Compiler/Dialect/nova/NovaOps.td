@@ -304,6 +304,7 @@ def Nova_ConstantOp : Nova_UnaryOp<"constant", [Pure]> {
 def Nova_AbsOp : Nova_UnaryOp<"abs", [Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let arguments = (ins Nova_Tensor:$input);
   let results = (outs Nova_Tensor:$output);
+  let hasCanonicalizer = 1;
   let assemblyFormat = [{
     $input attr-dict `:` type($input)
   }];
@@ -332,7 +333,16 @@ def Nova_SqrtOp : Nova_UnaryOp<"sqrt", [Pure,DeclareOpInterfaceMethods<InferType
   let extraClassDeclaration = [{
   }];
 }
-
+def Nova_RsqrtOp : Nova_UnaryOp<"rsqrt", [Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let arguments = (ins Nova_Tensor:$input);
+  let results = (outs Nova_Tensor:$output);
+  
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input)
+  }];
+  let extraClassDeclaration = [{
+  }];
+}
 def Nova_SignOp : Nova_UnaryOp<"sign", [Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>,NoComplexOperands]> {
   let arguments = (ins Nova_Tensor:$input);
   let results = (outs Nova_Tensor:$output);
@@ -357,7 +367,7 @@ def Nova_NegOp : Nova_UnaryOp<"neg", [Pure, SameOperandsAndResultType]>{
 def Nova_ReciprocalOp : Nova_UnaryOp<"reciprocal", [Pure, SameOperandsAndResultType,NoComplexOperands]> {
   let arguments = (ins Nova_Tensor:$input);
   let results = (outs Nova_Tensor:$output);
-
+  let hasCanonicalizer = 1;
   let assemblyFormat = [{
     $input attr-dict `:` type($input)
   }];
@@ -377,9 +387,13 @@ class Nova_ExponentsOp<string mnemonic, list<Trait> traits = [Pure, DeclareOpInt
 let extraClassDeclaration = [{
   }];
 }
- def Nova_ExpOp : Nova_ExponentsOp<"exp"> {} 
+ def Nova_ExpOp : Nova_ExponentsOp<"exp"> {
+    let hasCanonicalizer = 1;
+  } 
  def Nova_Exp2Op : Nova_ExponentsOp<"exp2"> {} 
- def Nova_LogOp : Nova_ExponentsOp<"log"> {} 
+ def Nova_LogOp : Nova_ExponentsOp<"log"> {
+    let hasCanonicalizer = 1;
+  } 
  def Nova_Log2Op : Nova_ExponentsOp<"log2"> {} 
  def Nova_Log10Op : Nova_ExponentsOp<"log10"> {} 
 

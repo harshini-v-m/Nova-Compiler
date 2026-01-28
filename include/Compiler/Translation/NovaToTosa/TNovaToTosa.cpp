@@ -84,10 +84,15 @@ struct NovaOpTosaOp {
     w = matchRank(builder, op.getLoc(), w, targetRank);
     return builder->create<tosa::PowOp>(op.getLoc(), resultType, v, w);
   }
-
-
-
-
+  static Value rmappingtosa(nova::RsqrtOp op, Type resultType, ValueRange input,
+                            OpBuilder *builder) {
+    auto restensor = cast<mlir::RankedTensorType>(resultType);
+    auto targetElemTy = restensor.getElementType();
+    int64_t targetRank = restensor.getRank();
+    auto v = castElementType(builder, op.getLoc(), input[0], targetElemTy);
+    v = matchRank(builder, op.getLoc(), v, targetRank);
+    return builder->create<tosa::RsqrtOp>(op.getLoc(), resultType, v);
+  }
   template <typename OpTy>
   static Value rmaptop(OpTy op, Type resultType, ValueRange input,
                        OpBuilder *builder) {
@@ -130,7 +135,8 @@ public:
 void populateNovaToTosaTemplatePatterns(mlir::RewritePatternSet &patterns) {
   patterns.add<NovaToTosaLoweringTemplater<nova::AddOp>,
                NovaToTosaLoweringTemplater<nova::SubOp>,
-               NovaToTosaLoweringTemplater<nova::PowOp>>(
+               NovaToTosaLoweringTemplater<nova::PowOp>,
+               NovaToTosaLoweringTemplater<nova::RsqrtOp>>(
       patterns.getContext());
 }
 } // namespace nova

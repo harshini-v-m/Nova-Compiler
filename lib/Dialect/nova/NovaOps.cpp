@@ -505,7 +505,39 @@ LogicalResult nova::SqrtOp::inferReturnTypes(
       getUnaryResultEncoding(inputType.getEncoding(), context)));
   return success();
 }
+//rqrt
+LogicalResult nova::RsqrtOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> location, ValueRange operands,
+    DictionaryAttr attrs, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredTypes) {
 
+  // rsqrt is unary
+  if (operands.size() != 1)
+    return failure();
+  auto inputType = dyn_cast<RankedTensorType>(operands[0].getType());
+  if (!inputType)
+    return failure();
+
+  auto elemTy = inputType.getElementType();
+
+  Type outElemTy;
+
+  // Integer → f32
+  if (isa<IntegerType>(elemTy)) {
+    outElemTy = Float32Type::get(context);
+  } else if (isa<FloatType>(elemTy)) {
+    outElemTy = elemTy;
+  } else if (isa<ComplexType>(elemTy)) {
+    outElemTy = elemTy;
+  } else {
+    return failure();
+  }
+
+  inferredTypes.push_back(RankedTensorType::get(
+      inputType.getShape(), outElemTy,
+      getUnaryResultEncoding(inputType.getEncoding(), context)));
+  return success();
+}
 // ModOp
 
 LogicalResult ModOp::verify() {
