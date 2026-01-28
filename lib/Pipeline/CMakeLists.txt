@@ -54,6 +54,10 @@ add_mlir_library(NovaPipelines
   MLIRMathTransforms
   MLIRUBToLLVM
   CompilerTransforms
+  MLIRTransformDialect
+  MLIRTransformDialectTransforms
+  MLIRLinalgTransformOps
+
 )
 
 target_include_directories(NovaPipelines PUBLIC 

@@ -20,6 +20,8 @@
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Math/Transforms/Passes.h"
+#include "mlir/Dialect/Transform/Transforms/Passes.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
 //buffer includes
 #include "mlir/Conversion/BufferizationToMemRef/BufferizationToMemRef.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
@@ -79,10 +81,31 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
 
   // Convert elementwise operations to Linalg
   pm.addPass(mlir::createConvertElementwiseToLinalgPass());
+  pm.addPass(createCanonicalizerPass());
+
+  // TILE NAMED OPS (before generalization) - CPU optimized for Intel i7-14700K
+  // This tiles linalg.matmul with [128, 128, 16] to fit in L2 cache
+  std::string transformFileName = "/home/blu-bridge021/Desktop/Nova-Compiler/include/Compiler/Transforms/Tiling/tiling_multilevel.mlir";
+  
+  mlir::transform::PreloadLibraryPassOptions preloadOptions;
+  preloadOptions.transformLibraryPaths = {transformFileName};
+  pm.addPass(mlir::transform::createPreloadLibraryPass(preloadOptions));
+
+  mlir::transform::InterpreterPassOptions interpOptions;
+  pm.addPass(mlir::transform::createInterpreterPass(interpOptions));
+  pm.addPass(createCanonicalizerPass());
+
+  // GENERALIZE (after tiling, for vectorization and fusion)
   pm.addNestedPass<mlir::func::FuncOp>(
                 mlir::createLinalgGeneralizeNamedOpsPass());
-  
-  //  Bufferization (Tensor -> MemRef)
+  pm.addPass(createCanonicalizerPass());
+
+  // FUSE ELEMENTWISE (operates on generalized ops)
+  pm.addPass(mlir::createLinalgElementwiseOpFusionPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(mlir::createCSEPass());
+
+  //  Bufferization (Tensor -> MemRef) - After tiling
   bufferization::OneShotBufferizePassOptions bufferizeOptions; 
   bufferizeOptions.bufferizeFunctionBoundaries = true; 
   bufferizeOptions.functionBoundaryTypeConversion= 
@@ -100,13 +123,7 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
 
   pm.addPass(mlir::createConvertLinalgToAffineLoopsPass());
 
-
   OpPassManager &funcPM = pm.nest<func::FuncOp>();
-  
-  if (failed(mlir::parsePassPipeline("func.func(affine-loop-tile{tile-sizes=32,32,8})", pm))) {
-    llvm::errs() << "Failed to parse affine tiling pipeline.\n";
-    return;
-  }
 
 
   if (failed(parsePassPipeline("func.func(affine-parallelize{max-nested=2})", pm))) {}
