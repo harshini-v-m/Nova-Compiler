@@ -400,13 +400,23 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
     SmallVector<utils::IteratorType> iteratorTypes(
         resultType.getRank(), utils::IteratorType::parallel);
 
+    auto indicesType = cast<RankedTensorType>(indices.getType());
+    Type indicesElemType = indicesType.getElementType();
+
     auto genericOp = rewriter.create<linalg::GenericOp>(
         loc, TypeRange{resultType}, indices, emptyTensor, indexingMaps,
         iteratorTypes, [&](OpBuilder &b, Location l, ValueRange args) {
           // args[0] is the index value
           Value batchIdx = b.create<linalg::IndexOp>(l, 0);
+
+          Value indexVal = args[0];
+          // If indices element type is float, cast to i32 first
+          if (llvm::isa<FloatType>(indicesElemType)) {
+            indexVal = b.create<arith::FPToSIOp>(l, b.getI32Type(), indexVal);
+          }
+
           Value classIdx =
-              b.create<arith::IndexCastOp>(l, b.getIndexType(), args[0]);
+              b.create<arith::IndexCastOp>(l, b.getIndexType(), indexVal);
           Value extracted = b.create<tensor::ExtractOp>(
               l, input, ValueRange{batchIdx, classIdx});
           b.create<linalg::YieldOp>(l, extracted);
