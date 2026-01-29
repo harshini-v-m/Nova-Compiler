@@ -454,6 +454,9 @@ struct NovaScatterAddOpLowering
     SmallVector<utils::IteratorType> iteratorTypes = {
         utils::IteratorType::parallel, utils::IteratorType::parallel};
 
+    auto indicesType = cast<RankedTensorType>(indices.getType());
+    Type indicesElemType = indicesType.getElementType();
+
     auto genericOp = rewriter.create<linalg::GenericOp>(
         loc, TypeRange{resultType}, ValueRange{indices, src, input}, input,
         indexingMaps, iteratorTypes,
@@ -463,8 +466,15 @@ struct NovaScatterAddOpLowering
           // args[2] is input[i, j]
 
           Value classIdx = b.create<linalg::IndexOp>(l, 1);
+
+          Value indexVal = args[0];
+          // If indices element type is float, cast to i32 first
+          if (llvm::isa<FloatType>(indicesElemType)) {
+            indexVal = b.create<arith::FPToSIOp>(l, b.getI32Type(), indexVal);
+          }
+
           Value targetClassIdx =
-              b.create<arith::IndexCastOp>(l, b.getIndexType(), args[0]);
+              b.create<arith::IndexCastOp>(l, b.getIndexType(), indexVal);
           Value isTarget = b.create<arith::CmpIOp>(l, arith::CmpIPredicate::eq,
                                                    classIdx, targetClassIdx);
 
