@@ -1,0 +1,62 @@
+#map = affine_map<(d0, d1) -> (0, d1)>
+#map1 = affine_map<(d0, d1) -> (d0, d1)>
+module {
+  func.func @main(%arg0: tensor<1024x1024xf32>, %arg1: tensor<1024x1024xf32>, %arg2: tensor<1x1024xf32>) -> tensor<1024x1024xf32> attributes {llvm.emit_c_interface} {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32>
+    %c128 = arith.constant 128 : index
+    %c256 = arith.constant 256 : index
+    %c1024 = arith.constant 1024 : index
+    %c0 = arith.constant 0 : index
+    %cst_0 = arith.constant 0.000000e+00 : f32
+    %0 = tensor.empty() : tensor<1024x1024xf32>
+    %1 = tensor.empty() : tensor<1024x1024xf32>
+    %2 = tensor.empty() : tensor<1024x1024xf32>
+    %3 = tensor.empty() : tensor<1024x1024xf32>
+    %4 = scf.for %arg3 = %c0 to %c1024 step %c256 iter_args(%arg4 = %3) -> (tensor<1024x1024xf32>) {
+      %5 = scf.for %arg5 = %c0 to %c1024 step %c256 iter_args(%arg6 = %arg4) -> (tensor<1024x1024xf32>) {
+        %extracted_slice = tensor.extract_slice %arg0[%arg3, 0] [256, 1024] [1, 1] : tensor<1024x1024xf32> to tensor<256x1024xf32>
+        %extracted_slice_1 = tensor.extract_slice %arg1[0, %arg5] [1024, 256] [1, 1] : tensor<1024x1024xf32> to tensor<1024x256xf32>
+        %extracted_slice_2 = tensor.extract_slice %0[%arg3, %arg5] [256, 256] [1, 1] : tensor<1024x1024xf32> to tensor<256x256xf32>
+        %extracted_slice_3 = tensor.extract_slice %arg2[0, %arg5] [1, 256] [1, 1] : tensor<1x1024xf32> to tensor<1x256xf32>
+        %extracted_slice_4 = tensor.extract_slice %1[%arg3, %arg5] [256, 256] [1, 1] : tensor<1024x1024xf32> to tensor<256x256xf32>
+        %extracted_slice_5 = tensor.extract_slice %2[%arg3, %arg5] [256, 256] [1, 1] : tensor<1024x1024xf32> to tensor<256x256xf32>
+        %extracted_slice_6 = tensor.extract_slice %arg6[%arg3, %arg5] [256, 256] [1, 1] : tensor<1024x1024xf32> to tensor<256x256xf32>
+        %6 = scf.for %arg7 = %c0 to %c256 step %c128 iter_args(%arg8 = %extracted_slice_6) -> (tensor<256x256xf32>) {
+          %7 = scf.for %arg9 = %c0 to %c256 step %c128 iter_args(%arg10 = %arg8) -> (tensor<256x256xf32>) {
+            %extracted_slice_7 = tensor.extract_slice %extracted_slice[%arg7, 0] [128, 1024] [1, 1] : tensor<256x1024xf32> to tensor<128x1024xf32>
+            %extracted_slice_8 = tensor.extract_slice %extracted_slice_1[0, %arg9] [1024, 128] [1, 1] : tensor<1024x256xf32> to tensor<1024x128xf32>
+            %extracted_slice_9 = tensor.extract_slice %extracted_slice_2[%arg7, %arg9] [128, 128] [1, 1] : tensor<256x256xf32> to tensor<128x128xf32>
+            %8 = linalg.fill ins(%cst_0 : f32) outs(%extracted_slice_9 : tensor<128x128xf32>) -> tensor<128x128xf32>
+            %9 = linalg.matmul ins(%extracted_slice_7, %extracted_slice_8 : tensor<128x1024xf32>, tensor<1024x128xf32>) outs(%8 : tensor<128x128xf32>) -> tensor<128x128xf32>
+            %extracted_slice_10 = tensor.extract_slice %extracted_slice_3[0, %arg9] [1, 128] [1, 1] : tensor<1x256xf32> to tensor<1x128xf32>
+            %extracted_slice_11 = tensor.extract_slice %extracted_slice_4[%arg7, %arg9] [128, 128] [1, 1] : tensor<256x256xf32> to tensor<128x128xf32>
+            %10 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "parallel"]} ins(%extracted_slice_10 : tensor<1x128xf32>) outs(%extracted_slice_11 : tensor<128x128xf32>) {
+            ^bb0(%in: f32, %out: f32):
+              linalg.yield %in : f32
+            } -> tensor<128x128xf32>
+            %extracted_slice_12 = tensor.extract_slice %extracted_slice_5[%arg7, %arg9] [128, 128] [1, 1] : tensor<256x256xf32> to tensor<128x128xf32>
+            %11 = linalg.generic {indexing_maps = [#map1, #map1, #map1], iterator_types = ["parallel", "parallel"]} ins(%9, %10 : tensor<128x128xf32>, tensor<128x128xf32>) outs(%extracted_slice_12 : tensor<128x128xf32>) {
+            ^bb0(%in: f32, %in_15: f32, %out: f32):
+              %13 = arith.addf %in, %in_15 : f32
+              linalg.yield %13 : f32
+            } -> tensor<128x128xf32>
+            %extracted_slice_13 = tensor.extract_slice %arg10[%arg7, %arg9] [128, 128] [1, 1] : tensor<256x256xf32> to tensor<128x128xf32>
+            %12 = linalg.generic {indexing_maps = [#map1, #map1, #map1], iterator_types = ["parallel", "parallel"]} ins(%11, %cst : tensor<128x128xf32>, tensor<128x128xf32>) outs(%extracted_slice_13 : tensor<128x128xf32>) {
+            ^bb0(%in: f32, %in_15: f32, %out: f32):
+              %13 = arith.maximumf %in, %in_15 : f32
+              linalg.yield %13 : f32
+            } -> tensor<128x128xf32>
+            %inserted_slice_14 = tensor.insert_slice %12 into %arg10[%arg7, %arg9] [128, 128] [1, 1] : tensor<128x128xf32> into tensor<256x256xf32>
+            scf.yield %inserted_slice_14 : tensor<256x256xf32>
+          }
+          scf.yield %7 : tensor<256x256xf32>
+        }
+        %inserted_slice = tensor.insert_slice %6 into %arg6[%arg3, %arg5] [256, 256] [1, 1] : tensor<256x256xf32> into tensor<1024x1024xf32>
+        scf.yield %inserted_slice : tensor<1024x1024xf32>
+      }
+      scf.yield %5 : tensor<1024x1024xf32>
+    }
+    return %4 : tensor<1024x1024xf32>
+  }
+}
+
