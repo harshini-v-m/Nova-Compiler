@@ -28,6 +28,7 @@ add_mlir_library(NovaPipelines
   MLIRNovaToArithTransforms
   MLIRNovaToLinalgTransforms
   MLIRNovaToTosaTransforms
+  MLIRNovaReduceToGpu
 
   MLIRSCFToControlFlow
   MLIRMemRefToLLVM

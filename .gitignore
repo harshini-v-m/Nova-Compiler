@@ -39,6 +39,7 @@ tablegen_compile_commands.yml
 
 # IDE / OS-specific
 .vscode/
+.agent/
 .idea/
 .DS_Store
 Thumbs.db

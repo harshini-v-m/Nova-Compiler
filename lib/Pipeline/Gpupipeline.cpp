@@ -65,6 +65,7 @@
 
 // header of this file
 #include "Compiler/Pipeline/Gpupipeline.h"
+#include "Compiler/Translation/NovaReduceToGpu/NovaReduceToGpu.h"
 
 using namespace mlir;
 
@@ -79,6 +80,7 @@ namespace mlir
         void createNovaGPUPipelines(mlir::OpPassManager &pm)
         {
             pm.addPass(mlir::createCanonicalizerPass());
+            pm.addPass(mlir::nova::createNovaReduceToGpuPass());
             pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
             pm.addNestedPass<mlir::func::FuncOp>(
                 mlir::nova::createNovaToLinalgLoweringPass());
@@ -109,6 +111,7 @@ namespace mlir
             bufferizeOptions.bufferizeFunctionBoundaries = true;
             bufferizeOptions.functionBoundaryTypeConversion = bufferization::LayoutMapOption::IdentityLayoutMap;
             bufferizeOptions.useEncodingForMemorySpace = true;
+            bufferizeOptions.allowUnknownOps = true;
             pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufferizeOptions));
 
             bufferization::BufferDeallocationPipelineOptions deallocationOptions;

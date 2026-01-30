@@ -1,21 +1,12 @@
-add_llvm_executable(nova-opt nova-opt.cpp)
+add_llvm_executable(nova-api-test nova-api-test.cpp)
 
-llvm_update_compile_flags(nova-opt)
-target_link_libraries(nova-opt PRIVATE
-  MLIROptLib
-  MLIRMlirOptMain
+llvm_update_compile_flags(nova-api-test)
+target_link_libraries(nova-api-test PRIVATE
   MLIRSupport
   MLIRIR
   MLIRParser
   MLIRPass
   MLIRTransforms
-  MLIRAnalysis
-  MLIRTransformUtils
-  MLIRRewrite
-  MLIRBytecodeReader
-  MLIRBytecodeWriter
-  MLIRDialect
-  MLIRDialectUtils
 
   # Your custom libraries
   MLIRNova
@@ -24,11 +15,11 @@ target_link_libraries(nova-opt PRIVATE
   MLIRNovaToArithTransforms
   MLIRNovaToLinalgTransforms
   MLIRNovaToTosaTransforms
-  MLIRNovaReduceToGpu
   
   # Dependencies ordered by usage: NovaPipelines depends on CompilerTransforms
   NovaPipelines
   CompilerTransforms
+  NovaCompilerAPI
 
   # Core dialects that we know exist and are needed
   MLIRAffineDialect
@@ -65,6 +56,10 @@ target_link_libraries(nova-opt PRIVATE
   MLIRGPUTransforms
   MLIRGPUToNVVMTransforms
   MLIRNVVMTarget
+  
+  # OpenMP and Complex conversion support
+  MLIROpenMPToLLVM
+  MLIRComplexToLLVM
 )
 
 set(LLVM_LINK_COMPONENTS
@@ -75,4 +70,4 @@ set(LLVM_LINK_COMPONENTS
   NVPTX
 )
 
-install(TARGETS nova-opt RUNTIME DESTINATION bin)
+install(TARGETS nova-api-test RUNTIME DESTINATION bin)

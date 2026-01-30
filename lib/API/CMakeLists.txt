@@ -60,6 +60,10 @@ add_mlir_library(NovaCompilerAPI
   MLIRControlFlowDialect
   MLIRControlFlowTransforms
   
+  # OpenMP and Complex conversion support
+  MLIROpenMPToLLVM
+  MLIRComplexToLLVM
+  
   MLIRNova
   NovaPipelines
 )

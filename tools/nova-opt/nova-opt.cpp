@@ -6,6 +6,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Target/LLVMIR/Export.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "mlir/Transforms/ViewOpGraph.h"
 #include "mlir/Transforms/Passes.h"
@@ -27,6 +28,7 @@
 #include "Compiler/Transforms/FuseMatmulBias.h"
 
 #include "Compiler/Translation/NovaToArith/NovaToArith.h"
+#include "Compiler/Translation/NovaReduceToGpu/NovaReduceToGpu.h"
 #include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 #include "Compiler/Pipeline/Pipeline.h"
@@ -55,12 +57,32 @@ namespace nova {
 
 #include "Compiler/Transforms/AddGpuMemoryCopies.h"
 
+namespace {
+struct AllReduceOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<AllReduceOpMemEffectModel, mlir::gpu::AllReduceOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<mlir::MemoryEffects::Effect>> &effects) const {
+    // No memory effects (operating on values)
+  }
+};
+}
+
 int main(int argc, char **argv) {
   mlir::registerAllPasses();
+  
+  mlir::DialectRegistry registry;
+  // Attach the interface to gpu::AllReduceOp when GPU dialect is loaded
+  registry.addExtension(+[](mlir::MLIRContext *ctx, mlir::gpu::GPUDialect *dialect) {
+    mlir::gpu::AllReduceOp::attachInterface<AllReduceOpMemEffectModel>(*ctx);
+  });
 
   // Register the AddGpuMemoryCopies pass
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::nova::createAddGpuMemoryCopiesPass();
+  });
+
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::nova::createNovaReduceToGpuPass();
   });
 
   // Register the ViewOpGraph pass specifically
@@ -69,7 +91,6 @@ int main(int argc, char **argv) {
   });
 
 
-  mlir::DialectRegistry registry;
   
   // Register only the dialects we need
   registry.insert<mlir::nova::NovaDialect>();
