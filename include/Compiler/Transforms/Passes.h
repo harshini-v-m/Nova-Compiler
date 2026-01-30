@@ -4,7 +4,7 @@
 #include "Compiler/Transforms/FuseMatmulBias.h"
 #include "Compiler/Transforms/FixGpuLaunch.h"
 #include "Compiler/Transforms/GenerateDynamicWrapper.h"
-#include "Compiler/Translation/NovaReduceToGpu/NovaReduceToGpu.h"
+#include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 
 namespace mlir {
 namespace nova {

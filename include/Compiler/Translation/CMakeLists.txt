@@ -2,4 +2,4 @@
 add_subdirectory(NovaToArith)
 add_subdirectory(NovaToLinalg)
 add_subdirectory(NovaToTosa)
-add_subdirectory(NovaReduceToGpu)
+add_subdirectory(NovaToGpu)

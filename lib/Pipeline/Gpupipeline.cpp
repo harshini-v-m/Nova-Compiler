@@ -65,7 +65,7 @@
 
 // header of this file
 #include "Compiler/Pipeline/Gpupipeline.h"
-#include "Compiler/Translation/NovaReduceToGpu/NovaReduceToGpu.h"
+#include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 
 using namespace mlir;
 
@@ -80,7 +80,7 @@ namespace mlir
         void createNovaGPUPipelines(mlir::OpPassManager &pm)
         {
             pm.addPass(mlir::createCanonicalizerPass());
-            pm.addPass(mlir::nova::createNovaReduceToGpuPass());
+            pm.addPass(mlir::nova::createNovaToGpuPass());
             pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
             pm.addNestedPass<mlir::func::FuncOp>(
                 mlir::nova::createNovaToLinalgLoweringPass());

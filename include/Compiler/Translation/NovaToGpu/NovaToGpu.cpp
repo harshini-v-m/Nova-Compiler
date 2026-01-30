@@ -1,4 +1,4 @@
-#include "Compiler/Translation/NovaReduceToGpu/NovaReduceToGpu.h"
+#include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
 #include "Compiler/Dialect/nova/NovaDialect.h"
 
@@ -21,7 +21,7 @@ using namespace mlir::nova;
 namespace mlir {
 namespace nova {
 
-class NovaReduceToGpuPattern : public OpRewritePattern<nova::ReduceOp> {
+class NovaToGpuPattern : public OpRewritePattern<nova::ReduceOp> {
 public:
   using OpRewritePattern<nova::ReduceOp>::OpRewritePattern;
 
@@ -234,11 +234,11 @@ public:
   }
 };
 
-struct NovaReduceToGpuPass : public PassWrapper<NovaReduceToGpuPass, OperationPass<func::FuncOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaReduceToGpuPass)
+struct NovaToGpuPass : public PassWrapper<NovaToGpuPass, OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaToGpuPass)
 
-  StringRef getArgument() const override { return "nova-reduce-to-gpu"; }
-  StringRef getDescription() const override { return "Lower nova.reduce to gpu.launch + all_reduce"; }
+  StringRef getArgument() const override { return "nova-to-gpu"; }
+  StringRef getDescription() const override { return "Lower nova to gpu dialect"; }
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect, memref::MemRefDialect, tensor::TensorDialect, bufferization::BufferizationDialect>();
@@ -247,7 +247,7 @@ struct NovaReduceToGpuPass : public PassWrapper<NovaReduceToGpuPass, OperationPa
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<NovaReduceToGpuPattern>(context);
+    patterns.add<NovaToGpuPattern>(context);
     
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
        // signalPassFailure();
@@ -255,8 +255,8 @@ struct NovaReduceToGpuPass : public PassWrapper<NovaReduceToGpuPass, OperationPa
   }
 };
 
-std::unique_ptr<Pass> createNovaReduceToGpuPass() {
-  return std::make_unique<NovaReduceToGpuPass>();
+std::unique_ptr<Pass> createNovaToGpuPass() {
+  return std::make_unique<NovaToGpuPass>();
 }
 
 } // namespace nova

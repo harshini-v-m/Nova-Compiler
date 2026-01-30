@@ -28,7 +28,7 @@
 #include "Compiler/Transforms/FuseMatmulBias.h"
 
 #include "Compiler/Translation/NovaToArith/NovaToArith.h"
-#include "Compiler/Translation/NovaReduceToGpu/NovaReduceToGpu.h"
+#include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 #include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 #include "Compiler/Pipeline/Pipeline.h"
@@ -82,7 +82,7 @@ int main(int argc, char **argv) {
   });
 
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
-    return mlir::nova::createNovaReduceToGpuPass();
+    return mlir::nova::createNovaToGpuPass();
   });
 
   // Register the ViewOpGraph pass specifically

@@ -24,7 +24,7 @@ target_link_libraries(nova-opt PRIVATE
   MLIRNovaToArithTransforms
   MLIRNovaToLinalgTransforms
   MLIRNovaToTosaTransforms
-  MLIRNovaReduceToGpu
+  MLIRNovaToGpu
   
   # Dependencies ordered by usage: NovaPipelines depends on CompilerTransforms
   NovaPipelines

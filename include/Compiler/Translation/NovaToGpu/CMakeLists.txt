@@ -1,5 +1,5 @@
-add_mlir_library(MLIRNovaReduceToGpu
-  NovaReduceToGpu.cpp
+add_mlir_library(MLIRNovaToGpu
+  NovaToGpu.cpp
 
   LINK_LIBS PUBLIC
   MLIRIR
@@ -11,11 +11,11 @@ add_mlir_library(MLIRNovaReduceToGpu
   MLIRNova
 )
 
-target_include_directories(MLIRNovaReduceToGpu PRIVATE
-  ${PROJECT_SOURCE_DIR}/include/Compiler/Translation/NovaReduceToGpu
+target_include_directories(MLIRNovaToGpu PRIVATE
+  ${PROJECT_SOURCE_DIR}/include/Compiler/Translation/NovaToGpu
 )
 
-install(TARGETS MLIRNovaReduceToGpu
+install(TARGETS MLIRNovaToGpu
   EXPORT mlir-compilerTargets
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib
