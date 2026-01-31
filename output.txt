@@ -1,2 +1,0 @@
-=== Running FuseMatmulBias Pass ===
-=== FuseMatmulBias Pass Complete ===
