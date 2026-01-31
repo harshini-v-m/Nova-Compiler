@@ -14,8 +14,12 @@
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/SCF/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/ControlFlow/Transforms/BufferDeallocationOpInterfaceImpl.h"
+#include "mlir/Dialect/GPU/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
@@ -98,6 +102,13 @@ NovaCompilerAPI::NovaCompilerAPI() {
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::vector::registerBufferizableOpInterfaceExternalModels(registry);
+  
+  // Register BufferDeallocationOpInterface external models
+  mlir::arith::registerBufferDeallocationOpInterfaceExternalModels(registry);
+  mlir::cf::registerBufferDeallocationOpInterfaceExternalModels(registry);
+  mlir::scf::registerBufferDeallocationOpInterfaceExternalModels(registry);
+  mlir::gpu::registerBufferDeallocationOpInterfaceExternalModels(registry);
+  
   mlir::vector::registerConvertVectorToLLVMInterface(registry);
   mlir::arith::registerConvertArithToLLVMInterface(registry);
   mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
@@ -177,6 +188,12 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::vector::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+  
+  // Register BufferDeallocationOpInterface external models
+  mlir::arith::registerBufferDeallocationOpInterfaceExternalModels(registry);
+  mlir::cf::registerBufferDeallocationOpInterfaceExternalModels(registry);
+  mlir::scf::registerBufferDeallocationOpInterfaceExternalModels(registry);
+  mlir::gpu::registerBufferDeallocationOpInterfaceExternalModels(registry);
 
   mlir::vector::registerConvertVectorToLLVMInterface(registry);
   mlir::arith::registerConvertArithToLLVMInterface(registry);
@@ -230,6 +247,17 @@ LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module,
   // IMPORTANT: Use the module's own context, not our internal context
   PassManager pm(module.getContext());
   
+  // Enable verbose mode to trace pipeline execution
+  if (options.verbose) {
+    pm.enableIRPrinting(
+      [](Pass*, Operation*) { return false; },  // before
+      [](Pass*, Operation*) { return true; },   // after
+      true,  // print module scope
+      false, // print after only on change
+      false, // print after only on failure
+      llvm::errs()
+    );
+  }
   
   if (options.runFullPipeline) {
     // Add the Nova optimization pipeline based on target device
