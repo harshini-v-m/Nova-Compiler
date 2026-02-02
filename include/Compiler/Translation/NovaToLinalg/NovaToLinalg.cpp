@@ -406,8 +406,11 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
     auto genericOp = rewriter.create<linalg::GenericOp>(
         loc, TypeRange{resultType}, indices, emptyTensor, indexingMaps,
         iteratorTypes, [&](OpBuilder &b, Location l, ValueRange args) {
-          // args[0] is the index value
-          Value batchIdx = b.create<linalg::IndexOp>(l, 0);
+          // Build extraction indices from loop induction variables (IndexOps)
+          SmallVector<Value> extractionIndices;
+          for (int64_t i = 0; i < resultType.getRank(); ++i) {
+            extractionIndices.push_back(b.create<linalg::IndexOp>(l, i));
+          }
 
           Value indexVal = args[0];
           // If indices element type is float, cast to i32 first
@@ -417,8 +420,12 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
 
           Value classIdx =
               b.create<arith::IndexCastOp>(l, b.getIndexType(), indexVal);
-          Value extracted = b.create<tensor::ExtractOp>(
-              l, input, ValueRange{batchIdx, classIdx});
+
+          // Append the gathered class index
+          extractionIndices.push_back(classIdx);
+
+          Value extracted =
+              b.create<tensor::ExtractOp>(l, input, extractionIndices);
           b.create<linalg::YieldOp>(l, extracted);
         });
 

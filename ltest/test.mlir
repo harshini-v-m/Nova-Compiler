@@ -1,8 +1,8 @@
 module {
-  // 2D Matmul
-  func.func @matmul_2d(%arg0: tensor<10x8xf32,  #nova.device<"1">>) -> tensor<f32, #nova.device<"1">> attributes {llvm.emit_c_interface} {
-    %0 = nova.reduce<sum> %arg0 dimension = [0,1]
-      : tensor<10x8xf32, #nova.device<"1">>
-        return %0 : tensor<f32, #nova.device<"1">>
+
+  func.func @sce_3d_2d(%logits: tensor<2x4x10xf32,#nova.device<"1">>, %target: tensor<2x4xi32,#nova.device<"1">>) -> tensor<f32,#nova.device<"1">> {
+    %0 = nova.sce %logits, %target : tensor<2x4x10xf32,#nova.device<"1">>, tensor<2x4xi32,#nova.device<"1">>
+    return %0 : tensor<f32,#nova.device<"1">>
   }
+
 }

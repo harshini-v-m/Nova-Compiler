@@ -1,16 +1,15 @@
 #include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
-#include "Compiler/Dialect/nova/NovaOps.h"
 #include "Compiler/Dialect/nova/NovaDialect.h"
+#include "Compiler/Dialect/nova/NovaOps.h"
 
-#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-
-// ... (skip down to getDependentDialects)
 
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -27,11 +26,12 @@ public:
 
   LogicalResult matchAndRewrite(nova::ReduceOp op,
                                 PatternRewriter &rewriter) const override {
-    //if it is not scalar rerduction return failure
-    if (cast<RankedTensorType>(op.getOutput().getType()).getShape().size() != 0) {
-      //if all shapes is not 1 return fail
+    // if it is not scalar rerduction return failure
+    if (cast<RankedTensorType>(op.getOutput().getType()).getShape().size() !=
+        0) {
+      // if all shapes is not 1 return fail
       auto shape = cast<RankedTensorType>(op.getOutput().getType()).getShape();
-      for (int i = 0; i < shape.size(); i++) {
+      for (size_t i = 0; i < shape.size(); i++) {
         if (shape[i] != 1) {
           return failure();
         }
@@ -40,217 +40,319 @@ public:
     // 1. Check if input has device attribute "1"
     Value input = op.getInput();
     auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
-    if (!inputType) return failure();
-
-    auto deviceAttr = llvm::dyn_cast_or_null<nova::NovaDeviceAttr>(inputType.getEncoding());
-    if (!deviceAttr || deviceAttr.getValue().getValue() != "1")
+    if (!inputType)
       return failure();
 
-    // 2. Map Reduction Kind to GPU Op
+    // Check for NovaDeviceAttr
+    if (auto deviceAttr = llvm::dyn_cast_or_null<nova::NovaDeviceAttr>(
+            inputType.getEncoding())) {
+      if (deviceAttr.getValue().getValue() != "1")
+        return failure();
+    }
+    // Check for IntegerAttr (e.g., 1 : i32)
+    else if (auto intAttr =
+                 llvm::dyn_cast_or_null<IntegerAttr>(inputType.getEncoding())) {
+      if (intAttr.getInt() != 1)
+        return failure();
+    } else {
+      return failure();
+    }
+    // 2. Map Reduction Kind to GPU Op attribute
     gpu::AllReduceOperation gpuOp;
     ReductionKind kind = op.getKind();
-    
-    // Simple mapping for demo purposes
+
     switch (kind) {
-      case ReductionKind::SUM: gpuOp = gpu::AllReduceOperation::ADD; break;
-      case ReductionKind::PRODUCT: gpuOp = gpu::AllReduceOperation::MUL; break;
-      // case ReductionKind::MAX: gpuOp = gpu::AllReduceOperation::MAX; break;
-      // case ReductionKind::MIN: gpuOp = gpu::AllReduceOperation::MIN; break;
-      default: return failure(); // Unsupported for direct GPU mapping yet
+    case ReductionKind::SUM:
+      gpuOp = gpu::AllReduceOperation::ADD;
+      break;
+    case ReductionKind::PRODUCT:
+      gpuOp = gpu::AllReduceOperation::MUL;
+      break;
+    case ReductionKind::MAX:
+      gpuOp = gpu::AllReduceOperation::MAXIMUMF;
+      break;
+    case ReductionKind::MIN:
+      gpuOp = gpu::AllReduceOperation::MINIMUMF;
+      break;
+    case ReductionKind::MEAN:
+      gpuOp = gpu::AllReduceOperation::ADD;
+      break;
+    default:
+      return failure(); // Unsupported for direct GPU mapping yet
     }
 
-    // 3. Create gpu.launch
-    // We launch 1 block with enough threads to cover the flattened input, 
-    // or just 32 threads and let them loop (simplest for now is 1-1 mapping for small tensors).
-    
-    int64_t numElements = inputType.getNumElements();
-    if (numElements > 1024) return failure(); // Too big for single block simple mapping
-
+    // Initialize output memory with identity value before launch
     Location loc = op.getLoc();
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value cNumThreads = rewriter.create<arith::ConstantIndexOp>(loc, numElements);
-    
-    // Create Alloc BEFORE launch to be visible outside
-    // Create Alloc BEFORE launch to be visible outside
-    // Result type is scalar f32 (0-D tensor -> 0-D memref)
-    auto outputType = cast<RankedTensorType>(op.getOutput().getType());
-    Value alloc = rewriter.create<memref::AllocOp>(loc, MemRefType::get(outputType.getShape(), inputType.getElementType(), MemRefLayoutAttrInterface{}, deviceAttr.getValue()));
 
-    auto launchOp = rewriter.create<gpu::LaunchOp>(
-        loc, 
-        c1, c1, c1,           // Grid: 1, 1, 1
-        cNumThreads, c1, c1   // Block: N, 1, 1
-    );
+    // 3. initializing accumulator memory
+
+    // Result type is got from output type
+    // and we are creating the memref for it
+    // (eg: 0-D tensor -> 0-D memref)
+    auto outputType = cast<RankedTensorType>(op.getOutput().getType());
+    auto memRefType = MemRefType::get(
+        outputType.getShape(), inputType.getElementType(),
+        MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
+
+    Value alloc = rewriter
+                      .create<gpu::AllocOp>(loc, memRefType,
+                                            /*asyncDependencies=*/ValueRange{},
+                                            /*dynamicSizes=*/ValueRange{},
+                                            /*symbolOperands=*/ValueRange{})
+                      .getMemref();
+    // selecting accumulator initial value based on the reduction kind
+    Value initialValue;
+    Type elementType = inputType.getElementType();
+    float initValFloat = 0.0f;
+    if (kind == ReductionKind::PRODUCT)
+      initValFloat = 1.0f;
+    else if (kind == ReductionKind::MAX)
+      initValFloat = -std::numeric_limits<float>::infinity();
+    else if (kind == ReductionKind::MIN)
+      initValFloat = std::numeric_limits<float>::infinity();
+    else if (kind == ReductionKind::MEAN)
+      initValFloat = 0.0f;
+
+    if (elementType.isF32()) {
+      initialValue = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getF32FloatAttr(initValFloat));
+    } else {
+      initialValue = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getZeroAttr(elementType));
+    }
+
+    // Initialize output memory using gpu.memset
+    rewriter.create<gpu::MemsetOp>(loc, Type(), ValueRange{}, alloc,
+                                   initialValue);
+
+    // 3. Create gpu.launch parameters
+    int64_t numElements = inputType.getNumElements();
+    int64_t threadsPerBlock = 1024;
+    int64_t numBlocks = (numElements + threadsPerBlock - 1) / threadsPerBlock;
+
+    Value cGridSize = rewriter.create<arith::ConstantIndexOp>(loc, numBlocks);
+    Value cBlockSize =
+        rewriter.create<arith::ConstantIndexOp>(loc, threadsPerBlock);
+
+    auto launchOp =
+        rewriter.create<gpu::LaunchOp>(loc, cGridSize, c1, c1, // Grid: M, 1, 1
+                                       cBlockSize, c1, c1 // Block: 1024, 1, 1
+        );
 
     // 4. Generate Body
     rewriter.setInsertionPointToStart(&launchOp.getBody().front());
-    
-    // Get thread ID
+
+    // Get thread/block/grid IDs
     Value tid = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-    
-    // Linearize/Extract element at TID
-    // (Assuming flattened 1D access or we need to compute multi-dim indices)
-    // For simplicity, let's treat it as 1D collapse if needed, or extract with Indices.
-    // Generating indices from linear TID for N-D tensor:
-    SmallVector<Value> indices;
-    Value linearId = tid;
-    
-    // Stride calculation to convert linearId to multi-dim indices
-    auto shape = inputType.getShape();
-   // int64_t stride = 1;
-    // We need strides. Just doing extract(tid) if 1D. 
-    // If 2D (4x8), we need to compute row/col.
-    
-    if (shape.size() == 1) {
-       indices.push_back(tid);
-    } else {
-       // Reverse compute indices
-       // shape [d0, d1] -> idx0 = tid / d1, idx1 = tid % d1
-       SmallVector<int64_t> strides(shape.size(), 1);
-       for (int i = shape.size()-1; i > 0; --i) {
-         strides[i-1] = strides[i] * shape[i];
-       }
-       
-       for (int i = 0; i < shape.size(); ++i) {
-          //Value dimStride = rewriter.create<arith::ConstantIndexOp>(loc, strides[i]);
-          Value idx;
-          if (i == shape.size()-1) {
-            // Last dim is mod
-             idx = linearId; // Simplified, assuming previous dims subtracted.
-             // Standard division/mod approach:
-             // val = tid
-             // idx_i = val / stride_i
-             // val = val % stride_i
-             // But wait, constructing this logic in IR is verbose.
-          }
-       }
-       // Fallback: Using tensor.from_elements + tensor.extract is complex inside launch.
-       // Let's rely on the prompt's simplification: "Extract scalar value from tensor"
-    }
+    Value bid = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x);
+    Value bdim = rewriter.create<gpu::BlockDimOp>(loc, gpu::Dimension::x);
+    Value gdim = rewriter.create<gpu::GridDimOp>(loc, gpu::Dimension::x);
 
-    // SIMPLIFICATION for correct IR generation without complex math: 
-    // Use `tensor.extract` with pre-computed indices if constant? No, dynamic TID.
-    // Let's assume input is 1D for now or we create a collapse_shape before launch?
-    // We can't insert ops before launch easily here without moving logic out.
-    
-    // Let's implement the "extract" via a helper (assuming 1D or handling conversion).
-    // Or just accept we only handle 1D tensors effectively for this demo.
-    // If not 1D, fail? 
-    // User example was 4x8 -> 32 elements.
-    
-    // Better strategy:
-    // 1. Collapse shape to 1D before launch.
-    // 2. Pass 1D tensor to launch (implicitly captured).
-    // 3. Extract at `tid`.
-    // 4. AllReduce.
-    
-    rewriter.setInsertionPoint(launchOp); // Step back out
-    
-    // Collapse to 1D
-  //  Type flatType = RankedTensorType::get({numElements}, inputType.getElementType(), inputType.getEncoding());
-    
-    // We can't use ReassociativeIndices easily in C++ without helper construction.
-    // Just assuming 1D for the MVP if complex.
-    // BUT the user input is 4x8.
-    
-    // Ok, let's do the index math inside kernel. It's safe.
-    // 4x8:
-    // row = tid / 8
-    // col = tid % 8
-    
-    Value extractedVal;
+    // Calculate global ID: tid + bid * bdim
+    Value bid_x_bdim = rewriter.create<arith::MulIOp>(loc, bid, bdim);
+    Value globalId = rewriter.create<arith::AddIOp>(loc, tid, bid_x_bdim);
+
+    // Calculate stride: bdim * gdim
+    Value stride = rewriter.create<arith::MulIOp>(loc, bdim, gdim);
+
+    // Initialize accumulator
+    Value accumulator = initialValue;
+
+    // 1. Flatten the input using reinterpret_cast to bypass layout checks
+    // First, convert the input tensor to a memref so we can use memref ops
+    auto inputMemRefType =
+        MemRefType::get(inputType.getShape(), inputType.getElementType(),
+                        MemRefLayoutAttrInterface{}, inputType.getEncoding());
+
+    Value inputMemRef =
+        rewriter.create<bufferization::ToBufferOp>(loc, inputMemRefType, input)
+            .getResult();
+
+    auto flatMemRefType =
+        MemRefType::get({numElements}, inputType.getElementType(),
+                        MemRefLayoutAttrInterface{}, inputType.getEncoding());
+
+    Value flatInput = rewriter.create<memref::ReinterpretCastOp>(
+        loc, flatMemRefType, inputMemRef, ValueRange{}, ValueRange{},
+        ValueRange{}, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{numElements},
+        ArrayRef<int64_t>{1});
+
+    // Loop over elements: for (i = globalId; i < numElements; i += stride)
+    Value lowerBound = globalId;
+    Value upperBound =
+        rewriter.create<arith::ConstantIndexOp>(loc, numElements);
+    Value step = stride; // Grid stride
+
+    scf::ForOp loop = rewriter.create<scf::ForOp>(
+        loc, lowerBound, upperBound, step, ValueRange{accumulator});
+
+    // Body of the loop
     {
-        rewriter.setInsertionPointToStart(&launchOp.getBody().front());
-        // Re-get Op params
-        loc = op.getLoc();
-        tid = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-        
-        Value curr = tid;
-        SmallVector<Value> accessIndices;
-        
-        // This logic handles fundamental row-major index reconstruction
-        if (shape.size() > 1) {
-             SmallVector<int64_t> reversedStrides;
-            // int64_t runningStride = 1;
-             for (auto dim : llvm::reverse(shape)) {
-                 reversedStrides.push_back(dim);
-             }
-             // Actually we want div/mod.
-             // idx_N = tid % dim_N
-             // tid = tid / dim_N
-             
-             SmallVector<Value> coords(shape.size());
-             for (int i = shape.size() - 1; i >= 0; --i) {
-                 Value dimSize = rewriter.create<arith::ConstantIndexOp>(loc, shape[i]);
-                 Value rem = rewriter.create<arith::RemUIOp>(loc, curr, dimSize);
-                 Value div = rewriter.create<arith::DivUIOp>(loc, curr, dimSize);
-                 coords[i] = rem;
-                 curr = div;
-             }
-             accessIndices = coords;
-        } else {
-            accessIndices.push_back(tid);
-        }
-        
-        extractedVal = rewriter.create<tensor::ExtractOp>(loc, input, accessIndices);
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(loop.getBody());
 
-        // GPU All Reduce
-        mlir::gpu::AllReduceOperationAttr opAttr = mlir::gpu::AllReduceOperationAttr::get(op.getContext(), gpuOp);
-        // Correct Builder signature: ResultType, Value, OpAttr, Uniform
-        Value reduced = rewriter.create<gpu::AllReduceOp>(loc, extractedVal.getType(), extractedVal, opAttr, /*uniform=*/true);
-        
-        // Store Result (Thread 0 only)
-        Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-        Value isMaster = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, tid, c0);
-        
-        scf::IfOp ifOp = rewriter.create<scf::IfOp>(loc, isMaster, /*withElseRegion=*/false);
-        rewriter.setInsertionPointToStart(ifOp.thenBlock());
+      Value idx = loop.getInductionVar();
+      Value currentAcc = loop.getRegionIterArgs()[0];
 
-        SmallVector<Value> indices;
-        for (int i = 0; i < outputType.getRank(); ++i) {
-             indices.push_back(c0);
-        }
-        rewriter.create<memref::StoreOp>(loc, reduced, alloc, indices);
-        
-        rewriter.setInsertionPointAfter(ifOp);
-        rewriter.create<gpu::TerminatorOp>(loc);
-        rewriter.setInsertionPointAfter(launchOp);
-        
-        // Load back to tensor
-      //  Value memrefVal = alloc;
-        // 5. Wrap the result memref into a tensor
-        // We cannot load from GPU memref on host (usually). 
-        // We use bufferization.to_tensor to indicate this buffer IS the tensor result.
-        
-        // Ensure inputs match: result type (tensor) and alloc (memref)
-        bufferization::ToTensorOp toTensor = rewriter.create<bufferization::ToTensorOp>(loc, op.getType(), alloc);
-        toTensor.setRestrict(true);
-        // toTensor.setWritable(true); // Optional but good for optimization if written later
-        
-        rewriter.replaceOp(op, toTensor.getResult());
+      // 2. Load directly using linear index (No Div/Mod needed!)
+      Value val =
+          rewriter.create<memref::LoadOp>(loc, flatInput, ValueRange{idx});
+
+      Value newAcc;
+      switch (kind) {
+      case ReductionKind::SUM:
+        newAcc = rewriter.create<arith::AddFOp>(loc, currentAcc, val);
+        break;
+      case ReductionKind::PRODUCT:
+        newAcc = rewriter.create<arith::MulFOp>(loc, currentAcc, val);
+        break;
+      case ReductionKind::MAX:
+        newAcc = rewriter.create<arith::MaximumFOp>(loc, currentAcc, val);
+        break;
+      case ReductionKind::MIN:
+        newAcc = rewriter.create<arith::MinimumFOp>(loc, currentAcc, val);
+        break;
+      case ReductionKind::MEAN:
+        newAcc = rewriter.create<arith::AddFOp>(loc, currentAcc, val);
+        break;
+      default:
+        newAcc = currentAcc;
+      }
+
+      rewriter.create<scf::YieldOp>(loc, newAcc);
     }
+
+    Value finalAccumulator = loop.getResult(0);
+
+    // GPU All Reduce (Block Level)
+    mlir::gpu::AllReduceOperationAttr opAttr =
+        mlir::gpu::AllReduceOperationAttr::get(op.getContext(), gpuOp);
+    Value reduced = rewriter.create<gpu::AllReduceOp>(
+        loc, finalAccumulator.getType(), finalAccumulator, opAttr,
+        /*uniform=*/true);
+
+    // Store Result (Thread 0 of each block ONLY)
+    // Then Atomic Update to Global
+    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value isBlockMaster =
+        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, tid, c0);
+
+    scf::IfOp ifOp = rewriter.create<scf::IfOp>(loc, isBlockMaster,
+                                                /*withElseRegion=*/false);
+    // if the tid is 0 then update the output memory with atomic rmw
+    rewriter.setInsertionPointToStart(ifOp.thenBlock());
+
+    // Atomic RMW on the output memory
+    SmallVector<Value> indices;
+
+    for (int i = 0; i < outputType.getRank(); ++i)
+      indices.push_back(c0);
+
+    arith::AtomicRMWKind atomicKind;
+    switch (kind) {
+    case ReductionKind::SUM:
+      atomicKind = arith::AtomicRMWKind::addf;
+      break;
+    case ReductionKind::PRODUCT:
+      atomicKind = arith::AtomicRMWKind::mulf;
+      break;
+    case ReductionKind::MAX:
+      atomicKind = arith::AtomicRMWKind::maximumf;
+      break;
+    case ReductionKind::MIN:
+      atomicKind = arith::AtomicRMWKind::minimumf;
+      break;
+    case ReductionKind::MEAN:
+      atomicKind = arith::AtomicRMWKind::addf;
+      break;
+    default:
+      atomicKind = arith::AtomicRMWKind::addf;
+    }
+
+    rewriter.create<memref::AtomicRMWOp>(loc, atomicKind, reduced, alloc,
+                                         indices);
+
+    rewriter.setInsertionPointAfter(ifOp);
+    rewriter.create<gpu::TerminatorOp>(loc);
+    rewriter.setInsertionPointAfter(launchOp);
+    // 5. Handle MEAN reduction (Division) with a second kernel
+    if (kind == ReductionKind::MEAN) {
+      Value c1_k2 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      auto launchOp2 = rewriter.create<gpu::LaunchOp>(loc, c1_k2, c1_k2, c1_k2,
+                                                      c1_k2, c1_k2, c1_k2);
+
+      rewriter.setInsertionPointToStart(&launchOp2.getBody().front());
+
+      // Load current sum
+      // Indices for 0-D memref are empty
+      SmallVector<Value> indices;
+      for (int i = 0; i < outputType.getRank(); ++i) {
+        indices.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+      }
+
+      Value sumVal = rewriter.create<memref::LoadOp>(loc, alloc, indices);
+
+      // Create divisor constant
+      Type elemType = inputType.getElementType();
+      Value divisor;
+      if (elemType.isF32() || elemType.isF64() || elemType.isF16() ||
+          elemType.isBF16()) {
+        divisor = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getFloatAttr(elemType, numElements));
+      } else {
+        divisor = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getIntegerAttr(elemType, numElements));
+      }
+
+      // Perform Division
+      Value meanVal;
+      if (isa<FloatType>(elemType)) {
+        meanVal = rewriter.create<arith::DivFOp>(loc, sumVal, divisor);
+      } else {
+        meanVal = rewriter.create<arith::DivSIOp>(loc, sumVal, divisor);
+      }
+
+      // Store back
+      rewriter.create<memref::StoreOp>(loc, meanVal, alloc, indices);
+      rewriter.create<gpu::TerminatorOp>(loc);
+
+      rewriter.setInsertionPointAfter(launchOp2);
+    }
+
+    // 6. Wrap the result memref into a tensor
+    bufferization::ToTensorOp toTensor =
+        rewriter.create<bufferization::ToTensorOp>(loc, op.getType(), alloc);
+    toTensor.setRestrict(true);
+
+    rewriter.replaceOp(op, toTensor.getResult());
 
     return success();
   }
 };
 
-struct NovaToGpuPass : public PassWrapper<NovaToGpuPass, OperationPass<func::FuncOp>> {
+struct NovaToGpuPass
+    : public PassWrapper<NovaToGpuPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaToGpuPass)
 
-  StringRef getArgument() const override { return "nova-to-gpu"; }
-  StringRef getDescription() const override { return "Lower nova to gpu dialect"; }
+  StringRef getArgument() const override { return "convert-nova-to-gpu"; }
+  StringRef getDescription() const override {
+    return "Lower nova to gpu dialect";
+  }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect, memref::MemRefDialect, tensor::TensorDialect, bufferization::BufferizationDialect>();
+    registry.insert<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect,
+                    memref::MemRefDialect, tensor::TensorDialect,
+                    bufferization::BufferizationDialect>();
   }
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     patterns.add<NovaToGpuPattern>(context);
-    
+
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
-       // signalPassFailure();
+      signalPassFailure();
     }
   }
 };

@@ -50,8 +50,8 @@
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Conversion/VectorToGPU/VectorToGPU.h"
-#include "mlir/Dialect/GPU/IR/GPUDialect.h"     // For GPUModuleOp
-#include "mlir/Dialect/GPU/Pipelines/Passes.h"  // For GpuNVVMAttachTarget
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"    // For GPUModuleOp
+#include "mlir/Dialect/GPU/Pipelines/Passes.h" // For GpuNVVMAttachTarget
 #include "mlir/Dialect/GPU/Transforms/Passes.h" // For createGpuKernelOutliningPass
 #include "mlir/Dialect/NVGPU/Transforms/Passes.h"
 #include "mlir/Dialect/SparseTensor/Transforms/Passes.h"

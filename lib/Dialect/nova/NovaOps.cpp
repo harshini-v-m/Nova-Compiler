@@ -32,9 +32,7 @@ static Attribute getBinaryResultEncoding(Attribute lhsEncoding,
 // Helper to determine result encoding for unary operations
 static Attribute getUnaryResultEncoding(Attribute operandEncoding,
                                         MLIRContext *context) {
-  if (auto attr = llvm::dyn_cast_or_null<NovaDeviceAttr>(operandEncoding))
-    return attr;
-  return Attribute();
+  return operandEncoding;
 }
 
 // type promotion for result type -heirarchy
@@ -505,7 +503,7 @@ LogicalResult nova::SqrtOp::inferReturnTypes(
       getUnaryResultEncoding(inputType.getEncoding(), context)));
   return success();
 }
-//rqrt
+//rsqrt
 LogicalResult nova::RsqrtOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
     DictionaryAttr attrs, OpaqueProperties properties, RegionRange regions,
