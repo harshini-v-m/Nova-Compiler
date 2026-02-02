@@ -21,6 +21,9 @@ static bool isMemorySpaceOne(Attribute memorySpace) {
   if (auto intAttr = llvm::dyn_cast<IntegerAttr>(memorySpace)) {
     return intAttr.getInt() == 1;
   }
+  if (auto novaAttr = llvm::dyn_cast<nova::NovaDeviceAttr>(memorySpace)) {
+    return novaAttr.getValue().getValue() == "1";
+  }
   return false;
 }
 
@@ -75,7 +78,7 @@ public:
         isMemorySpaceOne(dstType.getMemorySpace())) {
       // Synchronous memcpy (no async token)
       rewriter.replaceOpWithNewOp<gpu::MemcpyOp>(
-          op,TypeRange{}, ValueRange{}, op.getTarget(), op.getSource());
+          op, TypeRange{}, ValueRange{}, op.getTarget(), op.getSource());
       return success();
     }
     return failure();
@@ -100,8 +103,8 @@ struct ConvertMemRefToGpuPass
     replacer.addReplacement(
         [&](nova::NovaDeviceAttr attr) -> std::optional<Attribute> {
           if (attr.getValue().getValue() == "1")
-            return IntegerAttr::get(IntegerType::get(ctx, 32), 1);
-          return IntegerAttr::get(IntegerType::get(ctx, 32), 0);
+            return IntegerAttr::get(IntegerType::get(ctx, 64), 1);
+          return IntegerAttr::get(IntegerType::get(ctx, 64), 0);
         });
 
     replacer.addReplacement([&](MemRefType type) -> std::optional<Type> {
@@ -138,7 +141,7 @@ struct ConvertMemRefToGpuPass
                                           /*replaceLocs=*/false,
                                           /*replaceTypes=*/true);
 
-    // 2. Explicitly handle function signatures which might be missed by
+    // 3. Explicitly handle function signatures which might be missed by
     // recursive replacement
     module->walk([&](func::FuncOp func) {
       SmallVector<Type> argTypes;
@@ -156,7 +159,7 @@ struct ConvertMemRefToGpuPass
       func.setType(FunctionType::get(ctx, argTypes, resultTypes));
     });
 
-    // 3. Convert memref.alloc/dealloc with memory space 1 to gpu.alloc/dealloc
+    // 4. Convert memref.alloc/dealloc with memory space 1 to gpu.alloc/dealloc
     RewritePatternSet patterns(ctx);
     patterns.add<ConvertAllocOp, ConvertDeallocOp, ConvertMemrefOp>(ctx);
 

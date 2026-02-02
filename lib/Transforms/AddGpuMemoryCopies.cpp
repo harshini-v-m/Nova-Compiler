@@ -73,7 +73,8 @@ struct AddGpuMemoryCopiesPass
     ModuleOp module = func->getParentOfType<ModuleOp>();
     SymbolTable symbolTable(module);
 
-    // Collect all ReturnOps and returned values up front to avoid redundant walks
+    // Collect all ReturnOps and returned values up front to avoid redundant
+    // walks
     SmallVector<func::ReturnOp, 2> returnOps;
     SmallPtrSet<Value, 4> returnedValues;
     func.walk([&](func::ReturnOp returnOp) {
@@ -82,7 +83,8 @@ struct AddGpuMemoryCopiesPass
         returnedValues.insert(val);
     });
 
-    // 1. Promote internal allocations to device space if used in GPU regions or returned to a GPU-expecting result
+    // 1. Promote internal allocations to device space if used in GPU regions or
+    // returned to a GPU-expecting result
     SmallVector<Value, 4> promotedAllocsToDealloc;
     func.walk([&](memref::AllocOp allocOp) {
       bool shouldPromote = false;
@@ -102,7 +104,8 @@ struct AddGpuMemoryCopiesPass
               }
             }
           }
-          if (shouldPromote) break;
+          if (shouldPromote)
+            break;
         }
       }
 
@@ -110,7 +113,8 @@ struct AddGpuMemoryCopiesPass
       if (!shouldPromote) {
         for (auto &use : res.getUses()) {
           Operation *owner = use.getOwner();
-          if (isa<gpu::LaunchOp>(owner) || owner->getParentOfType<gpu::LaunchOp>()) {
+          if (isa<gpu::LaunchOp>(owner) ||
+              owner->getParentOfType<gpu::LaunchOp>()) {
             shouldPromote = true;
             break;
           }
@@ -122,13 +126,15 @@ struct AddGpuMemoryCopiesPass
         if (!isDeviceMemorySpace(oldType.getMemorySpace())) {
           MemRefType newType = MemRefType::get(
               oldType.getShape(), oldType.getElementType(), oldType.getLayout(),
-              IntegerAttr::get(IntegerType::get(func.getContext(), 32), 1));
+              IntegerAttr::get(IntegerType::get(func.getContext(), 64), 1));
+
           res.setType(newType);
 
           // Track for deallocation unless explicitly deallocated later
           bool hasDealloc = false;
           for (auto &use : res.getUses()) {
-            if (isa<memref::DeallocOp>(use.getOwner()) || isa<gpu::DeallocOp>(use.getOwner())) {
+            if (isa<memref::DeallocOp>(use.getOwner()) ||
+                isa<gpu::DeallocOp>(use.getOwner())) {
               hasDealloc = true;
               break;
             }
@@ -141,7 +147,7 @@ struct AddGpuMemoryCopiesPass
 
     // 2. Find all host memrefs used in GPU regions that need shadowing
     llvm::MapVector<Value, Value> hostToDeviceMap;
-    llvm::MapVector<Value, Value> registeredHostMem; 
+    llvm::MapVector<Value, Value> registeredHostMem;
     func.walk([&](gpu::LaunchOp launchOp) {
       launchOp.getRegion().walk([&](Operation *op) {
         for (OpOperand &operand : op->getOpOperands()) {
@@ -163,19 +169,21 @@ struct AddGpuMemoryCopiesPass
             builder.setInsertionPointAfter(defOp);
           else
             builder.setInsertionPointToStart(&func.getBody().front());
-          
+
           Location loc = val.getLoc();
 
           if (shouldRegisterHostMemory(val)) {
-            auto unrankedType = UnrankedMemRefType::get(memRefType.getElementType(), 0);
-            auto castOp = builder.create<memref::CastOp>(loc, unrankedType, val);
+            auto unrankedType =
+                UnrankedMemRefType::get(memRefType.getElementType(), 0);
+            auto castOp =
+                builder.create<memref::CastOp>(loc, unrankedType, val);
             builder.create<gpu::HostRegisterOp>(loc, castOp);
             registeredHostMem[val] = castOp;
           }
 
           MemRefType deviceType = MemRefType::get(
               memRefType.getShape(), memRefType.getElementType(),
-              memRefType.getLayout(), builder.getI32IntegerAttr(1));
+              memRefType.getLayout(), builder.getI64IntegerAttr(1));
 
           SmallVector<Value> dynamicSizes;
           for (int i = 0; i < memRefType.getRank(); ++i) {
@@ -186,11 +194,13 @@ struct AddGpuMemoryCopiesPass
             }
           }
 
-          auto allocOp = builder.create<gpu::AllocOp>(loc, deviceType, ValueRange{}, dynamicSizes, ValueRange{});
+          auto allocOp = builder.create<gpu::AllocOp>(
+              loc, deviceType, ValueRange{}, dynamicSizes, ValueRange{});
           Value deviceMem = allocOp.getResult(0);
           hostToDeviceMap[val] = deviceMem;
 
-          builder.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{}, deviceMem, val);
+          builder.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{},
+                                        deviceMem, val);
           operand.set(deviceMem);
         }
       });
@@ -200,23 +210,29 @@ struct AddGpuMemoryCopiesPass
     for (auto returnOp : returnOps) {
       OpBuilder builder(returnOp);
       Location loc = returnOp.getLoc();
-      
+
       for (unsigned i = 0; i < returnOp->getNumOperands(); ++i) {
         OpOperand &operand = returnOp->getOpOperand(i);
         Value val = operand.get();
         auto expectedType = func.getResultTypes()[i];
         auto expectedMemRef = llvm::dyn_cast<MemRefType>(expectedType);
-        if (!expectedMemRef) continue;
+        if (!expectedMemRef)
+          continue;
 
         auto currentMemRef = llvm::cast<MemRefType>(val.getType());
-        bool expectedDevice = isDeviceMemorySpace(expectedMemRef.getMemorySpace());
-        bool currentDevice = isDeviceMemorySpace(currentMemRef.getMemorySpace());
-            
+        bool expectedDevice =
+            isDeviceMemorySpace(expectedMemRef.getMemorySpace());
+        bool currentDevice =
+            isDeviceMemorySpace(currentMemRef.getMemorySpace());
+
         if (expectedDevice && !currentDevice) {
-          Value deviceMem = hostToDeviceMap.count(val) ? hostToDeviceMap[val] : nullptr;
+          Value deviceMem =
+              hostToDeviceMap.count(val) ? hostToDeviceMap[val] : nullptr;
           if (!deviceMem) {
-            MemRefType deviceType = MemRefType::get(currentMemRef.getShape(), currentMemRef.getElementType(),
-                                                   currentMemRef.getLayout(), builder.getI32IntegerAttr(1));
+            MemRefType deviceType = MemRefType::get(
+                currentMemRef.getShape(), currentMemRef.getElementType(),
+                currentMemRef.getLayout(), builder.getI64IntegerAttr(1));
+
             SmallVector<Value> dynamicSizes;
             for (int j = 0; j < currentMemRef.getRank(); ++j) {
               if (currentMemRef.isDynamicDim(j)) {
@@ -225,17 +241,21 @@ struct AddGpuMemoryCopiesPass
                 dynamicSizes.push_back(dim);
               }
             }
-            auto allocOp = builder.create<gpu::AllocOp>(loc, deviceType, ValueRange{}, dynamicSizes, ValueRange{});
+            auto allocOp = builder.create<gpu::AllocOp>(
+                loc, deviceType, ValueRange{}, dynamicSizes, ValueRange{});
             deviceMem = allocOp.getResult(0);
             hostToDeviceMap[val] = deviceMem;
-            builder.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{}, deviceMem, val);
+            builder.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{},
+                                          deviceMem, val);
           }
           operand.set(deviceMem);
         } else if (!expectedDevice && currentDevice) {
-          MemRefType hostType = MemRefType::get(currentMemRef.getShape(), currentMemRef.getElementType(),
-                                               currentMemRef.getLayout(), Attribute());
+          MemRefType hostType = MemRefType::get(
+              currentMemRef.getShape(), currentMemRef.getElementType(),
+              currentMemRef.getLayout(), Attribute());
           auto hostAlloc = builder.create<memref::AllocOp>(loc, hostType);
-          builder.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{}, hostAlloc, val);
+          builder.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{},
+                                        hostAlloc, val);
           operand.set(hostAlloc);
         }
       }
@@ -243,7 +263,8 @@ struct AddGpuMemoryCopiesPass
 
     // 4. Deallocate shadows and promoted allocs (unless returned)
     auto deallocBuffer = [&](Value buffer) {
-      if (!buffer || returnedValues.count(buffer)) return;
+      if (!buffer || returnedValues.count(buffer))
+        return;
 
       Block *allocBlock = buffer.getParentBlock();
       Operation *lastUser = nullptr;
@@ -253,7 +274,7 @@ struct AddGpuMemoryCopiesPass
         Operation *ancestor = use.getOwner();
         while (ancestor && ancestor->getBlock() != allocBlock)
           ancestor = ancestor->getParentOp();
-        
+
         if (!ancestor) {
           safeToDeallocEarly = false;
           break;
@@ -263,18 +284,23 @@ struct AddGpuMemoryCopiesPass
       }
 
       if (safeToDeallocEarly && lastUser) {
-        OpBuilder builder(lastUser->getBlock(), std::next(Block::iterator(lastUser)));
-        builder.create<gpu::DeallocOp>(lastUser->getLoc(), ValueRange{}, buffer);
+        OpBuilder builder(lastUser->getBlock(),
+                          std::next(Block::iterator(lastUser)));
+        builder.create<gpu::DeallocOp>(lastUser->getLoc(), ValueRange{},
+                                       buffer);
       } else {
         for (auto returnOp : returnOps) {
           OpBuilder builder(returnOp);
-          builder.create<gpu::DeallocOp>(returnOp.getLoc(), ValueRange{}, buffer);
+          builder.create<gpu::DeallocOp>(returnOp.getLoc(), ValueRange{},
+                                         buffer);
         }
       }
     };
 
-    for (auto pair : hostToDeviceMap) deallocBuffer(pair.second);
-    for (auto val : promotedAllocsToDealloc) deallocBuffer(val);
+    for (auto pair : hostToDeviceMap)
+      deallocBuffer(pair.second);
+    for (auto val : promotedAllocsToDealloc)
+      deallocBuffer(val);
 
     // 5. Unregister host memory
     if (!registeredHostMem.empty()) {

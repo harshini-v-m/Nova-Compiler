@@ -30,16 +30,4 @@ module {
       : tensor<f32, #nova.device<"1">>
   }
 }
-module {
-  // Case 1: Logits 3D, Target 2D
-  func.func @sce_3d_2d(%logits: tensor<2x4x10xf32>, %target: tensor<2x4xi32>) -> tensor<f32> {
-    %0 = nova.sce %logits, %target : tensor<2x4x10xf32>, tensor<2x4xi32>
-    return %0 : tensor<f32>
-  }
 
-  // Case 2: Logits 2D, Target 1D
-  func.func @sce_2d_1d(%logits: tensor<4x10xf32>, %target: tensor<4xi32>) -> tensor<f32> {
-    %0 = nova.sce %logits, %target : tensor<4x10xf32>, tensor<4xi32>
-    return %0 : tensor<f32>
-  }
-}

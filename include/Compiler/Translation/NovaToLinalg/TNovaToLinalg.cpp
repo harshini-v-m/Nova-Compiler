@@ -195,8 +195,6 @@ CompareTypePromotionLowering(top op, Type resultType, ArrayRef<Value> args,
   } else {
     return opdispatcher(op, args[0], args[1], builder);
   }
-
-  return nullptr;
 }
 // Scalar Operation Mapper
 
