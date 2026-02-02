@@ -63,3 +63,5 @@ add_mlir_library(NovaPipelines
 target_include_directories(NovaPipelines PUBLIC 
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include/Compiler/Pipeline>
 )
+
+add_compile_definitions(NOVA_SOURCE_DIR=\"${PROJECT_SOURCE_DIR}\")

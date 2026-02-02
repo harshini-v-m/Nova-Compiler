@@ -13,6 +13,8 @@
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/TosaToArith/TosaToArith.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 //utils
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Pass/Pass.h"
@@ -58,7 +60,7 @@ namespace nova {}
 } // namespace mlir::nova
 
 void mlir::nova::createNovaPipelines(OpPassManager &pm) {
-  //pm.addPass(createCanonicalizerPass());
+  // pm.addPass(createCanonicalizerPass());
   // pm.addNestedPass<func::FuncOp>(std::make_unique<DependencyAnalysisTestPass>());
   
   // Lower Nova dialect to standard dialects 
@@ -82,20 +84,20 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
   // Convert elementwise operations to Linalg
   pm.addPass(mlir::createConvertElementwiseToLinalgPass());
   pm.addPass(createCanonicalizerPass());
-
-  // TILE NAMED OPS (before generalization) - CPU optimized for Intel i7-14700K
-  // This tiles linalg.matmul with [128, 128, 16] to fit in L2 cache
-  std::string transformFileName = "/home/blu-bridge021/Desktop/Nova-Compiler/include/Compiler/Transforms/Tiling/tiling_multilevel.mlir";
+  pm.addPass(mlir::createCSEPass());
   
+  // TILE NAMED OPS (linalg.matmul, linalg.add) - BEFORE generalization
+  // CPU optimized for Intel i7-14700K cache hierarchy
+  std::string transformFileName = std::string(NOVA_SOURCE_DIR) + "/include/Compiler/Transforms/Tiling/tiling_multilevel.mlir";
   mlir::transform::PreloadLibraryPassOptions preloadOptions;
   preloadOptions.transformLibraryPaths = {transformFileName};
-  pm.addPass(mlir::transform::createPreloadLibraryPass(preloadOptions));
+ //pm.addPass(mlir::transform::createPreloadLibraryPass(preloadOptions));
 
   mlir::transform::InterpreterPassOptions interpOptions;
-  pm.addPass(mlir::transform::createInterpreterPass(interpOptions));
-  pm.addPass(createCanonicalizerPass());
+  //pm.addPass(mlir::transform::createInterpreterPass(interpOptions));
+//  pm.addPass(createCanonicalizerPass());
 
-  // GENERALIZE (after tiling, for vectorization and fusion)
+  // GENERALIZE NAMED OPS (after tiling, for vectorization)
   pm.addNestedPass<mlir::func::FuncOp>(
                 mlir::createLinalgGeneralizeNamedOpsPass());
   pm.addPass(createCanonicalizerPass());

@@ -80,8 +80,8 @@ namespace mlir
         void createNovaGPUPipelines(mlir::OpPassManager &pm)
         {
             pm.addPass(mlir::createCanonicalizerPass());
-            pm.addPass(mlir::nova::createNovaToGpuPass());
             pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToGpuPass());
             pm.addNestedPass<mlir::func::FuncOp>(
                 mlir::nova::createNovaToLinalgLoweringPass());
 
