@@ -60,9 +60,22 @@ add_mlir_library(NovaCompilerAPI
   MLIRControlFlowDialect
   MLIRControlFlowTransforms
   
-  # OpenMP and Complex conversion support
-  MLIROpenMPToLLVM
-  MLIRComplexToLLVM
+  # Transform Dialect and extensions
+  MLIRTransformDialect
+  MLIRTransformDialectTransforms
+  MLIRLinalgTransformOps
+  MLIRVectorTransformOps
+  MLIRFuncTransformOps
+  MLIRSCFTransformOps
+  MLIRMemRefTransformOps
+  MLIRGPUTransformOps
+  MLIRFuncInlinerExtension
+  
+  # Tiling and ValueBounds interfaces 
+  MLIRTilingInterface
+  MLIRTensorTilingInterfaceImpl
+  MLIRValueBoundsOpInterface
+  MLIRArithValueBoundsOpInterfaceImpl
   
   MLIRNova
   NovaPipelines

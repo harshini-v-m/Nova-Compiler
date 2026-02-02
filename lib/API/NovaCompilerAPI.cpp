@@ -12,7 +12,10 @@
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/IR/TensorTilingInterfaceImpl.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
@@ -20,6 +23,12 @@
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/ControlFlow/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/GPU/Transforms/BufferDeallocationOpInterfaceImpl.h"
+// ValueBoundsOpInterface implementations (needed for tiling transforms)
+#include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/MemRef/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Affine/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
@@ -35,6 +44,14 @@
 #include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
 #include "mlir/Target/LLVM/NVVM/Target.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
+#include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
+#include "mlir/Dialect/Func/TransformOps/FuncTransformOps.h"
+#include "mlir/Dialect/SCF/TransformOps/SCFTransformOps.h"
+#include "mlir/Dialect/MemRef/TransformOps/MemRefTransformOps.h"
+#include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 
 #include "mlir/Parser/Parser.h"
 #include "mlir/IR/Verifier.h"
@@ -179,7 +196,29 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
                  mlir::gpu::GPUDialect,
                  mlir::NVVM::NVVMDialect,
                  mlir::nvgpu::NVGPUDialect,
-                 mlir::LLVM::LLVMDialect>();
+                 mlir::LLVM::LLVMDialect,
+                 mlir::transform::TransformDialect>();
+
+  // Register Transform Dialect extensions
+  mlir::linalg::registerTransformDialectExtension(registry);
+  mlir::vector::registerTransformDialectExtension(registry);
+  mlir::func::registerTransformDialectExtension(registry);
+  mlir::scf::registerTransformDialectExtension(registry);
+  mlir::memref::registerTransformDialectExtension(registry);
+  mlir::gpu::registerTransformDialectExtension(registry);
+  mlir::func::registerInlinerExtension(registry);
+
+  // Register Tiling Interface external models
+  mlir::linalg::registerTilingInterfaceExternalModels(registry);
+  mlir::tensor::registerTilingInterfaceExternalModels(registry);
+
+  // Register ValueBoundsOpInterface external models (required for tiling)
+  mlir::scf::registerValueBoundsOpInterfaceExternalModels(registry);
+  mlir::tensor::registerValueBoundsOpInterfaceExternalModels(registry);
+  mlir::arith::registerValueBoundsOpInterfaceExternalModels(registry);
+  mlir::memref::registerValueBoundsOpInterfaceExternalModels(registry);
+  mlir::affine::registerValueBoundsOpInterfaceExternalModels(registry);
+  mlir::linalg::registerValueBoundsOpInterfaceExternalModels(registry);
 
   // Register external models and conversion interfaces
   mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
