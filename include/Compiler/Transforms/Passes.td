@@ -20,6 +20,19 @@ def FuseMatmulBias : Pass<"fuse-matmul-bias", "func::FuncOp"> {
     let constructor = "::mlir::nova::createFuseMatmulBiasPass()";
 }
 
+def AffineScalarizeAccumulator : Pass<"affine-scalarize-accumulator", "func::FuncOp"> {
+    let summary = "Convert buffer-based loop accumulation to register-based using iter_args";
+    let description = [{
+        Detects loop-carried accumulation through buffers and transforms them
+        to use affine.for iter_args for register-based accumulation.
+    }];
+    let dependentDialects = [
+        "mlir::affine::AffineDialect",
+        "mlir::memref::MemRefDialect"
+    ];
+    let constructor = "::mlir::nova::createAffineScalarizeAccumulatorPass()";
+}
+
 def ConvertMemRefToGpu : Pass<"convert-memref-to-gpu", "ModuleOp"> {
     let summary = "Convert memref.alloc/dealloc with memory space 1 to gpu.alloc/dealloc";
     let description = [{
