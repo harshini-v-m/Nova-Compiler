@@ -1,6 +1,7 @@
 #include "Compiler/Transforms/AddGpuMemoryCopies.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -65,6 +66,28 @@ struct AddGpuMemoryCopiesPass
     return false;
   }
 
+  // Helper to recursively update memory space of index-aliasing operations
+  void updateMemorySpaceRecursively(Value val, Attribute newSpace) {
+    auto oldType = llvm::dyn_cast<MemRefType>(val.getType());
+    if (!oldType)
+      return;
+
+    auto newType = MemRefType::get(oldType.getShape(), oldType.getElementType(),
+                                   oldType.getLayout(), newSpace);
+    val.setType(newType);
+
+    for (auto &use : val.getUses()) {
+      Operation *user = use.getOwner();
+      // List of index-aliasing operations that preserve memory space properties
+      if (isa<memref::CollapseShapeOp, memref::ExpandShapeOp, memref::SubViewOp,
+              memref::CastOp, bufferization::ToBufferOp>(user)) {
+        for (Value result : user->getResults()) {
+          updateMemorySpaceRecursively(result, newSpace);
+        }
+      }
+    }
+  }
+
   void runOnOperation() override {
     func::FuncOp func = getOperation();
     if (func->hasAttr(gpu::GPUDialect::getKernelFuncAttrName()))
@@ -124,11 +147,10 @@ struct AddGpuMemoryCopiesPass
       if (shouldPromote) {
         MemRefType oldType = allocOp.getType();
         if (!isDeviceMemorySpace(oldType.getMemorySpace())) {
-          MemRefType newType = MemRefType::get(
-              oldType.getShape(), oldType.getElementType(), oldType.getLayout(),
-              IntegerAttr::get(IntegerType::get(func.getContext(), 64), 1));
+          Attribute newSpace =
+              IntegerAttr::get(IntegerType::get(func.getContext(), 64), 1);
 
-          res.setType(newType);
+          updateMemorySpaceRecursively(res, newSpace);
 
           // Track for deallocation unless explicitly deallocated later
           bool hasDealloc = false;

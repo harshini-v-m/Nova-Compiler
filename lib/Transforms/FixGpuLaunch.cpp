@@ -281,6 +281,96 @@ public:
   }
 };
 
+class ConvertGpuMemsetToCall : public OpRewritePattern<gpu::MemsetOp> {
+public:
+  using OpRewritePattern<gpu::MemsetOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gpu::MemsetOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto ctx = op.getContext();
+
+    auto genericPtrTy = LLVM::LLVMPointerType::get(ctx);
+    auto int64Ty = IntegerType::get(ctx, 64);
+    auto int32Ty = IntegerType::get(ctx, 32);
+
+    auto cudaMemset = getOrDeclareFunc(module, rewriter, "cudaMemset", int32Ty,
+                                       {genericPtrTy, int32Ty, int64Ty});
+
+    Value memref = op.getDst();
+
+    auto getDescriptor = [&](Value val) -> Value {
+      auto memRefTy = llvm::cast<MemRefType>(val.getType());
+      unsigned addressSpace = 0;
+      if (auto intAttr =
+              llvm::dyn_cast_or_null<IntegerAttr>(memRefTy.getMemorySpace())) {
+        addressSpace = intAttr.getInt();
+      }
+      auto ptrTy = LLVM::LLVMPointerType::get(ctx, addressSpace);
+      SmallVector<Type> elemTypes;
+      elemTypes.push_back(ptrTy);
+      elemTypes.push_back(ptrTy);
+      elemTypes.push_back(int64Ty);
+      if (memRefTy.getRank() > 0) {
+        elemTypes.push_back(
+            LLVM::LLVMArrayType::get(int64Ty, memRefTy.getRank()));
+        elemTypes.push_back(
+            LLVM::LLVMArrayType::get(int64Ty, memRefTy.getRank()));
+      }
+      Type descTy = LLVM::LLVMStructType::getLiteral(ctx, elemTypes);
+      return rewriter.create<UnrealizedConversionCastOp>(loc, descTy, val)
+          .getResult(0);
+    };
+
+    Value desc = getDescriptor(memref);
+    Value rawPtr =
+        rewriter.create<LLVM::ExtractValueOp>(loc, desc, ArrayRef<int64_t>{1});
+
+    auto memRefType = llvm::cast<MemRefType>(memref.getType());
+    unsigned addressSpace = 0;
+    if (auto intAttr =
+            llvm::dyn_cast_or_null<IntegerAttr>(memRefType.getMemorySpace())) {
+      addressSpace = intAttr.getInt();
+    }
+    Value ptr = rawPtr;
+    if (addressSpace != 0) {
+      ptr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy, rawPtr);
+    }
+
+    int64_t elementSize =
+        memRefType.getElementType().getIntOrFloatBitWidth() / 8;
+    if (elementSize == 0)
+      elementSize = 1;
+
+    Value sizeBytes = rewriter.create<LLVM::ConstantOp>(
+        loc, int64Ty, rewriter.getI64IntegerAttr(elementSize));
+
+    for (int i = 0; i < memRefType.getRank(); ++i) {
+      Value dimSize;
+      if (memRefType.isDynamicDim(i)) {
+        dimSize = rewriter.create<LLVM::ExtractValueOp>(
+            loc, desc, ArrayRef<int64_t>{3, i});
+      } else {
+        dimSize = rewriter.create<LLVM::ConstantOp>(
+            loc, int64Ty, rewriter.getI64IntegerAttr(memRefType.getDimSize(i)));
+      }
+      sizeBytes = rewriter.create<LLVM::MulOp>(loc, sizeBytes, dimSize);
+    }
+
+    // Convert value to i32 (cudaMemset expects a byte or i32 depending on API,
+    // usually byte-wise)
+    // For float 0.0, we can just use 0.
+    Value fillValue = rewriter.create<LLVM::ConstantOp>(
+        loc, int32Ty, rewriter.getI32IntegerAttr(0));
+
+    rewriter.create<LLVM::CallOp>(loc, cudaMemset,
+                                  ValueRange{ptr, fillValue, sizeBytes});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 class ConvertGpuDeallocToCall : public OpRewritePattern<gpu::DeallocOp> {
 public:
   using OpRewritePattern<gpu::DeallocOp>::OpRewritePattern;
