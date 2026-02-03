@@ -551,7 +551,7 @@ public:
     patterns.add<ConvertGpuMemsetToCall>(module.getContext());
     patterns.add<FixHostGpuAccess>(module.getContext());
     patterns.add<FixHostGpuStore>(module.getContext());
-
+    patterns.add<ConvertGpuMemsetToCall>(module.getContext());
     if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
       signalPassFailure();
     }

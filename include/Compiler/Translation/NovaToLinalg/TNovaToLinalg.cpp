@@ -373,6 +373,34 @@ private:
     }
     return nullptr;
   }
+  // cosop
+  static Value mapOpImpl(nova::CosOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(args[0].getType()))
+      return builder->create<math::CosOp>(op.getLoc(), args[0]);
+    if (isa<IntegerType>(args[0].getType()))
+      return builder->create<math::CosOp>(
+          op.getLoc(), builder->create<arith::SIToFPOp>(
+                           op.getLoc(), builder->getF32Type(), args[0]));
+    if (isa<ComplexType>(args[0].getType())) {
+      return builder->create<complex::CosOp>(op.getLoc(), args[0]);
+    }
+    return nullptr;
+  }
+  // sinop
+  static Value mapOpImpl(nova::SinOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(args[0].getType()))
+      return builder->create<math::SinOp>(op.getLoc(), args[0]);
+    if (isa<IntegerType>(args[0].getType()))
+      return builder->create<math::SinOp>(
+          op.getLoc(), builder->create<arith::SIToFPOp>(
+                           op.getLoc(), builder->getF32Type(), args[0]));
+    if (isa<ComplexType>(args[0].getType())) {
+      return builder->create<complex::SinOp>(op.getLoc(), args[0]);
+    }
+    return nullptr;
+  }
   // asin operation
   static Value mapOpImpl(nova::AsinOp op, Type resultType, ArrayRef<Value> args,
                          OpBuilder *builder) {
@@ -463,7 +491,117 @@ private:
                            op.getLoc(), builder->getF32Type(), args[0]));
     return nullptr;
   }
+  // pow operation
+  static Value mapOpImpl(nova::PowOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    // if int use arith.powi else use math.powf
+    if (isa<IntegerType>(args[0].getType())) {
+      return builder->create<math::IPowIOp>(op.getLoc(), args[0], args[1]);
+    } else {
+      return builder->create<math::PowFOp>(op.getLoc(), args[0], args[1]);
+    }
+  }
 
+  // and operation
+  static Value mapOpImpl(nova::AndOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    Value lhs = args[0];
+    Value rhs = args[1];
+    Location loc = op.getLoc();
+
+    if (isa<FloatType>(lhs.getType())) {
+      Value zero = builder->create<arith::ConstantFloatOp>(
+          loc, cast<FloatType>(lhs.getType()),
+          APFloat::getZero(cast<FloatType>(lhs.getType()).getFloatSemantics()));
+      lhs = builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::UNE, lhs,
+                                           zero);
+    }
+    if (isa<FloatType>(rhs.getType())) {
+      Value zero = builder->create<arith::ConstantFloatOp>(
+          loc, cast<FloatType>(rhs.getType()),
+          APFloat::getZero(cast<FloatType>(rhs.getType()).getFloatSemantics()));
+      rhs = builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::UNE, rhs,
+                                           zero);
+    }
+
+    Value res = builder->create<arith::AndIOp>(loc, lhs, rhs);
+    return res;
+  }
+
+  // or operation
+  static Value mapOpImpl(nova::OrOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    Value lhs = args[0];
+    Value rhs = args[1];
+    Location loc = op.getLoc();
+
+    if (isa<FloatType>(lhs.getType())) {
+      Value zero = builder->create<arith::ConstantFloatOp>(
+          loc, cast<FloatType>(lhs.getType()),
+          APFloat::getZero(cast<FloatType>(lhs.getType()).getFloatSemantics()));
+      lhs = builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::UNE, lhs,
+                                           zero);
+    }
+    if (isa<FloatType>(rhs.getType())) {
+      Value zero = builder->create<arith::ConstantFloatOp>(
+          loc, cast<FloatType>(rhs.getType()),
+          APFloat::getZero(cast<FloatType>(rhs.getType()).getFloatSemantics()));
+      rhs = builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::UNE, rhs,
+                                           zero);
+    }
+
+    Value res = builder->create<arith::OrIOp>(loc, lhs, rhs);
+    return res;
+  }
+
+  // xor operation
+  static Value mapOpImpl(nova::XorOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    Value lhs = args[0];
+    Value rhs = args[1];
+    Location loc = op.getLoc();
+
+    if (isa<FloatType>(lhs.getType())) {
+      Value zero = builder->create<arith::ConstantFloatOp>(
+          loc, cast<FloatType>(lhs.getType()),
+          APFloat::getZero(cast<FloatType>(lhs.getType()).getFloatSemantics()));
+      lhs = builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::UNE, lhs,
+                                           zero);
+    }
+    if (isa<FloatType>(rhs.getType())) {
+      Value zero = builder->create<arith::ConstantFloatOp>(
+          loc, cast<FloatType>(rhs.getType()),
+          APFloat::getZero(cast<FloatType>(rhs.getType()).getFloatSemantics()));
+      rhs = builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::UNE, rhs,
+                                           zero);
+    }
+
+    Value res = builder->create<arith::XOrIOp>(loc, lhs, rhs);
+    return res;
+  }
+
+  // not operation
+  static Value mapOpImpl(nova::NotOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    Value input = args[0];
+    Location loc = op.getLoc();
+    Type inputType = input.getType();
+
+    if (auto integerType = dyn_cast<IntegerType>(inputType)) {
+      Value zero =
+          builder->create<arith::ConstantIntOp>(loc, 0, integerType.getWidth());
+      return builder->create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                            input, zero);
+
+    } else if (auto floatType = dyn_cast<FloatType>(inputType)) {
+      APFloat zeroVal(floatType.getFloatSemantics(), 0);
+      Value zeroConstant =
+          builder->create<arith::ConstantFloatOp>(loc, floatType, zeroVal);
+      return builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::OEQ,
+                                            input, zeroConstant);
+    }
+    return nullptr;
+  }
   // Compare operation
   static Value mapOpImpl(nova::CompareOp op, Type resultType,
                          ArrayRef<Value> args, OpBuilder *builder) {
@@ -749,8 +887,8 @@ public:
                                     ValueRange{emptyTensorMax})
             .result();
 
-    // We need to reduce along the arg-max axis, with parallel operations along
-    // the rest.
+    // We need to reduce along the arg-max axis, with parallel operations
+    // along the rest.
     SmallVector<utils::IteratorType, 4> iteratorTypes;
     iteratorTypes.resize(inputTy.getRank(), utils::IteratorType::parallel);
     iteratorTypes[axis] = utils::IteratorType::reduction;
@@ -1439,7 +1577,14 @@ void populateNovaToLinalgPatternsTemplate(RewritePatternSet &patterns) {
                NovaToLinalgElementwiseConverter<nova::AsinhOp>,
                NovaToLinalgElementwiseConverter<nova::AcoshOp>,
                NovaToLinalgElementwiseConverter<nova::AtanhOp>,
+               NovaToLinalgElementwiseConverter<nova::SinOp>,
+               NovaToLinalgElementwiseConverter<nova::CosOp>,
                NovaToLinalgElementwiseConverter<nova::CompareOp>,
+               NovaToLinalgElementwiseConverter<nova::NotOp>,
+               NovaToLinalgElementwiseConverter<nova::AndOp>,
+               NovaToLinalgElementwiseConverter<nova::OrOp>,
+               NovaToLinalgElementwiseConverter<nova::XorOp>,
+               NovaToLinalgElementwiseConverter<nova::PowOp>,
                NovaToLinalgElementwiseConverter<nova::SignOp>, ArgMinConverter,
                ArgMaxConverter, ReduceOpConverter, AdamOpConverter>(
       patterns.getContext());
