@@ -473,8 +473,26 @@ struct NovaOpTosaOp {
         dimensions.push_back(i);
       }
     }
-    return builder->create<nova::ReduceOp>(op.getLoc(), rk, abs, resultType,
+    // Determine scalar type
+    auto finalResultType = llvm::cast<RankedTensorType>(resultType);
+    auto scalarType = RankedTensorType::get({}, finalResultType.getElementType(), 
+                                            finalResultType.getEncoding());
+
+    // Reduce to scalar
+    Value reducedLoss = builder->create<nova::ReduceOp>(op.getLoc(), rk, abs, scalarType,
                                            false, dimensions);
+
+    // Reshape to {1}
+    llvm::SmallVector<int64_t> newShape = {1};
+    auto shapeAttrType = RankedTensorType::get({1}, builder->getIndexType());
+    auto shapeAttr = DenseIntElementsAttr::get(shapeAttrType, newShape);
+    
+    Value shapeConst = builder->create<tosa::ConstShapeOp>(
+        op.getLoc(),
+        mlir::tosa::shapeType::get(builder->getContext(), 1),
+        shapeAttr);
+        
+    return builder->create<tosa::ReshapeOp>(op.getLoc(), resultType, reducedLoss, shapeConst);
   }
   // CCE lowering pattern
   static Value mappingtosa(nova::CceOp op, Type resultType, ValueRange input,
@@ -726,10 +744,28 @@ struct NovaOpTosaOp {
     for (int64_t i = 0; i < probsType.getRank(); ++i)
       dimensions.push_back(i);
 
-    Value loss = builder->create<nova::ReduceOp>(op.getLoc(), rk, negLogProbs,
-                                                 resultType, false, dimensions);
+    // Determine the scalar type based on the result type
+    auto finalResultType = llvm::cast<RankedTensorType>(resultType);
+    auto scalarType = RankedTensorType::get({}, finalResultType.getElementType(), 
+                                            finalResultType.getEncoding());
+    
+    // Perform reduction to scalar
+    Value reducedLoss = builder->create<nova::ReduceOp>(op.getLoc(), rk, negLogProbs,
+                                                 scalarType, false, dimensions);
 
-    return loss;
+    // Reshape scalar to 1D tensor (as expected by the new return type)
+    llvm::SmallVector<int64_t> newShape = {1};
+    auto shapeAttrType = RankedTensorType::get({1}, builder->getIndexType());
+    auto shapeAttr = DenseIntElementsAttr::get(shapeAttrType, newShape);
+    
+    Value shapeConst = builder->create<tosa::ConstShapeOp>(
+        op.getLoc(),
+        mlir::tosa::shapeType::get(builder->getContext(), 1),
+        shapeAttr);
+        
+    Value finalLoss = builder->create<tosa::ReshapeOp>(op.getLoc(), resultType, reducedLoss, shapeConst);
+
+    return finalLoss;
   }
   template <typename OpTy>
   static Value maptop(OpTy op, Type resultType, ValueRange input,

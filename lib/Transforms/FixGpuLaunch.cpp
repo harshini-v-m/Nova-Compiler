@@ -548,6 +548,7 @@ public:
     patterns.add<ConvertGpuAllocToCall>(module.getContext());
     patterns.add<ConvertGpuMemcpyToCall>(module.getContext());
     patterns.add<ConvertGpuDeallocToCall>(module.getContext());
+    patterns.add<ConvertGpuMemsetToCall>(module.getContext());
     patterns.add<FixHostGpuAccess>(module.getContext());
     patterns.add<FixHostGpuStore>(module.getContext());
 

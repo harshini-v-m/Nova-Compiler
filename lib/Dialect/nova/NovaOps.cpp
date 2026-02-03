@@ -1647,7 +1647,7 @@ SceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   }
 
   auto outType = RankedTensorType::get(
-      {}, outElemTy,
+      {1}, outElemTy,
       getBinaryResultEncoding(logitsType.getEncoding(),
                               targetsType.getEncoding(), context));
 
@@ -1703,7 +1703,7 @@ MseOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   }
 
   auto outType = RankedTensorType::get(
-      {}, outElemTy,
+      {1}, outElemTy,
       getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
                               context));
 
