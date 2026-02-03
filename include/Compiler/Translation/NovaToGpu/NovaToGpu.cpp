@@ -159,8 +159,7 @@ public:
     // Initialize accumulator
     Value accumulator = initialValue;
 
-    // 1. Flatten the input using reinterpret_cast to bypass layout checks
-    // First, convert the input tensor to a memref so we can use memref ops
+    // 1. Convert the input tensor to a memref so we can use memref ops
     auto inputMemRefType =
         MemRefType::get(inputType.getShape(), inputType.getElementType(),
                         MemRefLayoutAttrInterface{}, inputType.getEncoding());
@@ -168,15 +167,6 @@ public:
     Value inputMemRef =
         rewriter.create<bufferization::ToBufferOp>(loc, inputMemRefType, input)
             .getResult();
-
-    auto flatMemRefType =
-        MemRefType::get({numElements}, inputType.getElementType(),
-                        MemRefLayoutAttrInterface{}, inputType.getEncoding());
-
-    Value flatInput = rewriter.create<memref::ReinterpretCastOp>(
-        loc, flatMemRefType, inputMemRef, ValueRange{}, ValueRange{},
-        ValueRange{}, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{numElements},
-        ArrayRef<int64_t>{1});
 
     // Loop over elements: for (i = globalId; i < numElements; i += stride)
     Value lowerBound = globalId;
@@ -195,9 +185,23 @@ public:
       Value idx = loop.getInductionVar();
       Value currentAcc = loop.getRegionIterArgs()[0];
 
-      // 2. Load directly using linear index (No Div/Mod needed!)
-      Value val =
-          rewriter.create<memref::LoadOp>(loc, flatInput, ValueRange{idx});
+      // 2. Delinearization index calculation
+      auto shape = inputType.getShape();
+      int64_t rank = shape.size();
+      SmallVector<Value> indices(rank);
+      Value rem = idx;
+
+      for (int i = rank - 1; i >= 0; --i) {
+        Value dimSize = rewriter.create<arith::ConstantIndexOp>(loc, shape[i]);
+        if (i > 0) {
+          indices[i] = rewriter.create<arith::RemUIOp>(loc, rem, dimSize);
+          rem = rewriter.create<arith::DivUIOp>(loc, rem, dimSize);
+        } else {
+          indices[i] = rem;
+        }
+      }
+
+      Value val = rewriter.create<memref::LoadOp>(loc, inputMemRef, indices);
 
       Value newAcc;
       switch (kind) {

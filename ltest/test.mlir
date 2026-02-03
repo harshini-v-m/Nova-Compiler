@@ -1,8 +1,6 @@
-module {
-
-  func.func @sce_3d_2d(%logits: tensor<2x4x10xf32,#nova.device<"1">>, %target: tensor<2x4xi32,#nova.device<"1">>) -> tensor<f32,#nova.device<"1">> {
-    %0 = nova.sce %logits, %target : tensor<2x4x10xf32,#nova.device<"1">>, tensor<2x4xi32,#nova.device<"1">>
-    return %0 : tensor<f32,#nova.device<"1">>
+ module {
+   func.func @main(%arg0: tensor<1x4xf32, #nova.device<"1">>) -> tensor<f32, #nova.device<"1">> attributes {llvm.emit_c_interface} {
+     %0 = nova.mse %arg0, %arg0 : tensor<1x4xf32, #nova.device<"1">>, tensor<1x4xf32, #nova.device<"1">>
+    return %0 : tensor<f32, #nova.device<"1">>
   }
-
-}
+ }
