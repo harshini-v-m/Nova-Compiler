@@ -2,7 +2,6 @@
 
 add_mlir_library(MLIRNovaToTosaTransforms
   NovaToTosa.cpp
-  TNovaToTosa.cpp
   NovaToTosa.h
 
   DEPENDS
