@@ -36,25 +36,42 @@ struct AffineScalarizeAccumulatorPass
   }
 
   bool shouldScalarize(AffineForOp forOp) {
-    // Pattern: Find load-compute-store where load and store access the same location
     auto &bodyOps = forOp.getBody()->getOperations();
     if (bodyOps.empty()) return false;
     
-    AffineLoadOp loadOp = nullptr;
+    // Find the last store
     AffineStoreOp storeOp = nullptr;
+    for (auto &op : llvm::reverse(bodyOps)) {
+      if (auto store = dyn_cast<AffineStoreOp>(op)) {
+        storeOp = store;
+        break;
+      }
+    }
+    if (!storeOp) return false;
     
+    // Find matching load to the same location
+    AffineLoadOp loadOp = nullptr;
     for (auto &op : bodyOps) {
       if (auto load = dyn_cast<AffineLoadOp>(op)) {
-        if (!loadOp) loadOp = load;  // Take first load
-      }
-      if (auto store = dyn_cast<AffineStoreOp>(op)) {
-        storeOp = store;  // Take last store
+        if (load.getMemRef() == storeOp.getMemRef() && 
+            load.getIndices().size() == storeOp.getIndices().size()) {
+          // Check if indices match exactly
+          bool indicesMatch = true;
+          for (auto zip : llvm::zip(load.getIndices(), storeOp.getIndices())) {
+            if (std::get<0>(zip) != std::get<1>(zip)) {
+              indicesMatch = false;
+              break;
+            }
+          }
+          if (indicesMatch) {
+            loadOp = load;
+            break;
+          }
+        }
       }
     }
     
-    if (!loadOp || !storeOp) return false;
-    if (loadOp.getMemRef() != storeOp.getMemRef()) return false;
-    if (loadOp.getIndices().size() != storeOp.getIndices().size()) return false;
+    if (!loadOp) return false;
     
     // Check indices are loop-invariant
     Value loopIV = forOp.getInductionVar();
@@ -62,15 +79,23 @@ struct AffineScalarizeAccumulatorPass
       if (idx == loopIV) return false;
     }
     
-    // Check for init store before loop
+    // Check for init store before loop (scanning backwards)
     Operation *prevOp = forOp->getPrevNode();
     while (prevOp) {
       if (auto store = dyn_cast<AffineStoreOp>(prevOp)) {
         if (store.getMemRef() == loadOp.getMemRef() &&
             store.getIndices().size() == loadOp.getIndices().size()) {
-          return true;  // Found the pattern!
+          bool indicesMatch = true;
+          for (auto zip : llvm::zip(store.getIndices(), loadOp.getIndices())) {
+            if (std::get<0>(zip) != std::get<1>(zip)) {
+              indicesMatch = false;
+              break;
+            }
+          }
+          if (indicesMatch) return true;
         }
       }
+      if (prevOp->getBlock() != forOp->getBlock()) break;
       prevOp = prevOp->getPrevNode();
     }
     
@@ -80,16 +105,34 @@ struct AffineScalarizeAccumulatorPass
   void scalarizeLoop(AffineForOp forOp) {
     auto &bodyOps = forOp.getBody()->getOperations();
     
-    // Find load, store, and init
-    AffineLoadOp loadOp = nullptr;
+    // Find last store
     AffineStoreOp storeOp = nullptr;
-    
-    for (auto &op : bodyOps) {
-      if (auto load = dyn_cast<AffineLoadOp>(op)) {
-        if (!loadOp) loadOp = load;
-      }
+    for (auto &op : llvm::reverse(bodyOps)) {
       if (auto store = dyn_cast<AffineStoreOp>(op)) {
         storeOp = store;
+        break;
+      }
+    }
+    if (!storeOp) return;
+
+    // Find matching load
+    AffineLoadOp loadOp = nullptr;
+    for (auto &op : bodyOps) {
+      if (auto load = dyn_cast<AffineLoadOp>(op)) {
+        if (load.getMemRef() == storeOp.getMemRef() && 
+            load.getIndices().size() == storeOp.getIndices().size()) {
+          bool indicesMatch = true;
+          for (auto zip : llvm::zip(load.getIndices(), storeOp.getIndices())) {
+            if (std::get<0>(zip) != std::get<1>(zip)) {
+              indicesMatch = false;
+              break;
+            }
+          }
+          if (indicesMatch) {
+            loadOp = load;
+            break;
+          }
+        }
       }
     }
     
@@ -98,11 +141,22 @@ struct AffineScalarizeAccumulatorPass
     Operation *prevOp = forOp->getPrevNode();
     while (prevOp) {
       if (auto store = dyn_cast<AffineStoreOp>(prevOp)) {
-        if (store.getMemRef() == loadOp.getMemRef()) {
-          initStore = store;
-          break;
+        if (store.getMemRef() == loadOp.getMemRef() && 
+            store.getIndices().size() == loadOp.getIndices().size()) {
+          bool indicesMatch = true;
+          for (auto zip : llvm::zip(store.getIndices(), loadOp.getIndices())) {
+            if (std::get<0>(zip) != std::get<1>(zip)) {
+              indicesMatch = false;
+              break;
+            }
+          }
+          if (indicesMatch) {
+            initStore = store;
+            break;
+          }
         }
       }
+      if (prevOp->getBlock() != forOp->getBlock()) break;
       prevOp = prevOp->getPrevNode();
     }
     
@@ -111,7 +165,6 @@ struct AffineScalarizeAccumulatorPass
     OpBuilder builder(forOp);
     Location loc = forOp.getLoc();
     Value initVal = initStore.getValueToStore();
-    Type elementType = initVal.getType();
     
     // Create new loop with iter_args using the simple integer bounds builder
     auto newForOp = builder.create<AffineForOp>(
@@ -146,7 +199,8 @@ struct AffineScalarizeAccumulatorPass
     // Store final result after loop
     builder.setInsertionPointAfter(newForOp);
     builder.create<AffineStoreOp>(
-        loc, newForOp.getResult(0), storeOp.getMemRef(), storeOp.getIndices());
+        loc, newForOp.getResult(0), storeOp.getMemRef(), 
+        storeOp.getAffineMap(), storeOp.getMapOperands());
     
     // Erase old operations
     forOp.erase();
