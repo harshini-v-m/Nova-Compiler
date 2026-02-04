@@ -333,6 +333,7 @@ def Nova_SqrtOp : Nova_UnaryOp<"sqrt", [Pure,DeclareOpInterfaceMethods<InferType
   let extraClassDeclaration = [{
   }];
 }
+
 def Nova_RsqrtOp : Nova_UnaryOp<"rsqrt", [Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let arguments = (ins Nova_Tensor:$input);
   let results = (outs Nova_Tensor:$output);
@@ -893,6 +894,7 @@ def Nova_ScatterAddOp : Op<Nova_Dialect, "scatter_add", [Pure, DeclareOpInterfac
   let results = (outs Nova_Tensor:$output);
   let assemblyFormat = "$input `,` $indices `,` $src attr-dict `:` type($input) `,` type($indices) `,` type($src)";
 }
+
 /*
 def Nova_ConvolutionOp : Op<Nova_Dialect, "convolution", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Convolution operation with padding and stride";
@@ -940,4 +942,19 @@ def Nova_ConvolutionOp : Op<Nova_Dialect, "convolution", [Pure, DeclareOpInterfa
 
   let hasVerifier=1;
 }*/
+def Nova_ReshapeOp : Op<Nova_Dialect, "reshape", [Pure]> {
+  let summary = "Reshape operation";
+  let description = [{
+    Reshapes the input tensor to a new shape.
+    Example:
+      %result = nova.reshape %input : (tensor<4x4xf32>) -> tensor<2x8xf32>
+  }];
+
+  let arguments = (ins Nova_Tensor:$input);
+  let results = (outs Nova_Tensor:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
 #endif // NOVA_OPS
