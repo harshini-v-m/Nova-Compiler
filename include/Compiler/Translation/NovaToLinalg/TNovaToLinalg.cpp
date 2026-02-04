@@ -213,6 +213,131 @@ private:
                          OpBuilder *builder) {
     return nullptr;
   }
+  // add operation
+  static Value mapOpImpl(nova::AddOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<arith::AddFOp>(op.getLoc(), args[0], args[1]);
+    if (isa<IntegerType>(resultType))
+      return builder->create<arith::AddIOp>(op.getLoc(), args[0], args[1]);
+    return nullptr;
+  }
+  // sub operation
+  static Value mapOpImpl(nova::SubOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<arith::SubFOp>(op.getLoc(), args[0], args[1]);
+    if (isa<IntegerType>(resultType))
+      return builder->create<arith::SubIOp>(op.getLoc(), args[0], args[1]);
+    return nullptr;
+  }
+  // mul operation
+  static Value mapOpImpl(nova::MulOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<arith::MulFOp>(op.getLoc(), args[0], args[1]);
+    if (isa<IntegerType>(resultType))
+      return builder->create<arith::MulIOp>(op.getLoc(), args[0], args[1]);
+    return nullptr;
+  }
+  // div operation
+  static Value mapOpImpl(nova::DivOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<arith::DivFOp>(op.getLoc(), args[0], args[1]);
+    if (isa<IntegerType>(resultType))
+      return builder->create<arith::DivSIOp>(op.getLoc(), args[0], args[1]);
+    return nullptr;
+  }
+  // max operation
+  static Value mapOpImpl(MaxOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<arith::MaximumFOp>(op.getLoc(), args[0], args[1]);
+    if (isa<IntegerType>(resultType))
+      return builder->create<arith::MaxSIOp>(op.getLoc(), args[0], args[1]);
+    return nullptr;
+  }
+  // min operation
+  static Value mapOpImpl(MinOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<arith::MinimumFOp>(op.getLoc(), args[0], args[1]);
+    if (isa<IntegerType>(resultType))
+      return builder->create<arith::MinSIOp>(op.getLoc(), args[0], args[1]);
+    return nullptr;
+  }
+  // abs operation
+  static Value mapOpImpl(nova::AbsOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<math::AbsFOp>(op.getLoc(), args[0]);
+    if (isa<IntegerType>(resultType))
+      return builder->create<math::AbsIOp>(op.getLoc(), args[0]);
+    return nullptr;
+  }
+  // log operation
+  static Value mapOpImpl(nova::LogOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<math::LogOp>(op.getLoc(), args[0]);
+    return nullptr;
+  }
+  // exp operation
+  static Value mapOpImpl(nova::ExpOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<math::ExpOp>(op.getLoc(), args[0]);
+    return nullptr;
+  }
+  // rsqrt operation
+  static Value mapOpImpl(RsqrtOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<math::RsqrtOp>(op.getLoc(), args[0]);
+    return nullptr;
+  }
+  // square operation
+  static Value mapOpImpl(nova::SquareOp op, Type resultType,
+                         ArrayRef<Value> args, OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<arith::MulFOp>(op.getLoc(), args[0], args[0]);
+    if (isa<IntegerType>(resultType))
+      return builder->create<arith::MulIOp>(op.getLoc(), args[0], args[0]);
+    return nullptr;
+  }
+  // neg operation
+  static Value mapOpImpl(nova::NegOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<arith::NegFOp>(op.getLoc(), args[0]);
+    return nullptr;
+  }
+  // tanh operation
+  static Value mapOpImpl(nova::TanhOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<math::TanhOp>(op.getLoc(), args[0]);
+    return nullptr;
+  }
+  // sqrt operation
+  static Value mapOpImpl(nova::SqrtOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<math::SqrtOp>(op.getLoc(), args[0]);
+    return nullptr;
+  }
+  // reciprocal operation
+  static Value mapOpImpl(nova::ReciprocalOp op, Type resultType,
+                         ArrayRef<Value> args, OpBuilder *builder) {
+    if (isa<FloatType>(resultType)) {
+      Value one = builder->create<arith::ConstantFloatOp>(
+          op.getLoc(), cast<FloatType>(resultType), APFloat(1.0f));
+      return builder->create<arith::DivFOp>(op.getLoc(), one, args[0]);
+    }
+    return nullptr;
+  }
+
   // mod operation
   static Value mapOpImpl(nova::ModOp op, Type resultType, ArrayRef<Value> args,
                          OpBuilder *builder) {
@@ -1339,11 +1464,11 @@ public:
   }
 };
 
-struct AdamOpConverter : public OpConversionPattern<nova::AdamOp> {
-  using OpConversionPattern<nova::AdamOp>::OpConversionPattern;
+struct AdamOpConverter : public OpConversionPattern<::mlir::nova::AdamOp> {
+  using OpConversionPattern<::mlir::nova::AdamOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(nova::AdamOp op, OpAdaptor adaptor,
+  matchAndRewrite(::mlir::nova::AdamOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
 
@@ -1506,6 +1631,34 @@ public:
   }
 };
 
+struct ReshapeOpConverter : public OpConversionPattern<nova::ReshapeOp> {
+  using OpConversionPattern<nova::ReshapeOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::ReshapeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto input = adaptor.getInput();
+    auto resultType = cast<RankedTensorType>(op.getType());
+    Location loc = op.getLoc();
+
+    // Create a constant tensor for the output shape
+    auto resultShape = resultType.getShape();
+    auto shapeType =
+        RankedTensorType::get({resultType.getRank()}, rewriter.getIndexType());
+
+    // Convert shape to attribute
+    auto shapeAttr = rewriter.getIndexTensorAttr(resultShape);
+    auto shapeConst =
+        rewriter.create<arith::ConstantOp>(loc, shapeType, shapeAttr);
+
+    // Create tensor.reshape
+    // resultType already contains the nova.device encoding if specified in Nova
+    rewriter.replaceOpWithNewOp<tensor::ReshapeOp>(op, resultType, input,
+                                                   shapeConst);
+    return success();
+  }
+};
+
 //---------------=-------------------=------------------=---------------------
 // Pass Definition
 
@@ -1564,30 +1717,45 @@ void regsiterNovaToLinalgLoweringTemplatePass() {
 
 void populateNovaToLinalgPatternsTemplate(RewritePatternSet &patterns) {
   // Use generic converters for pointwise ops
-  patterns.add<NovaToLinalgElementwiseConverter<nova::ModOp>,
-               NovaToLinalgElementwiseConverter<nova::Exp2Op>,
-               NovaToLinalgElementwiseConverter<nova::Log2Op>,
-               NovaToLinalgElementwiseConverter<nova::Log10Op>,
-               NovaToLinalgElementwiseConverter<nova::TanOp>,
-               NovaToLinalgElementwiseConverter<nova::AsinOp>,
-               NovaToLinalgElementwiseConverter<nova::AcosOp>,
-               NovaToLinalgElementwiseConverter<nova::AtanOp>,
-               NovaToLinalgElementwiseConverter<nova::SinhOp>,
-               NovaToLinalgElementwiseConverter<nova::CoshOp>,
-               NovaToLinalgElementwiseConverter<nova::AsinhOp>,
-               NovaToLinalgElementwiseConverter<nova::AcoshOp>,
-               NovaToLinalgElementwiseConverter<nova::AtanhOp>,
-               NovaToLinalgElementwiseConverter<nova::SinOp>,
-               NovaToLinalgElementwiseConverter<nova::CosOp>,
-               NovaToLinalgElementwiseConverter<nova::CompareOp>,
-               NovaToLinalgElementwiseConverter<nova::NotOp>,
-               NovaToLinalgElementwiseConverter<nova::AndOp>,
-               NovaToLinalgElementwiseConverter<nova::OrOp>,
-               NovaToLinalgElementwiseConverter<nova::XorOp>,
-               NovaToLinalgElementwiseConverter<nova::PowOp>,
-               NovaToLinalgElementwiseConverter<nova::SignOp>, ArgMinConverter,
-               ArgMaxConverter, ReduceOpConverter, AdamOpConverter>(
-      patterns.getContext());
+  patterns.add<NovaToLinalgElementwiseConverter<ModOp>,
+               NovaToLinalgElementwiseConverter<Exp2Op>,
+               NovaToLinalgElementwiseConverter<Log2Op>,
+               NovaToLinalgElementwiseConverter<Log10Op>,
+               NovaToLinalgElementwiseConverter<TanOp>,
+               NovaToLinalgElementwiseConverter<AsinOp>,
+               NovaToLinalgElementwiseConverter<AcosOp>,
+               NovaToLinalgElementwiseConverter<AtanOp>,
+               NovaToLinalgElementwiseConverter<SinhOp>,
+               NovaToLinalgElementwiseConverter<CoshOp>,
+               NovaToLinalgElementwiseConverter<AsinhOp>,
+               NovaToLinalgElementwiseConverter<AcoshOp>,
+               NovaToLinalgElementwiseConverter<AtanhOp>,
+               NovaToLinalgElementwiseConverter<SinOp>,
+               NovaToLinalgElementwiseConverter<CosOp>,
+               NovaToLinalgElementwiseConverter<CompareOp>,
+               NovaToLinalgElementwiseConverter<NotOp>,
+               NovaToLinalgElementwiseConverter<AndOp>,
+               NovaToLinalgElementwiseConverter<OrOp>,
+               NovaToLinalgElementwiseConverter<XorOp>,
+               NovaToLinalgElementwiseConverter<PowOp>,
+               NovaToLinalgElementwiseConverter<SignOp>,
+               NovaToLinalgElementwiseConverter<AddOp>,
+               NovaToLinalgElementwiseConverter<SubOp>,
+               NovaToLinalgElementwiseConverter<MulOp>,
+               NovaToLinalgElementwiseConverter<DivOp>,
+               NovaToLinalgElementwiseConverter<MaxOp>,
+               NovaToLinalgElementwiseConverter<MinOp>,
+               NovaToLinalgElementwiseConverter<AbsOp>,
+               NovaToLinalgElementwiseConverter<LogOp>,
+               NovaToLinalgElementwiseConverter<ExpOp>,
+               NovaToLinalgElementwiseConverter<nova::RsqrtOp>,
+               NovaToLinalgElementwiseConverter<SquareOp>,
+               NovaToLinalgElementwiseConverter<NegOp>,
+               NovaToLinalgElementwiseConverter<TanhOp>,
+               NovaToLinalgElementwiseConverter<SqrtOp>,
+               NovaToLinalgElementwiseConverter<ReciprocalOp>, ArgMinConverter,
+               ArgMaxConverter, ReduceOpConverter, AdamOpConverter,
+               ReshapeOpConverter>(patterns.getContext());
 }
 
 } // namespace nova
