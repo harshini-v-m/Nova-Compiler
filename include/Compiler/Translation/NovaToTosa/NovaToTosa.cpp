@@ -328,7 +328,7 @@ struct NovaOpTosaOp {
     auto reducemeanres = builder->create<nova::ReduceOp>(
         op.getLoc(), rk, sumterms, scalarType, false, dimensions);
 
-    // step9:create -1 constant tensor (scalar)
+    // restore -1 constant for BCE/CCE
     auto constType =
         mlir::RankedTensorType::get({}, targetElemType, v_type.getEncoding());
     auto minus1Attr = DenseElementsAttr::get(

@@ -939,7 +939,7 @@ LogicalResult ArgmaxOp::inferReturnTypes(
 
   if (resultShape.empty() && !keepDims) {
     inferredReturnTypes.push_back(RankedTensorType::get(
-        {}, IntegerType::get(context, 32),
+        {1}, IntegerType::get(context, 32),
         getUnaryResultEncoding(inputType.getEncoding(), context)));
   } else {
     inferredReturnTypes.push_back(RankedTensorType::get(
@@ -1020,7 +1020,7 @@ LogicalResult ArgMinOp::inferReturnTypes(
 
   if (resultShape.empty() && !keepDims) {
     inferredReturnTypes.push_back(RankedTensorType::get(
-        {}, IntegerType::get(context, 32),
+        {1}, IntegerType::get(context, 32),
         getUnaryResultEncoding(inputType.getEncoding(), context)));
   } else {
     inferredReturnTypes.push_back(RankedTensorType::get(
@@ -1395,7 +1395,7 @@ LogicalResult ReduceOp::inferReturnTypes(
 
   if (resultShape.empty() && !keepDims) {
     inferredReturnTypes.push_back(RankedTensorType::get(
-        {}, elementType,
+        {1}, elementType,
         getUnaryResultEncoding(inputType.getEncoding(), context)));
   } else {
     inferredReturnTypes.push_back(RankedTensorType::get(
@@ -1486,8 +1486,7 @@ LogicalResult ReduceOp::verify() {
         axisVal += inputRank;
       reduceDimension.insert(axisVal);
     }
-
-    for (int64_t i = 0; i < inputRank; ++i) {
+for (int64_t i = 0; i < inputRank; ++i) {
       if (reduceDimension.contains(i)) {
         if (getKeepdims()) {
           expectedShape.push_back(1);
@@ -1496,12 +1495,17 @@ LogicalResult ReduceOp::verify() {
         expectedShape.push_back(inputType.getDimSize(i));
       }
     }
+    if (expectedShape.empty() && !getKeepdims()) {
+      expectedShape.push_back(1);
+    }
   } else {
     // No Dimension specified - reduce all dimensions
-    if (getKeepdims()) {
+    // full reduction case - if keepdims is false, result is rank-1 size-1
+    if (!getKeepdims()) {
+      expectedShape.assign(1, 1);
+    } else {
       expectedShape.assign(inputRank, 1);
     }
-    // else expectedShape is empty (scalar result)
   }
 
   auto outputShape = outputType.getShape();
