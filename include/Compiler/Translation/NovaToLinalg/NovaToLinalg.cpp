@@ -406,11 +406,8 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
     auto genericOp = rewriter.create<linalg::GenericOp>(
         loc, TypeRange{resultType}, indices, emptyTensor, indexingMaps,
         iteratorTypes, [&](OpBuilder &b, Location l, ValueRange args) {
-          // Build extraction indices from loop induction variables (IndexOps)
-          SmallVector<Value> extractionIndices;
-          for (int64_t i = 0; i < resultType.getRank(); ++i) {
-            extractionIndices.push_back(b.create<linalg::IndexOp>(l, i));
-          }
+          auto inputRank = cast<RankedTensorType>(input.getType()).getRank();
+          int64_t axis = op.getAxis();
 
           Value indexVal = args[0];
           // If indices element type is float, cast to i32 first
@@ -421,8 +418,17 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
           Value classIdx =
               b.create<arith::IndexCastOp>(l, b.getIndexType(), indexVal);
 
-          // Append the gathered class index
-          extractionIndices.push_back(classIdx);
+          // Build extraction indices from loop induction variables (IndexOps)
+          SmallVector<Value> extractionIndices;
+          int resultIdx = 0;
+          for (int64_t i = 0; i < inputRank; ++i) {
+            if (i == axis) {
+              extractionIndices.push_back(classIdx);
+            } else {
+              extractionIndices.push_back(
+                  b.create<linalg::IndexOp>(l, resultIdx++));
+            }
+          }
 
           Value extracted =
               b.create<tensor::ExtractOp>(l, input, extractionIndices);
@@ -583,42 +589,6 @@ struct NovaToDeviceOpLowering : public OpConversionPattern<nova::ToDeviceOp> {
     return success();
   }
 };
-struct NovaDivOpLowering : public OpConversionPattern<nova::DivOp> {
-  using OpConversionPattern<nova::DivOp>::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(nova::DivOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    RankedTensorType resulttype = op.getResult().getType();
-    ValueRange input = op.getOperands();
-
-    auto output = rewriter.create<tensor::EmptyOp>(
-        op.getLoc(), resulttype.getShape(), resulttype.getElementType(),
-        resulttype.getEncoding());
-    auto divop = rewriter.create<linalg::DivOp>(op.getLoc(), resulttype, input,
-                                                ValueRange{output});
-    rewriter.replaceOp(op, divop.getResults());
-    return success();
-  }
-};
-struct NovaMulOpLowering : public OpConversionPattern<nova::MulOp> {
-  using OpConversionPattern<nova::MulOp>::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(nova::MulOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    ValueRange inputs = op.getOperands();
-    RankedTensorType resulttype = cast<mlir::RankedTensorType>(op.getType());
-    if (!resulttype) {
-      return failure();
-    }
-    auto output = rewriter.create<tensor::EmptyOp>(
-        op.getLoc(), resulttype.getShape(), resulttype.getElementType(),
-        resulttype.getEncoding());
-    auto mulop = rewriter.create<linalg::MulOp>(op.getLoc(), resulttype, inputs,
-                                                ValueRange{output});
-    rewriter.replaceOp(op, mulop);
-    return success();
-  }
-};
 struct NovaRandomOpLowering : public OpConversionPattern<nova::Rndm2DOp> {
   using OpConversionPattern<nova::Rndm2DOp>::OpConversionPattern;
   LogicalResult
@@ -650,7 +620,7 @@ void populateNovaToLinalgPatterns(RewritePatternSet &patterns) {
   patterns.add<NovaMatmulOpLowering, NovaBroadcastInDimOpLowering,
                NovaTransposeOpLowering, NovaToDeviceOpLowering,
                NovaScatterAddOpLowering, NovaGatherOpLowering,
-               NovaDivOpLowering, NovaMulOpLowering>(patterns.getContext());
+               NovaRandomOpLowering>(patterns.getContext());
 }
 } // namespace nova
 } // namespace mlir

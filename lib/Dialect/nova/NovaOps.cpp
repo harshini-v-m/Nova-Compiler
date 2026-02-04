@@ -503,7 +503,7 @@ LogicalResult nova::SqrtOp::inferReturnTypes(
       getUnaryResultEncoding(inputType.getEncoding(), context)));
   return success();
 }
-//rsqrt
+// rsqrt
 LogicalResult nova::RsqrtOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
     DictionaryAttr attrs, OpaqueProperties properties, RegionRange regions,
@@ -1675,7 +1675,7 @@ MaeOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   }
 
   auto outType = RankedTensorType::get(
-      {}, outElemTy,
+      {1}, outElemTy,
       getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
                               context));
 
@@ -1731,7 +1731,7 @@ CceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   }
 
   auto outType = RankedTensorType::get(
-      {}, outElemTy,
+      {1}, outElemTy,
       getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
                               context));
 
@@ -1759,7 +1759,7 @@ BceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   }
 
   auto outType = RankedTensorType::get(
-      {}, outElemTy,
+      {1}, outElemTy,
       getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
                               context));
 
@@ -1901,3 +1901,15 @@ struct SimplifyRedundantToDevice : public OpRewritePattern<ToDeviceOp> {
     return failure();
   }
 };
+
+LogicalResult ReshapeOp::verify() {
+  auto inputType = cast<RankedTensorType>(getInput().getType());
+  auto resultType = cast<RankedTensorType>(getResult().getType());
+
+  if (inputType.getNumElements() != resultType.getNumElements()) {
+    return emitOpError(
+        "input and result must have the same number of elements");
+  }
+
+  return success();
+}
