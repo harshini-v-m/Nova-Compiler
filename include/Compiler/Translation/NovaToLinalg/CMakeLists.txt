@@ -7,12 +7,14 @@ add_mlir_library(MLIRNovaToLinalgTransforms
 
   DEPENDS
   MLIRLinalgDialect
+  MLIRSCFDialect
 
   LINK_LIBS PUBLIC
   MLIRLinalgDialect
   MLIRTensorDialect
   MLIRFuncDialect
   MLIRArithDialect
+  MLIRSCFDialect
   MLIRIR
   MLIRPass
   MLIRTransforms

@@ -1771,34 +1771,6 @@ BceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   return success();
 }
 LogicalResult
-GatherOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
-                           ValueRange operands, DictionaryAttr attributes,
-                           OpaqueProperties properties, RegionRange regions,
-                           llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
-  auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
-  auto indexType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
-  if (!inputType || !indexType)
-    return failure();
-
-  inferredReturnTypes.push_back(
-      RankedTensorType::get(indexType.getShape(), inputType.getElementType(),
-                            inputType.getEncoding()));
-  return success();
-}
-
-LogicalResult ScatterAddOp::inferReturnTypes(
-    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
-    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
-  auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
-  if (!inputType)
-    return failure();
-
-  inferredReturnTypes.push_back(inputType);
-  return success();
-}
-
-LogicalResult
 AdamOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                          ValueRange operands, DictionaryAttr attributes,
                          OpaqueProperties properties, RegionRange regions,
@@ -1917,3 +1889,136 @@ LogicalResult ReshapeOp::verify() {
 
   return success();
 }
+
+// GatherOp
+LogicalResult
+GatherOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
+                           ValueRange operands, DictionaryAttr attributes,
+                           OpaqueProperties properties, RegionRange regions,
+                           llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
+  auto indexType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
+  if (!inputType || !indexType)
+    return failure();
+
+  int64_t inputRank = inputType.getRank();
+  int64_t axis = 0;
+  if (auto axisAttr = llvm::dyn_cast_or_null<IntegerAttr>(attributes.get("axis"))) {
+    axis = axisAttr.getInt();
+  }
+  if (axis < 0)
+    axis += inputRank;
+
+  llvm::SmallVector<int64_t, 4> outputShape;
+  // Dimensions before axis
+  for (int64_t i = 0; i < axis; ++i) {
+    outputShape.push_back(inputType.getDimSize(i));
+  }
+  // Indices dimensions
+  for (int64_t i = 0; i < indexType.getRank(); ++i) {
+    outputShape.push_back(indexType.getDimSize(i));
+  }
+  // Dimensions after axis
+  for (int64_t i = axis + 1; i < inputRank; ++i) {
+    outputShape.push_back(inputType.getDimSize(i));
+  }
+
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(outputShape, inputType.getElementType(),
+                            getBinaryResultEncoding(inputType.getEncoding(),
+                                                    indexType.getEncoding(),
+                                                    context)));
+
+  return success();
+}
+
+LogicalResult GatherOp::verify() {
+  auto inputType = llvm::dyn_cast<RankedTensorType>(getInput().getType());
+  auto indexType = llvm::dyn_cast<RankedTensorType>(getIndices().getType());
+
+  if (!inputType || !indexType)
+    return emitOpError("operands must be ranked tensors");
+
+  int64_t inputRank = inputType.getRank();
+  int64_t axis = getAxis();
+  if (axis < 0)
+    axis += inputRank;
+
+  if (axis < 0 || axis >= inputRank) {
+    return emitOpError("axis ")
+           << getAxis() << " is out of bounds for input rank " << inputRank;
+  }
+
+  if (!indexType.getElementType().isSignlessInteger()) {
+    return emitOpError("indices must be an integer tensor");
+  }
+
+  return success();
+}
+
+OpFoldResult GatherOp::fold(FoldAdaptor adaptor) { return nullptr; }
+
+// ScatterAddOp
+LogicalResult ScatterAddOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
+  auto indexType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
+  auto srcType = llvm::dyn_cast<RankedTensorType>(operands[2].getType());
+  if (!inputType || !indexType || !srcType)
+    return failure();
+  auto encoding = getBinaryResultEncoding(inputType.getEncoding(), 
+                                          srcType.getEncoding(), context);
+  encoding = getBinaryResultEncoding(encoding, indexType.getEncoding(), context);
+
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(inputType.getShape(), inputType.getElementType(),
+                            encoding));
+  return success();
+}
+
+LogicalResult ScatterAddOp::verify() {
+  auto inputType = llvm::dyn_cast<RankedTensorType>(getInput().getType());
+  auto indexType = llvm::dyn_cast<RankedTensorType>(getIndices().getType());
+  auto srcType = llvm::dyn_cast<RankedTensorType>(getSrc().getType());
+
+  if (!inputType || !indexType || !srcType)
+    return emitOpError("operands must be ranked tensors");
+
+  if (inputType.getRank() != srcType.getRank()) {
+    return emitOpError("input and src must have same rank");
+  }
+
+  int64_t inputRank = inputType.getRank();
+  int64_t axis = getAxis();
+  if (axis < 0)
+    axis += inputRank;
+
+  if (axis < 0 || axis >= inputRank) {
+    return emitOpError("axis ")
+           << getAxis() << " is out of bounds for input rank " << inputRank;
+  }
+
+  // Check shapes match except at axis
+  for (int64_t i = 0; i < inputRank; ++i) {
+    if (i == axis) {
+      if (srcType.getDimSize(i) != indexType.getDimSize(0)) {
+         return emitOpError("src dimension at axis must match index size");
+      }
+    } else {
+      if (inputType.getDimSize(i) != srcType.getDimSize(i)) {
+        return emitOpError("input and src shapes must match except at axis");
+      }
+    }
+  }
+
+  if (!indexType.getElementType().isSignlessInteger()) {
+    return emitOpError("indices must be an integer tensor");
+  }
+
+  return success();
+}
+
+OpFoldResult ScatterAddOp::fold(FoldAdaptor adaptor) { return nullptr; }
+

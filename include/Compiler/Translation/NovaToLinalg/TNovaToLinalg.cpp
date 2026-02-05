@@ -10,6 +10,9 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 
 #include "Compiler/Dialect/nova/NovaDialect.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
@@ -1669,9 +1672,10 @@ struct NovaToLinalgLoweringPassTemplate
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaToLinalgLoweringPassTemplate)
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry
-        .insert<linalg::LinalgDialect, tensor::TensorDialect,
-                arith::ArithDialect, tosa::TosaDialect, func::FuncDialect>();
+    registry.insert<linalg::LinalgDialect, tensor::TensorDialect,
+                    arith::ArithDialect, tosa::TosaDialect, func::FuncDialect,
+                    memref::MemRefDialect, bufferization::BufferizationDialect,
+                    scf::SCFDialect>();
   }
 
   StringRef getArgument() const final { return "convert-nova-to-linalg"; }
@@ -1691,6 +1695,9 @@ struct NovaToLinalgLoweringPassTemplate
     target.addLegalDialect<func::FuncDialect>();
     target.addLegalDialect<math::MathDialect>();
     target.addLegalDialect<tosa::TosaDialect>();
+    target.addLegalDialect<mlir::scf::SCFDialect>();
+    target.addLegalDialect<mlir::memref::MemRefDialect>();
+    target.addLegalDialect<mlir::bufferization::BufferizationDialect>();
     target.addIllegalDialect<nova::NovaDialect>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     RewritePatternSet patterns(context);

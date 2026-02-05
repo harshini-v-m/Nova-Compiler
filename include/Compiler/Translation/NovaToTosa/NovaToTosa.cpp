@@ -81,7 +81,7 @@ struct NovaOpTosaOp {
     // Determine scalar type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
     auto scalarType = RankedTensorType::get(
-        {}, finalResultType.getElementType(), finalResultType.getEncoding());
+        {1}, finalResultType.getElementType(), finalResultType.getEncoding());
 
     // Reduce to scalar
     Value reducedLoss = builder->create<nova::ReduceOp>(
@@ -136,7 +136,7 @@ struct NovaOpTosaOp {
     // Determine scalar type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
     auto scalarType = RankedTensorType::get(
-        {}, finalResultType.getElementType(), finalResultType.getEncoding());
+        {1}, finalResultType.getElementType(), finalResultType.getEncoding());
 
     // Reduce to scalar
     Value reducedLoss = builder->create<nova::ReduceOp>(
@@ -230,7 +230,7 @@ struct NovaOpTosaOp {
     // Determine scalar type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
     auto scalarType = RankedTensorType::get(
-        {}, finalResultType.getElementType(), finalResultType.getEncoding());
+        {1}, finalResultType.getElementType(), finalResultType.getEncoding());
 
     auto reducemeanres =
         builder->create<nova::ReduceOp>(op.getLoc(), rk, reduceres, scalarType);
@@ -321,7 +321,7 @@ struct NovaOpTosaOp {
     // Determine scalar type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
     auto scalarType = RankedTensorType::get(
-        {}, finalResultType.getElementType(), finalResultType.getEncoding());
+        {1}, finalResultType.getElementType(), finalResultType.getEncoding());
 
     // reducing along all axis
     auto rk = nova::ReductionKind::MEAN;
@@ -444,7 +444,7 @@ struct NovaOpTosaOp {
     // Determine the scalar type based on the result type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
     auto scalarType = RankedTensorType::get(
-        {}, finalResultType.getElementType(), finalResultType.getEncoding());
+        {1}, finalResultType.getElementType(), finalResultType.getEncoding());
 
     // Perform reduction to scalar
     Value reducedLoss = builder->create<nova::ReduceOp>(

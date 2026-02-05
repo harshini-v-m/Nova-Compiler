@@ -824,7 +824,7 @@ def Nova_Rndm2DOp:Op<Nova_Dialect,"rndm2d",[Pure]>{
   }];
 }
 
-def Nova_AdamOp : Op<Nova_Dialect,"adam",[Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]>{
+def AdamOp : Op<Nova_Dialect,"adam",[Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]>{
   let summary = "Adam optimizer stepping";
   let description = [{
     Implements adam optimizer step 
@@ -875,24 +875,39 @@ def Nova_AdamOp : Op<Nova_Dialect,"adam",[Pure, DeclareOpInterfaceMethods<InferT
   );
   
   let assemblyFormat = [{
-    $param `,` $m `,` $v `,` $grad attr-dict `:` type($param) `,` type($m) `,` type($v) `,` type($grad)
+    $param `,` $m `,` $v `,` $grad attr-dict `:` type($param) `,` type($m) `,` type($v) `,` type($grad) `->` type($new_param) `,` type($new_m) `,` type($new_v)
   }];
 
-   let extraClassDeclaration = [{
+  let extraClassDeclaration = [{
   }];
 }
-def Nova_GatherOp : Op<Nova_Dialect, "gather", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
-  let summary = "Gather operation";
-  let arguments = (ins Nova_Tensor:$input, Nova_Tensor:$indices, I64Attr:$axis);
+def GatherOp : Op<Nova_Dialect, "gather", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Gather Operation";
+  let description = [{The nova gather operation takes an input tensor and extracts slices along the specified `axis` using the provided `indices`}];
+  let arguments = (ins
+    Nova_Tensor:$input,
+    Nova_Tensor:$indices,
+    DefaultValuedAttr<I64Attr, "0">:$axis
+  );
   let results = (outs Nova_Tensor:$output);
-  let assemblyFormat = "$input `,` $indices attr-dict `:` type($input) `,` type($indices)";
+  let hasVerifier = 1;
+  let hasFolder = 1;
+  let assemblyFormat = [{
+    $input ` ` `[` $indices `]` (`axis` `=` $axis^)? attr-dict `:` type($input) `,` type($indices) `->` type($output)
+  }];
 }
 
-def Nova_ScatterAddOp : Op<Nova_Dialect, "scatter_add", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+def ScatterAddOp : Op<Nova_Dialect, "scatter_add", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "ScatterAdd operation";
-  let arguments = (ins Nova_Tensor:$input, Nova_Tensor:$indices, Nova_Tensor:$src, I64Attr:$axis);
+  let arguments = (ins Nova_Tensor:$input, Nova_Tensor:$indices, Nova_Tensor:$src, DefaultValuedAttr<I64Attr, "0">:$axis);
   let results = (outs Nova_Tensor:$output);
-  let assemblyFormat = "$input `,` $indices `,` $src attr-dict `:` type($input) `,` type($indices) `,` type($src)";
+
+  let hasVerifier = 1;
+  let hasFolder = 1;
+
+  let assemblyFormat = [{
+    $input `,` $indices `,` $src (`axis` `=` $axis^)? attr-dict `:` type($input) `,` type($indices) `,` type($src) `->` type($output)
+  }];
 }
 
 /*

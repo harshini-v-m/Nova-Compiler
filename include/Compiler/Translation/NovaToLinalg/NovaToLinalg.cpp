@@ -3,14 +3,21 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 
 #include "Compiler/Dialect/nova/NovaDialect.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
+
+using namespace mlir;
+using namespace mlir::nova;
+using namespace mlir::bufferization;
 
 namespace mlir {
 namespace nova {
@@ -395,22 +402,38 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
         loc, resultType.getShape(), resultType.getElementType(),
         resultType.getEncoding());
 
-    auto indexMap = rewriter.getMultiDimIdentityMap(resultType.getRank());
-    SmallVector<AffineMap> indexingMaps = {indexMap, indexMap};
-    SmallVector<utils::IteratorType> iteratorTypes(
-        resultType.getRank(), utils::IteratorType::parallel);
-
     auto indicesType = cast<RankedTensorType>(indices.getType());
+    int64_t indicesRank = indicesType.getRank();
+    int64_t resRank = resultType.getRank();
+    int64_t axis = op.getAxis();
+    auto inputType = cast<RankedTensorType>(input.getType());
+    int64_t inputRank = inputType.getRank();
+
+    if (axis < 0)
+      axis += inputRank;
+    // Map for indices: (d0, ..., d_{resRank-1}) -> (d_axis, ..., d_{axis + indicesRank - 1})
+    SmallVector<AffineExpr> indicesExprs;
+    for (int i = 0; i < indicesRank; ++i) {
+      indicesExprs.push_back(rewriter.getAffineDimExpr(axis + i));
+    }
+    auto indicesMap = AffineMap::get(resRank, 0, indicesExprs, rewriter.getContext());
+
+    // Map for output is identity
+    auto outMap = rewriter.getMultiDimIdentityMap(resRank);
+
+    SmallVector<AffineMap> indexingMaps;
+    indexingMaps.push_back(indicesMap);
+    indexingMaps.push_back(outMap);
+
+    SmallVector<utils::IteratorType> iteratorTypes(
+        resRank, utils::IteratorType::parallel);
+
     Type indicesElemType = indicesType.getElementType();
 
     auto genericOp = rewriter.create<linalg::GenericOp>(
         loc, TypeRange{resultType}, indices, emptyTensor, indexingMaps,
         iteratorTypes, [&](OpBuilder &b, Location l, ValueRange args) {
-          auto inputRank = cast<RankedTensorType>(input.getType()).getRank();
-          int64_t axis = op.getAxis();
-
           Value indexVal = args[0];
-          // If indices element type is float, cast to i32 first
           if (llvm::isa<FloatType>(indicesElemType)) {
             indexVal = b.create<arith::FPToSIOp>(l, b.getI32Type(), indexVal);
           }
@@ -418,16 +441,17 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
           Value classIdx =
               b.create<arith::IndexCastOp>(l, b.getIndexType(), indexVal);
 
-          // Build extraction indices from loop induction variables (IndexOps)
           SmallVector<Value> extractionIndices;
-          int resultIdx = 0;
-          for (int64_t i = 0; i < inputRank; ++i) {
-            if (i == axis) {
-              extractionIndices.push_back(classIdx);
-            } else {
-              extractionIndices.push_back(
-                  b.create<linalg::IndexOp>(l, resultIdx++));
-            }
+          // Before axis
+          for (int64_t i = 0; i < axis; ++i) {
+            extractionIndices.push_back(b.create<linalg::IndexOp>(l, i));
+          }
+          // At axis
+          extractionIndices.push_back(classIdx);
+          // After axis
+          for (int64_t i = axis + 1; i < inputRank; ++i) {
+            extractionIndices.push_back(
+                b.create<linalg::IndexOp>(l, i + indicesRank - 1));
           }
 
           Value extracted =
@@ -448,58 +472,68 @@ struct NovaScatterAddOpLowering
   matchAndRewrite(nova::ScatterAddOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto resultType = cast<RankedTensorType>(op.getType());
+    auto elementTy = resultType.getElementType();
     auto loc = op.getLoc();
-    Value input = adaptor.getInput(); // self
+    Value input = adaptor.getInput();
     Value indices = adaptor.getIndices();
     Value src = adaptor.getSrc();
+    int64_t axis = op.getAxis();
+    int64_t inputRank = resultType.getRank();
 
-    auto ctx = rewriter.getContext();
-    auto i = rewriter.getAffineDimExpr(0);
-    auto j = rewriter.getAffineDimExpr(1);
-
-    auto mapIndices = AffineMap::get(2, 0, {i}, ctx);
-    auto mapSrc = AffineMap::get(2, 0, {i}, ctx);
-    auto mapInput = AffineMap::get(2, 0, {i, j}, ctx);
-    auto mapResult = AffineMap::get(2, 0, {i, j}, ctx);
-
-    SmallVector<AffineMap> indexingMaps = {mapIndices, mapSrc, mapInput,
-                                           mapResult};
-    SmallVector<utils::IteratorType> iteratorTypes = {
-        utils::IteratorType::parallel, utils::IteratorType::parallel};
+    if (axis < 0)
+      axis += inputRank;
 
     auto indicesType = cast<RankedTensorType>(indices.getType());
-    Type indicesElemType = indicesType.getElementType();
 
-    auto genericOp = rewriter.create<linalg::GenericOp>(
-        loc, TypeRange{resultType}, ValueRange{indices, src, input}, input,
-        indexingMaps, iteratorTypes,
-        [&](OpBuilder &b, Location l, ValueRange args) {
-          // args[0] is index[i]
-          // args[1] is src[i]
-          // args[2] is input[i, j]
+    auto srcType = cast<RankedTensorType>(src.getType());
+    auto srcShape = srcType.getShape();
+    int64_t srcRank = srcType.getRank();
 
-          Value classIdx = b.create<linalg::IndexOp>(l, 1);
+    // 1. Bufferize operands to MemRef
+    auto inputMemType = MemRefType::get(resultType.getShape(), elementTy);
+    auto srcMemType = MemRefType::get(srcType.getShape(), srcType.getElementType());
+    auto indicesMemType = MemRefType::get(indicesType.getShape(), indicesType.getElementType());
 
-          Value indexVal = args[0];
-          // If indices element type is float, cast to i32 first
-          if (llvm::isa<FloatType>(indicesElemType)) {
-            indexVal = b.create<arith::FPToSIOp>(l, b.getI32Type(), indexVal);
+    Value inputMem = rewriter.create<ToBufferOp>(loc, inputMemType, input, /*restrict=*/true).getResult();
+    Value srcMem = rewriter.create<ToBufferOp>(loc, srcMemType, src, /*restrict=*/true).getResult();
+    Value indicesMem = rewriter.create<ToBufferOp>(loc, indicesMemType, indices, /*restrict=*/true).getResult();
+
+    auto zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    // 3. Parallel Loop over ALL dimensions of src
+    SmallVector<Value> lowerBounds(srcRank, zero);
+    SmallVector<Value> upperBounds;
+    for (int64_t i = 0; i < srcRank; ++i) {
+      upperBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, srcShape[i]));
+    }
+    SmallVector<Value> steps(srcRank, one);
+
+    rewriter.create<scf::ParallelOp>(
+        loc, lowerBounds, upperBounds, steps, [&](OpBuilder &b, Location l, ValueRange ivs) {
+          Value updateIdx = ivs[axis];
+
+          // Extract Index
+          Value idxVal = b.create<memref::LoadOp>(l, indicesMem, ValueRange{updateIdx});
+          if (llvm::isa<FloatType>(indicesType.getElementType())) {
+            idxVal = b.create<arith::FPToSIOp>(l, b.getI32Type(), idxVal);
+          }
+          Value targetIdx = b.create<arith::IndexCastOp>(l, b.getIndexType(), idxVal);
+
+          Value val = b.create<memref::LoadOp>(l, srcMem, ivs);
+          
+          SmallVector<Value> dstCoords;
+          for (int64_t d = 0; d < srcRank; ++d) {
+            if (d == axis) dstCoords.push_back(targetIdx);
+            else dstCoords.push_back(ivs[d]);
           }
 
-          Value targetClassIdx =
-              b.create<arith::IndexCastOp>(l, b.getIndexType(), indexVal);
-          Value isTarget = b.create<arith::CmpIOp>(l, arith::CmpIPredicate::eq,
-                                                   classIdx, targetClassIdx);
-
-          Value zero = b.create<arith::ConstantOp>(
-              l, b.getZeroAttr(resultType.getElementType()));
-          Value toAdd = b.create<arith::SelectOp>(l, isTarget, args[1], zero);
-
-          Value res = b.create<arith::AddFOp>(l, args[2], toAdd);
-          b.create<linalg::YieldOp>(l, res);
+          arith::AtomicRMWKind kind = llvm::isa<FloatType>(elementTy) ? arith::AtomicRMWKind::addf : arith::AtomicRMWKind::addi;
+          b.create<memref::AtomicRMWOp>(l, kind, val, inputMem, dstCoords);
+          b.create<scf::ReduceOp>(l);
         });
 
-    rewriter.replaceOp(op, genericOp.getResults());
+    Value resultTensor = rewriter.create<ToTensorOp>(loc, resultType, inputMem, /*restrict=*/true).getResult();
+    rewriter.replaceOp(op, resultTensor);
     return success();
   }
 };
@@ -608,6 +642,7 @@ struct NovaRandomOpLowering : public OpConversionPattern<nova::Rndm2DOp> {
     Value mySeed = rewriter.create<math::PowFOp>(loc, sum, args[1]);
     Value seedVal =
         rewriter.create<arith::FPToSIOp>(loc, rewriter.getI32Type(), mySeed);
+
 
     auto linalgop = rewriter.create<linalg::FillRng2DOp>(
         loc, ValueRange{args[0], args[1], seedVal}, ValueRange{output});
