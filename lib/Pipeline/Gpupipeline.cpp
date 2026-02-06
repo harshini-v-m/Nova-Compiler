@@ -80,7 +80,7 @@ namespace mlir
         void createNovaGPUPipelines(mlir::OpPassManager &pm)
         {
             pm.addPass(mlir::createCanonicalizerPass());
-            pm.addPass(mlir::nova::createRemDevAttrPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
             pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToGpuPass());
             pm.addNestedPass<mlir::func::FuncOp>(
@@ -119,7 +119,7 @@ namespace mlir
             bufferization::buildBufferDeallocationPipeline(pm, deallocationOptions);
             pm.addPass(mlir::createConvertBufferizationToMemRefPass());
             // device attribute handling pass
-            pm.addPass(mlir::nova::createConvertMemRefToGpuPass());
+            // pm.addPass(mlir::nova::createConvertMemRefToGpuPass());
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
 
             // 6. LINALG OPTIMIZATION & TILING
@@ -139,10 +139,9 @@ namespace mlir
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertParallelLoopToGpuPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
-
-            // Add custom memory management pass BEFORE outlining to capture gpu.launch
             pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createAddGpuMemoryCopiesPass());
-            pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+            pm.addPass(mlir::createCanonicalizerPass());
+            // pm.addPass(mlir::createPrintIRPass());
             pm.addPass(mlir::nova::createConvertMemRefToGpuPass());
             pm.addPass(mlir::createGpuKernelOutliningPass());
 
