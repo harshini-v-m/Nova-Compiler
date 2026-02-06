@@ -15,17 +15,17 @@ using namespace mlir;
 namespace mlir {
 namespace nova {
 
-static bool isMemorySpaceOne(Attribute memorySpace) {
-  if (!memorySpace)
-    return false;
-  if (auto intAttr = llvm::dyn_cast<IntegerAttr>(memorySpace)) {
-    return intAttr.getInt() == 1;
-  }
-  if (auto novaAttr = llvm::dyn_cast<nova::NovaDeviceAttr>(memorySpace)) {
-    return novaAttr.getValue().getValue() == "1";
-  }
-  return false;
-}
+// static bool isMemorySpaceOne(Attribute memorySpace) {
+//   if (!memorySpace)
+//     return false;
+//   if (auto intAttr = llvm::dyn_cast<IntegerAttr>(memorySpace)) {
+//     return intAttr.getInt() == 1;
+//   }
+//   if (auto novaAttr = llvm::dyn_cast<nova::NovaDeviceAttr>(memorySpace)) {
+//     return novaAttr.getValue().getValue() == "1";
+//   }
+//   return false;
+// }
 
 class ConvertAllocOp : public OpRewritePattern<memref::AllocOp> {
 public:
@@ -34,8 +34,8 @@ public:
   LogicalResult matchAndRewrite(memref::AllocOp op,
                                 PatternRewriter &rewriter) const override {
     MemRefType type = op.getType();
-    if (!isMemorySpaceOne(type.getMemorySpace()))
-      return failure();
+    // if (!isMemorySpaceOne(type.getMemorySpace()))
+    //   return failure();
 
     rewriter.replaceOpWithNewOp<gpu::AllocOp>(
         op, type, /*asyncToken=*/Type(), /*asyncDependencies=*/ValueRange{},
@@ -52,8 +52,8 @@ public:
                                 PatternRewriter &rewriter) const override {
     Value memref = op.getMemref();
     MemRefType type = llvm::dyn_cast<MemRefType>(memref.getType());
-    if (!type || !isMemorySpaceOne(type.getMemorySpace()))
-      return failure();
+    // if (!type || !isMemorySpaceOne(type.getMemorySpace()))
+    //   return failure();
 
     rewriter.replaceOpWithNewOp<gpu::DeallocOp>(op, TypeRange{}, ValueRange{},
                                                 memref);
@@ -74,14 +74,14 @@ public:
 
     // Convert to gpu.memcpy if either source or destination is in memory space
     // 1
-    if (isMemorySpaceOne(srcType.getMemorySpace()) ||
-        isMemorySpaceOne(dstType.getMemorySpace())) {
+    // if (isMemorySpaceOne(srcType.getMemorySpace()) ||
+    //     isMemorySpaceOne(dstType.getMemorySpace())) {
       // Synchronous memcpy (no async token)
-      rewriter.replaceOpWithNewOp<gpu::MemcpyOp>(
+    rewriter.replaceOpWithNewOp<gpu::MemcpyOp>(
           op, TypeRange{}, ValueRange{}, op.getTarget(), op.getSource());
-      return success();
-    }
-    return failure();
+    return success();
+    //}
+   // return failure();
   }
 };
 struct ConvertMemRefToGpuPass
@@ -118,16 +118,16 @@ struct ConvertMemRefToGpuPass
                              type.getLayout(), newSpace);
     });
 
-    replacer.addReplacement([&](RankedTensorType type) -> std::optional<Type> {
-      Attribute encoding = type.getEncoding();
-      if (!encoding)
-        return std::nullopt;
-      Attribute newEncoding = replacer.replace(encoding);
-      if (newEncoding == encoding)
-        return std::nullopt;
-      return RankedTensorType::get(type.getShape(), type.getElementType(),
-                                   newEncoding);
-    });
+    // replacer.addReplacement([&](RankedTensorType type) -> std::optional<Type> {
+    //   Attribute encoding = type.getEncoding();
+    //   if (!encoding)
+    //     return std::nullopt;
+    //   Attribute newEncoding = replacer.replace(encoding);
+    //   if (newEncoding == encoding)
+    //     return std::nullopt;
+    //   return RankedTensorType::get(type.getShape(), type.getElementType(),
+    //                                newEncoding);
+    // });
 
     replacer.addReplacement(
         [&](DenseElementsAttr attr) -> std::optional<Attribute> {

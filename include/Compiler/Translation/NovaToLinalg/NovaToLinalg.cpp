@@ -1,15 +1,15 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 
 #include "Compiler/Dialect/nova/NovaDialect.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
@@ -51,8 +51,7 @@ struct NovaBroadcastInDimOpLowering
 
     // Create empty output tensor
     Value emptyTensor = rewriter.create<tensor::EmptyOp>(
-        loc, resultType.getShape(), resultType.getElementType(),
-        resultType.getEncoding());
+        loc, resultType.getShape(), resultType.getElementType());
 
     // Build affine map for input
     SmallVector<AffineExpr> inputExprs;
@@ -192,7 +191,7 @@ static Value broadcastTensor(ConversionPatternRewriter &rewriter, Location loc,
 
   // Create empty output tensor
   Value emptyTensor = rewriter.create<tensor::EmptyOp>(
-      loc, targetShape, inputType.getElementType(), inputType.getEncoding());
+      loc, targetShape, inputType.getElementType());
 
   SmallVector<AffineMap> indexingMaps = {inputMap, outputMap};
   SmallVector<utils::IteratorType> iteratorTypes(targetRank,
@@ -265,10 +264,10 @@ struct NovaMatmulOpLowering : public OpConversionPattern<nova::MatmulOp> {
       SmallVector<int64_t> rank3_rhs_shape({N, K, N_cols});
       SmallVector<int64_t> rank3_output_shape({N, M, N_cols});
 
-      auto rank3LhsType = RankedTensorType::get(
-          rank3_lhs_shape, lhsType.getElementType(), lhsType.getEncoding());
-      auto rank3RhsType = RankedTensorType::get(
-          rank3_rhs_shape, rhsType.getElementType(), rhsType.getEncoding());
+      auto rank3LhsType =
+          RankedTensorType::get(rank3_lhs_shape, lhsType.getElementType());
+      auto rank3RhsType =
+          RankedTensorType::get(rank3_rhs_shape, rhsType.getElementType());
 
       // Build reassociation to collapse batch dimensions into one
       SmallVector<ReassociationIndices> lhsReassociation;
@@ -297,8 +296,7 @@ struct NovaMatmulOpLowering : public OpConversionPattern<nova::MatmulOp> {
       Value cst = rewriter.create<arith::ConstantOp>(
           op.getLoc(), rewriter.getZeroAttr(resultType.getElementType()));
       Value emptyTensor = rewriter.create<tensor::EmptyOp>(
-          op.getLoc(), rank3_output_shape, resultType.getElementType(),
-          resultType.getEncoding());
+          op.getLoc(), rank3_output_shape, resultType.getElementType());
       Value outputTensor =
           rewriter.create<linalg::FillOp>(op.getLoc(), cst, emptyTensor)
               .getResult(0);
@@ -366,8 +364,7 @@ struct NovaMatmulOpLowering : public OpConversionPattern<nova::MatmulOp> {
         op.getLoc(), rewriter.getZeroAttr(resultType.getElementType()));
     // Create an empty tensor for the output
     Value emptyTensor = rewriter.create<tensor::EmptyOp>(
-        op.getLoc(), resultType.getShape(), resultType.getElementType(),
-        resultType.getEncoding());
+        op.getLoc(), resultType.getShape(), resultType.getElementType());
     // create a fill op to initialize the output tensor to zero
     Value outputTensor =
         rewriter.create<linalg::FillOp>(op.getLoc(), cst, emptyTensor)
@@ -399,8 +396,7 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
 
     // Create empty output tensor
     Value emptyTensor = rewriter.create<tensor::EmptyOp>(
-        loc, resultType.getShape(), resultType.getElementType(),
-        resultType.getEncoding());
+        loc, resultType.getShape(), resultType.getElementType());
 
     auto indicesType = cast<RankedTensorType>(indices.getType());
     int64_t indicesRank = indicesType.getRank();
@@ -411,12 +407,14 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
 
     if (axis < 0)
       axis += inputRank;
-    // Map for indices: (d0, ..., d_{resRank-1}) -> (d_axis, ..., d_{axis + indicesRank - 1})
+    // Map for indices: (d0, ..., d_{resRank-1}) -> (d_axis, ..., d_{axis +
+    // indicesRank - 1})
     SmallVector<AffineExpr> indicesExprs;
     for (int i = 0; i < indicesRank; ++i) {
       indicesExprs.push_back(rewriter.getAffineDimExpr(axis + i));
     }
-    auto indicesMap = AffineMap::get(resRank, 0, indicesExprs, rewriter.getContext());
+    auto indicesMap =
+        AffineMap::get(resRank, 0, indicesExprs, rewriter.getContext());
 
     // Map for output is identity
     auto outMap = rewriter.getMultiDimIdentityMap(resRank);
@@ -491,12 +489,21 @@ struct NovaScatterAddOpLowering
 
     // 1. Bufferize operands to MemRef
     auto inputMemType = MemRefType::get(resultType.getShape(), elementTy);
-    auto srcMemType = MemRefType::get(srcType.getShape(), srcType.getElementType());
-    auto indicesMemType = MemRefType::get(indicesType.getShape(), indicesType.getElementType());
+    auto srcMemType =
+        MemRefType::get(srcType.getShape(), srcType.getElementType());
+    auto indicesMemType =
+        MemRefType::get(indicesType.getShape(), indicesType.getElementType());
 
-    Value inputMem = rewriter.create<ToBufferOp>(loc, inputMemType, input, /*restrict=*/true).getResult();
-    Value srcMem = rewriter.create<ToBufferOp>(loc, srcMemType, src, /*restrict=*/true).getResult();
-    Value indicesMem = rewriter.create<ToBufferOp>(loc, indicesMemType, indices, /*restrict=*/true).getResult();
+    Value inputMem =
+        rewriter.create<ToBufferOp>(loc, inputMemType, input, /*restrict=*/true)
+            .getResult();
+    Value srcMem =
+        rewriter.create<ToBufferOp>(loc, srcMemType, src, /*restrict=*/true)
+            .getResult();
+    Value indicesMem =
+        rewriter
+            .create<ToBufferOp>(loc, indicesMemType, indices, /*restrict=*/true)
+            .getResult();
 
     auto zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     auto one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
@@ -504,35 +511,46 @@ struct NovaScatterAddOpLowering
     SmallVector<Value> lowerBounds(srcRank, zero);
     SmallVector<Value> upperBounds;
     for (int64_t i = 0; i < srcRank; ++i) {
-      upperBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, srcShape[i]));
+      upperBounds.push_back(
+          rewriter.create<arith::ConstantIndexOp>(loc, srcShape[i]));
     }
     SmallVector<Value> steps(srcRank, one);
 
     rewriter.create<scf::ParallelOp>(
-        loc, lowerBounds, upperBounds, steps, [&](OpBuilder &b, Location l, ValueRange ivs) {
+        loc, lowerBounds, upperBounds, steps,
+        [&](OpBuilder &b, Location l, ValueRange ivs) {
           Value updateIdx = ivs[axis];
 
           // Extract Index
-          Value idxVal = b.create<memref::LoadOp>(l, indicesMem, ValueRange{updateIdx});
+          Value idxVal =
+              b.create<memref::LoadOp>(l, indicesMem, ValueRange{updateIdx});
           if (llvm::isa<FloatType>(indicesType.getElementType())) {
             idxVal = b.create<arith::FPToSIOp>(l, b.getI32Type(), idxVal);
           }
-          Value targetIdx = b.create<arith::IndexCastOp>(l, b.getIndexType(), idxVal);
+          Value targetIdx =
+              b.create<arith::IndexCastOp>(l, b.getIndexType(), idxVal);
 
           Value val = b.create<memref::LoadOp>(l, srcMem, ivs);
-          
+
           SmallVector<Value> dstCoords;
           for (int64_t d = 0; d < srcRank; ++d) {
-            if (d == axis) dstCoords.push_back(targetIdx);
-            else dstCoords.push_back(ivs[d]);
+            if (d == axis)
+              dstCoords.push_back(targetIdx);
+            else
+              dstCoords.push_back(ivs[d]);
           }
 
-          arith::AtomicRMWKind kind = llvm::isa<FloatType>(elementTy) ? arith::AtomicRMWKind::addf : arith::AtomicRMWKind::addi;
+          arith::AtomicRMWKind kind = llvm::isa<FloatType>(elementTy)
+                                          ? arith::AtomicRMWKind::addf
+                                          : arith::AtomicRMWKind::addi;
           b.create<memref::AtomicRMWOp>(l, kind, val, inputMem, dstCoords);
           b.create<scf::ReduceOp>(l);
         });
 
-    Value resultTensor = rewriter.create<ToTensorOp>(loc, resultType, inputMem, /*restrict=*/true).getResult();
+    Value resultTensor =
+        rewriter
+            .create<ToTensorOp>(loc, resultType, inputMem, /*restrict=*/true)
+            .getResult();
     rewriter.replaceOp(op, resultTensor);
     return success();
   }
@@ -576,13 +594,12 @@ struct NovaTransposeOpLowering : public OpConversionPattern<nova::TransposeOp> {
 
     Location loc = op.getLoc();
     auto permutedInit = rewriter.create<tensor::EmptyOp>(
-        loc, resultShape, resultType.getElementType(),
-        resultType.getEncoding());
+        loc, resultShape, resultType.getElementType());
 
     auto transposeOp = rewriter.replaceOpWithNewOp<linalg::TransposeOp>(
         op, adaptor.getInput(), permutedInit, perms);
 
-    // Explicitly set the result type to ensure encoding is preserved
+    // Explicitly set the result type
     transposeOp->getResult(0).setType(resultType);
 
     return success();
@@ -602,10 +619,9 @@ struct NovaToDeviceOpLowering : public OpConversionPattern<nova::ToDeviceOp> {
     Location loc = op.getLoc();
     Value input = adaptor.getInput();
 
-    // Create empty output tensor with the new encoding (device)
+    // Create empty output tensor
     Value emptyTensor = rewriter.create<tensor::EmptyOp>(
-        loc, resultType.getShape(), resultType.getElementType(),
-        resultType.getEncoding());
+        loc, resultType.getShape(), resultType.getElementType());
 
     // Identity maps for linalg.generic
     auto identityMap = rewriter.getMultiDimIdentityMap(resultType.getRank());
@@ -634,15 +650,13 @@ struct NovaRandomOpLowering : public OpConversionPattern<nova::Rndm2DOp> {
     }
     auto loc = op.getLoc();
     auto output = rewriter.create<tensor::EmptyOp>(
-        op.getLoc(), resulttype.getShape(), resulttype.getElementType(),
-        resulttype.getEncoding());
+        op.getLoc(), resulttype.getShape(), resulttype.getElementType());
     ValueRange args = op.getOperands();
     // seed= (min+max)^max
     Value sum = rewriter.create<arith::AddFOp>(loc, args[0], args[1]);
     Value mySeed = rewriter.create<math::PowFOp>(loc, sum, args[1]);
     Value seedVal =
         rewriter.create<arith::FPToSIOp>(loc, rewriter.getI32Type(), mySeed);
-
 
     auto linalgop = rewriter.create<linalg::FillRng2DOp>(
         loc, ValueRange{args[0], args[1], seedVal}, ValueRange{output});

@@ -11,6 +11,7 @@ namespace nova {
 
 std::unique_ptr<Pass> createConvertMemRefToGpuPass();
 std::unique_ptr<Pass> createAffineScalarizeAccumulatorPass();
+std::unique_ptr<Pass> createRemDevAttrPass();
 
 #define GEN_PASS_REGISTRATION
 #include "Compiler/Transforms/Passes.h.inc"

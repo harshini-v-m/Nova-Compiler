@@ -47,8 +47,8 @@ struct NovaOpTosaOp {
     auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType = mlir::RankedTensorType::get(
-        v_type.getShape(), targetElemType, v_type.getEncoding());
+    auto newVType =
+        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
     return builder->create<tosa::SigmoidOp>(op.getLoc(), resultType, v);
   }
@@ -59,12 +59,12 @@ struct NovaOpTosaOp {
     auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType = mlir::RankedTensorType::get(
-        v_type.getShape(), targetElemType, v_type.getEncoding());
+    auto newVType =
+        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
     auto w_type = cast<mlir::RankedTensorType>(input[1].getType());
-    auto newWType = mlir::RankedTensorType::get(
-        w_type.getShape(), targetElemType, w_type.getEncoding());
+    auto newWType =
+        mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
     auto w = builder->create<tosa::CastOp>(op.getLoc(), newWType, input[1]);
     // loss= reduce_mean(abs(arg0-arg1))
     auto sub = builder->create<nova::SubOp>(op.getLoc(), newVType, v, w);
@@ -80,8 +80,8 @@ struct NovaOpTosaOp {
     }
     // Determine scalar type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
-    auto scalarType = RankedTensorType::get(
-        {1}, finalResultType.getElementType(), finalResultType.getEncoding());
+    auto scalarType =
+        RankedTensorType::get({1}, finalResultType.getElementType());
 
     // Reduce to scalar
     Value reducedLoss = builder->create<nova::ReduceOp>(
@@ -106,17 +106,17 @@ struct NovaOpTosaOp {
     auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType = mlir::RankedTensorType::get(
-        v_type.getShape(), targetElemType, v_type.getEncoding());
+    auto newVType =
+        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
     auto w_type = cast<mlir::RankedTensorType>(input[1].getType());
-    auto newWType = mlir::RankedTensorType::get(
-        w_type.getShape(), targetElemType, w_type.getEncoding());
+    auto newWType =
+        mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
     auto w = builder->create<tosa::CastOp>(op.getLoc(), newWType, input[1]);
 
     auto sub = builder->create<nova::SubOp>(op.getLoc(), newVType, v, w);
-    mlir::RankedTensorType constType = mlir::RankedTensorType::get(
-        v_type.getShape(), targetElemType, v_type.getEncoding());
+    mlir::RankedTensorType constType =
+        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
     mlir::DenseElementsAttr constAttr = mlir::DenseElementsAttr::get(
         constType, builder->getFloatAttr(targetElemType, 2.0));
     auto constTwo =
@@ -135,8 +135,8 @@ struct NovaOpTosaOp {
     }
     // Determine scalar type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
-    auto scalarType = RankedTensorType::get(
-        {1}, finalResultType.getElementType(), finalResultType.getEncoding());
+    auto scalarType =
+        RankedTensorType::get({1}, finalResultType.getElementType());
 
     // Reduce to scalar
     Value reducedLoss = builder->create<nova::ReduceOp>(
@@ -161,16 +161,16 @@ struct NovaOpTosaOp {
     auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType = mlir::RankedTensorType::get(
-        v_type.getShape(), targetElemType, v_type.getEncoding());
+    auto newVType =
+        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
     auto w_type = cast<mlir::RankedTensorType>(input[1].getType());
-    auto newWType = mlir::RankedTensorType::get(
-        w_type.getShape(), targetElemType, w_type.getEncoding());
+    auto newWType =
+        mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
     auto w = builder->create<tosa::CastOp>(op.getLoc(), newWType, input[1]);
     // step1:creating 1x10^-7  tensor constant
-    auto hostVType = mlir::RankedTensorType::get(
-        newVType.getShape(), targetElemType, v_type.getEncoding());
+    auto hostVType =
+        mlir::RankedTensorType::get(newVType.getShape(), targetElemType);
 
     auto epiAttr = DenseElementsAttr::get(
         hostVType, builder->getFloatAttr(targetElemType, 1e-7));
@@ -187,8 +187,7 @@ struct NovaOpTosaOp {
     auto inputShape = cast<mlir::RankedTensorType>(v.getType()).getShape();
     // Get the boolean element type (i1)
     auto boolType = builder->getI1Type();
-    auto compareResultType =
-        mlir::RankedTensorType::get(inputShape, boolType, v_type.getEncoding());
+    auto compareResultType = mlir::RankedTensorType::get(inputShape, boolType);
     auto ck = nova::ComparisonType::LT;
     auto compare = builder->create<nova::CompareOp>(
         op.getLoc(), compareResultType, v, epi, ck);
@@ -204,8 +203,7 @@ struct NovaOpTosaOp {
     auto log = builder->create<nova::LogOp>(op.getLoc(), cp1);
     auto mul = builder->create<nova::MulOp>(op.getLoc(), log, w);
     // step6:create -1 constant tensor (scalar)
-    auto constType =
-        mlir::RankedTensorType::get({}, targetElemType, v_type.getEncoding());
+    auto constType = mlir::RankedTensorType::get({}, targetElemType);
     auto minus1Attr = DenseElementsAttr::get(
         constType, builder->getFloatAttr(targetElemType, -1.0));
     Value minus1 =
@@ -221,16 +219,16 @@ struct NovaOpTosaOp {
       dimensions.push_back(i);
       // newShape.push_back(1);
     }
-    auto reducedResultType = mlir::RankedTensorType::get(
-        newShape, targetElemType, v_type.getEncoding());
+    auto reducedResultType =
+        mlir::RankedTensorType::get(newShape, targetElemType);
 
     nova::ReductionKind rk = nova::ReductionKind::SUM;
     auto reduceres = builder->create<nova::ReduceOp>(
         op.getLoc(), rk, mul, reducedResultType, false, dimensions);
     // Determine scalar type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
-    auto scalarType = RankedTensorType::get(
-        {1}, finalResultType.getElementType(), finalResultType.getEncoding());
+    auto scalarType =
+        RankedTensorType::get({1}, finalResultType.getElementType());
 
     auto reducemeanres =
         builder->create<nova::ReduceOp>(op.getLoc(), rk, reduceres, scalarType);
@@ -258,17 +256,17 @@ struct NovaOpTosaOp {
     auto restensor = cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType = mlir::RankedTensorType::get(
-        v_type.getShape(), targetElemType, v_type.getEncoding());
+    auto newVType =
+        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
     auto w_type = cast<mlir::RankedTensorType>(input[1].getType());
-    auto newWType = mlir::RankedTensorType::get(
-        w_type.getShape(), targetElemType, w_type.getEncoding());
+    auto newWType =
+        mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
     auto w = builder->create<tosa::CastOp>(op.getLoc(), newWType, input[1]);
 
     // step1:creating 1x10^-7  tensor constant
-    auto hostVType = mlir::RankedTensorType::get(
-        newVType.getShape(), targetElemType, v_type.getEncoding());
+    auto hostVType =
+        mlir::RankedTensorType::get(newVType.getShape(), targetElemType);
 
     auto epiAttr = DenseElementsAttr::get(
         hostVType, builder->getFloatAttr(targetElemType, 1e-7));
@@ -285,8 +283,7 @@ struct NovaOpTosaOp {
     auto inputShape = cast<mlir::RankedTensorType>(v.getType()).getShape();
     // Get the boolean element type (i1)
     auto boolType = builder->getI1Type();
-    auto compareResultType =
-        mlir::RankedTensorType::get(inputShape, boolType, v_type.getEncoding());
+    auto compareResultType = mlir::RankedTensorType::get(inputShape, boolType);
     auto ck = nova::ComparisonType::LT;
     auto compare = builder->create<nova::CompareOp>(
         op.getLoc(), compareResultType, v, epi, ck);
@@ -320,8 +317,8 @@ struct NovaOpTosaOp {
     }
     // Determine scalar type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
-    auto scalarType = RankedTensorType::get(
-        {1}, finalResultType.getElementType(), finalResultType.getEncoding());
+    auto scalarType =
+        RankedTensorType::get({1}, finalResultType.getElementType());
 
     // reducing along all axis
     auto rk = nova::ReductionKind::MEAN;
@@ -329,8 +326,7 @@ struct NovaOpTosaOp {
         op.getLoc(), rk, sumterms, scalarType, false, dimensions);
 
     // restore -1 constant for BCE/CCE
-    auto constType =
-        mlir::RankedTensorType::get({}, targetElemType, v_type.getEncoding());
+    auto constType = mlir::RankedTensorType::get({}, targetElemType);
     auto minus1Attr = DenseElementsAttr::get(
         constType, builder->getFloatAttr(targetElemType, -1.0));
     Value minus1 =
@@ -362,9 +358,8 @@ struct NovaOpTosaOp {
     // Ensure targets are i32
     auto targetsType = cast<mlir::RankedTensorType>(targets.getType());
     if (isa<mlir::FloatType>(targetsType.getElementType())) {
-      auto newTargetsType = mlir::RankedTensorType::get(
-          targetsType.getShape(), builder->getI32Type(),
-          targetsType.getEncoding());
+      auto newTargetsType = mlir::RankedTensorType::get(targetsType.getShape(),
+                                                        builder->getI32Type());
       targets =
           builder->create<tosa::CastOp>(op.getLoc(), newTargetsType, targets);
       targetsType = newTargetsType;
@@ -376,9 +371,8 @@ struct NovaOpTosaOp {
     auto logitsElemType = logitsType.getElementType();
     if (!isa<mlir::FloatType>(logitsElemType) ||
         cast<mlir::FloatType>(logitsElemType).getWidth() != 32) {
-      auto newLogitsType = mlir::RankedTensorType::get(
-          logitsType.getShape(), builder->getF32Type(),
-          logitsType.getEncoding());
+      auto newLogitsType = mlir::RankedTensorType::get(logitsType.getShape(),
+                                                       builder->getF32Type());
       logits =
           builder->create<tosa::CastOp>(op.getLoc(), newLogitsType, logits);
       logitsType = newLogitsType;
@@ -391,8 +385,8 @@ struct NovaOpTosaOp {
 
     auto maxShape = logitsType.getShape().vec();
     maxShape[lastDim] = 1;
-    auto maxValType = mlir::RankedTensorType::get(
-        maxShape, builder->getF32Type(), logitsType.getEncoding());
+    auto maxValType =
+        mlir::RankedTensorType::get(maxShape, builder->getF32Type());
 
     Value maxVal = builder->create<tosa::ReduceMaxOp>(op.getLoc(), maxValType,
                                                       logits, axisAttr);
@@ -423,8 +417,7 @@ struct NovaOpTosaOp {
 
     // Step 8: loss = reduce_mean(selected_log_probs * -1.0)
     // Create -1.0 constant
-    auto constType = mlir::RankedTensorType::get({}, builder->getF32Type(),
-                                                 logitsType.getEncoding());
+    auto constType = mlir::RankedTensorType::get({}, builder->getF32Type());
     auto minus1Attr =
         DenseElementsAttr::get(constType, builder->getF32FloatAttr(-1.0));
     Value minus1 =
@@ -443,8 +436,8 @@ struct NovaOpTosaOp {
 
     // Determine the scalar type based on the result type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
-    auto scalarType = RankedTensorType::get(
-        {1}, finalResultType.getElementType(), finalResultType.getEncoding());
+    auto scalarType =
+        RankedTensorType::get({1}, finalResultType.getElementType());
 
     // Perform reduction to scalar
     Value reducedLoss = builder->create<nova::ReduceOp>(
@@ -490,44 +483,35 @@ struct NovaGeluOpLowering : public OpConversionPattern<mlir::nova::GeluOp> {
     // if input is integer, cast to float and update type for following ops
     auto inputType = cast<RankedTensorType>(input.getType());
     if (isa<IntegerType>(inputType.getElementType())) {
-      auto newInputType = RankedTensorType::get(
-          inputType.getShape(), rewriter.getF32Type(), inputType.getEncoding());
+      auto newInputType =
+          RankedTensorType::get(inputType.getShape(), rewriter.getF32Type());
       input = rewriter.create<mlir::tosa::CastOp>(loc, newInputType, input);
       inputType = newInputType;
     }
-    // Helper to get type without device encoding for constants
-    auto stripEncoding = [&](RankedTensorType type) -> RankedTensorType {
-      return RankedTensorType::get(type.getShape(), type.getElementType(),
-                                   type.getEncoding());
-    };
-    auto hostInputType = stripEncoding(inputType);
-
     // op0 = pow(x, 3)
     Value cst_3 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, hostInputType, DenseElementsAttr::get(hostInputType, {3.0f}));
+        loc, inputType, DenseElementsAttr::get(inputType, {3.0f}));
     auto op0 = rewriter.create<mlir::nova::PowOp>(loc, inputType, input, cst_3);
     // op1 = mul(op0, 0.044715)
     Value cst_004 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, hostInputType,
-        DenseElementsAttr::get(hostInputType, {4.471500e-02f}));
+        loc, inputType, DenseElementsAttr::get(inputType, {4.471500e-02f}));
     auto op1 = rewriter.create<mlir::nova::MulOp>(loc, inputType, op0, cst_004);
     // op2 = add(x, op1)
     auto op2 = rewriter.create<mlir::nova::AddOp>(loc, inputType, input, op1);
     // op3 = mul(op2, sqrt(2/pi))
     Value cst_sqrt2pi = rewriter.create<mlir::nova::ConstantOp>(
-        loc, hostInputType,
-        DenseElementsAttr::get(hostInputType, {0.797884583f}));
+        loc, inputType, DenseElementsAttr::get(inputType, {0.797884583f}));
     auto op3 =
         rewriter.create<mlir::nova::MulOp>(loc, inputType, op2, cst_sqrt2pi);
     // op4 = tanh(op3)
     auto op4 = rewriter.create<mlir::nova::TanhOp>(loc, inputType, op3);
     // op5 = add(op4 ,1)
     Value cst_1 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, hostInputType, DenseElementsAttr::get(hostInputType, {1.0f}));
+        loc, inputType, DenseElementsAttr::get(inputType, {1.0f}));
     auto op5 = rewriter.create<mlir::nova::AddOp>(loc, inputType, op4, cst_1);
     // op6 = mul(x, 0.5)
     Value cst_05 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, hostInputType, DenseElementsAttr::get(hostInputType, {0.5f}));
+        loc, inputType, DenseElementsAttr::get(inputType, {0.5f}));
     auto op6 =
         rewriter.create<mlir::nova::MulOp>(loc, inputType, input, cst_05);
 
@@ -561,12 +545,9 @@ struct NovaReluOpLowering : public OpConversionPattern<mlir::nova::ReluOp> {
     } else {
       return failure();
     }
-    auto hostInputType = RankedTensorType::get(
-        inputType.getShape(), elementType, inputType.getEncoding());
-    DenseElementsAttr zeroTensor =
-        DenseElementsAttr::get(hostInputType, zeroAttr);
+    DenseElementsAttr zeroTensor = DenseElementsAttr::get(inputType, zeroAttr);
     Value zero =
-        rewriter.create<mlir::nova::ConstantOp>(loc, hostInputType, zeroTensor);
+        rewriter.create<mlir::nova::ConstantOp>(loc, inputType, zeroTensor);
     Value result =
         rewriter.create<mlir::nova::MaxOp>(loc, inputType, input, zero);
 
@@ -597,8 +578,7 @@ struct NovaSoftmaxLoweringPattern
     dim.push_back(dimension);
 
     auto shape = NovaOpTosaOp::shapeFind(inputType, dimension);
-    auto tempresult = RankedTensorType::get(shape, restype.getElementType(),
-                                            restype.getEncoding());
+    auto tempresult = RankedTensorType::get(shape, restype.getElementType());
     // creating cast - only if element types differ
     if (inputType.getElementType() != restype.getElementType()) {
       input = rewriter.create<mlir::tosa::CastOp>(loc, restype, input);
@@ -693,8 +673,7 @@ struct NovaConstantToArithConstPattern
 
     auto outputType = cast<RankedTensorType>(op.getOutput().getType());
     auto hostOutputType = RankedTensorType::get(outputType.getShape(),
-                                                outputType.getElementType(),
-                                                outputType.getEncoding());
+                                                outputType.getElementType());
     auto hostValue = value.reshape(hostOutputType);
     rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, hostOutputType,
                                                    hostValue);

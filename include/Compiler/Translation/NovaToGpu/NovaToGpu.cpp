@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 using namespace mlir;
@@ -20,7 +21,7 @@ using namespace mlir::nova;
 namespace mlir {
 namespace nova {
 
-class NovaToGpuPattern : public OpRewritePattern<nova::ReduceOp> {
+class NovaToGpuReducePattern : public OpRewritePattern<nova::ReduceOp> {
 public:
   using OpRewritePattern<nova::ReduceOp>::OpRewritePattern;
 
@@ -37,26 +38,9 @@ public:
         }
       }
     }
-    // 1. Check if input has device attribute "1"
     Value input = op.getInput();
     auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
-    if (!inputType)
-      return failure();
 
-    // Check for NovaDeviceAttr
-    if (auto deviceAttr = llvm::dyn_cast_or_null<nova::NovaDeviceAttr>(
-            inputType.getEncoding())) {
-      if (deviceAttr.getValue().getValue() != "1")
-        return failure();
-    }
-    // Check for IntegerAttr (e.g., 1 : i32)
-    else if (auto intAttr =
-                 llvm::dyn_cast_or_null<IntegerAttr>(inputType.getEncoding())) {
-      if (intAttr.getInt() != 1)
-        return failure();
-    } else {
-      return failure();
-    }
     // 2. Map Reduction Kind to GPU Op attribute
     gpu::AllReduceOperation gpuOp;
     ReductionKind kind = op.getKind();
@@ -162,7 +146,7 @@ public:
     // 1. Convert the input tensor to a memref so we can use memref ops
     auto inputMemRefType =
         MemRefType::get(inputType.getShape(), inputType.getElementType(),
-                        MemRefLayoutAttrInterface{}, inputType.getEncoding());
+                        MemRefLayoutAttrInterface{});
 
     Value inputMemRef =
         rewriter.create<bufferization::ToBufferOp>(loc, inputMemRefType, input)
@@ -334,6 +318,53 @@ public:
     return success();
   }
 };
+struct ToDeviceOpLowering : public OpRewritePattern<nova::ToDeviceOp> {
+  using OpRewritePattern<nova::ToDeviceOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(nova::ToDeviceOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value input = op.getInput();
+    auto inputType = cast<RankedTensorType>(input.getType());
+
+    // 1. Convert Input Tensor to Host MemRef
+    // We assume the input is on host (default memory space)
+    auto hostMemRefType =
+        MemRefType::get(inputType.getShape(), inputType.getElementType());
+    Value hostMemRef =
+        rewriter.create<bufferization::ToBufferOp>(loc, hostMemRefType, input);
+
+    // 2. Allocate GPU Memory (Device MemRef)
+    // We need a MemRef type with memory space 1 (GPU Global)
+    auto gpuMemRefType =
+        MemRefType::get(inputType.getShape(), inputType.getElementType(),
+                        MemRefLayoutAttrInterface{},
+                        rewriter.getI64IntegerAttr(1)); // Memory Space 1
+
+    Value gpuMemRef = rewriter
+                          .create<gpu::AllocOp>(loc, gpuMemRefType,
+                                                /*asyncDeps=*/ValueRange{},
+                                                /*dynSizes=*/ValueRange{},
+                                                /*symbolOperands=*/ValueRange{})
+                          .getMemref();
+
+    // 3. Copy Host -> Device
+    rewriter.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{}, gpuMemRef,
+                                   hostMemRef);
+
+    // 4. Convert Device MemRef back to Tensor (for output)
+    // The output tensor type should match the op's result type
+    bufferization::ToTensorOp toTensor =
+        rewriter.create<bufferization::ToTensorOp>(loc, op.getType(),
+                                                   gpuMemRef);
+
+    // Optional: Restrict aliasing if you know ownership occurs here
+    toTensor.setRestrict(true);
+
+    rewriter.replaceOp(op, toTensor.getResult());
+    return success();
+  }
+};
 
 struct NovaToGpuPass
     : public PassWrapper<NovaToGpuPass, OperationPass<func::FuncOp>> {
@@ -353,7 +384,14 @@ struct NovaToGpuPass
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<NovaToGpuPattern>(context);
+    ConversionTarget target(*context);
+    target
+        .addLegalDialect<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect,
+                         memref::MemRefDialect, tensor::TensorDialect,
+                         bufferization::BufferizationDialect>();
+    target.addIllegalOp<nova::ToDeviceOp>();
+    patterns.add<NovaToGpuReducePattern>(context);
+    patterns.add<ToDeviceOpLowering>(context);
 
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       signalPassFailure();

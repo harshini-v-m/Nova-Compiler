@@ -5,6 +5,7 @@ add_mlir_library(CompilerTransforms
   ConvertMemRefToGpu.cpp
   FixGpuLaunch.cpp
   GenerateDynamicWrapper.cpp
+  RemDevAttr.cpp
 
   LINK_LIBS PUBLIC
   MLIRIR

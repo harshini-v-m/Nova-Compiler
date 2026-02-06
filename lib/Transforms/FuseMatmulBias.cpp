@@ -158,7 +158,7 @@ struct FuseMatmulBiasPattern : public OpRewritePattern<GenericOp> {
         // We use a linalg.generic op to perform the cast because arith.extf on tensors
         // is not supported by one-shot-bufferize.
         
-        auto newType = RankedTensorType::get(biasType.getShape(), targetElementType, biasType.getEncoding());
+        auto newType = RankedTensorType::get(biasType.getShape(), targetElementType);
         Value initTensor = rewriter.create<tensor::EmptyOp>(loc, newType.getShape(), newType.getElementType());
         
         SmallVector<AffineMap> maps = {
@@ -276,7 +276,7 @@ struct FuseMatmulBiasPattern : public OpRewritePattern<GenericOp> {
     indexingMaps.push_back(matmulMaps[1]); 
     indexingMaps.push_back(matmulMaps[2]);
 
-    auto fusedResultType = RankedTensorType::get(matmulType.getShape(), targetElementType, matmulType.getEncoding());
+    auto fusedResultType = RankedTensorType::get(matmulType.getShape(), targetElementType);
 
     // Create the fused generic op
     auto fusedOp = rewriter.create<GenericOp>(

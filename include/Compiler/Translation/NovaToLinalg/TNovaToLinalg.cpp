@@ -811,8 +811,7 @@ public:
     auto inElementTy = inputTy.getElementType();
     auto outElementTy = resultTy.getElementType();
     int axis = static_cast<int>(argminOp.getDimension().value());
-    auto resultMinTy = RankedTensorType::get(resultTy.getShape(), inElementTy,
-                                             resultTy.getEncoding());
+    auto resultMinTy = RankedTensorType::get(resultTy.getShape(), inElementTy);
 
     if (!isa<IntegerType>(outElementTy))
       return rewriter.notifyMatchFailure(
@@ -830,7 +829,7 @@ public:
     auto emptyTensorIdx =
         rewriter
             .create<tensor::EmptyOp>(loc, resultTy.getShape(), outElementTy,
-                                     dynDims, resultTy.getEncoding())
+                                     dynDims)
             .getResult();
     auto fillValueIdx = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIntegerAttr(outElementTy, 0));
@@ -844,7 +843,7 @@ public:
     auto emptyTensorMin =
         rewriter
             .create<tensor::EmptyOp>(loc, resultTy.getShape(), inElementTy,
-                                     dynDims, resultTy.getEncoding())
+                                     dynDims)
             .getResult();
     auto fillValueMinAttr =
         createInitialValueForReduceOp(argminOp, inElementTy, rewriter);
@@ -968,8 +967,7 @@ public:
     if (axis < 0)
       axis += inputTy.getRank();
 
-    auto resultMaxTy = RankedTensorType::get(resultTy.getShape(), inElementTy,
-                                             resultTy.getEncoding());
+    auto resultMaxTy = RankedTensorType::get(resultTy.getShape(), inElementTy);
 
     if (!isa<IntegerType>(outElementTy))
       return rewriter.notifyMatchFailure(
@@ -987,7 +985,7 @@ public:
     auto emptyTensorIdx =
         rewriter
             .create<tensor::EmptyOp>(loc, resultTy.getShape(), outElementTy,
-                                     dynDims, resultTy.getEncoding())
+                                     dynDims)
             .getResult();
     auto fillValueIdx = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIntegerAttr(outElementTy, 0));
@@ -1001,7 +999,7 @@ public:
     auto emptyTensorMax =
         rewriter
             .create<tensor::EmptyOp>(loc, resultTy.getShape(), inElementTy,
-                                     dynDims, resultTy.getEncoding())
+                                     dynDims)
             .getResult();
 
     auto fillValueMaxAttr =
@@ -1141,14 +1139,13 @@ static Value createReduceCombiner(OpBuilder &b, Location loc,
   }
 }
 
-// Linalg.generic based lowering for keepdims=true (preserves encoding)
+// Linalg.generic based lowering for keepdims=true 
 static LogicalResult
 lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
                        Location loc, Value input, RankedTensorType inputType,
                        RankedTensorType resultType, Type elemType, int64_t rank,
                        nova::ReductionKind kind, SmallVector<int64_t> &axes) {
 
-  Attribute encoding = inputType.getEncoding();
   llvm::sort(axes);
   llvm::SmallDenseSet<int64_t> axisSet(axes.begin(), axes.end());
 
@@ -1159,7 +1156,7 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
     reductionElemType = rewriter.getI1Type();
     if (elemType != reductionElemType) {
       auto boolType = RankedTensorType::get(inputType.getShape(),
-                                            reductionElemType, encoding);
+                                            reductionElemType);
       current = rewriter.create<tosa::CastOp>(loc, boolType, current);
     }
   }
@@ -1182,11 +1179,11 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
     keepdimsShape.push_back(axisSet.contains(i) ? 1 : inputType.getDimSize(i));
   }
 
-  // Create output tensor with keepdims shape and encoding
+  // Create output tensor with keepdims shape 
   auto keepdimsType =
-      RankedTensorType::get(keepdimsShape, reductionElemType, encoding);
+      RankedTensorType::get(keepdimsShape, reductionElemType);
   Value emptyTensor = rewriter.create<tensor::EmptyOp>(
-      loc, keepdimsShape, reductionElemType, ValueRange{}, encoding);
+      loc, keepdimsShape, reductionElemType, ValueRange{});
   Value filledTensor =
       rewriter.create<linalg::FillOp>(loc, identity, emptyTensor).result();
 
@@ -1250,14 +1247,14 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
         loc, rewriter.getFloatAttr(reductionElemType, divisor));
 
     Value divisorTensor = rewriter.create<tensor::EmptyOp>(
-        loc, keepdimsShape, reductionElemType, ValueRange{}, encoding);
+        loc, keepdimsShape, reductionElemType, ValueRange{});
     Value filledDivisor =
         rewriter.create<linalg::FillOp>(loc, divisorVal, divisorTensor)
             .result();
 
     SmallVector<AffineMap> maps(3, rewriter.getMultiDimIdentityMap(rank));
     Value outputTensor = rewriter.create<tensor::EmptyOp>(
-        loc, keepdimsShape, reductionElemType, ValueRange{}, encoding);
+        loc, keepdimsShape, reductionElemType, ValueRange{});
 
     auto divOp = rewriter.create<linalg::GenericOp>(
         loc, keepdimsType, ValueRange{reduced, filledDivisor}, outputTensor,
@@ -1323,7 +1320,7 @@ public:
         axes.push_back(i);
     }
 
-    // Use linalg.generic path to preserve encoding and avoid host-side loops
+    // Use linalg.generic path 
     return lowerWithLinalgGeneric(op, rewriter, loc, input, inputType,
                                   resultType, elemType, rank, kind, axes);
 
@@ -1351,28 +1348,28 @@ public:
       case nova::ReductionKind::SUM:
       case nova::ReductionKind::MEAN: {
         auto intermediateType = RankedTensorType::get(
-            resultShape, currentElemType, inputType.getEncoding());
+            resultShape, currentElemType);
         current = rewriter.create<tosa::ReduceSumOp>(loc, intermediateType,
                                                      current, axisAttr);
         break;
       }
       case nova::ReductionKind::MAX: {
         auto intermediateType = RankedTensorType::get(
-            resultShape, currentElemType, inputType.getEncoding());
+            resultShape, currentElemType);
         current = rewriter.create<tosa::ReduceMaxOp>(loc, intermediateType,
                                                      current, axisAttr);
         break;
       }
       case nova::ReductionKind::MIN: {
         auto intermediateType = RankedTensorType::get(
-            resultShape, currentElemType, inputType.getEncoding());
+            resultShape, currentElemType);
         current = rewriter.create<tosa::ReduceMinOp>(loc, intermediateType,
                                                      current, axisAttr);
         break;
       }
       case nova::ReductionKind::PRODUCT: {
         auto intermediateType = RankedTensorType::get(
-            resultShape, currentElemType, inputType.getEncoding());
+            resultShape, currentElemType);
         current = rewriter.create<tosa::ReduceProductOp>(loc, intermediateType,
                                                          current, axisAttr);
         break;
@@ -1381,12 +1378,11 @@ public:
         // ALL requires boolean input - cast to i1 if needed
         Type i1Type = rewriter.getI1Type();
         if (currentElemType != i1Type) {
-          auto boolType = RankedTensorType::get(currentType.getShape(), i1Type,
-                                                inputType.getEncoding());
+          auto boolType = RankedTensorType::get(currentType.getShape(), i1Type);
           current = rewriter.create<tosa::CastOp>(loc, boolType, current);
         }
         auto intermediateType =
-            RankedTensorType::get(resultShape, i1Type, inputType.getEncoding());
+            RankedTensorType::get(resultShape, i1Type);
         current = rewriter.create<tosa::ReduceAllOp>(loc, intermediateType,
                                                      current, axisAttr);
         break;
@@ -1395,12 +1391,11 @@ public:
         // ANY requires boolean input - cast to i1 if needed
         Type i1Type = rewriter.getI1Type();
         if (currentElemType != i1Type) {
-          auto boolType = RankedTensorType::get(currentType.getShape(), i1Type,
-                                                inputType.getEncoding());
+          auto boolType = RankedTensorType::get(currentType.getShape(), i1Type);
           current = rewriter.create<tosa::CastOp>(loc, boolType, current);
         }
         auto intermediateType =
-            RankedTensorType::get(resultShape, i1Type, inputType.getEncoding());
+            RankedTensorType::get(resultShape, i1Type);
         current = rewriter.create<tosa::ReduceAnyOp>(loc, intermediateType,
                                                      current, axisAttr);
         break;
@@ -1414,8 +1409,7 @@ public:
 
       // Create scalar divisor with shape [1, 1, ...] matching current rank
       SmallVector<int64_t> divisorShape(currentType.getRank(), 1);
-      auto divisorType = RankedTensorType::get(divisorShape, elemType,
-                                               inputType.getEncoding());
+      auto divisorType = RankedTensorType::get(divisorShape, elemType);
 
       Value divisor;
       if (llvm::isa<FloatType>(elemType)) {
@@ -1501,11 +1495,11 @@ struct AdamOpConverter : public OpConversionPattern<::mlir::nova::AdamOp> {
 
     // Create separate empty tensors for results
     Value empty_param = rewriter.create<tensor::EmptyOp>(
-        loc, resultType.getShape(), elementType, resultType.getEncoding());
+        loc, resultType.getShape(), elementType);
     Value empty_m = rewriter.create<tensor::EmptyOp>(
-        loc, resultType.getShape(), elementType, resultType.getEncoding());
+        loc, resultType.getShape(), elementType);
     Value empty_v = rewriter.create<tensor::EmptyOp>(
-        loc, resultType.getShape(), elementType, resultType.getEncoding());
+        loc, resultType.getShape(), elementType);
 
     auto genericOp = rewriter.create<linalg::GenericOp>(
         loc, TypeRange{resultType, resultType, resultType},
@@ -1592,8 +1586,7 @@ public:
     auto resultDataType = resultType.getElementType();
     // Create output tensor
     Value out = rewriter.create<tensor::EmptyOp>(
-        op.getLoc(), resultType.getShape(), resultDataType,
-        resultType.getEncoding());
+        op.getLoc(), resultType.getShape(), resultDataType);
 
     // Prepare affine maps
     int64_t rank = resultType.getRank();
@@ -1655,7 +1648,6 @@ struct ReshapeOpConverter : public OpConversionPattern<nova::ReshapeOp> {
         rewriter.create<arith::ConstantOp>(loc, shapeType, shapeAttr);
 
     // Create tensor.reshape
-    // resultType already contains the nova.device encoding if specified in Nova
     rewriter.replaceOpWithNewOp<tensor::ReshapeOp>(op, resultType, input,
                                                    shapeConst);
     return success();

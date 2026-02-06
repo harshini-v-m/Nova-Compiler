@@ -16,24 +16,6 @@ using namespace mlir::nova;
 
 // Helper Functions
 
-// Helper to determine result encoding for binary operations
-static Attribute getBinaryResultEncoding(Attribute lhsEncoding,
-                                         Attribute rhsEncoding,
-                                         MLIRContext *context) {
-  if (lhsEncoding && rhsEncoding) {
-    if (lhsEncoding == rhsEncoding)
-      return lhsEncoding;
-    // If they differ, pick one (usually they should be same in cgadimpl)
-    return lhsEncoding;
-  }
-  return lhsEncoding ? lhsEncoding : rhsEncoding;
-}
-
-// Helper to determine result encoding for unary operations
-static Attribute getUnaryResultEncoding(Attribute operandEncoding,
-                                        MLIRContext *context) {
-  return operandEncoding;
-}
 
 // type promotion for result type -heirarchy
 static LogicalResult BinaryTypePromotionReturnType(
@@ -55,17 +37,13 @@ static LogicalResult BinaryTypePromotionReturnType(
         inferredReturnTypes.push_back(RankedTensorType::get(
             computeBroadcastShape(lhstensor.getShape(), rhstensor.getShape())
                 .value(),
-            ComplexType::get(builder.getF64Type()),
-            getBinaryResultEncoding(lhstensor.getEncoding(),
-                                    rhstensor.getEncoding(), context)));
+            ComplexType::get(builder.getF64Type())));
         return success();
       }
       inferredReturnTypes.push_back(RankedTensorType::get(
           computeBroadcastShape(lhstensor.getShape(), rhstensor.getShape())
               .value(),
-          ComplexType::get(builder.getF32Type()),
-          getBinaryResultEncoding(lhstensor.getEncoding(),
-                                  rhstensor.getEncoding(), context)));
+          ComplexType::get(builder.getF32Type())));
       return success();
     }
     return success();
@@ -125,19 +103,13 @@ static LogicalResult BinaryTypePromotionReturnType(
       resultType = builder.getI16Type();
     }
     inferredReturnTypes.push_back(RankedTensorType::get(
-        *broadcastedShape, resultType,
-        getBinaryResultEncoding(lhstensor.getEncoding(),
-                                rhstensor.getEncoding(), context)));
+        *broadcastedShape, resultType));
     return success();
   } else {
     inferredReturnTypes.push_back(RankedTensorType::get(
-        *broadcastedShape, lhselemtype,
-        getBinaryResultEncoding(lhstensor.getEncoding(),
-                                rhstensor.getEncoding(), context)));
+        *broadcastedShape, lhselemtype));
     return success();
   }
-  auto encoding = getBinaryResultEncoding(lhstensor.getEncoding(),
-                                          rhstensor.getEncoding(), context);
   auto resulType = builder.getF16Type();
   switch (resultbitwidth) {
   case 64:
@@ -147,7 +119,7 @@ static LogicalResult BinaryTypePromotionReturnType(
     resulType = builder.getF32Type();
   }
   inferredReturnTypes.push_back(
-      RankedTensorType::get(*broadcastedShape, resulType, encoding));
+      RankedTensorType::get(*broadcastedShape, resulType));
   return success();
 }
 // float promotion for result type
@@ -170,18 +142,13 @@ static LogicalResult BinaryFloatPromotionReturnType(
         inferredReturnTypes.push_back(RankedTensorType::get(
             computeBroadcastShape(lhstensor.getShape(), rhstensor.getShape())
                 .value(),
-            builder.getF64Type(),
-            getBinaryResultEncoding(lhstensor.getEncoding(),
-                                    rhstensor.getEncoding(), context)));
+            builder.getF64Type()));
         return success();
       }
       inferredReturnTypes.push_back(RankedTensorType::get(
           computeBroadcastShape(lhstensor.getShape(), rhstensor.getShape())
               .value(),
-          builder.getF64Type(),
-          getBinaryResultEncoding(lhstensor.getEncoding(),
-                                  rhstensor.getEncoding(), context)));
-
+          builder.getF64Type()));
       return success();
     }
   }
@@ -233,10 +200,8 @@ static LogicalResult BinaryFloatPromotionReturnType(
     return failure();
   }
 
-  auto encoding = getBinaryResultEncoding(lhstensor.getEncoding(),
-                                          rhstensor.getEncoding(), context);
   inferredReturnTypes.push_back(
-      RankedTensorType::get(*broadcastedShape, resultType, encoding));
+      RankedTensorType::get(*broadcastedShape, resultType));
 
   return success();
 }
@@ -265,8 +230,7 @@ unarycastingInferReturnTypes(MLIRContext *context, std::optional<Location> loc,
     }
   }
   Type returnTensorType = RankedTensorType::get(
-      inputType.getShape(), resultType,
-      getUnaryResultEncoding(inputType.getEncoding(), context));
+      inputType.getShape(), resultType);
   inferredReturnTypes.push_back(returnTensorType);
   return success();
 }
@@ -499,8 +463,7 @@ LogicalResult nova::SqrtOp::inferReturnTypes(
   }
 
   inferredTypes.push_back(RankedTensorType::get(
-      inputType.getShape(), outElemTy,
-      getUnaryResultEncoding(inputType.getEncoding(), context)));
+      inputType.getShape(), outElemTy));
   return success();
 }
 // rsqrt
@@ -532,8 +495,7 @@ LogicalResult nova::RsqrtOp::inferReturnTypes(
   }
 
   inferredTypes.push_back(RankedTensorType::get(
-      inputType.getShape(), outElemTy,
-      getUnaryResultEncoding(inputType.getEncoding(), context)));
+      inputType.getShape(), outElemTy));
   return success();
 }
 // ModOp
@@ -675,11 +637,8 @@ AndOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                         OpaqueProperties properties, RegionRange regions,
                         llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
   auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
-  auto rhsType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
   Type resultType = RankedTensorType::get(
-      inputType.getShape(), IntegerType::get(context, 1),
-      getBinaryResultEncoding(inputType.getEncoding(), rhsType.getEncoding(),
-                              context));
+      inputType.getShape(), IntegerType::get(context, 1));
   inferredReturnTypes.push_back(resultType);
   return success();
 }
@@ -691,8 +650,7 @@ NotOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                         llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
   auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
   Type resultType = RankedTensorType::get(
-      inputType.getShape(), IntegerType::get(context, 1),
-      getUnaryResultEncoding(inputType.getEncoding(), context));
+      inputType.getShape(), IntegerType::get(context, 1));
   inferredReturnTypes.push_back(resultType);
   return success();
 }
@@ -725,11 +683,8 @@ OrOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                        OpaqueProperties properties, RegionRange regions,
                        llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
   auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
-  auto rhsType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
   Type resultType = RankedTensorType::get(
-      inputType.getShape(), IntegerType::get(context, 1),
-      getBinaryResultEncoding(inputType.getEncoding(), rhsType.getEncoding(),
-                              context));
+      inputType.getShape(), IntegerType::get(context, 1));
   inferredReturnTypes.push_back(resultType);
   return success();
 }
@@ -762,11 +717,8 @@ XorOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                         OpaqueProperties properties, RegionRange regions,
                         llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
   auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
-  auto rhsType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
   Type resultType = RankedTensorType::get(
-      inputType.getShape(), IntegerType::get(context, 1),
-      getBinaryResultEncoding(inputType.getEncoding(), rhsType.getEncoding(),
-                              context));
+      inputType.getShape(), IntegerType::get(context, 1));
   inferredReturnTypes.push_back(resultType);
   return success();
 }
@@ -778,15 +730,14 @@ AbsOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
   auto shape = inputType.getShape();
   Type elementType = inputType.getElementType();
-  auto encoding = getUnaryResultEncoding(inputType.getEncoding(), context);
   if (isa<FloatType>(elementType) || isa<IntegerType>(elementType)) {
-    Type resultType = RankedTensorType::get(shape, elementType, encoding);
+    Type resultType = RankedTensorType::get(shape, elementType);
     inferredReturnTypes.push_back(resultType);
     return success();
   } else if (isa<ComplexType>(elementType)) {
     auto ctype = llvm::dyn_cast<ComplexType>(elementType);
     Type realtype = ctype.getElementType();
-    Type resultType = RankedTensorType::get(shape, realtype, encoding);
+    Type resultType = RankedTensorType::get(shape, realtype);
     inferredReturnTypes.push_back(resultType);
     return success();
   } else {
@@ -939,12 +890,10 @@ LogicalResult ArgmaxOp::inferReturnTypes(
 
   if (resultShape.empty() && !keepDims) {
     inferredReturnTypes.push_back(RankedTensorType::get(
-        {1}, IntegerType::get(context, 32),
-        getUnaryResultEncoding(inputType.getEncoding(), context)));
+        {1}, IntegerType::get(context, 32)));
   } else {
     inferredReturnTypes.push_back(RankedTensorType::get(
-        resultShape, IntegerType::get(context, 32),
-        getUnaryResultEncoding(inputType.getEncoding(), context)));
+        resultShape, IntegerType::get(context, 32)));
   }
 
   return success();
@@ -1020,12 +969,10 @@ LogicalResult ArgMinOp::inferReturnTypes(
 
   if (resultShape.empty() && !keepDims) {
     inferredReturnTypes.push_back(RankedTensorType::get(
-        {1}, IntegerType::get(context, 32),
-        getUnaryResultEncoding(inputType.getEncoding(), context)));
+        {1}, IntegerType::get(context, 32)));
   } else {
     inferredReturnTypes.push_back(RankedTensorType::get(
-        resultShape, IntegerType::get(context, 32),
-        getUnaryResultEncoding(inputType.getEncoding(), context)));
+        resultShape, IntegerType::get(context, 32)));
   }
 
   return success();
@@ -1045,11 +992,8 @@ LogicalResult CompareOp::inferReturnTypes(
   // The result type of comparison is always a tensor of i1
   // the shape is tensor of shape same as inputs
   auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
-  auto rhsType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
   Type resultType = RankedTensorType::get(
-      inputType.getShape(), IntegerType::get(context, 1),
-      getBinaryResultEncoding(inputType.getEncoding(), rhsType.getEncoding(),
-                              context));
+      inputType.getShape(), IntegerType::get(context, 1));
   inferredReturnTypes.push_back(resultType);
   return success();
 }
@@ -1102,8 +1046,7 @@ LogicalResult TransposeOp::inferReturnTypes(
     }
   }
   inferredReturnTypes.push_back(RankedTensorType::get(
-      resshape, inputType.getElementType(),
-      getUnaryResultEncoding(inputType.getEncoding(), context)));
+      resshape, inputType.getElementType()));
   return success();
 }
 
@@ -1252,9 +1195,7 @@ LogicalResult MatmulOp::inferReturnTypes(
       return failure();
     }
     inferredReturnTypes.push_back(RankedTensorType::get(
-        {}, resultType,
-        getBinaryResultEncoding(lhstensor.getEncoding(),
-                                rhstensor.getEncoding(), context)));
+        {}, resultType));
     return success();
   }
 
@@ -1300,9 +1241,7 @@ LogicalResult MatmulOp::inferReturnTypes(
   }
 
   inferredReturnTypes.push_back(RankedTensorType::get(
-      resultShape, resultType,
-      getBinaryResultEncoding(lhstensor.getEncoding(), rhstensor.getEncoding(),
-                              context)));
+      resultShape, resultType));
   return success();
 }
 //---------------------------------reduce
@@ -1394,13 +1333,9 @@ LogicalResult ReduceOp::inferReturnTypes(
   }
 
   if (resultShape.empty() && !keepDims) {
-    inferredReturnTypes.push_back(RankedTensorType::get(
-        {1}, elementType,
-        getUnaryResultEncoding(inputType.getEncoding(), context)));
+    inferredReturnTypes.push_back(RankedTensorType::get({1}, elementType));
   } else {
-    inferredReturnTypes.push_back(RankedTensorType::get(
-        resultShape, elementType,
-        getUnaryResultEncoding(inputType.getEncoding(), context)));
+    inferredReturnTypes.push_back(RankedTensorType::get(resultShape, elementType));
   }
 
   return success();
@@ -1486,7 +1421,7 @@ LogicalResult ReduceOp::verify() {
         axisVal += inputRank;
       reduceDimension.insert(axisVal);
     }
-for (int64_t i = 0; i < inputRank; ++i) {
+    for (int64_t i = 0; i < inputRank; ++i) {
       if (reduceDimension.contains(i)) {
         if (getKeepdims()) {
           expectedShape.push_back(1);
@@ -1650,10 +1585,7 @@ SceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
       outElemTy = Float32Type::get(context);
   }
 
-  auto outType = RankedTensorType::get(
-      {1}, outElemTy,
-      getBinaryResultEncoding(logitsType.getEncoding(),
-                              targetsType.getEncoding(), context));
+  auto outType = RankedTensorType::get({1}, outElemTy);
 
   inferredReturnTypes.push_back(outType);
   return success();
@@ -1678,10 +1610,7 @@ MaeOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
       outElemTy = Float32Type::get(context);
   }
 
-  auto outType = RankedTensorType::get(
-      {1}, outElemTy,
-      getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
-                              context));
+  auto outType = RankedTensorType::get({1}, outElemTy);
 
   inferredReturnTypes.push_back(outType);
   return success();
@@ -1706,10 +1635,7 @@ MseOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
       outElemTy = Float32Type::get(context);
   }
 
-  auto outType = RankedTensorType::get(
-      {1}, outElemTy,
-      getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
-                              context));
+  auto outType = RankedTensorType::get({1}, outElemTy);
 
   inferredReturnTypes.push_back(outType);
   return success();
@@ -1734,10 +1660,7 @@ CceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
       outElemTy = Float32Type::get(context);
   }
 
-  auto outType = RankedTensorType::get(
-      {1}, outElemTy,
-      getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
-                              context));
+  auto outType = RankedTensorType::get({1}, outElemTy);
 
   inferredReturnTypes.push_back(outType);
   return success();
@@ -1762,10 +1685,7 @@ BceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
       outElemTy = Float32Type::get(context);
   }
 
-  auto outType = RankedTensorType::get(
-      {1}, outElemTy,
-      getBinaryResultEncoding(lhsType.getEncoding(), rhsType.getEncoding(),
-                              context));
+  auto outType = RankedTensorType::get({1}, outElemTy);
 
   inferredReturnTypes.push_back(outType);
   return success();
@@ -1790,7 +1710,12 @@ AdamOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
         loc, "All inputs (param,m,v,grad) must have the same shape");
   }
 
-  inferredReturnTypes.assign({paramType, mType, vType});
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(paramType.getShape(), paramType.getElementType()));
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(mType.getShape(), mType.getElementType()));
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(vType.getShape(), vType.getElementType()));
   return success();
 }
 
@@ -1810,23 +1735,7 @@ OpFoldResult ToDeviceOp::fold(FoldAdaptor adaptor) {
   return {};
 }
 
-LogicalResult ToDeviceOp::verify() {
-  auto inputType = cast<RankedTensorType>(getInput().getType());
-  auto resultType = cast<RankedTensorType>(getResult().getType());
-
-  auto inputEncoding =
-      dyn_cast_or_null<NovaDeviceAttr>(inputType.getEncoding());
-  auto resultEncoding =
-      dyn_cast_or_null<NovaDeviceAttr>(resultType.getEncoding());
-
-  if (!inputEncoding || !resultEncoding)
-    return emitOpError("input and result must have a nova device encoding");
-
-  if (inputEncoding.getValue() == resultEncoding.getValue())
-    return emitOpError("input and result device attributes must be different");
-
-  return success();
-}
+LogicalResult ToDeviceOp::verify() { return success(); }
 
 struct SimplifyRedundantToDevice : public OpRewritePattern<ToDeviceOp> {
   using OpRewritePattern<ToDeviceOp>::OpRewritePattern;
@@ -1903,7 +1812,8 @@ GatherOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
 
   int64_t inputRank = inputType.getRank();
   int64_t axis = 0;
-  if (auto axisAttr = llvm::dyn_cast_or_null<IntegerAttr>(attributes.get("axis"))) {
+  if (auto axisAttr =
+          llvm::dyn_cast_or_null<IntegerAttr>(attributes.get("axis"))) {
     axis = axisAttr.getInt();
   }
   if (axis < 0)
@@ -1923,11 +1833,8 @@ GatherOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
     outputShape.push_back(inputType.getDimSize(i));
   }
 
-  inferredReturnTypes.push_back(
-      RankedTensorType::get(outputShape, inputType.getElementType(),
-                            getBinaryResultEncoding(inputType.getEncoding(),
-                                                    indexType.getEncoding(),
-                                                    context)));
+  inferredReturnTypes.push_back(RankedTensorType::get(
+      outputShape, inputType.getElementType()));
 
   return success();
 }
@@ -1968,13 +1875,9 @@ LogicalResult ScatterAddOp::inferReturnTypes(
   auto srcType = llvm::dyn_cast<RankedTensorType>(operands[2].getType());
   if (!inputType || !indexType || !srcType)
     return failure();
-  auto encoding = getBinaryResultEncoding(inputType.getEncoding(), 
-                                          srcType.getEncoding(), context);
-  encoding = getBinaryResultEncoding(encoding, indexType.getEncoding(), context);
 
-  inferredReturnTypes.push_back(
-      RankedTensorType::get(inputType.getShape(), inputType.getElementType(),
-                            encoding));
+  inferredReturnTypes.push_back(RankedTensorType::get(
+      inputType.getShape(), inputType.getElementType()));
   return success();
 }
 
@@ -2004,7 +1907,7 @@ LogicalResult ScatterAddOp::verify() {
   for (int64_t i = 0; i < inputRank; ++i) {
     if (i == axis) {
       if (srcType.getDimSize(i) != indexType.getDimSize(0)) {
-         return emitOpError("src dimension at axis must match index size");
+        return emitOpError("src dimension at axis must match index size");
       }
     } else {
       if (inputType.getDimSize(i) != srcType.getDimSize(i)) {
@@ -2021,4 +1924,3 @@ LogicalResult ScatterAddOp::verify() {
 }
 
 OpFoldResult ScatterAddOp::fold(FoldAdaptor adaptor) { return nullptr; }
-

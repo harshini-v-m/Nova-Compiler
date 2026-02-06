@@ -46,4 +46,17 @@ def ConvertMemRefToGpu : Pass<"convert-memref-to-gpu", "ModuleOp"> {
     let constructor = "::mlir::nova::createConvertMemRefToGpuPass()";
 }
 
+def RemDevAttr : Pass<"rem-dev-attr", "func::FuncOp"> {
+    let summary = "Remove device attribute from function arguments and add explicit to_device copies";
+    let description = [{
+        Normalizes function arguments by removing #nova.device attributes.
+        If an argument has no attribute, it is considered a host tensor and 
+        a nova.to_device operation is inserted at the start of the function.
+    }];
+    let dependentDialects = [
+        "mlir::nova::NovaDialect"
+    ];
+    let constructor = "::mlir::nova::createRemDevAttrPass()";
+}
+
 #endif // NOVA_TRANSFORMS_PASSES
