@@ -6,6 +6,9 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
@@ -106,68 +109,164 @@ struct AddGpuMemoryCopiesPass
         returnedValues.insert(val);
     });
 
-    // 1. Promote internal allocations to device space if used in GPU regions or
-    // returned to a GPU-expecting result
-    SmallVector<Value, 4> promotedAllocsToDealloc;
-    func.walk([&](memref::AllocOp allocOp) {
-      bool shouldPromote = false;
-      Value res = allocOp.getResult();
-
-      // Check if returned and the function signature expects a device memref
-      if (returnedValues.count(res)) {
-        for (auto returnOp : returnOps) {
-          for (unsigned i = 0; i < returnOp->getNumOperands(); ++i) {
-            if (returnOp.getOperand(i) == res) {
-              auto expectedType = func.getResultTypes()[i];
-              if (auto memrefType = llvm::dyn_cast<MemRefType>(expectedType)) {
+    // 1. Identify all "device sinks" and propagate backwards to identify which allocations must be on device
+    SmallPtrSet<Value, 8> mustBeOnDevice;
+    
+    // Initial sinks: function results that expect device memrefs
+    for (auto returnOp : returnOps) {
+        for (unsigned i = 0; i < returnOp->getNumOperands(); ++i) {
+            Value val = returnOp.getOperand(i);
+            auto expectedType = func.getResultTypes()[i];
+            if (auto memrefType = llvm::dyn_cast<MemRefType>(expectedType)) {
                 if (isDeviceMemorySpace(memrefType.getMemorySpace())) {
-                  shouldPromote = true;
-                  break;
+                    mustBeOnDevice.insert(val);
                 }
-              }
             }
-          }
-          if (shouldPromote)
-            break;
         }
-      }
+    }
 
-      // Check if used in a GPU launch
-      if (!shouldPromote) {
-        for (auto &use : res.getUses()) {
-          Operation *owner = use.getOwner();
-          if (isa<gpu::LaunchOp>(owner) ||
-              owner->getParentOfType<gpu::LaunchOp>()) {
-            shouldPromote = true;
-            break;
-          }
-        }
-      }
-
-      if (shouldPromote) {
-        MemRefType oldType = allocOp.getType();
-        if (!isDeviceMemorySpace(oldType.getMemorySpace())) {
-          Attribute newSpace =
-              IntegerAttr::get(IntegerType::get(func.getContext(), 64), 1);
-
-          updateMemorySpaceRecursively(res, newSpace);
-
-          // Track for deallocation unless explicitly deallocated later
-          bool hasDealloc = false;
-          for (auto &use : res.getUses()) {
-            if (isa<memref::DeallocOp>(use.getOwner()) ||
-                isa<gpu::DeallocOp>(use.getOwner())) {
-              hasDealloc = true;
-              break;
+    // Initial sinks: Function arguments that already have device memory space 
+    // (important for DPS)
+    for (auto arg : func.getArguments()) {
+        if (auto memrefType = llvm::dyn_cast<MemRefType>(arg.getType())) {
+            if (isDeviceMemorySpace(memrefType.getMemorySpace())) {
+                mustBeOnDevice.insert(arg);
             }
-          }
-          if (!hasDealloc)
-            promotedAllocsToDealloc.push_back(res);
         }
-      }
+    }
+
+    // Worklist for propagation
+    SmallVector<Value, 16> worklist;
+    for (Value v : mustBeOnDevice) {
+        worklist.push_back(v);
+    }
+
+    // Initial sinks: GPU launches and HostRegister (these are consumers)
+    func.walk([&](Operation *op) {
+        // llvm::errs() << "[AGMC] Walker visiting: " << *op << "\n";
+        if (isa<gpu::LaunchOp>(op) || op->getParentOfType<gpu::LaunchOp>() || isa<gpu::HostRegisterOp>(op)) {
+            for (Value operand : op->getOperands()) {
+                if (llvm::isa<MemRefType>(operand.getType())) {
+                   if (mustBeOnDevice.insert(operand).second) {
+                       worklist.push_back(operand);
+                   }
+                }
+            }
+        }
+        // Also direct copies to device memory (both memref and gpu dialects)
+        if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
+            auto destType = llvm::dyn_cast<MemRefType>(copyOp.getTarget().getType());
+            if (destType && isDeviceMemorySpace(destType.getMemorySpace())) {
+                if (mustBeOnDevice.insert(copyOp.getSource()).second) {
+                    worklist.push_back(copyOp.getSource());
+                }
+            }
+        }
+        if (auto linalgCopyOp = dyn_cast<linalg::CopyOp>(op)) {
+            auto destType = llvm::dyn_cast<MemRefType>(linalgCopyOp.getOutputs()[0].getType());
+            if (destType && isDeviceMemorySpace(destType.getMemorySpace())) {
+                if (mustBeOnDevice.insert(linalgCopyOp.getInputs()[0]).second) {
+                    worklist.push_back(linalgCopyOp.getInputs()[0]);
+                }
+            }
+        }
+        if (auto gpuCopyOp = dyn_cast<gpu::MemcpyOp>(op)) {
+            auto destType = llvm::dyn_cast<MemRefType>(gpuCopyOp.getDst().getType());
+            if (destType && isDeviceMemorySpace(destType.getMemorySpace())) {
+                if (mustBeOnDevice.insert(gpuCopyOp.getSrc()).second) {
+                    worklist.push_back(gpuCopyOp.getSrc());
+                }
+            }
+        }
+        // Also captures inside gpu.launch regions
+        if (auto launchOp = dyn_cast<gpu::LaunchOp>(op)) {
+            launchOp.getRegion().walk([&](Operation *innerOp) {
+                for (Value operand : innerOp->getOperands()) {
+                    if (llvm::isa<MemRefType>(operand.getType())) {
+                        if (mustBeOnDevice.insert(operand).second) worklist.push_back(operand);
+                    }
+                }
+            });
+        }
     });
 
-    // 2. Find all host memrefs used in GPU regions that need shadowing
+    while (!worklist.empty()) {
+        Value curr = worklist.pop_back_val();
+        Operation *defOp = curr.getDefiningOp();
+        if (!defOp) continue;
+
+        // Propagate backwards through copies
+        if (auto copyOp = dyn_cast<memref::CopyOp>(defOp)) {
+            if (mustBeOnDevice.insert(copyOp.getSource()).second) 
+                worklist.push_back(copyOp.getSource());
+        }
+        else if (auto gpuCopyOp = dyn_cast<gpu::MemcpyOp>(defOp)) {
+            if (mustBeOnDevice.insert(gpuCopyOp.getSrc()).second) 
+                worklist.push_back(gpuCopyOp.getSrc());
+        }
+        // Propagate through subviews, casts, etc.
+        else if (isa<memref::SubViewOp, memref::CastOp, memref::CollapseShapeOp, 
+                     memref::ExpandShapeOp, bufferization::ToBufferOp>(defOp)) {
+            for (Value operand : defOp->getOperands()) {
+                if (llvm::isa<MemRefType>(operand.getType())) {
+                    if (mustBeOnDevice.insert(operand).second) 
+                        worklist.push_back(operand);
+                }
+            }
+        }
+        // Propagate through linalg ops
+        else if (auto linalgOp = dyn_cast<mlir::linalg::LinalgOp>(defOp)) {
+            for (Value operand : linalgOp->getOperands()) {
+                if (llvm::isa<MemRefType>(operand.getType())) {
+                    if (mustBeOnDevice.insert(operand).second) 
+                        worklist.push_back(operand);
+                }
+            }
+        }
+        // Propagate through SCF loops (Parallel and For)
+        else if (isa<scf::ParallelOp, scf::ForOp>(defOp)) {
+            defOp->walk([&](Operation *innerOp) {
+                for (Value operand : innerOp->getOperands()) {
+                    if (llvm::isa<MemRefType>(operand.getType())) {
+                        if (mustBeOnDevice.insert(operand).second)
+                            worklist.push_back(operand);
+                    }
+                }
+            });
+        }
+    }
+
+    // Now promote all allocations that are marked as "mustBeOnDevice"
+    SmallVector<Value, 4> promotedAllocsToDealloc;
+    
+    // Lambda to promote an allocation
+    auto promoteAlloc = [&](Value res, Operation* op) {
+        if (!mustBeOnDevice.count(res)) return;
+        
+        Attribute currentSpace;
+        if (auto allocOp = dyn_cast<memref::AllocOp>(op)) currentSpace = allocOp.getType().getMemorySpace();
+        else if (auto gpuAllocOp = dyn_cast<gpu::AllocOp>(op)) currentSpace = gpuAllocOp.getType().getMemorySpace();
+        else return;
+
+        if (!isDeviceMemorySpace(currentSpace)) {
+            Attribute newSpace = IntegerAttr::get(IntegerType::get(func.getContext(), 64), 1);
+            updateMemorySpaceRecursively(res, newSpace);
+
+            // Track for deallocation (if it doesn't have one)
+            bool hasDealloc = false;
+            for (auto &use : res.getUses()) {
+                if (isa<memref::DeallocOp, gpu::DeallocOp>(use.getOwner())) {
+                    hasDealloc = true; break;
+                }
+            }
+            if (!hasDealloc) promotedAllocsToDealloc.push_back(res);
+        }
+    };
+
+    func.walk([&](Operation *op) {
+        if (auto allocOp = dyn_cast<memref::AllocOp>(op)) promoteAlloc(allocOp.getResult(), op);
+        else if (auto gpuAllocOp = dyn_cast<gpu::AllocOp>(op)) promoteAlloc(gpuAllocOp.getResult(0), op);
+    });
     llvm::MapVector<Value, Value> hostToDeviceMap;
     llvm::MapVector<Value, Value> registeredHostMem;
     func.walk([&](gpu::LaunchOp launchOp) {

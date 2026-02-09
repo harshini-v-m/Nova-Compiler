@@ -13,6 +13,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/Casting.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 
 #include "Compiler/Translation/NovaToArith/NovaToArith.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"

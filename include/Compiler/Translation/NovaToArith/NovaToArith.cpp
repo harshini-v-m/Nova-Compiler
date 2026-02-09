@@ -81,7 +81,7 @@ struct NovaToArithLoweringPass
   StringRef getDescription() const final {
     return "Lower Nova dialect operations to Arith dialect";
   }
-
+mappingArith
   void runOnOperation() override {
     ModuleOp module = getOperation();
     
