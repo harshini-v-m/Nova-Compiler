@@ -1,87 +1,99 @@
 #include "Compiler/API/NovaCompilerAPI.h"
-#include "Compiler/Pipeline/Pipeline.h"
-#include "Compiler/Pipeline/Gpupipeline.h"
 #include "Compiler/Dialect/nova/NovaDialect.h"
+#include "Compiler/Pipeline/Gpupipeline.h"
+#include "Compiler/Pipeline/Pipeline.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Affine/Passes.h"
-#include "mlir/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
-#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
+#include "mlir/Transforms/Passes.h"
 
-#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/Tensor/IR/TensorTilingInterfaceImpl.h"
-#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
-#include "mlir/Dialect/Linalg/IR/ValueBoundsOpInterfaceImpl.h"
-#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/Transforms/BufferDeallocationOpInterfaceImpl.h"
-#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/SCF/Transforms/BufferDeallocationOpInterfaceImpl.h"
-#include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/ControlFlow/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/GPU/Transforms/BufferDeallocationOpInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
+#include "mlir/Dialect/SCF/Transforms/BufferDeallocationOpInterfaceImpl.h"
+#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/IR/TensorTilingInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
 // ValueBoundsOpInterface implementations (needed for tiling transforms)
-#include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
-#include "mlir/Dialect/Tensor/IR/ValueBoundsOpInterfaceImpl.h"
-#include "mlir/Dialect/Arith/IR/ValueBoundsOpInterfaceImpl.h"
-#include "mlir/Dialect/MemRef/IR/ValueBoundsOpInterfaceImpl.h"
-#include "mlir/Dialect/Affine/IR/ValueBoundsOpInterfaceImpl.h"
-#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
-#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
-#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
-#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
-#include "mlir/Conversion/GPUToNVVM/GPUToNVVM.h"
-#include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
-#include "mlir/Conversion/GPUCommon/GPUToLLVM.h"
+#include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/GPUCommon/GPUToLLVM.h"
+#include "mlir/Conversion/GPUToNVVM/GPUToNVVM.h"
+#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+#include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
 #include "mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h"
-#include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
-#include "mlir/Target/LLVM/NVVM/Target.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Dialect/Affine/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/Transform/IR/TransformDialect.h"
-#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
-#include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
-#include "mlir/Dialect/Func/TransformOps/FuncTransformOps.h"
-#include "mlir/Dialect/SCF/TransformOps/SCFTransformOps.h"
-#include "mlir/Dialect/MemRef/TransformOps/MemRefTransformOps.h"
-#include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
+#include "mlir/Dialect/Func/TransformOps/FuncTransformOps.h"
+#include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.h"
+#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
+#include "mlir/Dialect/MemRef/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/MemRef/TransformOps/MemRefTransformOps.h"
+#include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/SCF/TransformOps/SCFTransformOps.h"
+#include "mlir/Dialect/Tensor/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
+#include "mlir/Target/LLVM/NVVM/Target.h"
 
-#include "mlir/Parser/Parser.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tosa/IR/TosaOps.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Tosa/IR/TosaOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/ToolOutputFile.h"
+#include "mlir/Target/LLVMIR/Export.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/ToolOutputFile.h"
 
-#include <cstdlib>
 #include <array>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <sstream>
-#include <fstream>
 
 using namespace mlir;
 using namespace mlir::nova;
+
+namespace {
+struct AllReduceOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          AllReduceOpMemEffectModel, mlir::gpu::AllReduceOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // No memory effects (operating on values)
+  }
+};
+} // namespace
 
 //----------------------------------------------------------------------------//
 // NovaCompilerAPI Implementation
@@ -106,37 +118,32 @@ NovaCompilerAPI::NovaCompilerAPI() {
   mlir::registerCSEPass();
 
   context = std::make_unique<MLIRContext>();
-  
+
   // Create and populate dialect registry first
   DialectRegistry registry;
-  
+
   // Register necessary dialects
-  registry.insert<mlir::nova::NovaDialect,
-                 mlir::func::FuncDialect,
-                 mlir::arith::ArithDialect,
-                 mlir::tensor::TensorDialect,
-                 mlir::linalg::LinalgDialect,
-                 mlir::scf::SCFDialect,
-                 mlir::tosa::TosaDialect,
-                 mlir::memref::MemRefDialect,
-                 mlir::vector::VectorDialect,
-                 mlir::bufferization::BufferizationDialect,
-                 mlir::gpu::GPUDialect,
-                 mlir::NVVM::NVVMDialect,
-                 mlir::nvgpu::NVGPUDialect>();
-  
+  registry
+      .insert<mlir::nova::NovaDialect, mlir::func::FuncDialect,
+              mlir::arith::ArithDialect, mlir::tensor::TensorDialect,
+              mlir::linalg::LinalgDialect, mlir::scf::SCFDialect,
+              mlir::tosa::TosaDialect, mlir::memref::MemRefDialect,
+              mlir::vector::VectorDialect,
+              mlir::bufferization::BufferizationDialect, mlir::gpu::GPUDialect,
+              mlir::NVVM::NVVMDialect, mlir::nvgpu::NVGPUDialect>();
+
   mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::vector::registerBufferizableOpInterfaceExternalModels(registry);
-  
+
   // Register BufferDeallocationOpInterface external models
   mlir::arith::registerBufferDeallocationOpInterfaceExternalModels(registry);
   mlir::cf::registerBufferDeallocationOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferDeallocationOpInterfaceExternalModels(registry);
   mlir::gpu::registerBufferDeallocationOpInterfaceExternalModels(registry);
-  
+
   mlir::vector::registerConvertVectorToLLVMInterface(registry);
   mlir::arith::registerConvertArithToLLVMInterface(registry);
   mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
@@ -150,65 +157,58 @@ NovaCompilerAPI::NovaCompilerAPI() {
   mlir::registerConvertOpenMPToLLVMInterface(registry);
   mlir::registerConvertComplexToLLVMInterface(registry);
   mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
-  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
+      registry);
 
   // Register LLVM IR translation
   registerLLVMDialectTranslation(registry);
   registerAllToLLVMIRTranslations(registry);
-  
+
   context->appendDialectRegistry(registry);
   context->loadAllAvailableDialects();
 }
 
 NovaCompilerAPI::~NovaCompilerAPI() = default;
 
-std::unique_ptr<llvm::Module> NovaCompilerAPI::compileFile(const std::string &inputFile,
-                                               llvm::LLVMContext &llvmContext,
-                                               const CompilerOptions &options) {
+std::unique_ptr<llvm::Module>
+NovaCompilerAPI::compileFile(const std::string &inputFile,
+                             llvm::LLVMContext &llvmContext,
+                             const CompilerOptions &options) {
   // Parse the input file
   auto fileOrErr = llvm::MemoryBuffer::getFile(inputFile);
   if (std::error_code ec = fileOrErr.getError()) {
     llvm::errs() << "Failed to open file: " << ec.message() << "\n";
     return nullptr;
   }
-  
+
   llvm::SourceMgr sourceMgr;
   sourceMgr.AddNewSourceBuffer(std::move(*fileOrErr), llvm::SMLoc());
-  
-  OwningOpRef<ModuleOp> module = parseSourceFile<ModuleOp>(sourceMgr, context.get());
+
+  OwningOpRef<ModuleOp> module =
+      parseSourceFile<ModuleOp>(sourceMgr, context.get());
   if (!module) {
     llvm::errs() << "Failed to parse MLIR file\n";
     return nullptr;
   }
-  
+
   return compileToLLVMModule(*module, llvmContext, options);
 }
 
-
-
 //---------------------------------------------------------------------------------------------------
-// IMPORTANT 
+// IMPORTANT
 //---------------------------------------------------------------------------------------------------
 
 void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   // Register necessary dialects
-  registry.insert<mlir::nova::NovaDialect,
-                 mlir::func::FuncDialect,
-                 mlir::affine::AffineDialect,
-                 mlir::arith::ArithDialect,
-                 mlir::math::MathDialect,
-                 mlir::tensor::TensorDialect,
-                 mlir::linalg::LinalgDialect,
-                 mlir::scf::SCFDialect,
-                 mlir::tosa::TosaDialect,
-                 mlir::memref::MemRefDialect,
-                 mlir::vector::VectorDialect,
-                 mlir::bufferization::BufferizationDialect,
-                 mlir::gpu::GPUDialect,
-                 mlir::NVVM::NVVMDialect,
-                 mlir::nvgpu::NVGPUDialect,
-                 mlir::LLVM::LLVMDialect,
-                 mlir::transform::TransformDialect>();
+  registry.insert<
+      mlir::nova::NovaDialect, mlir::func::FuncDialect,
+      mlir::affine::AffineDialect, mlir::arith::ArithDialect,
+      mlir::math::MathDialect, mlir::tensor::TensorDialect,
+      mlir::linalg::LinalgDialect, mlir::scf::SCFDialect,
+      mlir::tosa::TosaDialect, mlir::memref::MemRefDialect,
+      mlir::vector::VectorDialect, mlir::bufferization::BufferizationDialect,
+      mlir::gpu::GPUDialect, mlir::NVVM::NVVMDialect, mlir::nvgpu::NVGPUDialect,
+      mlir::LLVM::LLVMDialect, mlir::transform::TransformDialect>();
 
   // Register Transform Dialect extensions
   mlir::linalg::registerTransformDialectExtension(registry);
@@ -237,8 +237,9 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::vector::registerBufferizableOpInterfaceExternalModels(registry);
-  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
-  
+  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
+      registry);
+
   // Register BufferDeallocationOpInterface external models
   mlir::arith::registerBufferDeallocationOpInterfaceExternalModels(registry);
   mlir::cf::registerBufferDeallocationOpInterfaceExternalModels(registry);
@@ -258,7 +259,7 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   mlir::registerConvertOpenMPToLLVMInterface(registry);
   mlir::registerConvertComplexToLLVMInterface(registry);
   mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
-  
+
   registerLLVMDialectTranslation(registry);
   registerAllToLLVMIRTranslations(registry);
     // Attach the interface to gpu::AllReduceOp when GPU dialect is loaded
@@ -268,52 +269,51 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   });
 }
 
-std::unique_ptr<llvm::Module> NovaCompilerAPI::compileToLLVMModule(
-    ModuleOp module,
-    llvm::LLVMContext& llvmContext,
-    const CompilerOptions &options) {
-  
+std::unique_ptr<llvm::Module>
+NovaCompilerAPI::compileToLLVMModule(ModuleOp module,
+                                     llvm::LLVMContext &llvmContext,
+                                     const CompilerOptions &options) {
+
   // Register required dialect interfaces on the module's context
-  // This is necessary because the module may have been created by a different context
-  mlir::MLIRContext* ctx = module.getContext();
+  // This is necessary because the module may have been created by a different
+  // context
+  mlir::MLIRContext *ctx = module.getContext();
   DialectRegistry registry;
   registerAllDialects(registry);
-  
+
   ctx->appendDialectRegistry(registry);
   ctx->loadAllAvailableDialects();
-  
+
   if (failed(verify(module))) {
     llvm::errs() << "Module verification failed\n";
     return nullptr;
   }
-  
+
   if (failed(runPipeline(module, options))) {
     llvm::errs() << "Pipeline execution failed\n";
     return nullptr;
   }
-  
+
   auto llvmModule = translateModuleToLLVMIR(module, llvmContext);
   return llvmModule;
 }
 
-LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module, 
+LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module,
                                            const CompilerOptions &options) {
   // Create a PassManager that operates on ModuleOp
   // IMPORTANT: Use the module's own context, not our internal context
   PassManager pm(module.getContext());
-  
+
   // Enable verbose mode to trace pipeline execution
   if (options.verbose) {
-    pm.enableIRPrinting(
-      [](Pass*, Operation*) { return false; },  // before
-      [](Pass*, Operation*) { return true; },   // after
-      true,  // print module scope
-      false, // print after only on change
-      false, // print after only on failure
-      llvm::errs()
-    );
+    pm.enableIRPrinting([](Pass *, Operation *) { return false; }, // before
+                        [](Pass *, Operation *) { return true; },  // after
+                        true,  // print module scope
+                        false, // print after only on change
+                        false, // print after only on failure
+                        llvm::errs());
   }
-  
+
   if (options.runFullPipeline) {
     // Add the Nova optimization pipeline based on target device
     if (options.device == "gpu") {
@@ -322,17 +322,16 @@ LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module,
       createNovaPipelines(pm);
     }
   }
-  
+
   // Run custom pipeline if specified
   if (!options.customPipeline.empty()) {
     if (failed(parsePassPipeline(options.customPipeline, pm))) {
       return failure();
     }
   }
-  
+
   return pm.run(module);
 }
-
 
 std::string NovaCompilerAPI::moduleToString(ModuleOp module) {
   std::string output;
@@ -349,16 +348,16 @@ std::string NovaCompilerAPI::moduleToString(ModuleOp module) {
 std::string NovaCompilerSystemAPI::executeCommand(const std::string &command) {
   std::array<char, 128> buffer;
   std::string result;
-  
-  FILE* pipe = popen(command.c_str(), "r");
+
+  FILE *pipe = popen(command.c_str(), "r");
   if (!pipe) {
     return "";
   }
-  
+
   while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
     result += buffer.data();
   }
-  
+
   pclose(pipe);
   return result;
 }
@@ -367,14 +366,13 @@ std::string NovaCompilerSystemAPI::findNovaOpt(const std::string &hint) {
   if (!hint.empty()) {
     return hint;
   }
-  
+
   // Try common locations
   std::vector<std::string> paths = {
-    "./build/tools/nova-opt/nova-opt",
-    "../build/tools/nova-opt/nova-opt",
-    "nova-opt"  // In PATH
+      "./build/tools/nova-opt/nova-opt", "../build/tools/nova-opt/nova-opt",
+      "nova-opt" // In PATH
   };
-  
+
   for (const auto &path : paths) {
     std::string cmd = "which " + path + " 2>/dev/null";
     std::string result = executeCommand(cmd);
@@ -386,21 +384,20 @@ std::string NovaCompilerSystemAPI::findNovaOpt(const std::string &hint) {
       return result;
     }
   }
-  
-  return "nova-opt";  // Fallback to PATH
+
+  return "nova-opt"; // Fallback to PATH
 }
-
-
 
 std::string NovaCompilerSystemAPI::getLLVMIR(const std::string &inputFile,
                                              const std::string &novaOptPath,
                                              const std::string &device) {
   std::string novaOpt = findNovaOpt(novaOptPath);
-  
+
   // Build command based on device
-  std::string pipeline = (device == "gpu") ? "--nova-gpu-pipeline" : "--nova-opt-pipeline";
+  std::string pipeline =
+      (device == "gpu") ? "--nova-gpu-pipeline" : "--nova-opt-pipeline";
   std::string cmd = novaOpt + " " + inputFile + " " + pipeline + " | " +
                     "mlir-translate --mlir-to-llvmir";
-  
+
   return executeCommand(cmd);
 }
