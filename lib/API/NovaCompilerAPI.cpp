@@ -86,6 +86,17 @@ using namespace mlir::nova;
 //----------------------------------------------------------------------------//
 // NovaCompilerAPI Implementation
 //----------------------------------------------------------------------------//
+namespace {
+struct AllReduceOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          AllReduceOpMemEffectModel, mlir::gpu::AllReduceOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // No memory effects (operating on values)
+  }
+};
+} // namespace
 
 NovaCompilerAPI::NovaCompilerAPI() {
   // Register all MLIR passes globally so they can be parsed from strings
@@ -250,6 +261,11 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   
   registerLLVMDialectTranslation(registry);
   registerAllToLLVMIRTranslations(registry);
+    // Attach the interface to gpu::AllReduceOp when GPU dialect is loaded
+  registry.addExtension(+[](mlir::MLIRContext *ctx,
+                            mlir::gpu::GPUDialect *dialect) {
+    mlir::gpu::AllReduceOp::attachInterface<AllReduceOpMemEffectModel>(*ctx);
+  });
 }
 
 std::unique_ptr<llvm::Module> NovaCompilerAPI::compileToLLVMModule(
