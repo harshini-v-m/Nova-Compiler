@@ -457,6 +457,30 @@ struct NovaOpTosaOp {
 
     return finalLoss;
   }
+  // Cast lowering pattern
+  static Value mappingtosa(nova::CastOp op, Type resultType, ValueRange input,
+                           OpBuilder *builder) {
+    auto inputType = cast<RankedTensorType>(input[0].getType());
+    auto outputType = cast<RankedTensorType>(resultType);
+    auto inputElemType = inputType.getElementType();
+    auto outputElemType = outputType.getElementType();
+
+    // Special case: bool (i1) to float (f16, f32, f64)
+    // TOSA cast doesn't support i1 to float directly.
+    // We do i1 -> i32 -> float
+    if (inputElemType.isInteger(1) && isa<FloatType>(outputElemType)) {
+      auto i32Type = builder->getI32Type();
+      auto intermediateType =
+          RankedTensorType::get(inputType.getShape(), i32Type);
+      auto intermediateCast = builder->create<tosa::CastOp>(
+          op.getLoc(), intermediateType, input[0]);
+      return builder->create<tosa::CastOp>(op.getLoc(), outputType,
+                                           intermediateCast);
+    }
+
+    return builder->create<tosa::CastOp>(op.getLoc(), resultType, input[0]);
+  }
+
   template <typename OpTy>
   static Value maptop(OpTy op, Type resultType, ValueRange input,
                       OpBuilder *builder) {
@@ -721,6 +745,7 @@ struct NovaToTosaLoweringPass
     target.addIllegalOp<nova::BceOp>();
     target.addIllegalOp<nova::SceOp>();
     target.addIllegalOp<nova::MaeOp>();
+    target.addIllegalOp<nova::CastOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     TypeConverter typeConverter;
     typeConverter.addConversion([](Type type) { return type; });
@@ -743,8 +768,8 @@ void populateNovaToTosaConversionPatterns(RewritePatternSet &patterns) {
                NovaToTosaLoweringTemplate<nova::CceOp>,
                NovaToTosaLoweringTemplate<nova::BceOp>,
                NovaToTosaLoweringTemplate<nova::SceOp>,
-               NovaToTosaLoweringTemplate<nova::SigmoidOp>>(
-      patterns.getContext());
+               NovaToTosaLoweringTemplate<nova::SigmoidOp>,
+               NovaToTosaLoweringTemplate<nova::CastOp>>(patterns.getContext());
 }
 
 // creating a pointer for this pass

@@ -813,6 +813,22 @@ def Nova_SceOp :Op<Nova_Dialect,"sce",[Pure,DeclareOpInterfaceMethods<InferTypeO
     $logits `,` $targets attr-dict `:` type($logits) `,` type($targets) 
   }];
 }
+
+def Nova_CastOp : Op<Nova_Dialect, "cast", [Pure]> {
+  let summary = "Cast operation";
+  let description = [{
+    Casts a tensor from one element type to another.
+    Example:
+    ```mlir
+    %0 = nova.cast %input : tensor<8xf32> -> tensor<8xi32>
+    ```
+  }];
+
+  let arguments = (ins Nova_Tensor:$input);
+  let results = (outs Nova_Tensor:$output);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($output)";
+}
 //==============================Weight initialier operations======================
 def Nova_Rndm2DOp:Op<Nova_Dialect,"rndm2d",[Pure]>{
   
