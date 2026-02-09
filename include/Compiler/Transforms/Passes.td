@@ -59,4 +59,23 @@ def RemDevAttr : Pass<"rem-dev-attr", "func::FuncOp"> {
     let constructor = "::mlir::nova::createRemDevAttrPass()";
 }
 
+def VectorOpt : Pass<"vector-opt", "func::FuncOp"> {
+    let summary = "Custom vector optimization pass";
+    let description = [{
+        Optimizes vector operations, including fusing mul/add to contract
+        and optionally unrolling loops.
+    }];
+    let dependentDialects = [
+        "mlir::vector::VectorDialect",
+        "mlir::affine::AffineDialect",
+        "mlir::scf::SCFDialect",
+        "mlir::arith::ArithDialect"
+    ];
+    let options = [
+        Option<"unrollFactor", "unroll-factor", "int", /*default=*/"1",
+               "Unrolling factor (1 to disable)">
+    ];
+    let constructor = "::mlir::nova::createVectorOptPass()";
+}
+
 #endif // NOVA_TRANSFORMS_PASSES
