@@ -43,6 +43,7 @@
 //optimization passes includes
 #include "Compiler/Transforms/FuseMatmulBias.h"
 #include "Compiler/Transforms/GenerateDynamicWrapper.h"
+#include "Compiler/Transforms/VectorOpt.h"
 
 //lowering passes
 #include "Compiler/Translation/NovaToArith/NovaToArith.h"
@@ -139,11 +140,14 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
   funcPM.addPass(mlir::createCanonicalizerPass());
   funcPM.addPass(mlir::createCSEPass());
   funcPM.addPass(mlir::math::createMathUpliftToFMA());  
- /*
-  mlir::affine::AffineVectorizeOptions vectorOptions;
-  vectorOptions.vectorSizes = {8};
-  funcPM.addPass(mlir::affine::createAffineVectorize(vectorOptions));
-*/
+
+  /*
+   mlir::affine::AffineVectorizeOptions vectorOptions;
+   vectorOptions.vectorSizes = {8};
+   funcPM.addPass(mlir::affine::createAffineVectorize(vectorOptions));
+ 
+  funcPM.addPass(mlir::nova::createVectorOptPass());
+  */
   funcPM.addPass(mlir::createCanonicalizerPass());
 
   // Lower affine to standard control flow

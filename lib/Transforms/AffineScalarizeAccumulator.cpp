@@ -79,27 +79,9 @@ struct AffineScalarizeAccumulatorPass
       if (idx == loopIV) return false;
     }
     
-    // Check for init store before loop (scanning backwards)
-    Operation *prevOp = forOp->getPrevNode();
-    while (prevOp) {
-      if (auto store = dyn_cast<AffineStoreOp>(prevOp)) {
-        if (store.getMemRef() == loadOp.getMemRef() &&
-            store.getIndices().size() == loadOp.getIndices().size()) {
-          bool indicesMatch = true;
-          for (auto zip : llvm::zip(store.getIndices(), loadOp.getIndices())) {
-            if (std::get<0>(zip) != std::get<1>(zip)) {
-              indicesMatch = false;
-              break;
-            }
-          }
-          if (indicesMatch) return true;
-        }
-      }
-      if (prevOp->getBlock() != forOp->getBlock()) break;
-      prevOp = prevOp->getPrevNode();
-    }
-    
-    return false;
+    // We can scalarize! 
+    // Even if init store is not found, we can insert a load.
+    return true;
   }
 
   void scalarizeLoop(AffineForOp forOp) {
@@ -136,7 +118,9 @@ struct AffineScalarizeAccumulatorPass
       }
     }
     
-    // Find init store
+    if (!loadOp || !storeOp) return;
+
+    // Find init store (optional)
     AffineStoreOp initStore = nullptr;
     Operation *prevOp = forOp->getPrevNode();
     while (prevOp) {
@@ -160,11 +144,17 @@ struct AffineScalarizeAccumulatorPass
       prevOp = prevOp->getPrevNode();
     }
     
-    if (!loadOp || !storeOp || !initStore) return;
-    
     OpBuilder builder(forOp);
     Location loc = forOp.getLoc();
-    Value initVal = initStore.getValueToStore();
+    Value initVal;
+    
+    if (initStore) {
+      initVal = initStore.getValueToStore();
+    } else {
+      // Insert load to initialize
+      initVal = builder.create<AffineLoadOp>(
+          loc, loadOp.getMemRef(), loadOp.getAffineMap(), loadOp.getMapOperands());
+    }
     
     // Create new loop with iter_args using the simple integer bounds builder
     auto newForOp = builder.create<AffineForOp>(
@@ -204,7 +194,7 @@ struct AffineScalarizeAccumulatorPass
     
     // Erase old operations
     forOp.erase();
-    initStore.erase();
+    if (initStore) initStore.erase();
   }
 
   StringRef getArgument() const final { return "affine-scalarize-accumulator"; }
