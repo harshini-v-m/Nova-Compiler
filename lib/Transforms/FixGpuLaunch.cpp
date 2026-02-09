@@ -55,8 +55,13 @@ public:
     }
     auto devicePtrTy = LLVM::LLVMPointerType::get(ctx, addressSpace);
 
-    int64_t elementSize =
-        memRefType.getElementType().getIntOrFloatBitWidth() / 8;
+    Type elementTy = memRefType.getElementType();
+    int64_t elementSize = 0;
+    if (elementTy.isIntOrFloat())
+      elementSize = elementTy.getIntOrFloatBitWidth() / 8;
+    else if (elementTy.isIndex())
+      elementSize = 8; // Treat index as 64-bit
+
     if (elementSize == 0)
       elementSize = 1;
 
@@ -226,8 +231,13 @@ public:
     Value srcPtr = getPtrFromMemRef(src);
 
     MemRefType memRefType = llvm::cast<MemRefType>(dst.getType());
-    int64_t elementSize =
-        memRefType.getElementType().getIntOrFloatBitWidth() / 8;
+    Type elementTy = memRefType.getElementType();
+    int64_t elementSize = 0;
+    if (elementTy.isIntOrFloat())
+      elementSize = elementTy.getIntOrFloatBitWidth() / 8;
+    else if (elementTy.isIndex())
+      elementSize = 8;
+
     if (elementSize == 0)
       elementSize = 1;
 
@@ -338,8 +348,13 @@ public:
       ptr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy, rawPtr);
     }
 
-    int64_t elementSize =
-        memRefType.getElementType().getIntOrFloatBitWidth() / 8;
+    Type elementTy = memRefType.getElementType();
+    int64_t elementSize = 0;
+    if (elementTy.isIntOrFloat())
+      elementSize = elementTy.getIntOrFloatBitWidth() / 8;
+    else if (elementTy.isIndex())
+      elementSize = 8;
+
     if (elementSize == 0)
       elementSize = 1;
 
@@ -461,7 +476,12 @@ public:
     Value srcPtr =
         rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy, ptr);
 
-    int64_t elementSize = elemTy.getIntOrFloatBitWidth() / 8;
+    int64_t elementSize = 0;
+    if (elemTy.isIntOrFloat())
+      elementSize = elemTy.getIntOrFloatBitWidth() / 8;
+    else if (elemTy.isIndex())
+      elementSize = 8;
+
     if (elementSize == 0)
       elementSize = 4; // Default to 4 for float/int32 if unknown
     Value sizeBytes = rewriter.create<LLVM::ConstantOp>(
@@ -520,7 +540,12 @@ public:
     Value srcPtr =
         rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy, hostPtrVar);
 
-    int64_t elementSize = elemTy.getIntOrFloatBitWidth() / 8;
+    int64_t elementSize = 0;
+    if (elemTy.isIntOrFloat())
+      elementSize = elemTy.getIntOrFloatBitWidth() / 8;
+    else if (elemTy.isIndex())
+      elementSize = 8;
+
     if (elementSize == 0)
       elementSize = 4;
     Value sizeBytes = rewriter.create<LLVM::ConstantOp>(
