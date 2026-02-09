@@ -95,20 +95,6 @@ struct AllReduceOpMemEffectModel
 };
 } // namespace
 
-//----------------------------------------------------------------------------//
-// NovaCompilerAPI Implementation
-//----------------------------------------------------------------------------//
-namespace {
-struct AllReduceOpMemEffectModel
-    : public mlir::MemoryEffectOpInterface::ExternalModel<
-          AllReduceOpMemEffectModel, mlir::gpu::AllReduceOp> {
-  void getEffects(mlir::Operation *op,
-                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
-                      mlir::MemoryEffects::Effect>> &effects) const {
-    // No memory effects (operating on values)
-  }
-};
-} // namespace
 
 NovaCompilerAPI::NovaCompilerAPI() {
   // Register all MLIR passes globally so they can be parsed from strings

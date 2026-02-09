@@ -225,38 +225,12 @@ private:
       return builder->create<arith::AddIOp>(op.getLoc(), args[0], args[1]);
     return nullptr;
   }
-  
   // sub operation
   static Value mapOpImpl(nova::SubOp op, Type resultType, ArrayRef<Value> args, OpBuilder *builder) {
-    Value lhs = args[0];
-    Value rhs = args[1];
-    Location loc = op.getLoc();
-
-    // 1. Handle Type Mismatch by casting to f32
-    if (lhs.getType() != rhs.getType()) {
-        Type f32Type = builder->getF32Type();
-        
-        auto castToF32 = [&](Value val) -> Value {
-            Type t = val.getType();
-            if (t == f32Type) return val;
-            if (isa<FloatType>(t)) 
-                return builder->create<arith::ExtFOp>(loc, f32Type, val);
-            if (isa<IntegerType>(t)) 
-                return builder->create<arith::SIToFPOp>(loc, f32Type, val);
-            return val;
-        };
-
-        lhs = castToF32(lhs);
-        rhs = castToF32(rhs);
-        // If we cast to float, we must use SubFOp regardless of original resultType
-        return builder->create<arith::SubFOp>(loc, lhs, rhs);
-    }
-
-    // 2. Standard dispatch if types already match
     if (isa<FloatType>(resultType))
-        return builder->create<arith::SubFOp>(loc, lhs, rhs);
+        return builder->create<arith::SubFOp>(op.getLoc(), args[0], args[1]);
     if (isa<IntegerType>(resultType))
-        return builder->create<arith::SubIOp>(loc, lhs, rhs);
+        return builder->create<arith::SubIOp>(op.getLoc(), args[0], args[1]);
 
     return nullptr;
 }
