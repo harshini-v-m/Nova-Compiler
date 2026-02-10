@@ -5,6 +5,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -482,17 +483,35 @@ struct NovaScatterAddOpLowering
       axis += inputRank;
 
     auto indicesType = cast<RankedTensorType>(indices.getType());
-
+//check the element type of indices and cast to i32 if it in in float
+    auto indicesElemType = indicesType.getElementType();
+    Value processedIndices = indices;
+    
+    if (llvm::isa<FloatType>(indicesElemType)) {
+      // Create target type with same shape but i32 element type
+      auto i32Type = rewriter.getI32Type();
+      auto castedIndicesType = RankedTensorType::get(
+          indicesType.getShape(), i32Type);
+      
+      // Cast float indices to i32 using TOSA cast
+      processedIndices = rewriter.create<tosa::CastOp>(
+          loc, castedIndicesType, indices);
+    }
+    
     auto srcType = cast<RankedTensorType>(src.getType());
     auto srcShape = srcType.getShape();
     int64_t srcRank = srcType.getRank();
-
+    
+    // Update indicesType to reflect the processed indices
+    auto processedIndicesType = cast<RankedTensorType>(processedIndices.getType());
+    
     // 1. Bufferize operands to MemRef
     auto inputMemType = MemRefType::get(resultType.getShape(), elementTy);
     auto srcMemType =
         MemRefType::get(srcType.getShape(), srcType.getElementType());
     auto indicesMemType =
-        MemRefType::get(indicesType.getShape(), indicesType.getElementType());
+        MemRefType::get(processedIndicesType.getShape(), processedIndicesType.getElementType());
+
 
     Value inputMem =
         rewriter.create<ToBufferOp>(loc, inputMemType, input, /*restrict=*/true)
@@ -502,8 +521,9 @@ struct NovaScatterAddOpLowering
             .getResult();
     Value indicesMem =
         rewriter
-            .create<ToBufferOp>(loc, indicesMemType, indices, /*restrict=*/true)
+            .create<ToBufferOp>(loc, indicesMemType, processedIndices, /*restrict=*/true)
             .getResult();
+
 
     auto zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     auto one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
@@ -521,14 +541,12 @@ struct NovaScatterAddOpLowering
         [&](OpBuilder &b, Location l, ValueRange ivs) {
           Value updateIdx = ivs[axis];
 
-          // Extract Index
+          // Extract Index (already i32 from TOSA cast if was float)
           Value idxVal =
               b.create<memref::LoadOp>(l, indicesMem, ValueRange{updateIdx});
-          if (llvm::isa<FloatType>(indicesType.getElementType())) {
-            idxVal = b.create<arith::FPToSIOp>(l, b.getI32Type(), idxVal);
-          }
           Value targetIdx =
               b.create<arith::IndexCastOp>(l, b.getIndexType(), idxVal);
+
 
           Value val = b.create<memref::LoadOp>(l, srcMem, ivs);
 
