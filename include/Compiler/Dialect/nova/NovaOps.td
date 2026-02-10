@@ -76,6 +76,7 @@ def Nova_CompareOp:Op<Nova_Dialect,"compare",[Pure,DeclareOpInterfaceMethods<Inf
  ];
  let skipDefaultBuilders=1;
   let hasVerifier=1;
+  let hasCanonicalizer=1; 
   let extraClassDeclaration = [{
   }];
 

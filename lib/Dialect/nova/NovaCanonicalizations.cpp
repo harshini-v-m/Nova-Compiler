@@ -903,3 +903,82 @@ void ReciprocalOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                                MLIRContext *context) {
   results.add<SimplifyReciprocalReciprocal>(context);
 }
+
+struct InsertBroadcastPatterncompare : public OpRewritePattern<CompareOp> {
+  using OpRewritePattern<CompareOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(CompareOp op,
+                                PatternRewriter &rewriter) const override {
+    auto lhsType = dyn_cast<RankedTensorType>(op.getLhs().getType());
+    auto rhsType = dyn_cast<RankedTensorType>(op.getRhs().getType());
+    auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
+  nova::ComparisonType compareType = op.getKind();
+    if (!lhsType || !rhsType || !resultType) {
+      return failure();
+    }
+
+    if (lhsType.getShape() == resultType.getShape() &&
+        rhsType.getShape() == resultType.getShape()) {
+      return failure();
+    }
+
+    Value newLhs = op.getLhs();
+    Value newRhs = op.getRhs();
+    bool changed = false;
+
+    if (lhsType.getShape() != resultType.getShape()) {
+      if (lhsType.getRank() > resultType.getRank()) {
+        return failure();
+      }
+      if (!isBroadcastCompatible(lhsType.getShape(), resultType.getShape())) {
+        return failure();
+      }
+
+      auto broadcastDims =
+          computeBroadcastDimensions(lhsType.getRank(), resultType.getRank());
+
+      auto broadcastDimsAttr = rewriter.getI64ArrayAttr(broadcastDims);
+      auto restype = resultType.clone(lhsType.getElementType());
+
+      newLhs = rewriter
+                   .create<BroadcastInDimOp>(op.getLoc(), restype, newLhs,
+                                             broadcastDimsAttr)
+                   .getResult();
+      changed = true;
+    }
+
+    if (rhsType.getShape() != resultType.getShape()) {
+      if (rhsType.getRank() > resultType.getRank()) {
+        return failure();
+      }
+      if (!isBroadcastCompatible(rhsType.getShape(), resultType.getShape())) {
+        return failure();
+      }
+
+      auto broadcastDims =
+          computeBroadcastDimensions(rhsType.getRank(), resultType.getRank());
+
+      auto broadcastDimsAttr = rewriter.getI64ArrayAttr(broadcastDims);
+      // here instead of creating the op with result type we should
+      // make thedata type of rhs to rhs itself
+      auto restype = resultType.clone(rhsType.getElementType());
+      newRhs = rewriter
+                   .create<BroadcastInDimOp>(op.getLoc(), restype, newRhs,
+                                             broadcastDimsAttr)
+                   .getResult();
+      changed = true;
+    }
+
+    if (!changed) {
+      return failure();
+    }
+
+    rewriter.replaceOpWithNewOp<CompareOp>(op, op.getResult().getType(), newLhs,
+                                        newRhs,compareType);
+    return success();
+  }
+};
+void CompareOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                               MLIRContext *context) {
+  results.add<InsertBroadcastPatterncompare>(context);
+}

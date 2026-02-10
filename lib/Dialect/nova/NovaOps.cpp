@@ -788,7 +788,8 @@ LogicalResult CompareOp::verify() {
 
   // Verify that input shapes match
   if (lhsType.getShape() != rhsType.getShape()) {
-    return emitOpError("operand shapes must match for comparison");
+    if (!isBroadcastCompatible(lhsType.getShape(), rhsType.getShape()))
+      return emitOpError("operand shapes must be broadcast compatible");
   }
 
   return success();
@@ -989,11 +990,25 @@ LogicalResult CompareOp::inferReturnTypes(
     return failure();
   }
 
+  auto lhsType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
+  auto rhsType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
+
+  if (!lhsType || !rhsType) {
+    return failure();
+  }
+
+  auto broadcastedShape = computeBroadcastShape(lhsType.getShape(), rhsType.getShape());
+  if (!broadcastedShape) {
+    if (location) {
+      mlir::emitError(*location) << "incompatible shapes for broadcasting - "
+                            << lhsType << " and " << rhsType;
+    }
+    return failure();
+  }
+
   // The result type of comparison is always a tensor of i1
-  // the shape is tensor of shape same as inputs
-  auto inputType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
   Type resultType = RankedTensorType::get(
-      inputType.getShape(), IntegerType::get(context, 1));
+      *broadcastedShape, IntegerType::get(context, 1));
   inferredReturnTypes.push_back(resultType);
   return success();
 }
@@ -1916,9 +1931,6 @@ LogicalResult ScatterAddOp::verify() {
     }
   }
 
-  if (!indexType.getElementType().isSignlessInteger()) {
-    return emitOpError("indices must be an integer tensor");
-  }
 
   return success();
 }
