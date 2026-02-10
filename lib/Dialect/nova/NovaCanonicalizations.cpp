@@ -96,6 +96,52 @@ struct InsertBroadcastPattern : public OpRewritePattern<OpType> {
 };
 
 //===----------------------------------------------------------------------===//
+// Cast Insertion Pattern (Generic for binary ops)
+//===----------------------------------------------------------------------===//
+template <typename OpType>
+struct InsertCastPattern : public OpRewritePattern<OpType> {
+  using OpRewritePattern<OpType>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(OpType op,
+                                PatternRewriter &rewriter) const override {
+    Value lhs = op.getLhs();
+    Value rhs = op.getRhs();
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    auto lhsType = cast<RankedTensorType>(lhs.getType());
+    auto rhsType = cast<RankedTensorType>(rhs.getType());
+
+    Type resultElemType = resultType.getElementType();
+    Type lhsElemType = lhsType.getElementType();
+    Type rhsElemType = rhsType.getElementType();
+
+    bool lhsNeedsCast = lhsElemType != resultElemType;
+    bool rhsNeedsCast = rhsElemType != resultElemType;
+
+    if (!lhsNeedsCast && !rhsNeedsCast) {
+      return failure();
+    }
+
+    Value newLhs = lhs;
+    Value newRhs = rhs;
+
+    if (lhsNeedsCast) {
+      auto newLhsType =
+          RankedTensorType::get(lhsType.getShape(), resultElemType);
+      newLhs = rewriter.create<nova::CastOp>(op.getLoc(), newLhsType, lhs);
+    }
+
+    if (rhsNeedsCast) {
+      auto newRhsType =
+          RankedTensorType::get(rhsType.getShape(), resultElemType);
+      newRhs = rewriter.create<nova::CastOp>(op.getLoc(), newRhsType, rhs);
+    }
+
+    rewriter.replaceOpWithNewOp<OpType>(op, resultType, newLhs, newRhs);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // AddOp Canonicalization Patterns
 //===----------------------------------------------------------------------===//
 
@@ -812,6 +858,7 @@ struct SimplifyPowConstant : public OpRewritePattern<PowOp> {
 void AddOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<AddOp>>(context);
+  results.add<InsertCastPattern<AddOp>>(context);
   results.add<EliminateAddZero>(context);
   results.add<CombineAddConstants>(context);
   results.add<ConstantFoldAdd>(context);
@@ -820,6 +867,7 @@ void AddOp::getCanonicalizationPatterns(RewritePatternSet &results,
 void SubOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<SubOp>>(context);
+  results.add<InsertCastPattern<SubOp>>(context);
   results.add<EliminateSubZero>(context);
   results.add<EliminateSubSelf>(context);
   results.add<SimplifySubZeroLhs>(context);
@@ -828,6 +876,7 @@ void SubOp::getCanonicalizationPatterns(RewritePatternSet &results,
 void MulOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<MulOp>>(context);
+  results.add<InsertCastPattern<MulOp>>(context);
   results.add<EliminateMulOne>(context);
   results.add<EliminateMulZero>(context);
   results.add<CombineMulConstants>(context);
@@ -836,6 +885,7 @@ void MulOp::getCanonicalizationPatterns(RewritePatternSet &results,
 void DivOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<DivOp>>(context);
+  results.add<InsertCastPattern<DivOp>>(context);
   results.add<EliminateDivOne>(context);
   results.add<Reciprocalsquare>(context);
   results.add<SimplifyDivSelf>(context);
@@ -844,23 +894,27 @@ void DivOp::getCanonicalizationPatterns(RewritePatternSet &results,
 void ModOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<ModOp>>(context);
+  results.add<InsertCastPattern<ModOp>>(context);
 }
 
 void PowOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<PowOp>>(context);
+  results.add<InsertCastPattern<PowOp>>(context);
   results.add<SimplifyPowConstant>(context);
 }
 
 void MaxOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<MaxOp>>(context);
+  results.add<InsertCastPattern<MaxOp>>(context);
   results.add<SimplifyMaxSelf>(context);
 }
 
 void MinOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<InsertBroadcastPattern<MinOp>>(context);
+  results.add<InsertCastPattern<MinOp>>(context);
   results.add<SimplifyMinSelf>(context);
 }
 

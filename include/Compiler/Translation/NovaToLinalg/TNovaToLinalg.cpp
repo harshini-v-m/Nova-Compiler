@@ -335,8 +335,9 @@ private:
   static Value mapOpImpl(nova::ReciprocalOp op, Type resultType,
                          ArrayRef<Value> args, OpBuilder *builder) {
     if (isa<FloatType>(resultType)) {
-      Value one = builder->create<arith::ConstantFloatOp>(
-          op.getLoc(), cast<FloatType>(resultType), APFloat(1.0f));
+      auto floatType = cast<FloatType>(resultType);
+      Value one = builder->create<arith::ConstantOp>(
+          op.getLoc(), floatType, builder->getFloatAttr(floatType, 1.0));
       return builder->create<arith::DivFOp>(op.getLoc(), one, args[0]);
     }
     return nullptr;
