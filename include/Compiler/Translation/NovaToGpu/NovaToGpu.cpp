@@ -65,7 +65,7 @@ public:
       return failure(); // Unsupported for direct GPU mapping yet
     }
 
-    // Initialize output memory with identity value before launch
+    // Initialize accumulator memory with identity value before launch
     Location loc = op.getLoc();
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
 
@@ -88,6 +88,13 @@ public:
     // selecting accumulator initial value based on the reduction kind
     Value initialValue;
     Type elementType = inputType.getElementType();
+
+    // For f16/bf16, we use f32 for accumulation
+    Type accType = elementType;
+    if (elementType.isF16() || elementType.isBF16()) {
+      accType = rewriter.getF32Type();
+    }
+
     float initValFloat = 0.0f;
     if (kind == ReductionKind::PRODUCT)
       initValFloat = 1.0f;
@@ -98,17 +105,20 @@ public:
     else if (kind == ReductionKind::MEAN)
       initValFloat = 0.0f;
 
-    if (elementType.isF32()) {
+    if (accType.isF32()) {
       initialValue = rewriter.create<arith::ConstantOp>(
           loc, rewriter.getF32FloatAttr(initValFloat));
     } else {
       initialValue = rewriter.create<arith::ConstantOp>(
-          loc, rewriter.getZeroAttr(elementType));
+          loc, rewriter.getZeroAttr(accType));
+    }
+    Value memsetVal = initialValue;
+    if (elementType != accType) {
+      memsetVal =
+          rewriter.create<arith::TruncFOp>(loc, elementType, initialValue);
     }
 
-    // Initialize output memory using gpu.memset
-    rewriter.create<gpu::MemsetOp>(loc, Type(), ValueRange{}, alloc,
-                                   initialValue);
+    rewriter.create<gpu::MemsetOp>(loc, Type(), ValueRange{}, alloc, memsetVal);
 
     // 3. Create gpu.launch parameters
     int64_t numElements = inputType.getNumElements();
@@ -187,22 +197,28 @@ public:
 
       Value val = rewriter.create<memref::LoadOp>(loc, inputMemRef, indices);
 
+      // Cast loaded value to f32 if necessary
+      Value calcVal = val;
+      if (elementType != accType) {
+        calcVal = rewriter.create<arith::ExtFOp>(loc, accType, val);
+      }
+
       Value newAcc;
       switch (kind) {
       case ReductionKind::SUM:
-        newAcc = rewriter.create<arith::AddFOp>(loc, currentAcc, val);
+        newAcc = rewriter.create<arith::AddFOp>(loc, currentAcc, calcVal);
         break;
       case ReductionKind::PRODUCT:
-        newAcc = rewriter.create<arith::MulFOp>(loc, currentAcc, val);
+        newAcc = rewriter.create<arith::MulFOp>(loc, currentAcc, calcVal);
         break;
       case ReductionKind::MAX:
-        newAcc = rewriter.create<arith::MaximumFOp>(loc, currentAcc, val);
+        newAcc = rewriter.create<arith::MaximumFOp>(loc, currentAcc, calcVal);
         break;
       case ReductionKind::MIN:
-        newAcc = rewriter.create<arith::MinimumFOp>(loc, currentAcc, val);
+        newAcc = rewriter.create<arith::MinimumFOp>(loc, currentAcc, calcVal);
         break;
       case ReductionKind::MEAN:
-        newAcc = rewriter.create<arith::AddFOp>(loc, currentAcc, val);
+        newAcc = rewriter.create<arith::AddFOp>(loc, currentAcc, calcVal);
         break;
       default:
         newAcc = currentAcc;
@@ -258,7 +274,13 @@ public:
       atomicKind = arith::AtomicRMWKind::addf;
     }
 
-    rewriter.create<memref::AtomicRMWOp>(loc, atomicKind, reduced, alloc,
+    // Cast reduced value back to element type for atomic op if needed
+    Value atomicVal = reduced;
+    if (reduced.getType() != elementType) {
+      atomicVal = rewriter.create<arith::TruncFOp>(loc, elementType, reduced);
+    }
+
+    rewriter.create<memref::AtomicRMWOp>(loc, atomicKind, atomicVal, alloc,
                                          indices);
 
     rewriter.setInsertionPointAfter(ifOp);
@@ -283,22 +305,36 @@ public:
 
       // Create divisor constant
       Type elemType = inputType.getElementType();
+
+      // Perform computation in f32 if input was f16/bf16
+      Type computeType = elemType;
+      if (elemType.isF16() || elemType.isBF16()) {
+        computeType = rewriter.getF32Type();
+        sumVal = rewriter.create<arith::ExtFOp>(loc, computeType, sumVal);
+      }
+
       Value divisor;
-      if (elemType.isF32() || elemType.isF64() || elemType.isF16() ||
-          elemType.isBF16()) {
+      if (computeType.isF32() || computeType.isF64()) {
         divisor = rewriter.create<arith::ConstantOp>(
-            loc, rewriter.getFloatAttr(elemType, numElements));
+            loc, rewriter.getFloatAttr(computeType, numElements));
       } else {
         divisor = rewriter.create<arith::ConstantOp>(
-            loc, rewriter.getIntegerAttr(elemType, numElements));
+            loc, rewriter.getIntegerAttr(
+                     elemType, numElements)); // Integer division not really
+                                              // supported for mean usually
       }
 
       // Perform Division
       Value meanVal;
-      if (isa<FloatType>(elemType)) {
+      if (isa<FloatType>(computeType)) {
         meanVal = rewriter.create<arith::DivFOp>(loc, sumVal, divisor);
       } else {
         meanVal = rewriter.create<arith::DivSIOp>(loc, sumVal, divisor);
+      }
+
+      // Cast back if needed
+      if (meanVal.getType() != elemType) {
+        meanVal = rewriter.create<arith::TruncFOp>(loc, elemType, meanVal);
       }
 
       // Store back

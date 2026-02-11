@@ -110,13 +110,24 @@ static LogicalResult BinaryTypePromotionReturnType(
         *broadcastedShape, lhselemtype));
     return success();
   }
-  auto resulType = builder.getF16Type();
-  switch (resultbitwidth) {
-  case 64:
-    resulType = builder.getF64Type();
-    break;
-  case 32:
+  Type resulType = builder.getF16Type();
+  if (lhselemtype == builder.getBF16Type() ||
+      rhselemType == builder.getBF16Type()) {
+    resulType = builder.getBF16Type();
+  } else if (lhselemtype == builder.getF32Type() ||
+             rhselemType == builder.getF32Type()) {
     resulType = builder.getF32Type();
+  }
+
+  if (resultbitwidth == 64) {
+    resulType = builder.getF64Type();
+  } else if (resultbitwidth == 32) {
+    resulType = builder.getF32Type();
+  } else if (resultbitwidth == 16) {
+    if (flhstype && frhstype && lhselemtype != rhselemType &&
+        flhstype.getWidth() == 16 && frhstype.getWidth() == 16) {
+      resulType = builder.getF32Type();
+    }
   }
   inferredReturnTypes.push_back(
       RankedTensorType::get(*broadcastedShape, resulType));
@@ -181,13 +192,24 @@ static LogicalResult BinaryFloatPromotionReturnType(
     unsigned rhsbitwidth = irhstype.getWidth();
     resultbitwidth = lhsbitwidth > rhsbitwidth ? lhsbitwidth : rhsbitwidth;
   }
-  auto resultType = builder.getF16Type();
-  switch (resultbitwidth) {
-  case 64:
+  Type resultType = builder.getF16Type();
+  if (lhselemtype == builder.getBF16Type() ||
+      rhselemType == builder.getBF16Type()) {
+    resultType = builder.getBF16Type();
+  }
+
+  if (resultbitwidth == 64) {
     resultType = builder.getF64Type();
-    break;
-  case 32:
+  } else if (resultbitwidth == 32) {
     resultType = builder.getF32Type();
+  } else if (resultbitwidth == 16) {
+    // If we already set resultType to BF16, keep it if either was BF16.
+    // If not, it defaults to F16 which is fine.
+    // If they were different 16-bit floats (F16 and BF16), promote to F32.
+    if (flhstype && frhstype && lhselemtype != rhselemType &&
+        flhstype.getWidth() == 16 && frhstype.getWidth() == 16) {
+      resultType = builder.getF32Type();
+    }
   }
   // 2.finding shape
   auto broadcastedShape =
@@ -1255,8 +1277,7 @@ LogicalResult MatmulOp::inferReturnTypes(
     resultShape.push_back(rhsShape[rhsShape.size() - 1]);
   }
 
-  inferredReturnTypes.push_back(RankedTensorType::get(
-      resultShape, resultType));
+  inferredReturnTypes.push_back(RankedTensorType::get(resultShape, resultType));
   return success();
 }
 //---------------------------------reduce
@@ -1350,7 +1371,8 @@ LogicalResult ReduceOp::inferReturnTypes(
   if (resultShape.empty() && !keepDims) {
     inferredReturnTypes.push_back(RankedTensorType::get({1}, elementType));
   } else {
-    inferredReturnTypes.push_back(RankedTensorType::get(resultShape, elementType));
+    inferredReturnTypes.push_back(
+        RankedTensorType::get(resultShape, elementType));
   }
 
   return success();
@@ -1568,6 +1590,19 @@ static Type getHigherHierarchyType(Type t1, Type t2, MLIRContext *context) {
   if (resultIsFloat) {
     if (maxBitwidth == 64)
       return builder.getF64Type();
+    if (maxBitwidth == 32)
+      return builder.getF32Type();
+
+    // Width is 16 or less.
+    if (isFloat1 && !isFloat2)
+      return t1;
+    if (!isFloat1 && isFloat2)
+      return t2;
+    if (isFloat1 && isFloat2) {
+      if (t1 == t2)
+        return t1;
+      return builder.getF32Type(); // Mixed F16/BF16
+    }
     return builder.getF32Type();
   }
 
@@ -1596,6 +1631,8 @@ SceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   if (auto itype = dyn_cast<IntegerType>(outElemTy)) {
     if (itype.getWidth() == 64)
       outElemTy = Float64Type::get(context);
+    else if (logitsType.getElementType().isBF16())
+      outElemTy = BFloat16Type::get(context);
     else
       outElemTy = Float32Type::get(context);
   }
@@ -1646,6 +1683,9 @@ MseOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   if (auto itype = dyn_cast<IntegerType>(outElemTy)) {
     if (itype.getWidth() == 64)
       outElemTy = Float64Type::get(context);
+    else if (lhsType.getElementType().isBF16() ||
+             rhsType.getElementType().isBF16())
+      outElemTy = BFloat16Type::get(context);
     else
       outElemTy = Float32Type::get(context);
   }
@@ -1671,6 +1711,9 @@ CceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   if (auto itype = dyn_cast<IntegerType>(outElemTy)) {
     if (itype.getWidth() == 64)
       outElemTy = Float64Type::get(context);
+    else if (lhsType.getElementType().isBF16() ||
+             rhsType.getElementType().isBF16())
+      outElemTy = BFloat16Type::get(context);
     else
       outElemTy = Float32Type::get(context);
   }
@@ -1696,6 +1739,9 @@ BceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   if (auto itype = dyn_cast<IntegerType>(outElemTy)) {
     if (itype.getWidth() == 64)
       outElemTy = Float64Type::get(context);
+    else if (lhsType.getElementType().isBF16() ||
+             rhsType.getElementType().isBF16())
+      outElemTy = BFloat16Type::get(context);
     else
       outElemTy = Float32Type::get(context);
   }
@@ -1848,8 +1894,8 @@ GatherOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
     outputShape.push_back(inputType.getDimSize(i));
   }
 
-  inferredReturnTypes.push_back(RankedTensorType::get(
-      outputShape, inputType.getElementType()));
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(outputShape, inputType.getElementType()));
 
   return success();
 }
@@ -1930,7 +1976,6 @@ LogicalResult ScatterAddOp::verify() {
       }
     }
   }
-
 
   return success();
 }

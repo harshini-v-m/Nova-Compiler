@@ -366,14 +366,15 @@ struct NovaOpTosaOp {
       targetsType = newTargetsType;
     }
 
+    auto restensor = cast<mlir::RankedTensorType>(resultType);
+    auto targetElemType = restensor.getElementType();
+
     auto logitsType = cast<mlir::RankedTensorType>(logits.getType());
 
-    // Ensure logits are f32
-    auto logitsElemType = logitsType.getElementType();
-    if (!isa<mlir::FloatType>(logitsElemType) ||
-        cast<mlir::FloatType>(logitsElemType).getWidth() != 32) {
-      auto newLogitsType = mlir::RankedTensorType::get(logitsType.getShape(),
-                                                       builder->getF32Type());
+    // Ensure logits match the target element type
+    if (logitsType.getElementType() != targetElemType) {
+      auto newLogitsType =
+          mlir::RankedTensorType::get(logitsType.getShape(), targetElemType);
       logits =
           builder->create<tosa::CastOp>(op.getLoc(), newLogitsType, logits);
       logitsType = newLogitsType;
@@ -386,8 +387,7 @@ struct NovaOpTosaOp {
 
     auto maxShape = logitsType.getShape().vec();
     maxShape[lastDim] = 1;
-    auto maxValType =
-        mlir::RankedTensorType::get(maxShape, builder->getF32Type());
+    auto maxValType = mlir::RankedTensorType::get(maxShape, targetElemType);
 
     Value maxVal = builder->create<tosa::ReduceMaxOp>(op.getLoc(), maxValType,
                                                       logits, axisAttr);
@@ -418,9 +418,9 @@ struct NovaOpTosaOp {
 
     // Step 8: loss = reduce_mean(selected_log_probs * -1.0)
     // Create -1.0 constant
-    auto constType = mlir::RankedTensorType::get({}, builder->getF32Type());
-    auto minus1Attr =
-        DenseElementsAttr::get(constType, builder->getF32FloatAttr(-1.0));
+    auto constType = mlir::RankedTensorType::get({}, targetElemType);
+    auto minus1Attr = DenseElementsAttr::get(
+        constType, builder->getFloatAttr(targetElemType, -1.0));
     Value minus1 =
         builder->create<nova::ConstantOp>(op.getLoc(), constType, minus1Attr);
 

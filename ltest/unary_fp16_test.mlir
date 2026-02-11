@@ -1,70 +1,7 @@
-// Comprehensive test file for all binary operations with fp16 data type
-// This file contains 3 functions testing all 11 binary operations in Nova
-
-module {
-  // Function 1: Arithmetic Binary Operations with fp16
-  func.func @binary_arithmetic_fp16(
-    %arg0: tensor<4x8xf16>,
-    %arg1: tensor<4x8xf16>
-  ) -> tensor<4x8xf16> {
-    
-    // Test: add, sub, mul, div, mod, pow
-    %add = nova.add %arg0, %arg1 : tensor<4x8xf16>, tensor<4x8xf16>
-    %sub = nova.sub %add, %arg1 : tensor<4x8xf16>, tensor<4x8xf16>
-    %mul = nova.mul %sub, %arg0 : tensor<4x8xf16>, tensor<4x8xf16>
-    %div = nova.div %mul, %arg1 : tensor<4x8xf16>, tensor<4x8xf16>
-    %mod = nova.mod %div, %arg0 : tensor<4x8xf16>, tensor<4x8xf16>
-    %pow = nova.pow %mod, %arg1 : tensor<4x8xf16>, tensor<4x8xf16>  
-    
-    return %pow : tensor<4x8xf16>
-  }
-
-  // Function 2: Comparison Binary Operations with fp16
-  func.func @binary_comparison_fp16(
-    %arg0: tensor<4x8xf16>,
-    %arg1: tensor<4x8xf16>
-  ) -> tensor<4x8xf16> {
-    
-    // Test: max, min
-    %max = nova.max %arg0, %arg1 : tensor<4x8xf16>, tensor<4x8xf16>
-    %min = nova.min %max, %arg1 : tensor<4x8xf16>, tensor<4x8xf16>
-    
-    return %min : tensor<4x8xf16>
-  }
-
-  // Function 3: Comprehensive chained test with fp16
-  func.func @binary_comprehensive_fp16(
-    %arg0: tensor<4x8xf16>,
-    %arg1: tensor<4x8xf16>
-  ) -> tensor<4x8xf16> {
-    
-    // Chain multiple operations to test type propagation
-    %0 = nova.add %arg0, %arg1 : tensor<4x8xf16>, tensor<4x8xf16>
-    %1 = nova.mul %0, %arg0 : tensor<4x8xf16>, tensor<4x8xf16>
-    %2 = nova.max %1, %arg1 : tensor<4x8xf16>, tensor<4x8xf16>
-    %3 = nova.sub %2, %arg0 : tensor<4x8xf16>, tensor<4x8xf16>
-    %4 = nova.div %3, %arg1 : tensor<4x8xf16>, tensor<4x8xf16>
-    %5 = nova.min %4, %arg0 : tensor<4x8xf16>, tensor<4x8xf16>
-    
-    return %5 : tensor<4x8xf16>
-  }
-
-  // Function 4: Test with broadcasting (scalar-like tensor)
-  func.func @binary_broadcast_fp16(
-    %arg0: tensor<4x8xf16>,
-    %arg1: tensor<1xf16>
-  ) -> tensor<4x8xf16> {
-    
-    // Test broadcasting behavior with fp16
-    %add = nova.add %arg0, %arg1 : tensor<4x8xf16>, tensor<1xf16>
-    %mul = nova.mul %add, %arg1 : tensor<4x8xf16>, tensor<1xf16>
-    
-    return %mul : tensor<4x8xf16>
-  }
-
 // Comprehensive test file for all unary operations with fp16 data type
 // This file contains 5 functions testing all 30+ unary operations in Nova
 
+module {
   // Function 1: Unary Arithmetic Operations with fp16
   func.func @unary_arithmetic_fp16(
     %arg0: tensor<4x8xf16>
