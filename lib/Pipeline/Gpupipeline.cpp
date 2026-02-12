@@ -44,6 +44,7 @@
 // optimization passes includes
 #include "Compiler/Transforms/FixGpuLaunch.h"
 #include "Compiler/Transforms/FuseMatmulBias.h"
+#include "Compiler/Transforms/RenameGpuKernels.h"
 
 // gpu
 #include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
@@ -144,6 +145,7 @@ namespace mlir
             // pm.addPass(mlir::createPrintIRPass());
             pm.addPass(mlir::nova::createConvertMemRefToGpuPass());
             pm.addPass(mlir::createGpuKernelOutliningPass());
+            pm.addPass(mlir::nova::createRenameGpuKernelsPass());
 
             mlir::GpuNVVMAttachTargetOptions nvvmTargetOptions;
             nvvmTargetOptions.triple = "nvptx64-nvidia-cuda";

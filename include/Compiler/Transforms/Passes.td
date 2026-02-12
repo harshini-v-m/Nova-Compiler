@@ -78,4 +78,16 @@ def VectorOpt : Pass<"vector-opt", "func::FuncOp"> {
     let constructor = "::mlir::nova::createVectorOptPass()";
 }
 
+def RenameGpuKernels : Pass<"rename-gpu-kernels", "ModuleOp"> {
+    let summary = "Rename GPU kernels to match their module name";
+    let description = [{
+        Renames GPU kernels to match their containing module name.
+        This ensures unique symbols in the generated binary output, which is useful for profiling.
+    }];
+    let dependentDialects = [
+        "mlir::gpu::GPUDialect"
+    ];
+    let constructor = "::mlir::nova::createRenameGpuKernelsPass()";
+}
+
 #endif // NOVA_TRANSFORMS_PASSES

@@ -7,6 +7,7 @@ add_mlir_library(CompilerTransforms
   GenerateDynamicWrapper.cpp
   VectorOpt.cpp
   RemDevAttr.cpp
+  RenameGpuKernels.cpp
 
   LINK_LIBS PUBLIC
   MLIRIR
