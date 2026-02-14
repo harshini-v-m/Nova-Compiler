@@ -11,6 +11,7 @@
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "mlir/Dialect/MemRef/Transforms/AllocationOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/ControlFlow/Transforms/BufferDeallocationOpInterfaceImpl.h"
@@ -118,6 +119,7 @@ NovaCompilerAPI::NovaCompilerAPI() {
               mlir::bufferization::BufferizationDialect, mlir::gpu::GPUDialect,
               mlir::NVVM::NVVMDialect, mlir::nvgpu::NVGPUDialect>();
 
+  mlir::memref::registerAllocationOpInterfaceExternalModels(registry);
   mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
@@ -218,6 +220,7 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   mlir::linalg::registerValueBoundsOpInterfaceExternalModels(registry);
 
   // Register external models and conversion interfaces
+  mlir::memref::registerAllocationOpInterfaceExternalModels(registry);
   mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);

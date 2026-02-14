@@ -51,8 +51,6 @@
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Conversion/VectorToGPU/VectorToGPU.h"
-#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
-#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"    // For GPUModuleOp
 #include "mlir/Dialect/GPU/Pipelines/Passes.h" // For GpuNVVMAttachTarget
 #include "mlir/Dialect/GPU/Transforms/Passes.h" // For createGpuKernelOutliningPass
@@ -164,12 +162,10 @@ namespace mlir
             //     )  
             // );
 
-            if (failed(mlir::parsePassPipeline(
-                    "func.func(affine-super-vectorize{virtual-vector-size=8 "
-                    "vectorize-reductions=true})",
-                    pm))) {
-                llvm::errs() << "Failed to parse vectorize pipeline\n";  
-            }  
+            // if (failed(mlir::parsePassPipeline(  
+            //     "func.func(affine-super-vectorize{virtual-vector-size=8,8})", pm))) {  
+            //     llvm::errs() << "Failed to parse vectorize pipeline\n";  
+            // }  
             pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineLoopNormalizePass());  
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
@@ -205,33 +201,19 @@ namespace mlir
             nvvmTargetOptions.ftzFlag = true;
             pm.addPass(mlir::createGpuNVVMAttachTarget(nvvmTargetOptions));
 
-            // Lower vectors on host before they become llvm.func
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToSCFPass());
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToLLVMPass());
+            pm.addPass(mlir::createGpuAsyncRegionPass());
 
             // Lowering INSIDE the GPU Module (Fixes 'index' in kernels)
             auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
-            gpuPm.addPass(mlir::createConvertVectorToSCFPass());
-            gpuPm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToGPUPass(true));
             gpuPm.addPass(mlir::createLowerAffinePass());
-
             gpuPm.addPass(mlir::createSCFToControlFlowPass());
-            gpuPm.addPass(mlir::createArithToLLVMConversionPass());
-            gpuPm.addPass(mlir::createConvertVectorToLLVMPass());
-
             mlir::ConvertGpuOpsToNVVMOpsOptions nvvmOptions;
-            nvvmOptions.useBarePtrCallConv = true; // Use bare pointers to match host
+            // nvvmOptions.useBarePtrCallConv = true; // Disabled to match dynamic wrapper
             gpuPm.addPass(mlir::createConvertGpuOpsToNVVMOps(nvvmOptions));
-            gpuPm.addPass(mlir::nova::createFixGpuKernelSignaturePass());
             gpuPm.addPass(mlir::createConvertIndexToLLVMPass());
+            gpuPm.addPass(mlir::createArithToLLVMConversionPass());
             gpuPm.addPass(mlir::createConvertMathToLLVMPass());
             gpuPm.addPass(mlir::createReconcileUnrealizedCastsPass());
-
-            // MAIN LOWERING: gpu.launch_func -> runtime calls (Host side)
-            // Run this AFTER device lowering so it sees the fixed kernel signatures (AS 0)
-            mlir::GpuToLLVMConversionPassOptions hostOptions;
-            hostOptions.kernelBarePtrCallConv = true; // Use bare pointers to avoid descriptor expansion
-            pm.addPass(mlir::createGpuToLLVMConversionPass(hostOptions));
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
 
@@ -241,6 +223,10 @@ namespace mlir
             binaryOptions.compilationTarget = "isa"; 
             pm.addPass(mlir::createGpuModuleToBinaryPass(binaryOptions));
 
+            // MAIN LOWERING: gpu.launch_func -> runtime calls
+            mlir::GpuToLLVMConversionPassOptions hostOptions;
+            // hostOptions.kernelBarePtrCallConv = true; // Disabled to match dynamic wrapper
+            pm.addPass(mlir::createGpuToLLVMConversionPass(hostOptions));
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
