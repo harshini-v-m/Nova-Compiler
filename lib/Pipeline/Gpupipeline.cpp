@@ -51,6 +51,8 @@
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Conversion/VectorToGPU/VectorToGPU.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"    // For GPUModuleOp
 #include "mlir/Dialect/GPU/Pipelines/Passes.h" // For GpuNVVMAttachTarget
 #include "mlir/Dialect/GPU/Transforms/Passes.h" // For createGpuKernelOutliningPass
@@ -98,15 +100,19 @@ namespace mlir
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createTosaToArithPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createTosaToTensorPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createTosaToSCFPass());
+            pm.addPass(mlir::createCanonicalizerPass());
 
-            // 4. NOVA TRANSFORMS & LINALG OPT
+
+            // 4. LINALG OPT to linalg generalize pass
+            pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createFuseMatmulBiasPass());
             pm.addPass(mlir::createCanonicalizerPass());
+            pm.addPass(mlir::createLinalgFoldUnitExtentDimsPass());
+
             // Tiling is handled in Section 6 after parallel loop conversion
-            pm.addNestedPass<mlir::func::FuncOp>(
-                mlir::createLinalgElementwiseOpFusionPass());
-            pm.addNestedPass<mlir::func::FuncOp>(
-                mlir::createLinalgGeneralizeNamedOpsPass());
+            pm.addPass(mlir::createLinalgElementwiseOpFusionPass());
+            // pm.addNestedPass<mlir::func::FuncOp>(
+            //     mlir::createLinalgGeneralizeNamedOpsPass());
 
             // 5. BUFFERIZATION & DEALLOCATION
             bufferization::OneShotBufferizePassOptions bufferizeOptions;
@@ -118,31 +124,75 @@ namespace mlir
 
             bufferization::BufferDeallocationPipelineOptions deallocationOptions;
             bufferization::buildBufferDeallocationPipeline(pm, deallocationOptions);
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferHoistingPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
             pm.addPass(mlir::createConvertBufferizationToMemRefPass());
             // device attribute handling pass
             // pm.addPass(mlir::nova::createConvertMemRefToGpuPass());
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
 
-            // 6. LINALG OPTIMIZATION & TILING
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgFoldUnitExtentDimsPass());
+            // lowering through Affine
             pm.addPass(mlir::createCanonicalizerPass());
 
-            // Map Linalg to Parallel Loops
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertLinalgToParallelLoopsPass());
-            // Apply Tiling HERE on the parallel loops
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::createParallelLoopTilingPass({32, 32, 1}));
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::createParallelLoopFusionPass());
-            pm.addPass(mlir::createCanonicalizerPass());
-            // 8. GPU MAPPINGcreateParallelLoopFusionPass
+            pm.addPass(mlir::createConvertLinalgToAffineLoopsPass());
+            pm.addPass(mlir::memref::createFoldMemRefAliasOpsPass());
+            //add this pass --affine-expand-index-ops-as-affine
+            pm.addPass(mlir::affine::createAffineExpandIndexOpsAsAffinePass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
+            //affine fusion pass
+            pm.addPass(mlir::affine::createLoopFusionPass(1, 1024, true, mlir::affine::FusionMode::Greedy));
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createSimplifyAffineStructuresPass());
+            pm.addPass(mlir::createCanonicalizerPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createAffineScalarizeAccumulatorPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineLoopInvariantCodeMotionPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineScalarReplacementPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createRaiseMemrefToAffine());
+            
+            // Setting explicit tile sizes {128, 8, ...} via text pipeline 
+            // since createLoopTilingPass(cacheSize) uses a heuristic.
+            if (failed(mlir::parsePassPipeline("func.func(affine-loop-tile{tile-sizes=128,8})", pm)))
+                llvm::errs() << "Pipeline parsing failed for affine-loop-tile\n";
+
+            // pm.addNestedPass<mlir::func::FuncOp>(  
+            //     mlir::affine::createAffineDataCopyGenerationPass(  
+            //         /*slowMemorySpace=*/0,  
+            //         /*fastMemorySpace=*/3,  
+            //         /*tagMemorySpace=*/0,  
+            //         /*minDmaTransferSize=*/1024,  
+            //         /*fastMemCapacityBytes=*/32*1024  
+            //     )  
+            // );
+
+            if (failed(mlir::parsePassPipeline(
+                    "func.func(affine-super-vectorize{virtual-vector-size=8 "
+                    "vectorize-reductions=true})",
+                    pm))) {
+                llvm::errs() << "Failed to parse vectorize pipeline\n";  
+            }  
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineLoopNormalizePass());  
+            pm.addPass(mlir::createCanonicalizerPass());
+            pm.addPass(mlir::createCSEPass());
+
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createAddGpuMemoryCopiesPass());
+            
+            // Map tiled loops to parallel loops. We use parsePassPipeline to avoid 
+            // the linker error for createAffineParallelizePass.
+            if (failed(mlir::parsePassPipeline("func.func(affine-parallelize)", pm)))
+                llvm::errs() << "Pipeline parsing failed for affine-parallelize\n";
+
+            pm.addPass(mlir::createLowerAffinePass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createParallelLoopFusionPass());
+            pm.addPass(mlir::createCanonicalizerPass());
+            pm.addPass(mlir::createCSEPass());
+
+            // Use the modern SCF-based mapping which is much more robust than 
+            // ConvertAffineForToGPU for tiled and non-perfectly nested loops.
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createGpuMapParallelLoopsPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertParallelLoopToGpuPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createAddGpuMemoryCopiesPass());
-            pm.addPass(mlir::createCanonicalizerPass());
-            // pm.addPass(mlir::createPrintIRPass());
+
             pm.addPass(mlir::nova::createConvertMemRefToGpuPass());
             pm.addPass(mlir::createGpuKernelOutliningPass());
             pm.addPass(mlir::nova::createRenameGpuKernelsPass());
@@ -150,19 +200,38 @@ namespace mlir
             mlir::GpuNVVMAttachTargetOptions nvvmTargetOptions;
             nvvmTargetOptions.triple = "nvptx64-nvidia-cuda";
             nvvmTargetOptions.chip = "sm_86";
+            nvvmTargetOptions.optLevel = 3;
+            nvvmTargetOptions.fastFlag = true;
+            nvvmTargetOptions.ftzFlag = true;
             pm.addPass(mlir::createGpuNVVMAttachTarget(nvvmTargetOptions));
+
+            // Lower vectors on host before they become llvm.func
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToSCFPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToLLVMPass());
 
             // Lowering INSIDE the GPU Module (Fixes 'index' in kernels)
             auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
+            gpuPm.addPass(mlir::createConvertVectorToSCFPass());
+            gpuPm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToGPUPass(true));
             gpuPm.addPass(mlir::createLowerAffinePass());
+
             gpuPm.addPass(mlir::createSCFToControlFlowPass());
-            mlir::ConvertGpuOpsToNVVMOpsOptions nvvmOptions;
-            // nvvmOptions.useBarePtrCallConv = true; // Disabled to match dynamic wrapper
-            gpuPm.addPass(mlir::createConvertGpuOpsToNVVMOps(nvvmOptions));
-            gpuPm.addPass(mlir::createConvertIndexToLLVMPass());
             gpuPm.addPass(mlir::createArithToLLVMConversionPass());
+            gpuPm.addPass(mlir::createConvertVectorToLLVMPass());
+
+            mlir::ConvertGpuOpsToNVVMOpsOptions nvvmOptions;
+            nvvmOptions.useBarePtrCallConv = true; // Use bare pointers to match host
+            gpuPm.addPass(mlir::createConvertGpuOpsToNVVMOps(nvvmOptions));
+            gpuPm.addPass(mlir::nova::createFixGpuKernelSignaturePass());
+            gpuPm.addPass(mlir::createConvertIndexToLLVMPass());
             gpuPm.addPass(mlir::createConvertMathToLLVMPass());
             gpuPm.addPass(mlir::createReconcileUnrealizedCastsPass());
+
+            // MAIN LOWERING: gpu.launch_func -> runtime calls (Host side)
+            // Run this AFTER device lowering so it sees the fixed kernel signatures (AS 0)
+            mlir::GpuToLLVMConversionPassOptions hostOptions;
+            hostOptions.kernelBarePtrCallConv = true; // Use bare pointers to avoid descriptor expansion
+            pm.addPass(mlir::createGpuToLLVMConversionPass(hostOptions));
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
 
@@ -172,10 +241,6 @@ namespace mlir
             binaryOptions.compilationTarget = "isa"; 
             pm.addPass(mlir::createGpuModuleToBinaryPass(binaryOptions));
 
-            // MAIN LOWERING: gpu.launch_func -> runtime calls
-            mlir::GpuToLLVMConversionPassOptions hostOptions;
-            // hostOptions.kernelBarePtrCallConv = true; // Disabled to match dynamic wrapper
-            pm.addPass(mlir::createGpuToLLVMConversionPass(hostOptions));
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());

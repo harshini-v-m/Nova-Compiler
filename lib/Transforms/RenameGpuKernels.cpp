@@ -36,10 +36,6 @@ struct RenameGpuKernelsPass
         if (oldName == newName)
           return;
 
-        // Use SymbolTable to rename the function. This should update references
-        // reachable via the symbol table hierarchy.
-        // However, gpu.launch_func uses specific symbol reference syntax.
-        // We will perform the rename and then verify/fixup launch calls if needed.
         if (failed(gpuModuleSymbolTable.rename(gpuFunc, newName))) {
             return; 
         }

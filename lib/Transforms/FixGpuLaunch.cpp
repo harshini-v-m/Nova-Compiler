@@ -44,14 +44,17 @@ public:
     auto int64Ty = IntegerType::get(ctx, 64);
     auto int32Ty = IntegerType::get(ctx, 32);
 
-    auto cudaMalloc = getOrDeclareFunc(module, rewriter, "cudaMalloc", int32Ty,
-                                       {genericPtrTy, int64Ty});
+    auto cudaMalloc = getOrDeclareFunc(module, rewriter, "cudaMallocAsync", int32Ty,
+                                       {genericPtrTy, int64Ty, genericPtrTy});
 
     MemRefType memRefType = op.getType();
     unsigned addressSpace = 0;
     if (auto intAttr =
             llvm::dyn_cast_or_null<IntegerAttr>(memRefType.getMemorySpace())) {
       addressSpace = intAttr.getInt();
+    } else if (auto addrSpaceAttr = llvm::dyn_cast_or_null<gpu::AddressSpaceAttr>(
+                   memRefType.getMemorySpace())) {
+      addressSpace = (unsigned)addrSpaceAttr.getValue();
     }
     auto devicePtrTy = LLVM::LLVMPointerType::get(ctx, addressSpace);
 
@@ -91,8 +94,9 @@ public:
     Value ptrVar =
         rewriter.create<LLVM::AllocaOp>(loc, genericPtrTy, devicePtrTy, one, 8);
 
+    Value zeroPtr = rewriter.create<LLVM::ZeroOp>(loc, genericPtrTy);
     rewriter.create<LLVM::CallOp>(loc, cudaMalloc,
-                                  ValueRange{ptrVar, sizeBytes});
+                                  ValueRange{ptrVar, sizeBytes, zeroPtr});
     Value devicePtr = rewriter.create<LLVM::LoadOp>(loc, devicePtrTy, ptrVar);
 
     SmallVector<Type> elemTypes;
@@ -119,11 +123,11 @@ public:
 
     if (memRefType.getRank() > 0) {
       Value sizesArray = rewriter.create<LLVM::UndefOp>(loc, elemTypes[3]);
-      dynamicIdx = 0;
+      unsigned dIdx = 0;
       for (int i = 0; i < memRefType.getRank(); ++i) {
         Value dimSize;
         if (memRefType.isDynamicDim(i)) {
-          Value dynSize = dynamicSizes[dynamicIdx++];
+          Value dynSize = dynamicSizes[dIdx++];
           dimSize =
               rewriter.create<UnrealizedConversionCastOp>(loc, int64Ty, dynSize)
                   .getResult(0);
@@ -148,12 +152,11 @@ public:
 
         Value dimSize;
         if (memRefType.isDynamicDim(i)) {
-          // Re-extract or use the one we have
-          unsigned dIdx = 0;
+          unsigned dIdx2 = 0;
           for (int j = 0; j < i; ++j)
             if (memRefType.isDynamicDim(j))
-              dIdx++;
-          Value dynSize = dynamicSizes[dIdx];
+              dIdx2++;
+          Value dynSize = dynamicSizes[dIdx2];
           dimSize =
               rewriter.create<UnrealizedConversionCastOp>(loc, int64Ty, dynSize)
                   .getResult(0);
@@ -169,8 +172,18 @@ public:
                                                   ArrayRef<int64_t>{4});
     }
 
-    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(op, memRefType,
-                                                            desc);
+    SmallVector<Value, 2> results;
+    Value memrefVal = rewriter.create<UnrealizedConversionCastOp>(loc, memRefType, desc).getResult(0);
+    results.push_back(memrefVal);
+
+    if (op.getAsyncToken()) {
+      auto tokenTy = gpu::AsyncTokenType::get(ctx);
+      Value nullPtr = rewriter.create<LLVM::ZeroOp>(loc, LLVM::LLVMPointerType::get(ctx));
+      results.push_back(
+          rewriter.create<UnrealizedConversionCastOp>(loc, tokenTy, nullPtr).getResult(0));
+    }
+
+    rewriter.replaceOp(op, results);
     return success();
   }
 };
@@ -190,8 +203,8 @@ public:
     auto int32Ty = IntegerType::get(ctx, 32);
 
     auto cudaMemcpy =
-        getOrDeclareFunc(module, rewriter, "cudaMemcpy", int32Ty,
-                         {genericPtrTy, genericPtrTy, int64Ty, int32Ty});
+        getOrDeclareFunc(module, rewriter, "cudaMemcpyAsync", int32Ty,
+                         {genericPtrTy, genericPtrTy, int64Ty, int32Ty, genericPtrTy});
 
     Value dst = op.getDst();
     Value src = op.getSrc();
@@ -202,6 +215,10 @@ public:
       if (auto intAttr =
               llvm::dyn_cast_or_null<IntegerAttr>(memRefTy.getMemorySpace())) {
         addressSpace = intAttr.getInt();
+      } else if (auto addrSpaceAttr =
+                     llvm::dyn_cast_or_null<gpu::AddressSpaceAttr>(
+                         memRefTy.getMemorySpace())) {
+        addressSpace = (unsigned)addrSpaceAttr.getValue();
       }
       auto ptrTy = LLVM::LLVMPointerType::get(ctx, addressSpace);
       SmallVector<Type> elemTypes;
@@ -251,6 +268,10 @@ public:
       if (auto intAttr =
               llvm::dyn_cast_or_null<IntegerAttr>(memRefTy.getMemorySpace())) {
         addressSpace = intAttr.getInt();
+      } else if (auto addrSpaceAttr =
+                     llvm::dyn_cast_or_null<gpu::AddressSpaceAttr>(
+                         memRefTy.getMemorySpace())) {
+        addressSpace = (unsigned)addrSpaceAttr.getValue();
       }
       auto ptrTy = LLVM::LLVMPointerType::get(ctx, addressSpace);
       SmallVector<Type> elemTypes;
@@ -282,11 +303,43 @@ public:
       sizeBytes = rewriter.create<LLVM::MulOp>(loc, sizeBytes, dimSize);
     }
 
+    auto getAddrSpace = [&](Value val) -> unsigned {
+      auto memRefTy = llvm::cast<MemRefType>(val.getType());
+      if (auto intAttr =
+              llvm::dyn_cast_or_null<IntegerAttr>(memRefTy.getMemorySpace())) {
+        return intAttr.getInt();
+      } else if (auto addrSpaceAttr =
+                     llvm::dyn_cast_or_null<gpu::AddressSpaceAttr>(
+                         memRefTy.getMemorySpace())) {
+        return (unsigned)addrSpaceAttr.getValue();
+      }
+      return 0;
+    };
+
+    unsigned dstSpace = getAddrSpace(dst);
+    unsigned srcSpace = getAddrSpace(src);
+    int kindVal = 4; // Default
+    if (dstSpace != 0 && srcSpace == 0) kindVal = 1; // HostToDevice
+    else if (dstSpace == 0 && srcSpace != 0) kindVal = 2; // DeviceToHost
+    else if (dstSpace != 0 && srcSpace != 0) kindVal = 3; // DeviceToDevice
+    else if (dstSpace == 0 && srcSpace == 0) kindVal = 0; // HostToHost
+
     Value kind = rewriter.create<LLVM::ConstantOp>(
-        loc, int32Ty, rewriter.getI32IntegerAttr(4));
+        loc, int32Ty, rewriter.getI32IntegerAttr(kindVal));
+    Value zeroPtr = rewriter.create<LLVM::ZeroOp>(loc, genericPtrTy);
     rewriter.create<LLVM::CallOp>(loc, cudaMemcpy,
-                                  ValueRange{dstPtr, srcPtr, sizeBytes, kind});
-    rewriter.eraseOp(op);
+                                  ValueRange{dstPtr, srcPtr, sizeBytes, kind, zeroPtr});
+
+    if (op.getAsyncToken()) {
+      auto tokenTy = gpu::AsyncTokenType::get(ctx);
+      Value nullPtr = rewriter.create<LLVM::ZeroOp>(loc, LLVM::LLVMPointerType::get(ctx));
+      Value dummyToken =
+          rewriter.create<UnrealizedConversionCastOp>(loc, tokenTy, nullPtr)
+              .getResult(0);
+      rewriter.replaceOp(op, {dummyToken});
+    } else {
+      rewriter.eraseOp(op);
+    }
     return success();
   }
 };
@@ -305,8 +358,8 @@ public:
     auto int64Ty = IntegerType::get(ctx, 64);
     auto int32Ty = IntegerType::get(ctx, 32);
 
-    auto cudaMemset = getOrDeclareFunc(module, rewriter, "cudaMemset", int32Ty,
-                                       {genericPtrTy, int32Ty, int64Ty});
+    auto cudaMemset = getOrDeclareFunc(module, rewriter, "cudaMemsetAsync", int32Ty,
+                                       {genericPtrTy, int32Ty, int64Ty, genericPtrTy});
 
     Value memref = op.getDst();
 
@@ -316,6 +369,10 @@ public:
       if (auto intAttr =
               llvm::dyn_cast_or_null<IntegerAttr>(memRefTy.getMemorySpace())) {
         addressSpace = intAttr.getInt();
+      } else if (auto addrSpaceAttr =
+                     llvm::dyn_cast_or_null<gpu::AddressSpaceAttr>(
+                         memRefTy.getMemorySpace())) {
+        addressSpace = (unsigned)addrSpaceAttr.getValue();
       }
       auto ptrTy = LLVM::LLVMPointerType::get(ctx, addressSpace);
       SmallVector<Type> elemTypes;
@@ -379,9 +436,20 @@ public:
     Value fillValue = rewriter.create<LLVM::ConstantOp>(
         loc, int32Ty, rewriter.getI32IntegerAttr(0));
 
+    Value zeroPtr = rewriter.create<LLVM::ZeroOp>(loc, genericPtrTy);
     rewriter.create<LLVM::CallOp>(loc, cudaMemset,
-                                  ValueRange{ptr, fillValue, sizeBytes});
-    rewriter.eraseOp(op);
+                                  ValueRange{ptr, fillValue, sizeBytes, zeroPtr});
+
+    if (op.getAsyncToken()) {
+      auto tokenTy = gpu::AsyncTokenType::get(ctx);
+      Value nullPtr = rewriter.create<LLVM::ZeroOp>(loc, LLVM::LLVMPointerType::get(ctx));
+      Value dummyToken =
+          rewriter.create<UnrealizedConversionCastOp>(loc, tokenTy, nullPtr)
+              .getResult(0);
+      rewriter.replaceOp(op, {dummyToken});
+    } else {
+      rewriter.eraseOp(op);
+    }
     return success();
   }
 };
@@ -400,7 +468,7 @@ public:
     auto int64Ty = IntegerType::get(ctx, 64);
 
     auto cudaFree =
-        getOrDeclareFunc(module, rewriter, "cudaFree", int32Ty, {genericPtrTy});
+        getOrDeclareFunc(module, rewriter, "cudaFreeAsync", int32Ty, {genericPtrTy, genericPtrTy});
     auto memRef = op.getMemref();
 
     auto memRefTy = llvm::cast<MemRefType>(memRef.getType());
@@ -408,6 +476,9 @@ public:
     if (auto intAttr =
             llvm::dyn_cast_or_null<IntegerAttr>(memRefTy.getMemorySpace())) {
       addressSpace = intAttr.getInt();
+    } else if (auto addrSpaceAttr = llvm::dyn_cast_or_null<gpu::AddressSpaceAttr>(
+                   memRefTy.getMemorySpace())) {
+      addressSpace = (unsigned)addrSpaceAttr.getValue();
     }
     auto ptrTy = LLVM::LLVMPointerType::get(ctx, addressSpace);
     SmallVector<Type> elemTypes;
@@ -434,8 +505,19 @@ public:
       ptr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, genericPtrTy, rawPtr);
     }
 
-    rewriter.create<LLVM::CallOp>(loc, cudaFree, ValueRange{ptr});
-    rewriter.eraseOp(op);
+    Value zeroPtr = rewriter.create<LLVM::ZeroOp>(loc, genericPtrTy);
+    rewriter.create<LLVM::CallOp>(loc, cudaFree, ValueRange{ptr, zeroPtr});
+
+    if (op.getAsyncToken()) {
+      auto tokenTy = gpu::AsyncTokenType::get(ctx);
+      Value nullPtr = rewriter.create<LLVM::ZeroOp>(loc, LLVM::LLVMPointerType::get(ctx));
+      Value dummyToken =
+          rewriter.create<UnrealizedConversionCastOp>(loc, tokenTy, nullPtr)
+              .getResult(0);
+      rewriter.replaceOp(op, {dummyToken});
+    } else {
+      rewriter.eraseOp(op);
+    }
     return success();
   }
 };
@@ -459,7 +541,7 @@ public:
     auto int64Ty = IntegerType::get(ctx, 64);
     auto int32Ty = IntegerType::get(ctx, 32);
 
-    auto cudaMemcpy =
+    auto cudaMemcpySync =
         getOrDeclareFunc(module, rewriter, "cudaMemcpy", int32Ty,
                          {genericPtrTy, genericPtrTy, int64Ty, int32Ty});
 
@@ -490,7 +572,7 @@ public:
     Value kind = rewriter.create<LLVM::ConstantOp>(
         loc, int32Ty, rewriter.getI32IntegerAttr(2)); // DeviceToHost = 2
 
-    rewriter.create<LLVM::CallOp>(loc, cudaMemcpy,
+    rewriter.create<LLVM::CallOp>(loc, cudaMemcpySync,
                                   ValueRange{dstPtr, srcPtr, sizeBytes, kind});
 
     // Load from host buffer instead
@@ -520,7 +602,7 @@ public:
     auto int64Ty = IntegerType::get(ctx, 64);
     auto int32Ty = IntegerType::get(ctx, 32);
 
-    auto cudaMemcpy =
+    auto cudaMemcpySync =
         getOrDeclareFunc(module, rewriter, "cudaMemcpy", int32Ty,
                          {genericPtrTy, genericPtrTy, int64Ty, int32Ty});
 
@@ -554,13 +636,86 @@ public:
     Value kind = rewriter.create<LLVM::ConstantOp>(
         loc, int32Ty, rewriter.getI32IntegerAttr(1)); // HostToDevice = 1
 
-    rewriter.create<LLVM::CallOp>(loc, cudaMemcpy,
+    rewriter.create<LLVM::CallOp>(loc, cudaMemcpySync,
                                   ValueRange{dstPtr, srcPtr, sizeBytes, kind});
 
     rewriter.eraseOp(op);
     return success();
   }
 };
+
+// Pass to fix GPU kernel signatures to match host-side bare pointers (AS 0)
+// by changing arguments to AS 0 and inserting casts to AS 1.
+class FixGpuKernelSignaturePass
+    : public PassWrapper<FixGpuKernelSignaturePass, OperationPass<gpu::GPUModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FixGpuKernelSignaturePass)
+
+  void runOnOperation() override {
+    gpu::GPUModuleOp module = getOperation();
+    module.walk([&](LLVM::LLVMFuncOp func) {
+      // Only modify functions that look like kernels (void return, external linkage usually)
+      // or just check if they have arguments that need fixing.
+      
+      auto funcType = func.getFunctionType();
+      SmallVector<Type> newArgTypes;
+      bool changed = false;
+      
+      for (Type t : funcType.getParams()) {
+        if (auto ptrTy = llvm::dyn_cast<LLVM::LLVMPointerType>(t)) {
+          if (ptrTy.getAddressSpace() == 1) {
+            newArgTypes.push_back(LLVM::LLVMPointerType::get(func.getContext(), 0));
+            changed = true;
+          } else {
+            newArgTypes.push_back(t);
+          }
+        } else {
+          newArgTypes.push_back(t);
+        }
+      }
+
+      if (!changed)
+        return;
+
+      // Update function type
+      auto newFuncType = LLVM::LLVMFunctionType::get(
+          funcType.getReturnType(), newArgTypes, funcType.isVarArg());
+      func.setType(newFuncType);
+
+      // Fix arguments and insert casts
+      if (func.empty()) return; // External declaration
+      
+      Block &entryBlock = func.getBody().front();
+      OpBuilder builder(&entryBlock, entryBlock.begin());
+
+      for (unsigned i = 0; i < func.getNumArguments(); ++i) {
+        BlockArgument arg = entryBlock.getArgument(i);
+        Type oldType = funcType.getParams()[i];
+        
+        if (newArgTypes[i] != oldType) {
+          // Update argument type
+          arg.setType(newArgTypes[i]);
+
+          // Create cast back to old type (ptr<1>)
+          auto cast = builder.create<LLVM::AddrSpaceCastOp>(
+              func.getLoc(), oldType, arg);
+
+          // Replace uses of 'arg' with 'cast', except 'cast' itself
+          arg.replaceAllUsesExcept(cast, cast);
+        }
+      }
+    });
+  }
+
+  StringRef getArgument() const final { return "fix-gpu-kernel-signature"; }
+  StringRef getDescription() const final {
+    return "Fix GPU kernel signatures to match host bare pointers";
+  }
+};
+
+std::unique_ptr<Pass> createFixGpuKernelSignaturePass() {
+  return std::make_unique<FixGpuKernelSignaturePass>();
+}
 
 class GpuRuntimeLoweringPass
     : public PassWrapper<GpuRuntimeLoweringPass, OperationPass<ModuleOp>> {
@@ -576,7 +731,6 @@ public:
     patterns.add<ConvertGpuMemsetToCall>(module.getContext());
     patterns.add<FixHostGpuAccess>(module.getContext());
     patterns.add<FixHostGpuStore>(module.getContext());
-    patterns.add<ConvertGpuMemsetToCall>(module.getContext());
     if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
       signalPassFailure();
     }

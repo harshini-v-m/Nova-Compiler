@@ -90,4 +90,18 @@ def RenameGpuKernels : Pass<"rename-gpu-kernels", "ModuleOp"> {
     let constructor = "::mlir::nova::createRenameGpuKernelsPass()";
 }
 
+
+def GpuRuntimeLowering : Pass<"gpu-runtime-lowering", "ModuleOp"> {
+    let summary = "Lower abstract GPU memory operations to CUDA runtime calls";
+    let description = [{
+        Lower abstract GPU memory operations (gpu.alloc, gpu.memcpy, etc.) 
+        to CUDA runtime calls (cudaMalloc, cudaMemcpy, etc.) or custom runtime wrappers.
+    }];
+    let dependentDialects = [
+        "mlir::gpu::GPUDialect",
+        "mlir::LLVM::LLVMDialect"
+    ];
+    let constructor = "::mlir::nova::createGpuRuntimeLoweringPass()";
+}
+
 #endif // NOVA_TRANSFORMS_PASSES

@@ -10,6 +10,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/MapVector.h"
@@ -25,7 +26,7 @@ struct AddGpuMemoryCopiesPass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AddGpuMemoryCopiesPass)
 
   // Helper to recursively update memory space of index-aliasing operations
-  void updateMemorySpaceRecursively(Value val, Attribute newSpace) {
+  void updateMemorySpaceRecursively(Value val, Attribute newSpace, SmallVectorImpl<Operation*>& redundantCopies) {
     auto oldType = llvm::dyn_cast<MemRefType>(val.getType());
     if (!oldType)
       return;
@@ -36,11 +37,19 @@ struct AddGpuMemoryCopiesPass
 
     for (auto &use : val.getUses()) {
       Operation *user = use.getOwner();
+      
+      // If the user is a memcpy and both sides are now the same space, mark it redundant
+      if (auto memcpyOp = llvm::dyn_cast<gpu::MemcpyOp>(user)) {
+        // We'll check this later in the main loop to avoid iterator invalidation
+        redundantCopies.push_back(user);
+        continue;
+      }
+
       if (isa<memref::CollapseShapeOp, memref::ExpandShapeOp, memref::SubViewOp,
               memref::CastOp, memref::ReshapeOp, memref::TransposeOp,
               memref::ReinterpretCastOp, bufferization::ToBufferOp>(user)) {
         for (Value result : user->getResults()) {
-          updateMemorySpaceRecursively(result, newSpace);
+          updateMemorySpaceRecursively(result, newSpace, redundantCopies);
         }
       }
     }
@@ -73,84 +82,124 @@ struct AddGpuMemoryCopiesPass
     if (func->hasAttr(gpu::GPUDialect::getKernelFuncAttrName()))
       return;
 
-    MLIRContext *ctx = func.getContext();
+    ModuleOp module = func->getParentOfType<ModuleOp>();
+    // MLIRContext *ctx = func.getContext(); // Removed unused variable
+    OpBuilder moduleBuilder(module.getBodyRegion());
 
-    // Track host constants that need to be copied to device
-    llvm::MapVector<Value, Value> hostToDeviceMap;
-    SmallVector<Value, 4> deviceAllocsToDealloc;
+    // Phase 1: Promote host memref arguments to address space 1
+    SmallVector<Operation*, 8> redundantCopies;
+    SmallVector<Type, 8> newArgTypes;
+    bool signatureChanged = false;
+    for (auto arg : func.getArguments()) {
+      auto memRefType = llvm::dyn_cast<MemRefType>(arg.getType());
+      if (memRefType && memRefType.getMemorySpaceAsInt() == 0) {
+        auto newType = MemRefType::get(
+            memRefType.getShape(), memRefType.getElementType(),
+            memRefType.getLayout(), moduleBuilder.getI64IntegerAttr(1));
+        arg.setType(newType);
+        updateMemorySpaceRecursively(arg, moduleBuilder.getI64IntegerAttr(1), redundantCopies);
+        newArgTypes.push_back(newType);
+        signatureChanged = true;
+      } else {
+        newArgTypes.push_back(arg.getType());
+      }
+    }
 
-    // Walk all gpu.launch operations and find host constants used inside
+    if (signatureChanged) {
+      auto newFuncType = FunctionType::get(
+          func.getContext(), newArgTypes, func.getFunctionType().getResults());
+      func.setType(newFuncType);
+    }
+
+    // Erase redundant copies (where src and dst are now in the same space)
+    for (Operation* op : redundantCopies) {
+      if (auto memcpyOp = llvm::dyn_cast<gpu::MemcpyOp>(op)) {
+         Value src = memcpyOp.getSrc();
+         Value dst = memcpyOp.getDst();
+         if (src.getType() == dst.getType()) {
+            dst.replaceAllUsesWith(src);
+            op->erase();
+         }
+      }
+    }
+
+    // Phase 2: persistent constants (Already implemented)
     func.walk([&](gpu::LaunchOp launchOp) {
       launchOp.getRegion().walk([&](Operation *op) {
         for (OpOperand &operand : op->getOpOperands()) {
           Value val = operand.get();
           auto memRefType = llvm::dyn_cast<MemRefType>(val.getType());
-          if (!memRefType)
+          if (!memRefType || memRefType.getMemorySpaceAsInt() != 0)
             continue;
 
           // Skip values defined inside the launch region
           if (launchOp.getRegion().isAncestor(val.getParentRegion()))
             continue;
 
-          // Skip if already mapped
-          if (hostToDeviceMap.count(val)) {
-            operand.set(hostToDeviceMap[val]);
-            continue;
-          }
-
           // Only process host constants (memref.get_global and derived views)
           if (!isHostConstant(val))
             continue;
 
-          OpBuilder builder(func.getBody().front().getTerminator());
-          if (auto defOp = val.getDefiningOp())
-            builder.setInsertionPointAfter(defOp);
-          else
-            builder.setInsertionPointToStart(&func.getBody().front());
+          // Find the original memref.get_global and collect views
+          memref::GetGlobalOp getGlobal;
+          SmallVector<Operation*, 4> views;
+          Operation *curr = val.getDefiningOp();
+          while (curr && !llvm::isa<memref::GetGlobalOp>(curr)) {
+            views.push_back(curr);
+            if (curr->getNumOperands() > 0 && llvm::isa<MemRefType>(curr->getOperand(0).getType()))
+              curr = curr->getOperand(0).getDefiningOp();
+            else
+              curr = nullptr;
+          }
+          getGlobal = dyn_cast_or_null<memref::GetGlobalOp>(curr);
+          if (!getGlobal) continue;
 
-          Location loc = val.getLoc();
+          StringRef hostSymbol = getGlobal.getName();
+          std::string deviceSymbol = (hostSymbol + "_device").str();
 
-          // Create device buffer with address space 1
-          MemRefType deviceType = MemRefType::get(
-              memRefType.getShape(), memRefType.getElementType(),
-              memRefType.getLayout(), builder.getI64IntegerAttr(1));
+          // Ensure the device global exists
+          if (!module.lookupSymbol(deviceSymbol)) {
+            auto hostGlobal = module.lookupSymbol<memref::GlobalOp>(hostSymbol);
+            if (!hostGlobal) continue;
 
-          SmallVector<Value> dynamicSizes;
-          for (int i = 0; i < memRefType.getRank(); ++i) {
-            if (memRefType.isDynamicDim(i)) {
-              Value idx = builder.create<arith::ConstantIndexOp>(loc, i);
-              Value dim = builder.create<memref::DimOp>(loc, val, idx);
-              dynamicSizes.push_back(dim);
-            }
+            auto hostGlobalType = llvm::cast<MemRefType>(hostGlobal.getType());
+            auto deviceGlobalType = MemRefType::get(
+                hostGlobalType.getShape(), hostGlobalType.getElementType(),
+                hostGlobalType.getLayout(), moduleBuilder.getI64IntegerAttr(1));
+
+            moduleBuilder.setInsertionPointToStart(module.getBody());
+            Attribute initVal = hostGlobal.getInitialValue() ? *hostGlobal.getInitialValue() : Attribute();
+            moduleBuilder.create<memref::GlobalOp>(
+                getGlobal.getLoc(), deviceSymbol,
+                moduleBuilder.getStringAttr("public"), deviceGlobalType,
+                initVal, /*constant=*/true, /*alignment=*/nullptr);
           }
 
-          auto allocOp = builder.create<gpu::AllocOp>(
-              loc, deviceType, ValueRange{}, dynamicSizes, ValueRange{});
-          Value deviceMem = allocOp.getResult(0);
-          hostToDeviceMap[val] = deviceMem;
-          deviceAllocsToDealloc.push_back(deviceMem);
-
-          // Copy host constant to device
-          builder.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{},
-                                        deviceMem, val);
-
-          // Replace the operand with device buffer
-          operand.set(deviceMem);
+          // Create get_global and re-apply views at the start of the function
+          OpBuilder funcBuilder(&func.getBody().front().front());
+          auto deviceGlobalType = llvm::cast<MemRefType>(module.lookupSymbol<memref::GlobalOp>(deviceSymbol).getType());
+          Value deviceVal = funcBuilder.create<memref::GetGlobalOp>(
+              getGlobal.getLoc(), deviceGlobalType, deviceSymbol);
+          
+          // Reverse order of views as we collected them from leaf to root
+          for (int i = views.size() - 1; i >= 0; --i) {
+             Operation* oldView = views[i];
+             IRMapping mapping;
+             mapping.map(oldView->getOperand(0), deviceVal);
+             Operation* newView = funcBuilder.clone(*oldView, mapping);
+             
+             // Update return type of cloned view to address space 1
+             auto oldType = llvm::cast<MemRefType>(oldView->getResult(0).getType());
+             auto newType = MemRefType::get(oldType.getShape(), oldType.getElementType(),
+                                            oldType.getLayout(), funcBuilder.getI64IntegerAttr(1));
+             newView->getResult(0).setType(newType);
+             deviceVal = newView->getResult(0);
+          }
+          
+          operand.set(deviceVal);
         }
       });
     });
-
-    // Deallocate device buffers for constants at function return
-    SmallVector<func::ReturnOp, 2> returnOps;
-    func.walk([&](func::ReturnOp returnOp) { returnOps.push_back(returnOp); });
-
-    for (Value deviceMem : deviceAllocsToDealloc) {
-      for (auto returnOp : returnOps) {
-        OpBuilder builder(returnOp);
-        builder.create<gpu::DeallocOp>(returnOp.getLoc(), ValueRange{},
-                                       deviceMem);
-      }
-    }
   }
 
   StringRef getArgument() const final { return "add-gpu-memory-copies"; }

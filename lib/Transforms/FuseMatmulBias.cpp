@@ -385,6 +385,11 @@ private:
     //check if the operatiopn has two inputs
     if (op.getNumDpsInputs() != 2)
       return false;
+
+    // Ensure all loops are parallel
+    if (op.getNumParallelLoops() != op.getNumLoops())
+      return false;
+    
     //return true for only add operation
     Operation *definingOp = op.getBody()->getTerminator()->getOperand(0).getDefiningOp();
     return definingOp && (isa<arith::AddFOp>(definingOp) || isa<arith::AddIOp>(definingOp));
