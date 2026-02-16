@@ -4,6 +4,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -17,6 +18,228 @@
 
 using namespace mlir;
 using namespace mlir::nova;
+
+namespace {
+
+// Helper to create shared memory reduction for max/sum
+// Returns the reduced value for the block (only thread 0 has the valid result)
+Value createBlockReduce(PatternRewriter &rewriter, Location loc, Value val,
+                        gpu::AllReduceOperation op, int blockDim) {
+  // Use gpu.all_reduce for simplicity and efficiency within the block
+  // This generates the necessary shuffle/shared memory ops
+  mlir::gpu::AllReduceOperationAttr opAttr =
+      mlir::gpu::AllReduceOperationAttr::get(rewriter.getContext(), op);
+  return rewriter.create<gpu::AllReduceOp>(loc, val.getType(), val, opAttr,
+                                           /*uniform=*/true);
+}
+
+struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
+  using OpRewritePattern<mlir::nova::SceOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mlir::nova::SceOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value logits = op.getLogits();
+    Value targets = op.getTargets();
+    auto logitsType = cast<RankedTensorType>(logits.getType());
+    auto targetsType = cast<RankedTensorType>(targets.getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+
+    // Shapes: logits [N, C], targets [N]
+    auto logitsShape = logitsType.getShape();
+    int64_t N = logitsShape[0];
+    int64_t C = logitsShape[1];
+
+    // 1. Allocate memory for the FINAL loss (scalar, size [1])
+    // The fused kernel will atomically add per-row loss here.
+    auto lossMemRefType = MemRefType::get({1}, resultType.getElementType(),
+                                          MemRefLayoutAttrInterface{},
+                                          rewriter.getI64IntegerAttr(1));
+
+    Value lossMemRef =
+        rewriter
+            .create<gpu::AllocOp>(loc, lossMemRefType,
+                                  /*asyncDependencies=*/ValueRange{},
+                                  /*dynamicSizes=*/ValueRange{},
+                                  /*symbolOperands=*/ValueRange{})
+            .getMemref();
+
+    // Initialize to 0.0
+    Value zero_init = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(resultType.getElementType(), 0.0));
+    // Builder: (Type asyncToken, ValueRange asyncDependencies, Value dst, Value
+    // value)
+    rewriter.create<gpu::MemsetOp>(loc, Type(), ValueRange{}, lossMemRef,
+                                   zero_init);
+
+    // 2. Prepare Inputs (Convert Tensors to MemRefs)
+    auto logitsMemRefType =
+        MemRefType::get(logitsType.getShape(), logitsType.getElementType());
+    Value logitsMemRef =
+        rewriter
+            .create<bufferization::ToBufferOp>(loc, logitsMemRefType, logits)
+            .getResult();
+
+    // Cast targets to i32 if needed (usually i32)
+    Value targetsMemRef;
+    if (targetsType.getElementType().isInteger(32)) {
+      auto targetsMemType =
+          MemRefType::get(targetsType.getShape(), targetsType.getElementType());
+      targetsMemRef =
+          rewriter
+              .create<bufferization::ToBufferOp>(loc, targetsMemType, targets)
+              .getResult();
+    } else {
+      // Handle non-i32 targets if necessary, or assume i32 for now
+      auto targetsMemType =
+          MemRefType::get(targetsType.getShape(), targetsType.getElementType());
+      targetsMemRef =
+          rewriter
+              .create<bufferization::ToBufferOp>(loc, targetsMemType, targets)
+              .getResult();
+    }
+
+    // 3. Launch Fused SCE Kernel
+    // Grid: N (one block per row), Block: 128 (configurable)
+    int64_t threadsPerBlock = 128;
+
+    Value cGridSize = rewriter.create<arith::ConstantIndexOp>(loc, N);
+    Value cBlockSize =
+        rewriter.create<arith::ConstantIndexOp>(loc, threadsPerBlock);
+    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+    auto launchOp =
+        rewriter.create<gpu::LaunchOp>(loc, cGridSize, c1, c1, // Grid: N, 1, 1
+                                       cBlockSize, c1, c1 // Block: 128, 1, 1
+        );
+
+    // 4. Kernel Body
+    rewriter.setInsertionPointToStart(&launchOp.getBody().front());
+
+    Value bid =
+        rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x); // Row ID
+    Value tid = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+    Value bdim = rewriter.create<gpu::BlockDimOp>(loc, gpu::Dimension::x);
+
+    // Constants
+    Value cC = rewriter.create<arith::ConstantIndexOp>(loc, C);
+    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value neg_inf = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getF32FloatAttr(-std::numeric_limits<float>::infinity()));
+    Value zero_f32 =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getF32FloatAttr(0.0f));
+
+    // A. Load Target Class for this row
+    Value targetIdxVal =
+        rewriter.create<memref::LoadOp>(loc, targetsMemRef, ValueRange{bid});
+    Value targetIdx = targetIdxVal;
+    if (!targetIdx.getType().isIndex())
+      targetIdx = rewriter.create<arith::IndexCastOp>(
+          loc, rewriter.getIndexType(), targetIdxVal);
+
+    // B. Pass 1: Find Max (Row-wise)
+    Value initialMax = neg_inf;
+    auto ptr = rewriter.create<scf::ForOp>(
+        loc, tid, cC, bdim, ValueRange{initialMax},
+        [&](OpBuilder &b, Location l, Value idx, ValueRange args) {
+          Value val =
+              b.create<memref::LoadOp>(l, logitsMemRef, ValueRange{bid, idx});
+          if (val.getType().isF16() || val.getType().isBF16())
+            val = b.create<arith::ExtFOp>(l, b.getF32Type(), val);
+
+          Value newMax = b.create<arith::MaximumFOp>(l, args[0], val);
+          b.create<scf::YieldOp>(l, newMax);
+        });
+
+    Value threadMax = ptr.getResult(0);
+    Value rowMax =
+        createBlockReduce(rewriter, loc, threadMax,
+                          gpu::AllReduceOperation::MAXIMUMF, threadsPerBlock);
+
+    // C. Pass 2: Compute Sum(Exp) and Capture Target Logit
+    Value initialSum = zero_f32;
+    Value initialTargetLogit = zero_f32;
+
+    auto loop2 = rewriter.create<scf::ForOp>(
+        loc, tid, cC, bdim, ValueRange{initialSum, initialTargetLogit},
+        [&](OpBuilder &b, Location l, Value idx, ValueRange args) {
+          Value currSum = args[0];
+          Value currTargetLogit = args[1];
+
+          Value val =
+              b.create<memref::LoadOp>(l, logitsMemRef, ValueRange{bid, idx});
+          if (val.getType().isF16() || val.getType().isBF16())
+            val = b.create<arith::ExtFOp>(l, b.getF32Type(), val);
+
+          Value diff = b.create<arith::SubFOp>(l, val, rowMax);
+          Value expVal = b.create<mlir::math::ExpOp>(l, diff);
+          Value newSum = b.create<arith::AddFOp>(l, currSum, expVal);
+
+          Value isTarget = b.create<arith::CmpIOp>(l, arith::CmpIPredicate::eq,
+                                                   idx, targetIdx);
+          Value zero = b.create<arith::ConstantOp>(l, b.getF32FloatAttr(0.0f));
+          Value valIfTarget = b.create<arith::SelectOp>(l, isTarget, val, zero);
+          Value newTargetLogit =
+              b.create<arith::AddFOp>(l, currTargetLogit, valIfTarget);
+
+          b.create<scf::YieldOp>(l, ValueRange{newSum, newTargetLogit});
+        });
+
+    Value threadSum = loop2.getResult(0);
+    Value threadTargetLogit = loop2.getResult(1);
+
+    Value rowSum =
+        createBlockReduce(rewriter, loc, threadSum,
+                          gpu::AllReduceOperation::ADD, threadsPerBlock);
+    Value rowTargetLogit =
+        createBlockReduce(rewriter, loc, threadTargetLogit,
+                          gpu::AllReduceOperation::ADD, threadsPerBlock);
+
+    // D. Compute Loss (Only Thread 0 writes)
+    Value isMaster =
+        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, tid, c0);
+
+    scf::IfOp writeOp =
+        rewriter.create<scf::IfOp>(loc, isMaster, /*withElseRegion=*/false);
+    rewriter.setInsertionPointToStart(writeOp.thenBlock());
+
+    Value logSum = rewriter.create<mlir::math::LogOp>(loc, rowSum);
+    Value term2 = rewriter.create<arith::SubFOp>(loc, rowTargetLogit, rowMax);
+    Value loss = rewriter.create<arith::SubFOp>(loc, logSum, term2);
+
+    // NORMALIZE by Batch Size N
+    Value cN_f32 = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getF32FloatAttr(static_cast<float>(N)));
+    Value normalizedLoss = rewriter.create<arith::DivFOp>(loc, loss, cN_f32);
+
+    // Cast back to output element type if needed
+    Value finalLoss = normalizedLoss;
+    Type elemType = resultType.getElementType();
+    if (elemType.isF16() || elemType.isBF16()) {
+      finalLoss =
+          rewriter.create<arith::TruncFOp>(loc, elemType, normalizedLoss);
+    }
+
+    // Atomic Add to Output[0]
+    rewriter.create<memref::AtomicRMWOp>(loc, arith::AtomicRMWKind::addf,
+                                         finalLoss, lossMemRef, ValueRange{c0});
+
+    rewriter.setInsertionPointAfter(writeOp);
+    rewriter.create<gpu::TerminatorOp>(loc);
+    rewriter.setInsertionPointAfter(launchOp);
+
+    // 5. Result
+    auto scalarTensorType =
+        RankedTensorType::get({1}, resultType.getElementType());
+    Value lossTensor = rewriter.create<bufferization::ToTensorOp>(
+        loc, scalarTensorType, lossMemRef, /*restrict=*/true,
+        /*writable=*/true);
+
+    rewriter.replaceOp(op, lossTensor);
+    return success();
+  }
+};
+} // namespace
 
 namespace mlir {
 namespace nova {
@@ -122,7 +345,7 @@ public:
 
     // 3. Create gpu.launch parameters
     int64_t numElements = inputType.getNumElements();
-    int64_t threadsPerBlock = 1024;
+    int64_t threadsPerBlock = 128;
     int64_t numBlocks = (numElements + threadsPerBlock - 1) / threadsPerBlock;
 
     Value cGridSize = rewriter.create<arith::ConstantIndexOp>(loc, numBlocks);
@@ -428,6 +651,7 @@ struct NovaToGpuPass
     target.addIllegalOp<nova::ToDeviceOp>();
     patterns.add<NovaToGpuReducePattern>(context);
     patterns.add<ToDeviceOpLowering>(context);
+    patterns.add<SceOpLowering>(context);
 
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       signalPassFailure();
