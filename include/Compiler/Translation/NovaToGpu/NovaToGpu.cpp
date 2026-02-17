@@ -15,6 +15,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include <algorithm>
+#include <limits>
 
 using namespace mlir;
 using namespace mlir::nova;
@@ -45,13 +47,18 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     auto targetsType = cast<RankedTensorType>(targets.getType());
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
 
-    // Shapes: logits [N, C], targets [N]
+    // Generalized Shapes: logits [D1, D2, ..., Dn, C], targets [D1, D2, ...,
+    // Dn]
     auto logitsShape = logitsType.getShape();
-    int64_t N = logitsShape[0];
-    int64_t C = logitsShape[1];
+    int64_t rank = logitsType.getRank();
+    int64_t C = logitsShape[rank - 1];
+    int64_t N = 1;
+    for (int i = 0; i < rank - 1; ++i) {
+      if (logitsShape[i] != ShapedType::kDynamic)
+        N *= logitsShape[i];
+    }
 
     // 1. Allocate memory for the FINAL loss (scalar, size [1])
-    // The fused kernel will atomically add per-row loss here.
     auto lossMemRefType = MemRefType::get({1}, resultType.getElementType(),
                                           MemRefLayoutAttrInterface{},
                                           rewriter.getI64IntegerAttr(1));
@@ -67,8 +74,6 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     // Initialize to 0.0
     Value zero_init = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getFloatAttr(resultType.getElementType(), 0.0));
-    // Builder: (Type asyncToken, ValueRange asyncDependencies, Value dst, Value
-    // value)
     rewriter.create<gpu::MemsetOp>(loc, Type(), ValueRange{}, lossMemRef,
                                    zero_init);
 
@@ -80,27 +85,12 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
             .create<bufferization::ToBufferOp>(loc, logitsMemRefType, logits)
             .getResult();
 
-    // Cast targets to i32 if needed (usually i32)
-    Value targetsMemRef;
-    if (targetsType.getElementType().isInteger(32)) {
-      auto targetsMemType =
-          MemRefType::get(targetsType.getShape(), targetsType.getElementType());
-      targetsMemRef =
-          rewriter
-              .create<bufferization::ToBufferOp>(loc, targetsMemType, targets)
-              .getResult();
-    } else {
-      // Handle non-i32 targets if necessary, or assume i32 for now
-      auto targetsMemType =
-          MemRefType::get(targetsType.getShape(), targetsType.getElementType());
-      targetsMemRef =
-          rewriter
-              .create<bufferization::ToBufferOp>(loc, targetsMemType, targets)
-              .getResult();
-    }
+    auto targetsMemType =
+        MemRefType::get(targetsType.getShape(), targetsType.getElementType());
+    Value targetsMemRef =
+        rewriter.create<bufferization::ToBufferOp>(loc, targetsMemType, targets)
+            .getResult();
 
-    // 3. Launch Fused SCE Kernel
-    // Grid: N (one block per row), Block: 128 (configurable)
     int64_t threadsPerBlock = 128;
 
     Value cGridSize = rewriter.create<arith::ConstantIndexOp>(loc, N);
@@ -116,10 +106,26 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     // 4. Kernel Body
     rewriter.setInsertionPointToStart(&launchOp.getBody().front());
 
-    Value bid =
-        rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x); // Row ID
+    Value bid = rewriter.create<gpu::BlockIdOp>(
+        loc, gpu::Dimension::x); // Sample ID (flattened)
     Value tid = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
     Value bdim = rewriter.create<gpu::BlockDimOp>(loc, gpu::Dimension::x);
+
+    // Delinearize bid for targets and logits indexing
+    SmallVector<Value> targetIndices;
+    Value rem = bid;
+    for (int i = rank - 2; i >= 0; --i) {
+      Value dimSize =
+          rewriter.create<arith::ConstantIndexOp>(loc, logitsShape[i]);
+      if (i > 0) {
+        targetIndices.push_back(
+            rewriter.create<arith::RemUIOp>(loc, rem, dimSize));
+        rem = rewriter.create<arith::DivUIOp>(loc, rem, dimSize);
+      } else {
+        targetIndices.push_back(rem);
+      }
+    }
+    std::reverse(targetIndices.begin(), targetIndices.end());
 
     // Constants
     Value cC = rewriter.create<arith::ConstantIndexOp>(loc, C);
@@ -129,9 +135,9 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     Value zero_f32 =
         rewriter.create<arith::ConstantOp>(loc, rewriter.getF32FloatAttr(0.0f));
 
-    // A. Load Target Class for this row
-    Value targetIdxVal =
-        rewriter.create<memref::LoadOp>(loc, targetsMemRef, ValueRange{bid});
+    // A. Load Target Class for this sample
+    Value targetIdxVal = rewriter.create<memref::LoadOp>(
+        loc, targetsMemRef, ValueRange(targetIndices));
     Value targetIdx = targetIdxVal;
     if (!targetIdx.getType().isIndex())
       targetIdx = rewriter.create<arith::IndexCastOp>(
@@ -142,8 +148,10 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     auto ptr = rewriter.create<scf::ForOp>(
         loc, tid, cC, bdim, ValueRange{initialMax},
         [&](OpBuilder &b, Location l, Value idx, ValueRange args) {
+          SmallVector<Value> logitsIdx = targetIndices;
+          logitsIdx.push_back(idx);
           Value val =
-              b.create<memref::LoadOp>(l, logitsMemRef, ValueRange{bid, idx});
+              b.create<memref::LoadOp>(l, logitsMemRef, ValueRange(logitsIdx));
           if (val.getType().isF16() || val.getType().isBF16())
             val = b.create<arith::ExtFOp>(l, b.getF32Type(), val);
 
@@ -166,8 +174,9 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
           Value currSum = args[0];
           Value currTargetLogit = args[1];
 
-          Value val =
-              b.create<memref::LoadOp>(l, logitsMemRef, ValueRange{bid, idx});
+          SmallVector<Value> logitsIdx = targetIndices;
+          logitsIdx.push_back(idx);
+          Value val = b.create<memref::LoadOp>(l, logitsMemRef, logitsIdx);
           if (val.getType().isF16() || val.getType().isBF16())
             val = b.create<arith::ExtFOp>(l, b.getF32Type(), val);
 
@@ -207,7 +216,7 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     Value term2 = rewriter.create<arith::SubFOp>(loc, rowTargetLogit, rowMax);
     Value loss = rewriter.create<arith::SubFOp>(loc, logSum, term2);
 
-    // NORMALIZE by Batch Size N
+    // NORMALIZE by Total Samples N
     Value cN_f32 = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getF32FloatAttr(static_cast<float>(N)));
     Value normalizedLoss = rewriter.create<arith::DivFOp>(loc, loss, cN_f32);

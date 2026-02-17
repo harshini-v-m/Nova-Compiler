@@ -222,7 +222,7 @@ namespace mlir
             binaryOptions.toolkitPath = "/usr/local/cuda-13.0";
             binaryOptions.compilationTarget = "isa"; 
             pm.addPass(mlir::createGpuModuleToBinaryPass(binaryOptions));
-
+           pm.addPass(mlir::nova::createGpuRuntimeLoweringPass());
             // MAIN LOWERING: gpu.launch_func -> runtime calls
             mlir::GpuToLLVMConversionPassOptions hostOptions;
             // hostOptions.kernelBarePtrCallConv = true; // Disabled to match dynamic wrapper
@@ -236,7 +236,7 @@ namespace mlir
             
             pm.addPass(mlir::memref::createExpandStridedMetadataPass());
             pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-            pm.addPass(mlir::nova::createGpuRuntimeLoweringPass());
+ 
             pm.addPass(mlir::createConvertFuncToLLVMPass());
             pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
