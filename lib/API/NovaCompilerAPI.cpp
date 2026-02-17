@@ -22,6 +22,7 @@
 #include "mlir/Dialect/SCF/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/TensorTilingInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/IR/TensorInferTypeOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
 // ValueBoundsOpInterface implementations (needed for tiling transforms)
@@ -248,6 +249,7 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   mlir::registerConvertOpenMPToLLVMInterface(registry);
   mlir::registerConvertComplexToLLVMInterface(registry);
   mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
+  mlir::tensor::registerInferTypeOpInterfaceExternalModels(registry);
 
   registerLLVMDialectTranslation(registry);
   registerAllToLLVMIRTranslations(registry);

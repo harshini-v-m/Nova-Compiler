@@ -102,17 +102,16 @@ namespace mlir
 
 
             // 4. LINALG OPT to linalg generalize pass
-            pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgGeneralizeNamedOpsPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createFuseMatmulBiasPass());
             pm.addPass(mlir::createCanonicalizerPass());
-            pm.addPass(mlir::createLinalgFoldUnitExtentDimsPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgFoldUnitExtentDimsPass());
 
             // Tiling is handled in Section 6 after parallel loop conversion
-            pm.addPass(mlir::createLinalgElementwiseOpFusionPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgElementwiseOpFusionPass());
             // pm.addNestedPass<mlir::func::FuncOp>(
             //     mlir::createLinalgGeneralizeNamedOpsPass());
 
-            // 5. BUFFERIZATION & DEALLOCATION
             bufferization::OneShotBufferizePassOptions bufferizeOptions;
             bufferizeOptions.bufferizeFunctionBoundaries = true;
             bufferizeOptions.functionBoundaryTypeConversion = bufferization::LayoutMapOption::IdentityLayoutMap;
@@ -121,10 +120,10 @@ namespace mlir
             pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufferizeOptions));
 
             bufferization::BufferDeallocationPipelineOptions deallocationOptions;
-            bufferization::buildBufferDeallocationPipeline(pm, deallocationOptions);
+            bufferization::buildBufferDeallocationPipeline(pm.nest<mlir::func::FuncOp>(), deallocationOptions);
             pm.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferHoistingPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
-            pm.addPass(mlir::createConvertBufferizationToMemRefPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertBufferizationToMemRefPass());
             // device attribute handling pass
             // pm.addPass(mlir::nova::createConvertMemRefToGpuPass());
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
@@ -132,18 +131,18 @@ namespace mlir
             // lowering through Affine
             pm.addPass(mlir::createCanonicalizerPass());
 
-            pm.addPass(mlir::createConvertLinalgToAffineLoopsPass());
-            pm.addPass(mlir::memref::createFoldMemRefAliasOpsPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertLinalgToAffineLoopsPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::memref::createFoldMemRefAliasOpsPass());
             //add this pass --affine-expand-index-ops-as-affine
-            pm.addPass(mlir::affine::createAffineExpandIndexOpsAsAffinePass());
-            pm.addPass(mlir::createCanonicalizerPass());
-            pm.addPass(mlir::createCSEPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineExpandIndexOpsAsAffinePass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createCanonicalizerPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createCSEPass());
             //affine fusion pass
-            pm.addPass(mlir::affine::createLoopFusionPass(1, 1024, true, mlir::affine::FusionMode::Greedy));
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createLoopFusionPass(1, 1024, true, mlir::affine::FusionMode::Greedy));
             pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createSimplifyAffineStructuresPass());
-            pm.addPass(mlir::createCanonicalizerPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createCanonicalizerPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createAffineScalarizeAccumulatorPass());
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineLoopInvariantCodeMotionPass());
+            // pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineLoopInvariantCodeMotionPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineScalarReplacementPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createRaiseMemrefToAffine());
             
@@ -177,7 +176,7 @@ namespace mlir
             if (failed(mlir::parsePassPipeline("func.func(affine-parallelize)", pm)))
                 llvm::errs() << "Pipeline parsing failed for affine-parallelize\n";
 
-            pm.addPass(mlir::createLowerAffinePass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createLowerAffinePass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createParallelLoopFusionPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
@@ -201,7 +200,7 @@ namespace mlir
             nvvmTargetOptions.ftzFlag = true;
             pm.addPass(mlir::createGpuNVVMAttachTarget(nvvmTargetOptions));
 
-            pm.addPass(mlir::createGpuAsyncRegionPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createGpuAsyncRegionPass());
 
             // Lowering INSIDE the GPU Module (Fixes 'index' in kernels)
             auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
@@ -222,7 +221,8 @@ namespace mlir
             binaryOptions.toolkitPath = "/usr/local/cuda-13.0";
             binaryOptions.compilationTarget = "isa"; 
             pm.addPass(mlir::createGpuModuleToBinaryPass(binaryOptions));
-           pm.addPass(mlir::nova::createGpuRuntimeLoweringPass());
+            pm.addPass(mlir::nova::createGpuRuntimeLoweringPass());
+
             // MAIN LOWERING: gpu.launch_func -> runtime calls
             mlir::GpuToLLVMConversionPassOptions hostOptions;
             // hostOptions.kernelBarePtrCallConv = true; // Disabled to match dynamic wrapper
@@ -236,7 +236,7 @@ namespace mlir
             
             pm.addPass(mlir::memref::createExpandStridedMetadataPass());
             pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
- 
+            
             pm.addPass(mlir::createConvertFuncToLLVMPass());
             pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
