@@ -74,6 +74,7 @@ add_mlir_library(NovaCompilerAPI
   # Tiling and ValueBounds interfaces 
   MLIRTilingInterface
   MLIRTensorTilingInterfaceImpl
+  MLIRTensorInferTypeOpInterfaceImpl
   MLIRValueBoundsOpInterface
   MLIRArithValueBoundsOpInterfaceImpl
   
