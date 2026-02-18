@@ -316,7 +316,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 
 
 
-def Nova_SquareOp : Nova_UnaryOp<"square", [Pure, SameOperandsAndResultType,NoComplexOperands]>{
+def Nova_SquareOp : Nova_UnaryOp<"square", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,NoComplexOperands]>{
   let arguments = (ins Nova_Tensor:$input);
   let results = (outs Nova_Tensor:$output);
   let assemblyFormat = [{
@@ -355,7 +355,7 @@ def Nova_SignOp : Nova_UnaryOp<"sign", [Pure,DeclareOpInterfaceMethods<InferType
       let extraClassDeclaration = [{
   }];
 }
-def Nova_NegOp : Nova_UnaryOp<"neg", [Pure, SameOperandsAndResultType]>{
+def Nova_NegOp : Nova_UnaryOp<"neg", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]>{
   let arguments = (ins Nova_Tensor:$input);
   let results = (outs Nova_Tensor:$output);
   
@@ -366,7 +366,7 @@ def Nova_NegOp : Nova_UnaryOp<"neg", [Pure, SameOperandsAndResultType]>{
   
 }
 
-def Nova_ReciprocalOp : Nova_UnaryOp<"reciprocal", [Pure, SameOperandsAndResultType,NoComplexOperands]> {
+def Nova_ReciprocalOp : Nova_UnaryOp<"reciprocal", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,NoComplexOperands]> {
   let arguments = (ins Nova_Tensor:$input);
   let results = (outs Nova_Tensor:$output);
   let hasCanonicalizer = 1;
@@ -528,7 +528,7 @@ def Nova_AcosOp : Nova_UnaryOp<"acos", [Pure, DeclareOpInterfaceMethods<InferTyp
 } 
 //--------------------------SPECIAL FUNCTIONS----------------------------
 
-def Nova_ReluOp : Nova_UnaryOp<"relu", [Pure, SameOperandsAndResultType,NoComplexOperands]> {
+def Nova_ReluOp : Nova_UnaryOp<"relu", [Pure,NoComplexOperands, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let arguments = (ins Nova_Tensor:$input);
   let results = (outs Nova_Tensor:$output);
   let assemblyFormat = [{
