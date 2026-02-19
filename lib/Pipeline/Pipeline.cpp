@@ -67,9 +67,10 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
   // Lower Nova dialect to standard dialects 
 //pm.addNestedPass<func::FuncOp>(ceateNovaToLinalg());  
   pm.addPass(createCanonicalizerPass()); 
+  pm.addPass(createNovaToArithLoweringPass());
   pm.addPass(createNovaToTosaLoweringPass());
   pm.addNestedPass<func::FuncOp>(createNovaToLinalgLoweringPass());
-  pm.addPass(createNovaToArithLoweringPass());
+  
   pm.addPass(createCanonicalizerPass());
 //  pm.addPass(mlir::createTensorBufferizePass());  
   pm.addPass(mlir::createReconcileUnrealizedCastsPass());
