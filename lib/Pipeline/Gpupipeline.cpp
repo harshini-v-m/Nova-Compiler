@@ -148,7 +148,7 @@ namespace mlir
             
             // Setting explicit tile sizes {128, 8, ...} via text pipeline 
             // since createLoopTilingPass(cacheSize) uses a heuristic.
-            if (failed(mlir::parsePassPipeline("func.func(affine-loop-tile{tile-sizes=128,8})", pm)))
+            if (failed(mlir::parsePassPipeline("func.func(affine-loop-tile{tile-sizes=1,4,32})", pm)))
                 llvm::errs() << "Pipeline parsing failed for affine-loop-tile\n";
 
             // pm.addNestedPass<mlir::func::FuncOp>(  
@@ -169,8 +169,6 @@ namespace mlir
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
 
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createAddGpuMemoryCopiesPass());
-            
             // Map tiled loops to parallel loops. We use parsePassPipeline to avoid 
             // the linker error for createAffineParallelizePass.
             if (failed(mlir::parsePassPipeline("func.func(affine-parallelize)", pm)))
@@ -187,6 +185,9 @@ namespace mlir
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertParallelLoopToGpuPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
+
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createAddGpuMemoryCopiesPass());
+            pm.addPass(mlir::createReconcileUnrealizedCastsPass());
 
             pm.addPass(mlir::nova::createConvertMemRefToGpuPass());
             pm.addPass(mlir::createGpuKernelOutliningPass());
