@@ -65,6 +65,14 @@ struct AllReduceOpMemEffectModel
     // No memory effects (operating on values)
   }
 };
+
+struct BarrierOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<BarrierOpMemEffectModel, mlir::gpu::BarrierOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<mlir::MemoryEffects::Effect>> &effects) const {
+    // No memory effects (from bufferization's perspective)
+  }
+};
 }
 
 int main(int argc, char **argv) {
@@ -74,6 +82,7 @@ int main(int argc, char **argv) {
   // Attach the interface to gpu::AllReduceOp when GPU dialect is loaded
   registry.addExtension(+[](mlir::MLIRContext *ctx, mlir::gpu::GPUDialect *dialect) {
     mlir::gpu::AllReduceOp::attachInterface<AllReduceOpMemEffectModel>(*ctx);
+    mlir::gpu::BarrierOp::attachInterface<BarrierOpMemEffectModel>(*ctx);
   });
 
   // Register the AddGpuMemoryCopies pass

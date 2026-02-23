@@ -97,6 +97,27 @@ struct AllReduceOpMemEffectModel
 };
 } // namespace
 
+struct DynamicSharedMemoryOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          DynamicSharedMemoryOpMemEffectModel, mlir::gpu::DynamicSharedMemoryOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // No memory side effects
+  }
+};
+
+struct BarrierOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          BarrierOpMemEffectModel, mlir::gpu::BarrierOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // Barrier has effects on execution order, but here we mean memory side effects
+    // that might block outlining. Barrier doesn't read/write memory itself.
+  }
+};
+
 
 NovaCompilerAPI::NovaCompilerAPI() {
   // Register all MLIR passes globally so they can be parsed from strings
@@ -257,6 +278,8 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   registry.addExtension(+[](mlir::MLIRContext *ctx,
                             mlir::gpu::GPUDialect *dialect) {
     mlir::gpu::AllReduceOp::attachInterface<AllReduceOpMemEffectModel>(*ctx);
+    mlir::gpu::DynamicSharedMemoryOp::attachInterface<DynamicSharedMemoryOpMemEffectModel>(*ctx);
+    mlir::gpu::BarrierOp::attachInterface<BarrierOpMemEffectModel>(*ctx);
   });
 }
 

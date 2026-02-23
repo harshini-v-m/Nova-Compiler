@@ -8,6 +8,7 @@ namespace mlir {
 namespace nova {
 
 std::unique_ptr<Pass> createNovaToGpuPass();
+void populateMatmulPatterns(RewritePatternSet &patterns);
 
 } // namespace nova
 } // namespace mlir

@@ -11,18 +11,39 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include <algorithm>
 #include <limits>
 
 using namespace mlir;
 using namespace mlir::nova;
 
+namespace mlir {
+namespace nova {
+
 namespace {
 
+struct Barrier0OpMemoryEffects
+    : public MemoryEffectOpInterface::ExternalModel<Barrier0OpMemoryEffects,
+                                                     NVVM::Barrier0Op> {
+  void getEffects(
+      Operation *op,
+      SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+          &effects) const {
+    // Report both Read and Write effects to satisfy bufferization analysis.
+    effects.emplace_back(MemoryEffects::Write::get(),
+                         SideEffects::DefaultResource::get());
+    effects.emplace_back(MemoryEffects::Read::get(),
+                         SideEffects::DefaultResource::get());
+  }
+};
+
+} // namespace
 // Helper to create shared memory reduction for max/sum
 // Returns the reduced value for the block (only thread 0 has the valid result)
 Value createBlockReduce(PatternRewriter &rewriter, Location loc, Value val,
@@ -248,10 +269,6 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     return success();
   }
 };
-} // namespace
-
-namespace mlir {
-namespace nova {
 
 class NovaToGpuReducePattern : public OpRewritePattern<nova::ReduceOp> {
 public:
@@ -898,25 +915,39 @@ struct NovaToGpuPass
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect,
                     memref::MemRefDialect, tensor::TensorDialect,
-                    bufferization::BufferizationDialect>();
+                    bufferization::BufferizationDialect,
+                    math::MathDialect, func::FuncDialect,
+                    NVVM::NVVMDialect>();
+    
+    // Register the side-effect interface for nvvm.barrier0.
+    registry.addExtension(+[](MLIRContext *context, NVVM::NVVMDialect *dialect) {
+      NVVM::Barrier0Op::attachInterface<Barrier0OpMemoryEffects>(*context);
+    });
   }
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
+
     RewritePatternSet patterns(context);
     ConversionTarget target(*context);
     target
-        .addLegalDialect<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect,
-                         memref::MemRefDialect, tensor::TensorDialect,
-                         bufferization::BufferizationDialect>();
-    target.addIllegalOp<nova::ToDeviceOp>();
+        .addLegalDialect<arith::ArithDialect, gpu::GPUDialect,
+                          scf::SCFDialect, memref::MemRefDialect,
+                          func::FuncDialect, math::MathDialect,
+                          tensor::TensorDialect,
+                          bufferization::BufferizationDialect,
+                          NVVM::NVVMDialect>();
+    target.addLegalOp<gpu::BarrierOp>();
+    target.addIllegalOp<nova::ToDeviceOp, nova::SceOp, nova::MatmulOp,
+                        nova::GatherOp, nova::ScatterAddOp>();
     patterns.add<NovaToGpuReducePattern>(context);
     patterns.add<ToDeviceOpLowering>(context);
     patterns.add<SceOpLowering>(context);
     patterns.add<NovaToGpuGatherPattern>(context);
     patterns.add<ScatterAddOpGpuLowering>(context);
+    populateMatmulPatterns(patterns);
 
-    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+    if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
       signalPassFailure();
     }
   }
