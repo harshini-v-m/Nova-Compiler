@@ -1111,5 +1111,49 @@ def Nova_FusionBarrierOp : Op<Nova_Dialect, "fusion_barrier", [
   let assemblyFormat = "attr-dict $source `:` type($result)";
 }
 
+
+//===----------------------------------------------------------------------===//
+// FusionBarrierOp
+//===----------------------------------------------------------------------===//
+// A tensor-level scheduling fence that prevents loop fusion analysis from
+// merging the global-to-workgroup linalg.copy (Stage 1) with the
+// thread-local promoted linalg.copy (Stage 2) into the same loop body.
+//
+// This op is a pure identity: its result equals its source at runtime.
+// It is erased at the very beginning of bufferization once all tiling and
+// fusion decisions have been made.
+//
+// Mirrors IREE's iree_codegen.fusion_barrier (IREECodegenOps.td).
+//
+// Usage in NovaGPUPromoteMatmulOperands:
+//   %alloc  = bufferization.alloc_tensor {workgroup}
+//   %stage1 = linalg.copy(%global -> %alloc)   <- fills shared memory
+//   %fence  = nova.fusion_barrier %stage1       <- fusion cannot cross here
+//   %stage2 = linalg.copy(%fence -> %empty)     <- per-thread promoted copy
+//
+// Usage at bufferization (NovaGPUBufferize / Passes.cpp):
+//   Erase all nova.fusion_barrier by replacing with their source value.
+
+def Nova_FusionBarrierOp : Op<Nova_Dialect, "fusion_barrier", [
+    SameOperandsAndResultType, Pure]> {
+  let summary = "Prevents fusion through a ranked tensor value";
+  let description = [{
+    Identity operation on a ranked tensor that acts as an opaque fence for
+    the fusion analysis. The fusion/tiling passes cannot see through this op,
+    so producer operations on the source side and consumer operations on the
+    result side will be placed in separate loops.
+
+    This op must be erased before bufferization. Example erasure:
+    ```cpp
+    funcOp.walk([&](nova::FusionBarrierOp barrier) {
+      rewriter.replaceOp(barrier, barrier.getSource());
+    });
+    ```
+  }];
+  let arguments = (ins AnyRankedTensor:$source);
+  let results   = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "attr-dict $source `:` type($result)";
+}
+
 #endif // NOVA_OPS
 
