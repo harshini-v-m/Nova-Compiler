@@ -26,6 +26,58 @@ def NoIntegerOperands : NativeOpTrait<"NoIntegerOperands">;
   let assemblyFormat = "`<` $value `>`";
 }
 
+//===----------------------------------------------------------------------===//
+// GPU Lowering Config Attribute
+//===----------------------------------------------------------------------===//
+
+// Nova_LoweringConfigAttr — carries tiling levels, MMA kind, promoted operands.
+// Stored as a DictionaryAttr with well-known keys:
+//   "workgroup"         : I64ArrayAttr  — workgroup tile sizes per loop dim
+//   "reduction"         : I64ArrayAttr  — reduction tile sizes per loop dim
+//   "mma_kind"          : I32Attr       — NVMMAIntrinsic enum value
+//   "promoted_operands" : I64ArrayAttr  — operand indices to promote to smem
+//
+// Example in IR:
+//   {lowering_config = #nova.lowering_config<{
+//       workgroup = [128, 128, 0], reduction = [0, 0, 32],
+//       mma_kind = 1 : i32, promoted_operands = [0, 1]}>}
+def Nova_LoweringConfigAttr : AttrDef<Nova_Dialect, "LoweringConfig"> {
+  let mnemonic = "lowering_config";
+  let summary = "Drive GPU lowering of an op (tile sizes, MMA kind, promotion).";
+  let description = [{
+    GPU-specific lowering configuration attached to linalg ops.
+    Mirrors IREE's IREEGPU_LoweringConfigAttr but self-contained in Nova.
+    The `attributes` dictionary holds all configuration fields.
+  }];
+  let parameters = (ins
+    AttrParameter<"DictionaryAttr",
+        "Configured fields (tiling levels, mma_kind, promoted_operands, ...)">:$attributes
+  );
+  let assemblyFormat = "`<` $attributes `>`";
+}
+
+//===----------------------------------------------------------------------===//
+// NVIDIA MMA Intrinsic Kind Enum
+//===----------------------------------------------------------------------===//
+
+// Identifies a concrete NVIDIA hardware MMA intrinsic.
+// Used as the value of the "mma_kind" key in Nova_LoweringConfigAttr.
+def Nova_NVMMAIntrinsicKind : I32EnumAttr<"NVMMAIntrinsic",
+    "NVIDIA hardware MMA intrinsic", [
+  // No MMA — fall back to SIMT / vectorization pipeline.
+  I32EnumAttrCase<"NONE",               0, "none">,
+  // Volta/Turing WMMA: C(16x16) += A(16x16) * B(16x16), f16 inputs, f32 acc.
+  I32EnumAttrCase<"WMMA_F32_16x16x16",  1, "wmma_f32_16x16x16">,
+  // Turing WMMA: C(16x16) += A(16x16) * B(16x16), f16 inputs, f16 acc.
+  I32EnumAttrCase<"WMMA_F16_16x16x16",  2, "wmma_f16_16x16x16">,
+  // Ampere mma.sync: C(16x8) += A(16x16) * B(16x8), f16 inputs, f32 acc.
+  I32EnumAttrCase<"MMA_SYNC_F16_16x8x16", 3, "mma_sync_f16_16x8x16">,
+  // Ampere mma.sync: C(16x8) += A(16x16) * B(16x8), bf16 inputs, f32 acc.
+  I32EnumAttrCase<"MMA_SYNC_BF16_16x8x16", 4, "mma_sync_bf16_16x8x16">,
+]> {
+  let cppNamespace = "::mlir::nova";
+}
+
 // data types
 def I4 : Type<CPred<"$_self.isInteger(4)">, "4-bit integer">,
          BuildableType<"$_builder.getIntegerType(4)">;
@@ -989,4 +1041,49 @@ def Nova_ReshapeOp : Op<Nova_Dialect, "reshape", [Pure]> {
   let hasVerifier = 1;
 }
 
+
+//===----------------------------------------------------------------------===//
+// FusionBarrierOp
+//===----------------------------------------------------------------------===//
+// A tensor-level scheduling fence that prevents loop fusion analysis from
+// merging the global-to-workgroup linalg.copy (Stage 1) with the
+// thread-local promoted linalg.copy (Stage 2) into the same loop body.
+//
+// This op is a pure identity: its result equals its source at runtime.
+// It is erased at the very beginning of bufferization once all tiling and
+// fusion decisions have been made.
+//
+// Mirrors IREE's iree_codegen.fusion_barrier (IREECodegenOps.td).
+//
+// Usage in NovaGPUPromoteMatmulOperands:
+//   %alloc  = bufferization.alloc_tensor {workgroup}
+//   %stage1 = linalg.copy(%global -> %alloc)   <- fills shared memory
+//   %fence  = nova.fusion_barrier %stage1       <- fusion cannot cross here
+//   %stage2 = linalg.copy(%fence -> %empty)     <- per-thread promoted copy
+//
+// Usage at bufferization (NovaGPUBufferize / Passes.cpp):
+//   Erase all nova.fusion_barrier by replacing with their source value.
+
+def Nova_FusionBarrierOp : Op<Nova_Dialect, "fusion_barrier", [
+    SameOperandsAndResultType, Pure]> {
+  let summary = "Prevents fusion through a ranked tensor value";
+  let description = [{
+    Identity operation on a ranked tensor that acts as an opaque fence for
+    the fusion analysis. The fusion/tiling passes cannot see through this op,
+    so producer operations on the source side and consumer operations on the
+    result side will be placed in separate loops.
+
+    This op must be erased before bufferization. Example erasure:
+    ```cpp
+    funcOp.walk([&](nova::FusionBarrierOp barrier) {
+      rewriter.replaceOp(barrier, barrier.getSource());
+    });
+    ```
+  }];
+  let arguments = (ins AnyRankedTensor:$source);
+  let results   = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "attr-dict $source `:` type($result)";
+}
+
 #endif // NOVA_OPS
+

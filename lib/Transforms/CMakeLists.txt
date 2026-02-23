@@ -25,3 +25,4 @@ add_mlir_library(CompilerTransforms
   MLIRGPUDialect
 )
 add_subdirectory(Affine)
+add_subdirectory(LLVMGPU)

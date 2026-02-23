@@ -1,0 +1,264 @@
+//===- NovaKernelConfig.cpp - GPU matmul config heuristic -----------------===//
+//
+// Implements the heuristic that picks workgroup tile sizes, MMA intrinsic,
+// and promoted operands for linalg contraction ops, then attaches a
+// "lowering_config" DictionaryAttr to each op.
+//
+// The strategy (mirroring IREE's KernelConfig.cpp):
+//
+// For MMA-capable targets (Volta+):
+//   1. Select the best MMA intrinsic for the element types.
+//   2. Pick subgroup counts (numSubgroupsM, numSubgroupsN) = (2, 2) giving 4
+//      subgroups per workgroup.
+//   3. Pick per-subgroup tile counts (subgroupTilesM = subgroupTilesN = 4).
+//   4. workgroupTileM = mmaM * numSubgroupsM * subgroupTilesM
+//      workgroupTileN = mmaN * numSubgroupsN * subgroupTilesN
+//   5. reductionStepK = mmaK * kTilesPerStep (kTilesPerStep = 2 by default).
+//   6. Build config dict and attach.
+//
+// For SIMT fallback (no MMA):
+//   Use IREE's SIMT table:
+//   [{128,64,8},{32,8,4}], [{32,128,32},{32,8,1}], ...
+//===----------------------------------------------------------------------===//
+
+#include "Compiler/Transforms/LLVMGPU/NovaKernelConfig.h"
+#include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
+#include "llvm/Support/Debug.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Utils/Utils.h"
+#include "mlir/IR/Operation.h"
+
+#define DEBUG_TYPE "nova-kernel-config"
+
+namespace mlir::nova {
+
+//===----------------------------------------------------------------------===//
+// SIMT fallback tile table
+//===----------------------------------------------------------------------===//
+
+struct SimtTilePair {
+  std::array<int64_t, 3> tileMNK;   // Workgroup tile for M, N, K
+  std::array<int64_t, 3> workgroup; // Thread block dim (x, y, z)
+};
+
+// Mirrors IREE's getMatmulConfig() table. Listed from largest to smallest;
+// we pick the first one whose tile sizes divide the problem dimensions.
+static constexpr SimtTilePair kSimtTable[] = {
+    {{128,  64,  8}, {16,  8, 1}},
+    {{ 32, 128, 32}, {32,  8, 1}},
+    {{128,  32, 32}, {16, 16, 1}},
+    {{ 16, 256, 32}, {64,  2, 1}},
+    {{ 64,  64, 32}, {16,  8, 1}},
+    {{ 32,  64,  8}, {16,  4, 1}},
+    {{ 16,  64,  4}, {16,  2, 1}},
+    {{  1, 128,  8}, {32,  1, 1}},
+};
+
+//===----------------------------------------------------------------------===//
+// Helper: infer M/N/K dims from contraction op
+//===----------------------------------------------------------------------===//
+
+struct MatmulDims {
+  int64_t M = -1, N = -1, K = -1;
+  bool valid() const { return M > 0 && N > 0 && K > 0; }
+};
+
+static MatmulDims inferMatmulDims(linalg::LinalgOp op) {
+  auto contractionDims = mlir::linalg::inferContractionDims(op);
+  if (failed(contractionDims))
+    return {};
+  if (contractionDims->m.empty() || contractionDims->n.empty() ||
+      contractionDims->k.empty())
+    return {};
+
+  SmallVector<int64_t> bounds = op.getStaticLoopRanges();
+  int64_t mDim = contractionDims->m.back();
+  int64_t nDim = contractionDims->n.back();
+  int64_t kDim = contractionDims->k.back();
+
+  if (ShapedType::isDynamic(bounds[mDim]) ||
+      ShapedType::isDynamic(bounds[nDim]) ||
+      ShapedType::isDynamic(bounds[kDim]))
+    return {};
+
+  return {bounds[mDim], bounds[nDim], bounds[kDim]};
+}
+
+//===----------------------------------------------------------------------===//
+// MMA-based config selection
+//===----------------------------------------------------------------------===//
+
+/// Attempts to build a LoweringConfig using MMA intrinsics from `target`.
+/// Returns failure() if no suitable intrinsic found.
+static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
+                                     const NVIDIATargetInfo &target,
+                                     const MatmulDims &dims,
+                                     int numLoops) {
+  // Determine element types.
+  Type lhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(0)->get());
+  Type rhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(1)->get());
+  Type accType = getElementTypeOrSelf(matmul.getDpsInitOperand(0)->get());
+
+  int32_t lhsKind = typeToElementKind(lhsType);
+  int32_t rhsKind = typeToElementKind(rhsType);
+  int32_t accKind = typeToElementKind(accType);
+  if (lhsKind < 0 || rhsKind < 0 || accKind < 0)
+    return failure();
+
+  NVMMAIntrinsicValues intrinsic =
+      selectMMAIntrinsic(target, lhsKind, rhsKind, accKind);
+  if (intrinsic == NVMMAIntrinsicValues::NONE)
+    return failure();
+
+  // Find the intrinsic info to get tile shapes.
+  const NVMMAIntrinsicInfo *info = nullptr;
+  for (const auto &i : target.mmaIntrinsics) {
+    if (i.intrinsic == intrinsic) {
+      info = &i;
+      break;
+    }
+  }
+  if (!info)
+    return failure();
+
+  // Pick subgroup layout: 2×2 subgroups per workgroup, 4 MMA tiles per subgroup.
+  // This gives workgroup tile of mmaM*2*4 = 128 (for 16x16 WMMA),
+  //                              mmaN*2*4 = 128.
+  constexpr int64_t kNumSubgroupsM      = 2;
+  constexpr int64_t kNumSubgroupsN      = 2;
+  constexpr int64_t kSubgroupTilesM     = 4;
+  constexpr int64_t kSubgroupTilesN     = 4;
+  constexpr int64_t kKTilesPerStep      = 2;
+
+  int64_t wgM = info->mSize * kNumSubgroupsM * kSubgroupTilesM;
+  int64_t wgN = info->nSize * kNumSubgroupsN * kSubgroupTilesN;
+  int64_t kStep = info->kSize * kKTilesPerStep;
+
+  // Clamp tile to problem size.
+  wgM   = std::min(wgM, dims.M);
+  wgN   = std::min(wgN, dims.N);
+  kStep = std::min(kStep, dims.K);
+
+  // Build per-loop tile size arrays (remaining dims tiled to 1 or 0).
+  auto contractionDims = mlir::linalg::inferContractionDims(matmul);
+  SmallVector<int64_t> workgroupTiles(numLoops, 0);
+  SmallVector<int64_t> reductionTiles(numLoops, 0);
+
+  // Tile all outer M dims to 1 (inner = wgM).
+  for (int64_t m : llvm::drop_end(contractionDims->m))
+    workgroupTiles[m] = 1;
+  // Tile all outer N dims to 1 (inner = wgN).
+  for (int64_t n : llvm::drop_end(contractionDims->n))
+    workgroupTiles[n] = 1;
+  // Tile all outer K dims to 1 (inner = kStep).
+  for (int64_t k : llvm::drop_end(contractionDims->k))
+    reductionTiles[k] = 1;
+  // Tile batch dims to 1.
+  for (int64_t b : contractionDims->batch)
+    workgroupTiles[b] = 1;
+
+  workgroupTiles[contractionDims->m.back()] = wgM;
+  workgroupTiles[contractionDims->n.back()] = wgN;
+  reductionTiles[contractionDims->k.back()] = kStep;
+
+  LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] MMA config: "
+                           << "wgM=" << wgM << " wgN=" << wgN
+                           << " kStep=" << kStep
+                           << " intrinsic=" << (int)intrinsic << "\n");
+
+  MLIRContext *ctx = matmul.getContext();
+  // Promoted operands: always inputs 0 (A) and 1 (B).
+  SmallVector<int64_t> promotedOps = {0, 1};
+  setMatmulLoweringConfigAttrs(matmul.getOperation(), ctx,
+                               workgroupTiles, reductionTiles,
+                               static_cast<int32_t>(intrinsic),
+                               promotedOps);
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// SIMT fallback config selection
+//===----------------------------------------------------------------------===//
+
+static void setSimtConfig(linalg::LinalgOp matmul,
+                          const MatmulDims &dims,
+                          int numLoops) {
+  // Pick first table entry whose M,N tile divides the problem dims.
+  const SimtTilePair *chosen = nullptr;
+  for (const auto &entry : kSimtTable) {
+    if (dims.M % entry.tileMNK[0] == 0 &&
+        dims.N % entry.tileMNK[1] == 0) {
+      chosen = &entry;
+      break;
+    }
+  }
+
+  // If nothing divides, pick the last (smallest) entry.
+  if (!chosen)
+    chosen = &kSimtTable[std::size(kSimtTable) - 1];
+
+  auto contractionDims = mlir::linalg::inferContractionDims(matmul);
+
+  SmallVector<int64_t> workgroupTiles(numLoops, 0);
+  SmallVector<int64_t> reductionTiles(numLoops, 0);
+
+  for (int64_t b : contractionDims->batch) workgroupTiles[b] = 1;
+  for (int64_t m : llvm::drop_end(contractionDims->m)) workgroupTiles[m] = 1;
+  for (int64_t n : llvm::drop_end(contractionDims->n)) workgroupTiles[n] = 1;
+  for (int64_t k : llvm::drop_end(contractionDims->k)) reductionTiles[k] = 1;
+
+  workgroupTiles[contractionDims->m.back()] = chosen->tileMNK[0];
+  workgroupTiles[contractionDims->n.back()] = chosen->tileMNK[1];
+  reductionTiles[contractionDims->k.back()] = chosen->tileMNK[2];
+
+  LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] SIMT fallback config: "
+                           << "M=" << chosen->tileMNK[0]
+                           << " N=" << chosen->tileMNK[1]
+                           << " K=" << chosen->tileMNK[2] << "\n");
+
+  MLIRContext *ctx = matmul.getContext();
+  // No MMA → no promoted operands config (promotion pass uses its own heuristic).
+  setMatmulLoweringConfigAttrs(matmul.getOperation(), ctx,
+                               workgroupTiles, reductionTiles,
+                               static_cast<int32_t>(NVMMAIntrinsicValues::NONE),
+                               /*promotedOperands=*/{0, 1});
+}
+
+//===----------------------------------------------------------------------===//
+// Public API
+//===----------------------------------------------------------------------===//
+
+LogicalResult setMatmulLoweringConfig(linalg::LinalgOp matmul,
+                                      const NVIDIATargetInfo &target) {
+  MatmulDims dims = inferMatmulDims(matmul);
+  if (!dims.valid())
+    return failure();
+
+  int numLoops = matmul.getNumLoops();
+
+  // Try MMA-based config first.
+  if (!target.mmaIntrinsics.empty()) {
+    if (succeeded(trySetMMAConfig(matmul, target, dims, numLoops)))
+      return success();
+  }
+
+  // Fall back to SIMT tile table.
+  setSimtConfig(matmul, dims, numLoops);
+  return success();
+}
+
+void initNovaGPULaunchConfig(mlir::func::FuncOp funcOp,
+                              const NVIDIATargetInfo &target) {
+  funcOp.walk([&](linalg::LinalgOp op) {
+    // Only configure contraction-like ops.
+    if (!isa<linalg::MatmulOp, linalg::BatchMatmulOp,
+             linalg::MatmulTransposeBOp>(op.getOperation()))
+      return;
+    // Skip ops that already have a config.
+    if (getLoweringConfig(op.getOperation()))
+      return;
+    (void)setMatmulLoweringConfig(op, target);
+  });
+}
+
+} // namespace mlir::nova

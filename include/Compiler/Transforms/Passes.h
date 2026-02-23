@@ -18,6 +18,12 @@ std::unique_ptr<Pass> createRenameGpuKernelsPass();
 #define GEN_PASS_REGISTRATION
 #include "Compiler/Transforms/Passes.h.inc"
 
+//===----------------------------------------------------------------------===//
+// LLVMGPU Pipeline
+//===----------------------------------------------------------------------===//
+void addNovaGPUOptimizedPipeline(OpPassManager &pm);
+void registerNovaLLVMGPUPasses();
+
 }  // namespace nova
 }  // namespace mlir
 

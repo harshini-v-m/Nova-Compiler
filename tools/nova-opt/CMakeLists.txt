@@ -29,6 +29,7 @@ target_link_libraries(nova-opt PRIVATE
   # Dependencies ordered by usage: NovaPipelines depends on CompilerTransforms
   NovaPipelines
   CompilerTransforms
+  NovaLLVMGPUTransforms
 
   # Core dialects that we know exist and are needed
   MLIRAffineDialect
