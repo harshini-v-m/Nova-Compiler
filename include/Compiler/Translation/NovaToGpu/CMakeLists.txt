@@ -1,5 +1,6 @@
 add_mlir_library(MLIRNovaToGpu
   NovaToGpu.cpp
+  matmul.cpp
 
   LINK_LIBS PUBLIC
   MLIRIR

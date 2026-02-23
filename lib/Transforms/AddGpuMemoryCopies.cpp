@@ -148,7 +148,15 @@ struct AddGpuMemoryCopiesPass
         for (OpOperand &operand : op->getOpOperands()) {
           Value val = operand.get();
           auto memRefType = llvm::dyn_cast<MemRefType>(val.getType());
-          if (!memRefType || memRefType.getMemorySpaceAsInt() != 0)
+          if (!memRefType) continue;
+          
+          Attribute space = memRefType.getMemorySpace();
+          // Skip non-integer address spaces (e.g., #gpu.address_space<workgroup>)
+          if (space && !llvm::isa<IntegerAttr>(space))
+            continue;
+
+          // Now safely check integer value for host space (0)
+          if (memRefType.getMemorySpaceAsInt() != 0)
             continue;
 
           // Skip values defined inside (allocs in kernel)
