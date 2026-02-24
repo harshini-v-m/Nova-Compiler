@@ -1,10 +1,15 @@
 #include "Passes.h"
+#include "Compiler/Dialect/nova/NovaOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Vector/Transforms/Passes.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 
 using namespace mlir;
 
@@ -105,14 +110,21 @@ void addNovaGPUOptimizedPipeline(OpPassManager &pm,
   pm.addPass(createCSEPass());
 
   // -------------------------------------------------------------------------
-  // Step 7: Bufferize tensors → memrefs
-  // TODO: Replace with GPU-aware bufferization (GPUInferMemorySpacePass +
-  //       custom allocationFn/memcpyFn that inserts gpu.barrier) to match
-  //       IREE's addGPUBufferizePasses().
+  // Step 7: Fuse and hoist parallel loops
+  // After thread/subgroup tiling we have multiple producer scf.forall {thread}
+  // and consumer scf.forall {thread} ops. This pass greedily merges them into
+  // a single flat forall and hoists foralls out of the K-loop when safe.
+  // CRITICAL: must run BEFORE bufferization (uses tensor-level IR).
+  // Mirrors IREE's createGPUFuseAndHoistParallelLoopsPass().
   // -------------------------------------------------------------------------
-  bufferization::OneShotBufferizePassOptions bufferizeOptions;
-  bufferizeOptions.bufferizeFunctionBoundaries = true;
-  pm.addPass(bufferization::createOneShotBufferizePass(bufferizeOptions));
+  pm.addPass(createNovaGPUFuseAndHoistParallelLoopsPass());
+
+  // -------------------------------------------------------------------------
+  // Step 7 (was TODO): GPU-aware bufferization
+  // Erases nova.fusion_barrier, infers memory spaces, bufferizes with GPU
+  // allocation function. Mirrors IREE's addGPUBufferizePasses().
+  // -------------------------------------------------------------------------
+  addNovaGPUBufferizePasses(pm);
 
   // TODO: DistributeForall (IREE: GPUDistributeForallPass)
   // Lowers scf.forall {gpu.thread} → gpu.thread_id indexing.
@@ -129,6 +141,40 @@ void registerNovaLLVMGPUPasses() {
     registerNovaGPUApplyTilingLevelReductionPass();
     registerNovaGPUApplyTilingLevelThreadPass();
     registerNovaGPUApplyTilingLevelSubgroupPass();
+    registerNovaGPUFuseAndHoistParallelLoopsPass();
+    registerNovaGPUEraseFusionBarriersPass();
+    registerNovaGPUInferMemorySpacePass();
+    registerNovaGPUComprehensiveBufferizePass();
+    registerNovaEliminateEmptyTensorsPass();
+}
+
+// ---------------------------------------------------------------------------
+// addNovaGPUBufferizePasses
+// Mirrors IREE's addGPUBufferizePasses() from LLVMGPU/Passes.cpp.
+//
+// Three steps in order:
+//  1. NovaGPUInferMemorySpacePass: tag every unmarked alloc_tensor as
+//     workgroup or private based on usage pattern.
+//  2. createEmptyTensorToAllocTensorPass: convert tensor.empty → alloc_tensor.
+//  3. NovaGPUComprehensiveBufferizePass: erase nova.fusion_barrier ops
+//     (GAP 2) then run OneShotBufferize with GPU-aware alloc/copy fns (GAP 3).
+// ---------------------------------------------------------------------------
+void addNovaGPUBufferizePasses(OpPassManager &pm) {
+  // Pre-bufferize passes.
+  pm.addPass(createNovaEliminateEmptyTensorsPass());
+  pm.addPass(bufferization::createEmptyTensorToAllocTensorPass());
+  pm.addPass(createNovaGPUInferMemorySpacePass());
+
+  // GPU-aware comprehensive bufferize: erases nova.fusion_barrier (GAP 2)
+  // and runs OneShotBufferize with GPU alloc/copy fns (GAP 3).
+  pm.addPass(createNovaGPUComprehensiveBufferizePass());
+
+  // Post-bufferization cleanup.
+  pm.addPass(memref::createResolveShapedTypeResultDimsPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+  pm.addPass(createCanonicalizerPass());
 }
 
 } // namespace mlir::nova
+

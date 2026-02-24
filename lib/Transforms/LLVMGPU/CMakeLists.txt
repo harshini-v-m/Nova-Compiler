@@ -5,6 +5,14 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaGPUPadOperands.cpp
   NovaGPUPromoteMatmulOperands.cpp
   NovaGPUApplyTilingLevelReduction.cpp
+  # GAP 2: Erase fusion barriers before bufferization
+  NovaGPUEraseFusionBarriers.cpp
+  # GAP 3: Infer GPU memory spaces before bufferization
+  NovaGPUInferMemorySpace.cpp
+  # GAP 3: Comprehensive GPU-aware bufferize pass (mirrors IREEComprehensiveBufferizePass)
+  NovaGPUBufferize.cpp
+  # Pre-bufferize: eliminate tensor.empty ops (mirrors IREE's EliminateEmptyTensorsPass)
+  NovaEliminateEmptyTensors.cpp
   # Config propagation (mirrors IREE's ConfigTrackingCanonicalizerPass)
   NovaConfigTrackingCanonicalizer.cpp
   # Phase 2: LoweringConfig read/write utilities
@@ -15,6 +23,8 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaKernelConfig.cpp
   # Phase 5: Strategy pass
   NovaGPUSelectLoweringStrategy.cpp
+  # Phase 6: Fuse and hoist parallel loops (mirrors IREE GPUFuseAndHoistParallelLoops)
+  NovaGPUFuseAndHoistParallelLoops.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include

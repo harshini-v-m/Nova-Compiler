@@ -143,23 +143,38 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   auto contractionDims = mlir::linalg::inferContractionDims(matmul);
   SmallVector<int64_t> workgroupTiles(numLoops, 0);
   SmallVector<int64_t> reductionTiles(numLoops, 0);
+  SmallVector<int64_t> threadTiles(numLoops, 0);
+  SmallVector<int64_t> subgroupTiles(numLoops, 0);
 
   // Tile all outer M dims to 1 (inner = wgM).
-  for (int64_t m : llvm::drop_end(contractionDims->m))
+  for (int64_t m : llvm::drop_end(contractionDims->m)) {
     workgroupTiles[m] = 1;
+    threadTiles[m] = 1;
+    subgroupTiles[m] = 1;
+  }
   // Tile all outer N dims to 1 (inner = wgN).
-  for (int64_t n : llvm::drop_end(contractionDims->n))
+  for (int64_t n : llvm::drop_end(contractionDims->n)) {
     workgroupTiles[n] = 1;
+    threadTiles[n] = 1;
+    subgroupTiles[n] = 1;
+  }
   // Tile all outer K dims to 1 (inner = kStep).
   for (int64_t k : llvm::drop_end(contractionDims->k))
     reductionTiles[k] = 1;
   // Tile batch dims to 1.
-  for (int64_t b : contractionDims->batch)
+  for (int64_t b : contractionDims->batch) {
     workgroupTiles[b] = 1;
+    threadTiles[b] = 1;
+    subgroupTiles[b] = 1;
+  }
 
   workgroupTiles[contractionDims->m.back()] = wgM;
   workgroupTiles[contractionDims->n.back()] = wgN;
   reductionTiles[contractionDims->k.back()] = kStep;
+  threadTiles[contractionDims->m.back()] = 4;
+  threadTiles[contractionDims->n.back()] = 4;
+  subgroupTiles[contractionDims->m.back()] = 16;
+  subgroupTiles[contractionDims->n.back()] = 16;
 
   LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] MMA config: "
                            << "wgM=" << wgM << " wgN=" << wgN
@@ -171,6 +186,7 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   SmallVector<int64_t> promotedOps = {0, 1};
   setMatmulLoweringConfigAttrs(matmul.getOperation(), ctx,
                                workgroupTiles, reductionTiles,
+                               threadTiles, subgroupTiles,
                                static_cast<int32_t>(intrinsic),
                                promotedOps);
   return success();
@@ -201,15 +217,33 @@ static void setSimtConfig(linalg::LinalgOp matmul,
 
   SmallVector<int64_t> workgroupTiles(numLoops, 0);
   SmallVector<int64_t> reductionTiles(numLoops, 0);
+  SmallVector<int64_t> threadTiles(numLoops, 0);
+  SmallVector<int64_t> subgroupTiles(numLoops, 0);
 
-  for (int64_t b : contractionDims->batch) workgroupTiles[b] = 1;
-  for (int64_t m : llvm::drop_end(contractionDims->m)) workgroupTiles[m] = 1;
-  for (int64_t n : llvm::drop_end(contractionDims->n)) workgroupTiles[n] = 1;
+  for (int64_t b : contractionDims->batch) {
+    workgroupTiles[b] = 1;
+    threadTiles[b] = 1;
+    subgroupTiles[b] = 1;
+  }
+  for (int64_t m : llvm::drop_end(contractionDims->m)) {
+    workgroupTiles[m] = 1;
+    threadTiles[m] = 1;
+    subgroupTiles[m] = 1;
+  }
+  for (int64_t n : llvm::drop_end(contractionDims->n)) {
+    workgroupTiles[n] = 1;
+    threadTiles[n] = 1;
+    subgroupTiles[n] = 1;
+  }
   for (int64_t k : llvm::drop_end(contractionDims->k)) reductionTiles[k] = 1;
 
   workgroupTiles[contractionDims->m.back()] = chosen->tileMNK[0];
   workgroupTiles[contractionDims->n.back()] = chosen->tileMNK[1];
   reductionTiles[contractionDims->k.back()] = chosen->tileMNK[2];
+  threadTiles[contractionDims->m.back()] = 4;
+  threadTiles[contractionDims->n.back()] = 4;
+  subgroupTiles[contractionDims->m.back()] = 16;
+  subgroupTiles[contractionDims->n.back()] = 16;
 
   LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] SIMT fallback config: "
                            << "M=" << chosen->tileMNK[0]
@@ -220,6 +254,7 @@ static void setSimtConfig(linalg::LinalgOp matmul,
   // No MMA → no promoted operands config (promotion pass uses its own heuristic).
   setMatmulLoweringConfigAttrs(matmul.getOperation(), ctx,
                                workgroupTiles, reductionTiles,
+                               threadTiles, subgroupTiles,
                                static_cast<int32_t>(NVMMAIntrinsicValues::NONE),
                                /*promotedOperands=*/{0, 1});
 }

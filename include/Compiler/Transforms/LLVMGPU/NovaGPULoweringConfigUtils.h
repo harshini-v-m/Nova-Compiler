@@ -8,6 +8,8 @@
 //
 //   kWorkgroupKey     "workgroup"         — I64ArrayAttr of tile sizes
 //   kReductionKey     "reduction"         — I64ArrayAttr of tile sizes
+//   kThreadKey        "thread"            — I64ArrayAttr of tile sizes
+//   kSubgroupKey      "subgroup"          — I64ArrayAttr of tile sizes
 //   kMmaKindKey       "mma_kind"          — I32Attr (NVMMAIntrinsic value)
 //   kPromotedOpsKey   "promoted_operands" — I64ArrayAttr of operand indices
 //
@@ -30,6 +32,8 @@ namespace mlir::nova {
 // Well-known key names for the LoweringConfig DictionaryAttr.
 constexpr llvm::StringLiteral kWorkgroupKey     = "workgroup";
 constexpr llvm::StringLiteral kReductionKey     = "reduction";
+constexpr llvm::StringLiteral kThreadKey        = "thread";
+constexpr llvm::StringLiteral kSubgroupKey      = "subgroup";
 constexpr llvm::StringLiteral kMmaKindKey       = "mma_kind";
 constexpr llvm::StringLiteral kPromotedOpsKey   = "promoted_operands";
 
@@ -87,6 +91,8 @@ void setMatmulLoweringConfigAttrs(Operation *op,
                                   MLIRContext *ctx,
                                   ArrayRef<int64_t> workgroupTiles,
                                   ArrayRef<int64_t> reductionTiles,
+                                  ArrayRef<int64_t> threadTiles,
+                                  ArrayRef<int64_t> subgroupTiles,
                                   int32_t mmaKindValue,
                                   ArrayRef<int64_t> promotedOperands);
 

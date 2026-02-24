@@ -65,6 +65,48 @@ void registerNovaGPUApplyTilingLevelThreadPass();
 std::unique_ptr<Pass> createNovaGPUApplyTilingLevelSubgroupPass();
 void registerNovaGPUApplyTilingLevelSubgroupPass();
 
+// Greedily fuses and hoists parallel scf.forall loops after thread/subgroup
+// tiling. Runs 3 rounds of patterns (forall fusion, consumer fusion, producer
+// fusion) to produce a single flat thread-mapped forall per compute region.
+// Mirrors IREE's GPUFuseAndHoistParallelLoops pass.
+std::unique_ptr<Pass> createNovaGPUFuseAndHoistParallelLoopsPass();
+void registerNovaGPUFuseAndHoistParallelLoopsPass();
+
+// Erases all nova.fusion_barrier ops by replacing them with their source
+// operand. Must run as the first step of addNovaGPUBufferizePasses.
+// Mirrors what IREE's IREEComprehensiveBufferizePass does at its start.
+std::unique_ptr<Pass> createNovaGPUEraseFusionBarriersPass();
+void registerNovaGPUEraseFusionBarriersPass();
+
+// Infers GPU memory spaces for `bufferization.alloc_tensor` ops.
+// Any alloc used as the shared_outs init of a thread-mapped scf.forall is
+// tagged as workgroup (shared) memory; all others become private memory.
+// Must run immediately before bufferization.
+// Mirrors IREE's GPUInferMemorySpacePass.
+std::unique_ptr<Pass> createNovaGPUInferMemorySpacePass();
+void registerNovaGPUInferMemorySpacePass();
+
+// Eliminates tensor.empty ops by finding existing destination tensors.
+// Runs linalg convert-to-DPS patterns then bufferization empty tensor
+// elimination analysis. Reduces unnecessary allocations.
+// Mirrors IREE's EliminateEmptyTensorsPass.
+std::unique_ptr<Pass> createNovaEliminateEmptyTensorsPass();
+void registerNovaEliminateEmptyTensorsPass();
+
+// GPU-aware bufferization helper.
+// Erases nova.fusion_barrier ops, infers memory spaces, then runs
+// OneShotBufferize with GPU alloc / memcpy functions (workgroup → memref.alloc,
+// private → memref.alloca; barriers inserted around workgroup copies).
+// Mirrors IREE's addGPUBufferizePasses().
+void addNovaGPUBufferizePasses(OpPassManager &pm);
+
+// GPU comprehensive bufferize pass.
+// Erases nova.fusion_barrier (GAP 2) and runs OneShotBufferize with
+// GPU-aware alloc/copy fns (GAP 3). Called by addNovaGPUBufferizePasses.
+// Mirrors IREE's IREEComprehensiveBufferizePass.
+std::unique_ptr<Pass> createNovaGPUComprehensiveBufferizePass();
+void registerNovaGPUComprehensiveBufferizePass();
+
 } // namespace nova
 } // namespace mlir
 

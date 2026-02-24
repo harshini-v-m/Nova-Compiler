@@ -119,11 +119,15 @@ void setMatmulLoweringConfigAttrs(Operation *op,
                                   MLIRContext *ctx,
                                   ArrayRef<int64_t> workgroupTiles,
                                   ArrayRef<int64_t> reductionTiles,
+                                  ArrayRef<int64_t> threadTiles,
+                                  ArrayRef<int64_t> subgroupTiles,
                                   int32_t mmaKindValue,
                                   ArrayRef<int64_t> promotedOperands) {
   SmallVector<NamedAttribute> attrs;
   setLoweringConfigTileSizes(ctx, attrs, kWorkgroupKey, workgroupTiles);
   setLoweringConfigTileSizes(ctx, attrs, kReductionKey, reductionTiles);
+  setLoweringConfigTileSizes(ctx, attrs, kThreadKey, threadTiles);
+  setLoweringConfigTileSizes(ctx, attrs, kSubgroupKey, subgroupTiles);
   setMmaKindRaw(ctx, attrs, mmaKindValue);
   appendPromotedOperandsList(ctx, attrs, promotedOperands);
   auto configDict = DictionaryAttr::get(ctx, attrs);

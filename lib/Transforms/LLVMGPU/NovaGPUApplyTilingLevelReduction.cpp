@@ -180,7 +180,18 @@ getTileSizes(RewriterBase &rewriter, linalg::LinalgOp op,
   }
 
   if (tilingLevel == NovaTilingLevel::Thread) {
-    // Tile only parallel (M/N) dims by kThreadTile.
+    // Tile only parallel (M/N) dims.
+    // Use lowering_config `thread` tile size if available, otherwise fallback.
+    if (auto config = getLoweringConfig(op.getOperation())) {
+      SmallVector<int64_t> threadTiles =
+          getLoweringConfigTileSizes(config, kThreadKey);
+      if (threadTiles.size() == static_cast<size_t>(numLoops)) {
+        for (int i = 0; i < numLoops; ++i) {
+          tileSizes[i] = rewriter.getIndexAttr(threadTiles[i]);
+        }
+        return tileSizes;
+      }
+    }
     for (int i = 0; i < numLoops; ++i) {
       if (linalg::isParallelIterator(op.getIteratorTypesArray()[i]))
         tileSizes[i] = rewriter.getIndexAttr(kThreadTile);
@@ -189,7 +200,18 @@ getTileSizes(RewriterBase &rewriter, linalg::LinalgOp op,
   }
 
   if (tilingLevel == NovaTilingLevel::Subgroup) {
-    // Tile only parallel (M/N) dims by kSubgroupTile.
+    // Tile only parallel (M/N) dims.
+    // Use lowering_config `subgroup` tile size if available, otherwise fallback.
+    if (auto config = getLoweringConfig(op.getOperation())) {
+      SmallVector<int64_t> subgroupTiles =
+          getLoweringConfigTileSizes(config, kSubgroupKey);
+      if (subgroupTiles.size() == static_cast<size_t>(numLoops)) {
+        for (int i = 0; i < numLoops; ++i) {
+          tileSizes[i] = rewriter.getIndexAttr(subgroupTiles[i]);
+        }
+        return tileSizes;
+      }
+    }
     for (int i = 0; i < numLoops; ++i) {
       if (linalg::isParallelIterator(op.getIteratorTypesArray()[i]))
         tileSizes[i] = rewriter.getIndexAttr(kSubgroupTile);
