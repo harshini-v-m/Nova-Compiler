@@ -3,19 +3,28 @@
 
 #include "mlir/Pass/Pass.h"
 #include <memory>
-namespace mlir{
-    class Pass;
-    class RewritePatternSet;
-    class TypeConverter;
-    namespace nova{
-        std::unique_ptr<Pass> createNovaToLinalgLoweringPass();
-        void regsiterNovaToLinalgLoweringTemplatePass();
-        void populateNovaToLinalgPatterns(RewritePatternSet &patterns);
-        void populateNovaToLinalgPatternsTemplate(RewritePatternSet &patterns);
 
-    }
-}
+namespace mlir {
+class Pass;
+class RewritePatternSet;
+class TypeConverter;
+namespace nova {
+
+// From TNovaToLinalg.cpp — elementwise Nova ops → linalg.generic
+std::unique_ptr<Pass> createNovaElementwiseToLinalgPass();
+void registerNovaElementwiseToLinalgPass();
+void populateNovaToLinalgPatternsTemplate(RewritePatternSet &patterns);
+
+// From NovaToLinalg.cpp — structural Nova ops (matmul, gather, etc.) → linalg
+std::unique_ptr<Pass> createNovaToLinalgPass();
+void registerNovaToLinalgPass();
+void populateNovaToLinalgPatterns(RewritePatternSet &patterns);
+
+} // namespace nova
+} // namespace mlir
+
 #endif
+
 /*
 NovaMatmulOpLoweringgeneric, 
 NovaBroadcastInDimOpLowering,

@@ -1,6 +1,7 @@
 add_mlir_library(MLIRNovaToGpu
   NovaToGpu.cpp
   matmul.cpp
+  FusionKernelEmitter.cpp
 
   LINK_LIBS PUBLIC
   MLIRIR

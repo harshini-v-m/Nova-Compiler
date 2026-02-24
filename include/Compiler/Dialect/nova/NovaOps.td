@@ -154,7 +154,8 @@ def Nova_ReduceOp : Op<Nova_Dialect,"reduce", [Pure,DeclareOpInterfaceMethods<In
     ```}];
       let extraClassDeclaration = [{
   }];
-  
+    let hasCanonicalizer = 1;
+
   let arguments = (ins 
     Nova_ReductionKind:$kind,
     Nova_Tensor:$input,

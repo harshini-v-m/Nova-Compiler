@@ -69,7 +69,8 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
   pm.addPass(createCanonicalizerPass()); 
   pm.addPass(createNovaToArithLoweringPass());
   pm.addPass(createNovaToTosaLoweringPass());
-  pm.addNestedPass<func::FuncOp>(createNovaToLinalgLoweringPass());
+  pm.addNestedPass<func::FuncOp>(createNovaElementwiseToLinalgPass());
+  pm.addNestedPass<func::FuncOp>(createNovaToLinalgPass());
   
   pm.addPass(createCanonicalizerPass());
 //  pm.addPass(mlir::createTensorBufferizePass());  
