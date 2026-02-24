@@ -118,8 +118,7 @@ int main(int argc, char **argv) {
   mlir::registerAllToLLVMIRTranslations(registry);
 
   mlir::nova::registerNovaPipelines();
-   mlir::nova::registerNovaGPUPipelines();
-   mlir::nova::registerNovaLLVMGPUPasses(); // Add this
+  mlir::nova::registerNovaGPUPipelines();
   mlir::nova::registerAffinePasses();
 
   mlir::nova::registerNovaToArithLoweringPass();
