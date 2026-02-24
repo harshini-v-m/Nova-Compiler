@@ -14,6 +14,46 @@ using namespace mlir;
 using namespace mlir::nova;
 
 namespace {
+struct NormalizeReduceIndicesPattern : public OpRewritePattern<ReduceOp> {
+  using OpRewritePattern<ReduceOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ReduceOp op,
+                                PatternRewriter &rewriter) const override {
+    auto inputType = cast<RankedTensorType>(op.getInput().getType());
+    int64_t rank = inputType.getRank();
+
+    auto dimAttr = op.getDimensionAttr();
+    if (!dimAttr)
+      return failure();
+
+    bool changed = false;
+    SmallVector<int64_t> newDims;
+    for (auto attr : dimAttr.getAsValueRange<IntegerAttr>()) {
+      int64_t dim = attr.getSExtValue();
+      if (dim < 0) {
+        dim += rank;
+        changed = true;
+      }
+      newDims.push_back(dim);
+    }
+
+    if (!changed)
+      return failure();
+
+    rewriter.replaceOpWithNewOp<ReduceOp>(op, op.getKind(), op.getInput(),
+                                          op.getType(), op.getKeepdims(),
+                                          newDims, op.getIgnoreNan());
+    return success();
+  }
+};
+} // namespace
+
+void ReduceOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                           MLIRContext *context) {
+  results.add<NormalizeReduceIndicesPattern>(context);
+}
+
+namespace {
 
 //===----------------------------------------------------------------------===//
 // Broadcast Insertion Pattern (Generic for all binary ops)
@@ -966,7 +1006,7 @@ struct InsertBroadcastPatterncompare : public OpRewritePattern<CompareOp> {
     auto lhsType = dyn_cast<RankedTensorType>(op.getLhs().getType());
     auto rhsType = dyn_cast<RankedTensorType>(op.getRhs().getType());
     auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
-  nova::ComparisonType compareType = op.getKind();
+    nova::ComparisonType compareType = op.getKind();
     if (!lhsType || !rhsType || !resultType) {
       return failure();
     }
@@ -1028,11 +1068,11 @@ struct InsertBroadcastPatterncompare : public OpRewritePattern<CompareOp> {
     }
 
     rewriter.replaceOpWithNewOp<CompareOp>(op, op.getResult().getType(), newLhs,
-                                        newRhs,compareType);
+                                           newRhs, compareType);
     return success();
   }
 };
 void CompareOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                               MLIRContext *context) {
+                                            MLIRContext *context) {
   results.add<InsertBroadcastPatterncompare>(context);
 }

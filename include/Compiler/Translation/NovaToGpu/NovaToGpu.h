@@ -9,6 +9,8 @@ namespace nova {
 
 std::unique_ptr<Pass> createNovaToGpuPass();
 void populateMatmulPatterns(RewritePatternSet &patterns);
+std::unique_ptr<Pass> createNovaFusionKernelEmitterPass();
+void registerNovaFusionKernelEmitterPass();
 
 } // namespace nova
 } // namespace mlir
