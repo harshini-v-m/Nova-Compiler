@@ -356,6 +356,50 @@ struct FullReduceLowering : public OpRewritePattern<nova::ReduceOp> {
     rewriter.create<gpu::TerminatorOp>(loc);
     rewriter.setInsertionPointAfter(launchOp);
 
+    if (kind == ReductionKind::MEAN) {
+      Value c1_k2 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      auto launchOp2 = rewriter.create<gpu::LaunchOp>(loc, c1_k2, c1_k2, c1_k2,
+                                                      c1_k2, c1_k2, c1_k2);
+      rewriter.setInsertionPointToStart(&launchOp2.getBody().front());
+
+      SmallVector<Value> indices(
+          outputType.getRank(),
+          rewriter.create<arith::ConstantIndexOp>(loc, 0).getResult());
+      Value sumVal = rewriter.create<memref::LoadOp>(loc, alloc, indices);
+
+      Type elemType = inputType.getElementType();
+      Type computeType = elemType;
+      if (elemType.isF16() || elemType.isBF16()) {
+        computeType = rewriter.getF32Type();
+        sumVal = rewriter.create<arith::ExtFOp>(loc, computeType, sumVal);
+      }
+
+      Value divisor;
+      if (computeType.isF32() || computeType.isF64()) {
+        divisor = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getFloatAttr(computeType, numElements));
+      } else {
+        divisor = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getIntegerAttr(elemType, numElements));
+      }
+
+      Value meanVal;
+      if (isa<FloatType>(computeType)) {
+        meanVal = rewriter.create<arith::DivFOp>(loc, sumVal, divisor);
+      } else {
+        meanVal = rewriter.create<arith::DivSIOp>(loc, sumVal, divisor);
+      }
+
+      if (meanVal.getType() != elemType) {
+        meanVal = rewriter.create<arith::TruncFOp>(loc, elemType, meanVal);
+      }
+
+      rewriter.create<memref::StoreOp>(loc, meanVal, alloc, indices);
+      rewriter.create<gpu::TerminatorOp>(loc);
+
+      rewriter.setInsertionPointAfter(launchOp2);
+    }
+
     auto toTensor =
         rewriter.create<bufferization::ToTensorOp>(loc, outputType, alloc);
     toTensor.setRestrict(true);
@@ -590,6 +634,38 @@ struct PartialReduceLowering : public OpRewritePattern<nova::ReduceOp> {
     Value reduced =
         createBlockReduce(rewriter, loc, finalAcc, gpuOp, threadsPerBlock);
 
+    if (kind == ReductionKind::MEAN) {
+      Type elementType = inputType.getElementType();
+      Type computeType = elementType;
+      Value sumVal = reduced;
+
+      if (elementType.isF16() || elementType.isBF16()) {
+        computeType = rewriter.getF32Type();
+        sumVal = rewriter.create<arith::ExtFOp>(loc, computeType, sumVal);
+      }
+
+      Value divisor;
+      if (computeType.isF32() || computeType.isF64()) {
+        divisor = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getFloatAttr(computeType, numReduction));
+      } else {
+        divisor = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getIntegerAttr(elementType, numReduction));
+      }
+
+      Value meanVal;
+      if (isa<FloatType>(computeType)) {
+        meanVal = rewriter.create<arith::DivFOp>(loc, sumVal, divisor);
+      } else {
+        meanVal = rewriter.create<arith::DivSIOp>(loc, sumVal, divisor);
+      }
+
+      if (meanVal.getType() != elementType) {
+        meanVal = rewriter.create<arith::TruncFOp>(loc, elementType, meanVal);
+      }
+      reduced = meanVal;
+    }
+
     // 4. Fusion and Store
     Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0).getResult();
     SmallVector<Operation *> allFusedOps;
@@ -754,11 +830,11 @@ struct NovaFusionKernelEmitterPass
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<FullReduceLowering, PartialReduceLowering>(context);
+    patterns.add<FullReduceLowering>(context);
 
     ConversionTarget target(*context);
     target.addLegalDialect<nova::NovaDialect>();
-    target.addIllegalOp<nova::ReduceOp>();
+   // target.addIllegalOp<nova::ReduceOp>();
     target.addLegalDialect<gpu::GPUDialect, arith::ArithDialect,
                            scf::SCFDialect, memref::MemRefDialect,
                            math::MathDialect, linalg::LinalgDialect,
