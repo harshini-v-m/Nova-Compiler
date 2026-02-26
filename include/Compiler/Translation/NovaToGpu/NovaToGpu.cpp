@@ -8,15 +8,15 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include <algorithm>
 #include <limits>
 
@@ -30,11 +30,11 @@ namespace {
 
 struct Barrier0OpMemoryEffects
     : public MemoryEffectOpInterface::ExternalModel<Barrier0OpMemoryEffects,
-                                                     NVVM::Barrier0Op> {
-  void getEffects(
-      Operation *op,
-      SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
-          &effects) const {
+                                                    NVVM::Barrier0Op> {
+  void
+  getEffects(Operation *op,
+             SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+                 &effects) const {
     // Report both Read and Write effects to satisfy bufferization analysis.
     effects.emplace_back(MemoryEffects::Write::get(),
                          SideEffects::DefaultResource::get());
@@ -111,13 +111,13 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     // 3. Single-Block Execution Parameters
     // We launch exactly one block to ensure total determinism across rows.
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value c768 = rewriter.create<arith::ConstantIndexOp>(loc, 768);
+    Value c256 = rewriter.create<arith::ConstantIndexOp>(loc, 256);
     Value cN = rewriter.create<arith::ConstantIndexOp>(loc, N);
     Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
 
     auto launchOp =
         rewriter.create<gpu::LaunchOp>(loc, c1, c1, c1, // Grid: 1, 1, 1
-                                       c768, c1, c1     // Block: 256, 1, 1
+                                       c256, c1, c1     // Block: 256, 1, 1
         );
 
     // 4. Kernel Body
@@ -251,6 +251,7 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     return success();
   }
 };
+
 class NovaToGpuReducePattern : public OpRewritePattern<nova::ReduceOp> {
 public:
   using OpRewritePattern<nova::ReduceOp>::OpRewritePattern;
@@ -309,12 +310,7 @@ public:
         outputType.getShape(), inputType.getElementType(),
         MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
 
-    Value alloc = rewriter
-                      .create<gpu::AllocOp>(loc, memRefType,
-                                            /*asyncDependencies=*/ValueRange{},
-                                            /*dynamicSizes=*/ValueRange{},
-                                            /*symbolOperands=*/ValueRange{})
-                      .getMemref();
+    Value alloc = rewriter.create<memref::AllocOp>(loc, memRefType).getResult();
     // selecting accumulator initial value based on the reduction kind
     Value initialValue;
     Type elementType = inputType.getElementType();
@@ -350,7 +346,16 @@ public:
 
     rewriter.create<gpu::MemsetOp>(loc, Type(), ValueRange{}, alloc, memsetVal);
 
-    // 3. Create gpu.launch parameters
+    // 3. Convert input tensor to memref BEFORE launch (avoids gpu.alloc inside
+    // kernel)
+    auto inputMemRefType =
+        MemRefType::get(inputType.getShape(), inputType.getElementType(),
+                        MemRefLayoutAttrInterface{});
+    Value inputMemRef =
+        rewriter.create<bufferization::ToBufferOp>(loc, inputMemRefType, input)
+            .getResult();
+
+    // 4. Create gpu.launch parameters
     int64_t numElements = inputType.getNumElements();
     int64_t threadsPerBlock = 128;
     int64_t numBlocks = (numElements + threadsPerBlock - 1) / threadsPerBlock;
@@ -382,15 +387,6 @@ public:
 
     // Initialize accumulator
     Value accumulator = initialValue;
-
-    // 1. Convert the input tensor to a memref so we can use memref ops
-    auto inputMemRefType =
-        MemRefType::get(inputType.getShape(), inputType.getElementType(),
-                        MemRefLayoutAttrInterface{});
-
-    Value inputMemRef =
-        rewriter.create<bufferization::ToBufferOp>(loc, inputMemRefType, input)
-            .getResult();
 
     // Loop over elements: for (i = globalId; i < numElements; i += stride)
     Value lowerBound = globalId;
@@ -584,50 +580,63 @@ public:
     return success();
   }
 };
-//cretae rewriter pattern for the gather op to gpu kernel from the novatolinalg pass
-struct NovaToGpuGatherPattern : public OpRewritePattern<nova::GatherOp>{
+// cretae rewriter pattern for the gather op to gpu kernel from the novatolinalg
+// pass
+struct NovaToGpuGatherPattern : public OpRewritePattern<nova::GatherOp> {
   using OpRewritePattern<nova::GatherOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(nova::GatherOp op, PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(nova::GatherOp op,
+                                PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
     Value indices = op.getIndices();
-    int64_t axis = op.getAxis();  
+    int64_t axis = op.getAxis();
 
-    auto inputType = cast<RankedTensorType> (input.getType());
-    auto indiceType =cast<RankedTensorType> (indices.getType());
-    auto resultType = cast<RankedTensorType> (op.getResult().getType());
-    
+    auto inputType = cast<RankedTensorType>(input.getType());
+    auto indiceType = cast<RankedTensorType>(indices.getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+
     // bufferize — preserve GPU memory space from tensor encoding
-    auto inputMemRefType = MemRefType::get(inputType.getShape(), inputType.getElementType(),
+    auto inputMemRefType = MemRefType::get(
+        inputType.getShape(), inputType.getElementType(),
         MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
-    auto indicesMemRefType = MemRefType::get(indiceType.getShape(), indiceType.getElementType(),
+    auto indicesMemRefType = MemRefType::get(
+        indiceType.getShape(), indiceType.getElementType(),
         MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
-    Value inputMemRef = rewriter.create<bufferization::ToBufferOp>(loc, inputMemRefType, input);
-    Value indicesMemRef = rewriter.create<bufferization::ToBufferOp>(loc, indicesMemRefType, indices);
-    auto outputMemrefType=MemRefType::get(resultType.getShape(), resultType.getElementType(),
+    Value inputMemRef =
+        rewriter.create<bufferization::ToBufferOp>(loc, inputMemRefType, input);
+    Value indicesMemRef = rewriter.create<bufferization::ToBufferOp>(
+        loc, indicesMemRefType, indices);
+    auto outputMemrefType = MemRefType::get(
+        resultType.getShape(), resultType.getElementType(),
         MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
 
-    Value outputMemRef = rewriter.create<gpu::AllocOp>(loc, outputMemrefType,
-        /*asyncDependencies=*/ValueRange{},
-        /*dynamicSizes=*/ValueRange{},
-        /*symbolOperands=*/ValueRange{}).getMemref();
+    Value outputMemRef =
+        rewriter
+            .create<gpu::AllocOp>(loc, outputMemrefType,
+                                  /*asyncDependencies=*/ValueRange{},
+                                  /*dynamicSizes=*/ValueRange{},
+                                  /*symbolOperands=*/ValueRange{})
+            .getMemref();
 
     int64_t totalElements = resultType.getNumElements();
     int64_t threadsPerBlock = 256;
     int64_t numBlocks = (totalElements + threadsPerBlock - 1) / threadsPerBlock;
 
     Value cGrid = rewriter.create<arith::ConstantIndexOp>(loc, numBlocks);
-    Value cBlock = rewriter.create<arith::ConstantIndexOp>(loc, threadsPerBlock);
+    Value cBlock =
+        rewriter.create<arith::ConstantIndexOp>(loc, threadsPerBlock);
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    
-    auto launchOp = rewriter.create<gpu::LaunchOp>(loc, cGrid, c1, c1, cBlock, c1, c1);
+
+    auto launchOp =
+        rewriter.create<gpu::LaunchOp>(loc, cGrid, c1, c1, cBlock, c1, c1);
     rewriter.setInsertionPointToStart(&launchOp.getBody().front());
 
-    Value tid=rewriter.create<gpu::ThreadIdOp> (loc ,gpu::Dimension::x);
-    Value bid=rewriter.create<gpu::BlockIdOp>(loc,gpu::Dimension::x);
-    Value bdim=rewriter.create<gpu::BlockDimOp>(loc,gpu::Dimension::x);
-    Value globalId= rewriter.create<arith::AddIOp>(loc,tid,rewriter.create<arith::MulIOp>(loc,bid,bdim));
-     Value cTotal = rewriter.create<arith::ConstantIndexOp>(loc, totalElements);
+    Value tid = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+    Value bid = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x);
+    Value bdim = rewriter.create<gpu::BlockDimOp>(loc, gpu::Dimension::x);
+    Value globalId = rewriter.create<arith::AddIOp>(
+        loc, tid, rewriter.create<arith::MulIOp>(loc, bid, bdim));
+    Value cTotal = rewriter.create<arith::ConstantIndexOp>(loc, totalElements);
     Value inBounds = rewriter.create<arith::CmpIOp>(
         loc, arith::CmpIPredicate::ult, globalId, cTotal);
     // ── 6. Bounds-guarded body ──
@@ -640,7 +649,8 @@ struct NovaToGpuGatherPattern : public OpRewritePattern<nova::GatherOp>{
     SmallVector<Value> outIndices(resRank);
     Value rem = globalId;
     for (int i = resRank - 1; i >= 0; --i) {
-      Value dimSize = rewriter.create<arith::ConstantIndexOp>(loc, resultShape[i]);
+      Value dimSize =
+          rewriter.create<arith::ConstantIndexOp>(loc, resultShape[i]);
       if (i > 0) {
         outIndices[i] = rewriter.create<arith::RemUIOp>(loc, rem, dimSize);
         rem = rewriter.create<arith::DivUIOp>(loc, rem, dimSize);
@@ -650,43 +660,33 @@ struct NovaToGpuGatherPattern : public OpRewritePattern<nova::GatherOp>{
     }
     // Build input indices:
     //   Before axis dims: outIndices[0..axis-1]  (none if axis=0)
-    //   At axis:         indices[outIndices[axis..axis+indicesRank-1]]  (the gather lookup)
-    //   After axis:      outIndices[axis+indicesRank .. resRank-1]
-    
+    //   At axis:         indices[outIndices[axis..axis+indicesRank-1]]  (the
+    //   gather lookup) After axis:      outIndices[axis+indicesRank ..
+    //   resRank-1]
+
     // Load the index value from indices tensor
     SmallVector<Value> idxAccessIndices;
     int64_t indicesRank = indiceType.getRank();
     for (int i = 0; i < indicesRank; ++i) {
       idxAccessIndices.push_back(outIndices[axis + i]);
     }
-    Value gatherIdx = rewriter.create<memref::LoadOp>(loc, indicesMemRef, idxAccessIndices);
-    
+    Value gatherIdx =
+        rewriter.create<memref::LoadOp>(loc, indicesMemRef, idxAccessIndices);
+
     // Cast to index type if needed
     if (!gatherIdx.getType().isIndex())
-      gatherIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), gatherIdx);
-
-    // ── Bounds Check for Gather Index ──
-    Value axisDim = rewriter.create<arith::ConstantIndexOp>(loc, inputType.getShape()[axis]);
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value lowerBound = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, gatherIdx, c0);
-    Value upperBound = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, gatherIdx, axisDim);
-    Value isSafe = rewriter.create<arith::AndIOp>(loc, lowerBound, upperBound);
-
-    auto safeIfOp = rewriter.create<scf::IfOp>(loc, isSafe, /*withElseRegion=*/false);
-    rewriter.setInsertionPointToStart(safeIfOp.thenBlock());
-
+      gatherIdx = rewriter.create<arith::IndexCastOp>(
+          loc, rewriter.getIndexType(), gatherIdx);
     // Build the full input access indices
     SmallVector<Value> inputIndices;
     for (int64_t i = 0; i < axis; ++i)
-      inputIndices.push_back(outIndices[i]);           // before axis
-    inputIndices.push_back(gatherIdx);                  // at axis (gathered)
+      inputIndices.push_back(outIndices[i]); // before axis
+    inputIndices.push_back(gatherIdx);       // at axis (gathered)
     for (int64_t i = axis + 1; i < inputType.getRank(); ++i)
       inputIndices.push_back(outIndices[i + indicesRank - 1]); // after axis
     // Load from input, store to output
     Value val = rewriter.create<memref::LoadOp>(loc, inputMemRef, inputIndices);
     rewriter.create<memref::StoreOp>(loc, val, outputMemRef, outIndices);
-
-    rewriter.setInsertionPointAfter(safeIfOp);
     // ── 7. Close kernel ──
     rewriter.setInsertionPointAfter(ifOp);
     rewriter.create<gpu::TerminatorOp>(loc);
@@ -728,10 +728,13 @@ struct ScatterAddOpGpuLowering : public OpRewritePattern<nova::ScatterAddOp> {
 
     // 1. Bufferize operands to MemRef — preserve GPU memory space
     auto inputMemType = MemRefType::get(resultType.getShape(), elementTy,
+                                        MemRefLayoutAttrInterface{},
+                                        rewriter.getI64IntegerAttr(1));
+    auto srcMemType = MemRefType::get(
+        srcType.getShape(), srcType.getElementType(),
         MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
-    auto srcMemType = MemRefType::get(srcType.getShape(), srcType.getElementType(),
-        MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
-    auto indicesMemType = MemRefType::get(indicesType.getShape(), indicesType.getElementType(),
+    auto indicesMemType = MemRefType::get(
+        indicesType.getShape(), indicesType.getElementType(),
         MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
 
     Value inputMem =
@@ -743,16 +746,6 @@ struct ScatterAddOpGpuLowering : public OpRewritePattern<nova::ScatterAddOp> {
     Value indicesMem =
         rewriter.create<bufferization::ToBufferOp>(loc, indicesMemType, indices,
                                                    /*restrict=*/true);
-
-    // Allocate a fresh output buffer and copy input into it.
-    // This prevents in-place mutation of the original weight buffer.
-    Value outputMem = rewriter.create<gpu::AllocOp>(
-        loc, inputMemType,
-        /*asyncDependencies=*/ValueRange{},
-        /*dynamicSizes=*/ValueRange{},
-        /*symbolOperands=*/ValueRange{}).getMemref();
-    rewriter.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{},
-                                    outputMem, inputMem);
 
     // 2. Compute total src elements
     int64_t totalSrcElements = 1;
@@ -793,8 +786,7 @@ struct ScatterAddOpGpuLowering : public OpRewritePattern<nova::ScatterAddOp> {
     SmallVector<Value> srcIndices(srcRank);
     Value rem = globalId;
     for (int i = srcRank - 1; i >= 0; --i) {
-      Value dimSize =
-          rewriter.create<arith::ConstantIndexOp>(loc, srcShape[i]);
+      Value dimSize = rewriter.create<arith::ConstantIndexOp>(loc, srcShape[i]);
       if (i > 0) {
         srcIndices[i] = rewriter.create<arith::RemUIOp>(loc, rem, dimSize);
         rem = rewriter.create<arith::DivUIOp>(loc, rem, dimSize);
@@ -803,15 +795,11 @@ struct ScatterAddOpGpuLowering : public OpRewritePattern<nova::ScatterAddOp> {
       }
     }
 
-    // 7. Load index value from indices tensor
-    SmallVector<Value> idxAccessIndices;
-    int64_t indicesRank = indicesType.getRank();
-    // For GPT-2/Embedding-like cases, indices shape corresponds to prefix of src shape
-    for (int i = 0; i < indicesRank; ++i) {
-      idxAccessIndices.push_back(srcIndices[i]);
-    }
-    Value idxVal = rewriter.create<memref::LoadOp>(loc, indicesMem, idxAccessIndices);
-
+    // 7. Load index value: indices[srcIndices[axis]]
+    //    For 1D indices: indices[srcIndices[axis]]
+    //    For nD indices: same shape as src's axis dimensions
+    Value idxVal = rewriter.create<memref::LoadOp>(
+        loc, indicesMem, ValueRange{srcIndices[axis]});
     // Cast to index
     Value targetIdx = idxVal;
     if (!targetIdx.getType().isIndex())
@@ -821,29 +809,33 @@ struct ScatterAddOpGpuLowering : public OpRewritePattern<nova::ScatterAddOp> {
     // 8. Load value from src
     Value val = rewriter.create<memref::LoadOp>(loc, srcMem, srcIndices);
 
-    // 9. Build destination coordinates: replace axis dimensions with gathered index
+    // 9. Build destination coordinates: replace axis dim with gathered index
     SmallVector<Value> dstCoords;
-    for (int64_t i = 0; i < axis; ++i)
-      dstCoords.push_back(srcIndices[i]); // before axis
-    dstCoords.push_back(targetIdx);       // at axis
-    for (int64_t i = axis + 1; i < inputRank; ++i)
-      dstCoords.push_back(srcIndices[i + indicesRank - 1]); // after axis
+    for (int64_t d = 0; d < srcRank; ++d) {
+      if (d == axis)
+        dstCoords.push_back(targetIdx);
+      else
+        dstCoords.push_back(srcIndices[d]);
+    }
 
     // 9b. Bounds Check for safety (prevents CUDA_ERROR_ILLEGAL_ADDRESS)
-    Value axisDim = rewriter.create<arith::ConstantIndexOp>(loc, resultType.getShape()[axis]);
+    Value axisDim = rewriter.create<arith::ConstantIndexOp>(
+        loc, resultType.getShape()[axis]);
     Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value lowerBound = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, targetIdx, c0);
-    Value upperBound = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, targetIdx, axisDim);
+    Value lowerBound = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::sge, targetIdx, c0);
+    Value upperBound = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::slt, targetIdx, axisDim);
     Value isSafe = rewriter.create<arith::AndIOp>(loc, lowerBound, upperBound);
 
     auto safeIfOp = rewriter.create<scf::IfOp>(loc, isSafe, /*withElse=*/false);
     rewriter.setInsertionPointToStart(safeIfOp.thenBlock());
 
-    // 10. Atomic scatter-add into output copy (not the original input)
+    // 10. Atomic scatter-add into input
     arith::AtomicRMWKind kind = llvm::isa<FloatType>(elementTy)
                                     ? arith::AtomicRMWKind::addf
                                     : arith::AtomicRMWKind::addi;
-    rewriter.create<memref::AtomicRMWOp>(loc, kind, val, outputMem, dstCoords);
+    rewriter.create<memref::AtomicRMWOp>(loc, kind, val, inputMem, dstCoords);
 
     rewriter.setInsertionPointAfter(safeIfOp);
 
@@ -852,14 +844,13 @@ struct ScatterAddOpGpuLowering : public OpRewritePattern<nova::ScatterAddOp> {
     rewriter.create<gpu::TerminatorOp>(loc);
     rewriter.setInsertionPointAfter(launchOp);
 
-    // 12. Convert result back to tensor (from the fresh copy, not the original)
+    // 12. Convert result back to tensor
     Value resultTensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, resultType, outputMem, /*restrict=*/true, /*writable=*/true);
+        loc, resultType, inputMem, /*restrict=*/true, /*writable=*/true);
     rewriter.replaceOp(op, resultTensor);
     return success();
   }
 };
-
 
 struct ToDeviceOpLowering : public OpRewritePattern<nova::ToDeviceOp> {
   using OpRewritePattern<nova::ToDeviceOp>::OpRewritePattern;
@@ -921,14 +912,14 @@ struct NovaToGpuPass
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect,
                     memref::MemRefDialect, tensor::TensorDialect,
-                    bufferization::BufferizationDialect,
-                    math::MathDialect, func::FuncDialect,
-                    NVVM::NVVMDialect>();
-    
+                    bufferization::BufferizationDialect, math::MathDialect,
+                    func::FuncDialect, NVVM::NVVMDialect>();
+
     // Register the side-effect interface for nvvm.barrier0.
-    registry.addExtension(+[](MLIRContext *context, NVVM::NVVMDialect *dialect) {
-      NVVM::Barrier0Op::attachInterface<Barrier0OpMemoryEffects>(*context);
-    });
+    registry.addExtension(
+        +[](MLIRContext *context, NVVM::NVVMDialect *dialect) {
+          NVVM::Barrier0Op::attachInterface<Barrier0OpMemoryEffects>(*context);
+        });
   }
 
   void runOnOperation() override {
@@ -936,24 +927,23 @@ struct NovaToGpuPass
 
     RewritePatternSet patterns(context);
     ConversionTarget target(*context);
-    target
-        .addLegalDialect<arith::ArithDialect, gpu::GPUDialect,
-                          scf::SCFDialect, memref::MemRefDialect,
-                          func::FuncDialect, math::MathDialect,
-                          tensor::TensorDialect,
-                          bufferization::BufferizationDialect,
-                          NVVM::NVVMDialect>();
+    target.addLegalDialect<
+        arith::ArithDialect, gpu::GPUDialect, scf::SCFDialect,
+        memref::MemRefDialect, func::FuncDialect, math::MathDialect,
+        tensor::TensorDialect, bufferization::BufferizationDialect,
+        NVVM::NVVMDialect>();
     target.addLegalOp<gpu::BarrierOp>();
     target.addIllegalOp<nova::ToDeviceOp, nova::SceOp, nova::MatmulOp,
                         nova::GatherOp, nova::ScatterAddOp>();
-    patterns.add<NovaToGpuReducePattern>(context);
+ //   patterns.add<NovaToGpuReducePattern>(context);
     patterns.add<ToDeviceOpLowering>(context);
     patterns.add<SceOpLowering>(context);
     patterns.add<NovaToGpuGatherPattern>(context);
     patterns.add<ScatterAddOpGpuLowering>(context);
     populateMatmulPatterns(patterns);
 
-    if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
+    if (failed(applyPartialConversion(getOperation(), target,
+                                      std::move(patterns)))) {
       signalPassFailure();
     }
   }

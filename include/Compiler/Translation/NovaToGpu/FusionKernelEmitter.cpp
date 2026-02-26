@@ -31,7 +31,7 @@ Value createBlockReduce(OpBuilder &rewriter, Location loc, Value val,
       mlir::gpu::AllReduceOperationAttr::get(rewriter.getContext(), op);
   return rewriter
       .create<gpu::AllReduceOp>(loc, val.getType(), val, opAttr,
-                                /*uniform=*/true)
+                                /*uniform=*/false)
       .getResult();
 }
 
@@ -201,16 +201,6 @@ struct FullReduceLowering : public OpRewritePattern<nova::ReduceOp> {
       return failure();
     }
 
-    arith::AtomicRMWKind rmwKind = arith::AtomicRMWKind::addf;
-    if (kind == ReductionKind::SUM || kind == ReductionKind::MEAN)
-      rmwKind = arith::AtomicRMWKind::addf;
-    else if (kind == ReductionKind::PRODUCT)
-      rmwKind = arith::AtomicRMWKind::mulf;
-    else if (kind == ReductionKind::MAX)
-      rmwKind = arith::AtomicRMWKind::maximumf;
-    else if (kind == ReductionKind::MIN)
-      rmwKind = arith::AtomicRMWKind::minimumf;
-
     // 2. Prepare Buffers
     auto accMemRefType = MemRefType::get(
         outputType.getShape(), inputType.getElementType(),
@@ -229,34 +219,14 @@ struct FullReduceLowering : public OpRewritePattern<nova::ReduceOp> {
     rewriter.create<gpu::MemsetOp>(loc, Type(), ValueRange{}, alloc,
                                    initialValue);
 
-    // 3. Launch Kernel
+    // 3. Launch Kernel — single block for deterministic reduction
     int64_t numElements = inputType.getNumElements();
-    int64_t threadsPerBlock = 128;
-    int64_t numBlocks = (numElements + threadsPerBlock - 1) / threadsPerBlock;
+    int64_t threadsPerBlock = 32; // 1 warp — ensures AllReduceOp uses only
+                                  // warp shuffles (no shared memory races)
 
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1).getResult();
-    Value cG =
-        rewriter.create<arith::ConstantIndexOp>(loc, numBlocks).getResult();
     Value cB = rewriter.create<arith::ConstantIndexOp>(loc, threadsPerBlock)
                    .getResult();
-
-    auto launchOp = rewriter.create<gpu::LaunchOp>(loc, cG, c1, c1, cB, c1, c1);
-    rewriter.setInsertionPointToStart(&launchOp.getBody().front());
-
-    Value tid = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-    Value bid = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x);
-    Value bdim = rewriter.create<gpu::BlockDimOp>(loc, gpu::Dimension::x);
-    Value gdim = rewriter.create<gpu::GridDimOp>(loc, gpu::Dimension::x);
-
-    Value globalId =
-        rewriter
-            .create<arith::AddIOp>(
-                loc, tid,
-                rewriter.create<arith::MulIOp>(loc, bid, bdim).getResult())
-            .getResult();
-    Value stride = rewriter.create<arith::MulIOp>(loc, bdim, gdim).getResult();
-    Value cNumElements =
-        rewriter.create<arith::ConstantIndexOp>(loc, numElements).getResult();
 
     auto inputMemRefType = MemRefType::get(
         inputType.getShape(), inputType.getElementType(),
@@ -265,7 +235,16 @@ struct FullReduceLowering : public OpRewritePattern<nova::ReduceOp> {
         rewriter.create<bufferization::ToBufferOp>(loc, inputMemRefType, input)
             .getResult();
 
-    auto loop = rewriter.create<scf::ForOp>(loc, globalId, cNumElements, stride,
+    auto launchOp = rewriter.create<gpu::LaunchOp>(loc, c1, c1, c1, cB, c1, c1);
+    rewriter.setInsertionPointToStart(&launchOp.getBody().front());
+
+    Value tid = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+    Value bdim = rewriter.create<gpu::BlockDimOp>(loc, gpu::Dimension::x);
+
+    Value cNumElements =
+        rewriter.create<arith::ConstantIndexOp>(loc, numElements).getResult();
+
+    auto loop = rewriter.create<scf::ForOp>(loc, tid, cNumElements, bdim,
                                             ValueRange{initialValue});
     {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -348,27 +327,12 @@ struct FullReduceLowering : public OpRewritePattern<nova::ReduceOp> {
     Value resultToStore = fusionResult.first;
     SmallVector<Operation *> fusedOps = fusionResult.second;
 
-    SmallVector<Value> storeIdx(outputType.getRank(), c0);
-    rewriter.create<memref::AtomicRMWOp>(loc, rmwKind, resultToStore, alloc,
-                                         storeIdx);
-
-    rewriter.setInsertionPointAfter(ifOp);
-    rewriter.create<gpu::TerminatorOp>(loc);
-    rewriter.setInsertionPointAfter(launchOp);
-
+    // For MEAN, divide by numElements before storing
     if (kind == ReductionKind::MEAN) {
-      Value c1_k2 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-      auto launchOp2 = rewriter.create<gpu::LaunchOp>(loc, c1_k2, c1_k2, c1_k2,
-                                                      c1_k2, c1_k2, c1_k2);
-      rewriter.setInsertionPointToStart(&launchOp2.getBody().front());
-
-      SmallVector<Value> indices(
-          outputType.getRank(),
-          rewriter.create<arith::ConstantIndexOp>(loc, 0).getResult());
-      Value sumVal = rewriter.create<memref::LoadOp>(loc, alloc, indices);
-
       Type elemType = inputType.getElementType();
       Type computeType = elemType;
+      Value sumVal = resultToStore;
+
       if (elemType.isF16() || elemType.isBF16()) {
         computeType = rewriter.getF32Type();
         sumVal = rewriter.create<arith::ExtFOp>(loc, computeType, sumVal);
@@ -393,12 +357,15 @@ struct FullReduceLowering : public OpRewritePattern<nova::ReduceOp> {
       if (meanVal.getType() != elemType) {
         meanVal = rewriter.create<arith::TruncFOp>(loc, elemType, meanVal);
       }
-
-      rewriter.create<memref::StoreOp>(loc, meanVal, alloc, indices);
-      rewriter.create<gpu::TerminatorOp>(loc);
-
-      rewriter.setInsertionPointAfter(launchOp2);
+      resultToStore = meanVal;
     }
+
+    SmallVector<Value> storeIdx(outputType.getRank(), c0);
+    rewriter.create<memref::StoreOp>(loc, resultToStore, alloc, storeIdx);
+
+    rewriter.setInsertionPointAfter(ifOp);
+    rewriter.create<gpu::TerminatorOp>(loc);
+    rewriter.setInsertionPointAfter(launchOp);
 
     auto toTensor =
         rewriter.create<bufferization::ToTensorOp>(loc, outputType, alloc);
@@ -532,9 +499,16 @@ struct PartialReduceLowering : public OpRewritePattern<nova::ReduceOp> {
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1).getResult();
     Value cG =
         rewriter.create<arith::ConstantIndexOp>(loc, numParallel).getResult();
-    int64_t threadsPerBlock = 128;
+    int64_t threadsPerBlock = 32; // 1 warp — deterministic AllReduceOp
     Value cB = rewriter.create<arith::ConstantIndexOp>(loc, threadsPerBlock)
                    .getResult();
+
+    auto inputMemRefType = MemRefType::get(
+        inputType.getShape(), inputType.getElementType(),
+        MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
+    Value inputMemRef =
+        rewriter.create<bufferization::ToBufferOp>(loc, inputMemRefType, input)
+            .getResult();
 
     auto launchOp = rewriter.create<gpu::LaunchOp>(loc, cG, c1, c1, cB, c1, c1);
     rewriter.setInsertionPointToStart(&launchOp.getBody().front());
@@ -545,13 +519,6 @@ struct PartialReduceLowering : public OpRewritePattern<nova::ReduceOp> {
 
     Value cNumReduction =
         rewriter.create<arith::ConstantIndexOp>(loc, numReduction).getResult();
-
-    auto inputMemRefType = MemRefType::get(
-        inputType.getShape(), inputType.getElementType(),
-        MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
-    Value inputMemRef =
-        rewriter.create<bufferization::ToBufferOp>(loc, inputMemRefType, input)
-            .getResult();
 
     // Loop over reduction dimensions
     auto loop = rewriter.create<scf::ForOp>(loc, tid, cNumReduction, bdim,
@@ -706,8 +673,7 @@ struct PartialReduceLowering : public OpRewritePattern<nova::ReduceOp> {
         }
       }
 
-      rewriter.create<memref::AtomicRMWOp>(loc, rmwKind, resultToStore, alloc,
-                                           storeIdx);
+      rewriter.create<memref::StoreOp>(loc, resultToStore, alloc, storeIdx);
 
       rewriter.setInsertionPointAfter(ifOp);
     } else {
@@ -831,10 +797,12 @@ struct NovaFusionKernelEmitterPass
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     patterns.add<FullReduceLowering>(context);
+    patterns.add<PartialReduceLowering>(context);
 
     ConversionTarget target(*context);
     target.addLegalDialect<nova::NovaDialect>();
-   // target.addIllegalOp<nova::ReduceOp>();
+    // Mark ALL reduce ops as illegal so both Full and Partial lowerings apply.
+    target.addIllegalOp<nova::ReduceOp>();
     target.addLegalDialect<gpu::GPUDialect, arith::ArithDialect,
                            scf::SCFDialect, memref::MemRefDialect,
                            math::MathDialect, linalg::LinalgDialect,
