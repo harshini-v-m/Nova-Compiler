@@ -697,7 +697,181 @@ struct NovaConstantToArithConstPattern
     return success();
   }
 };
+// layer norm lowering with nova operations
+struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
+  using OpConversionPattern<nova::LayerNormOp>::OpConversionPattern;
 
+  LogicalResult
+  matchAndRewrite(nova::LayerNormOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    //  y = (x - E[x]) / sqrt(Var[x] + eps) * gamma + beta
+    // getting operands
+    Location loc = op.getLoc();
+    Value x = adaptor.getInput();
+    Value gamma = adaptor.getGamma();
+    Value beta = adaptor.getBeta();
+    auto xres = cast<RankedTensorType>(op.getType());
+    auto xType = cast<RankedTensorType>(x.getType());
+
+    auto elemType = xType.getElementType();
+    // setting up
+    float eps = 1e-5f;
+    // 1.finding row mean
+    std::vector<int64_t> meanShape(xType.getShape().begin(),
+                                   xType.getShape().end());
+    meanShape.back() = 1;
+    auto meanType = mlir::RankedTensorType::get(meanShape, elemType);
+    auto mean = rewriter
+                    .create<mlir::nova::ReduceOp>(
+                        loc, mlir::nova::ReductionKind::MEAN, x, meanType, true,
+                        llvm::ArrayRef<int64_t>{-1}, false)
+                    .getResult();
+    auto x_minus_mean =
+        rewriter.create<mlir::nova::SubOp>(loc, xres, x, mean).getResult();
+    // 3. (x - mean)^2
+    auto sq_diff =
+        rewriter
+            .create<mlir::nova::MulOp>(loc, xres, x_minus_mean, x_minus_mean)
+            .getResult();
+    // 4. Var(x) = Mean((x-mean)^2)
+    auto var = rewriter
+                   .create<mlir::nova::ReduceOp>(
+                       loc, mlir::nova::ReductionKind::MEAN, sq_diff, meanType,
+                       true, llvm::ArrayRef<int64_t>{-1}, false)
+                   .getResult();
+    // 5. sqrt(var + eps)
+    auto epsAttr = mlir::DenseElementsAttr::get(
+        mlir::cast<mlir::RankedTensorType>(var.getType()), eps);
+    auto epsConst =
+        rewriter.create<mlir::nova::ConstantOp>(loc, var.getType(), epsAttr)
+            .getResult();
+    auto var_plus_eps =
+        rewriter.create<mlir::nova::AddOp>(loc, var.getType(), var, epsConst)
+            .getResult();
+    auto std_inv =
+        rewriter.create<mlir::nova::RsqrtOp>(loc, var.getType(), var_plus_eps)
+            .getResult();
+    // 6. Normalize
+    auto norm =
+        rewriter.create<mlir::nova::MulOp>(loc, xres, x_minus_mean, std_inv)
+            .getResult();
+    // 7. scale and shift
+    // multiply by gamma
+    auto res =
+        rewriter.create<mlir::nova::MulOp>(loc, xres, norm, gamma).getResult();
+    // add beta
+    auto result =
+        rewriter.create<mlir::nova::AddOp>(loc, xres, res, beta).getResult();
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+struct NovaSceBackwardOpLowering
+    : public OpConversionPattern<mlir::nova::SceBackwardOp> {
+  using OpConversionPattern<mlir::nova::SceBackwardOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(mlir::nova::SceBackwardOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value logits = adaptor.getLogits();
+    Value targets = adaptor.getTargets();
+    auto resultType = cast<RankedTensorType>(op.getType());
+    auto logitsType = cast<RankedTensorType>(logits.getType());
+    auto targetsType = cast<RankedTensorType>(targets.getType());
+    int64_t rank = logitsType.getRank();
+    auto resultElemType = resultType.getElementType();
+    auto targetIdxElemType = targetsType.getElementType();
+
+    int64_t dim = op.getDim();
+    if (dim < 0)
+      dim += rank;
+
+    // 1. Calculate Softmax
+    auto deviceAttr = op->getAttr("device");
+    auto softmaxOp = rewriter.create<mlir::nova::SoftmaxOp>(
+        loc, logitsType, logits, rewriter.getI32IntegerAttr(dim));
+    if (deviceAttr) softmaxOp->setAttr("device", deviceAttr);
+    Value softmaxRes = softmaxOp.getResult();
+
+    // 2. Flattened Probabilities
+    int64_t totalel = 1;
+    for (auto s : logitsType.getShape()) {
+      if (s == ShapedType::kDynamic) return failure();
+      totalel *= s;
+    }
+    auto flatProbType = RankedTensorType::get({totalel}, resultElemType);
+    auto probFlatOp = rewriter.create<mlir::nova::ReshapeOp>(loc, flatProbType, softmaxRes);
+    if (deviceAttr) probFlatOp->setAttr("device", deviceAttr);
+    Value probFlat = probFlatOp.getResult();
+
+    // 3. Calculate N and flattened offsets
+    int64_t B = logitsType.getDimSize(0);
+    int64_t C = (rank > 1) ? logitsType.getDimSize(1) : 1;
+    if (rank == 3) {
+      B = logitsType.getDimSize(0) * logitsType.getDimSize(1);
+      C = logitsType.getDimSize(2);
+    }
+    
+    int64_t N = 1;
+    for (int64_t i = 0; i < rank; ++i) {
+      if (i != dim) N *= logitsType.getDimSize(i);
+    }
+
+    // Force i64 indices throughout
+    auto i64Type = rewriter.getI64Type();
+    auto offsetsType = RankedTensorType::get({B}, i64Type);
+    std::vector<int64_t> offsets(B);
+    for (int64_t i = 0; i < B; ++i) offsets[i] = i * C;
+    auto offsetsAttr = DenseIntElementsAttr::get(offsetsType, llvm::ArrayRef<int64_t>(offsets));
+    auto offsetsConstOp = rewriter.create<mlir::nova::ConstantOp>(loc, offsetsType, offsetsAttr);
+    if (deviceAttr) offsetsConstOp->setAttr("device", deviceAttr);
+    Value offsetsConst = offsetsConstOp.getResult();
+
+    Value targetsI64 = targets;
+    if (!targetIdxElemType.isInteger(64)) {
+       auto targetsI64Type = RankedTensorType::get(targetsType.getShape(), i64Type);
+       targetsI64 = rewriter.create<mlir::tosa::CastOp>(loc, targetsI64Type, targets);
+    }
+
+    auto targetFlatType = RankedTensorType::get({B}, i64Type);
+    auto targetFlatOp = rewriter.create<mlir::nova::ReshapeOp>(loc, targetFlatType, targetsI64);
+    if (deviceAttr) targetFlatOp->setAttr("device", deviceAttr);
+    Value targetFlat = targetFlatOp.getResult();
+
+    auto indicesFlatOp = rewriter.create<mlir::nova::AddOp>(loc, targetFlatType, targetFlat, offsetsConst);
+    if (deviceAttr) indicesFlatOp->setAttr("device", deviceAttr);
+    Value indicesFlat = indicesFlatOp.getResult();
+
+    // 4. -1.0 values to add
+    auto negOnesType = RankedTensorType::get({B}, resultElemType);
+    auto negOnesAttr = DenseElementsAttr::get(negOnesType, rewriter.getFloatAttr(resultElemType, -1.0));
+    auto negOnesConstOp = rewriter.create<mlir::nova::ConstantOp>(loc, negOnesType, negOnesAttr);
+    if (deviceAttr) negOnesConstOp->setAttr("device", deviceAttr);
+    Value negOnesConst = negOnesConstOp.getResult();
+
+    // 5. Scatter Add
+    auto scatterAddOp = rewriter.create<mlir::nova::ScatterAddOp>(
+        loc, flatProbType, probFlat, indicesFlat, negOnesConst, rewriter.getI64IntegerAttr(0));
+    if (deviceAttr) scatterAddOp->setAttr("device", deviceAttr);
+    Value diffFlat = scatterAddOp.getResult();
+
+    // 6. Reshape back
+    auto diffOp = rewriter.create<mlir::nova::ReshapeOp>(loc, logitsType, diffFlat);
+    if (deviceAttr) diffOp->setAttr("device", deviceAttr);
+    Value diff = diffOp.getResult();
+
+
+    // 7. Normalization (divide by N)
+    auto nInvConstType = RankedTensorType::get({}, resultElemType);
+    auto nInvConstAttr = DenseElementsAttr::get(nInvConstType, rewriter.getFloatAttr(resultElemType, 1.0 / N));
+    Value nInvConst = rewriter.create<mlir::nova::ConstantOp>(loc, nInvConstType, nInvConstAttr);
+
+    Value finalGrad = rewriter.create<mlir::nova::MulOp>(loc, resultType, diff, nInvConst);
+
+    rewriter.replaceOp(op, finalGrad);
+    return success();
+  }
+};
 // pass definition
 namespace {
 struct NovaToTosaLoweringPass
@@ -736,7 +910,8 @@ struct NovaToTosaLoweringPass
     target.addIllegalOp<nova::GeluOp>();
     target.addIllegalOp<nova::SoftmaxOp>();
     target.addIllegalOp<nova::BceOp>();
-
+    target.addIllegalOp<nova::SceBackwardOp>();
+    target.addIllegalOp<nova::LayerNormOp>();
     target.addIllegalOp<nova::MaeOp>();
     target.addIllegalOp<nova::CastOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
@@ -755,8 +930,8 @@ struct NovaToTosaLoweringPass
 
 void populateNovaToTosaConversionPatterns(RewritePatternSet &patterns) {
   patterns.add<NovaReluOpLowering, NovaGeluOpLowering,
-               NovaSoftmaxLoweringPattern, NovaConstantToArithConstPattern,
-               NovaToTosaLoweringTemplate<nova::MaeOp>,
+               NovaSoftmaxLoweringPattern, NovaConstantToArithConstPattern,NovaSceBackwardOpLowering,
+               NovaLayerNormPattern, NovaToTosaLoweringTemplate<nova::MaeOp>,
                NovaToTosaLoweringTemplate<nova::MseOp>,
                NovaToTosaLoweringTemplate<nova::CceOp>,
                NovaToTosaLoweringTemplate<nova::BceOp>,

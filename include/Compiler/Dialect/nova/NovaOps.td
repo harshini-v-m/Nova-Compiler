@@ -927,54 +927,6 @@ def ScatterAddOp : Op<Nova_Dialect, "scatter_add", [Pure, DeclareOpInterfaceMeth
     $input `,` $indices `,` $src (`axis` `=` $axis^)? attr-dict `:` type($input) `,` type($indices) `,` type($src) `->` type($output)
   }];
 }
-
-/*
-def Nova_ConvolutionOp : Op<Nova_Dialect, "convolution", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
-  let summary = "Convolution operation with padding and stride";
-  let description = [{
-    Performs convolution operation with configurable padding and stride.
-    Example:
-    ```mlir
-    %result = nova.convolution %input, %kernel 
-      {padding = [1, 1], stride = [1, 1]} 
-      : tensor<1x3x32x32xf32>, tensor<64x3x3x3xf32> -> tensor<1x64x32x32xf32>
-    ```
-  }];
-  
-  let arguments = (ins 
-    Nova_Tensor:$lhs,
-    Nova_Tensor:$rhs,
-    ArrayAttr:$padding,
-    ArrayAttr:$stride
-  );
-  
-  let results = (outs Nova_Tensor:$result);
-  
-  let assemblyFormat = [{
-    $lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs)}];
-  
-  let extraClassDeclaration = [{
-    //inferReturnTypes
-    
-    // Helper method to get padding values
-    SmallVector<int64_t> getPaddingValues() {
-      SmallVector<int64_t> result;
-      for (auto val : getPadding())
-        result.push_back(llvm::cast<IntegerAttr>(val).getInt());
-      return result;
-    }
-    
-    // Helper method to get stride values
-    SmallVector<int64_t> getStrideValues() {
-      SmallVector<int64_t> result;
-      for (auto val : getStride())
-        result.push_back(llvm::cast<IntegerAttr>(val).getInt());
-      return result;
-    }
-  }];
-
-  let hasVerifier=1;
-}*/
 def Nova_ReshapeOp : Op<Nova_Dialect, "reshape", [Pure]> {
   let summary = "Reshape operation";
   let description = [{
@@ -988,6 +940,49 @@ def Nova_ReshapeOp : Op<Nova_Dialect, "reshape", [Pure]> {
 
   let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
   let hasVerifier = 1;
+}
+
+//===============================
+//MLP OPERATIONS
+//===============================
+def LayerNormOp :Op<Nova_Dialect,"layer_norm",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary ="Layer norm operation y = (x - E[x]) / sqrt(Var[x] + eps) * gamma + beta";
+  let arguments = (ins Nova_Tensor:$input, Nova_Tensor:$gamma, Nova_Tensor:$beta);
+  let results=(outs Nova_Tensor:$output);
+  //let hasVerifier=1;
+    let assemblyFormat = [{
+    $input `,` $gamma `,` $beta attr-dict `:` type($input) `,` type($gamma) `,` type($beta) 
+  }];
+}
+def Nova_SceBackwardOp : Op<Nova_Dialect, "sce_backward",
+    [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Sparse Cross Entropy backward (gradient w.r.t. logits)";
+  let description = [{
+    Computes the gradient of the sparse cross-entropy loss w.r.t. logits:
+      grad_logits = (softmax(logits, dim) - one_hot(targets)) / N
+    where N = total number of samples (product of non-class dimensions).
+
+    The dim attribute specifies which dimension is the class dimension
+    Negative values index from the end.
+
+    logits: tensor<[..., C, ...] x float>
+    targets: tensor<[...] x int>           
+
+    Example:
+      %grad = nova.sce_backward %logits, %targets {dim = -1}
+        : tensor<4x128x50304xf32>, tensor<4x128xi32>
+  }];
+
+  let arguments = (ins Nova_Tensor:$logits, Nova_Tensor:$targets,
+                       DefaultValuedAttr<I64Attr, "-1">:$dim);
+  let results = (outs Nova_Tensor:$grad_logits);
+
+  let hasVerifier = 1;
+  let hasFolder = 1;
+
+  let assemblyFormat = [{
+    $logits `,` $targets attr-dict `:` type($logits) `,` type($targets)
+  }];
 }
 
 #endif // NOVA_OPS

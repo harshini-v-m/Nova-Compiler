@@ -16,6 +16,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include <numeric>
 
@@ -372,13 +373,12 @@ struct FullReduceLowering : public OpRewritePattern<nova::ReduceOp> {
     toTensor.setRestrict(true);
 
     if (!fusedOps.empty()) {
+      // Replace only the last fused op; its predecessors become dead naturally
+      // and the greedy rewriter's DCE will clean them up.
       rewriter.replaceOp(fusedOps.back(), toTensor.getResult());
-      for (auto it = fusedOps.rbegin(); it != fusedOps.rend(); ++it) {
-        if (*it != fusedOps.back()) {
-          rewriter.eraseOp(*it);
-        }
-      }
-      rewriter.eraseOp(op);
+      // The nova.reduce result feeds fusedOps[0]; with fusedOps[0] now dead
+      // (orphaned by its predecessor becoming dead), replace the reduce too.
+      rewriter.replaceOp(op, toTensor.getResult());
     } else {
       rewriter.replaceOp(op, toTensor.getResult());
     }
@@ -400,23 +400,24 @@ struct PartialReduceLowering : public OpRewritePattern<nova::ReduceOp> {
 
     Location loc = op.getLoc();
 
+    int64_t inputRank = inputType.getRank();
+
     // 1. Identify Reduced and Parallel Dimensions
     SmallVector<int64_t> reducedDims;
     if (auto dimAttr = op.getDimension()) {
       for (auto attr : dimAttr.value()) {
-        reducedDims.push_back(cast<IntegerAttr>(attr).getInt());
+        int64_t d = cast<IntegerAttr>(attr).getInt();
+        if (d < 0)
+          d += inputRank;
+        reducedDims.push_back(d);
       }
     } else {
-      // Fallback or assume row-wise if missing?
       // For now, if no dimension, we expect same rank implementation or fail.
-      // Let's rely on dimension being present for rank-reducing.
       return failure();
     }
 
     // Sort reduced dims for easier processing
     std::sort(reducedDims.begin(), reducedDims.end());
-
-    int64_t inputRank = inputType.getRank();
     SmallVector<int64_t> parallelDims;
     for (int64_t i = 0; i < inputRank; ++i) {
       bool isReduced = false;
@@ -755,16 +756,9 @@ struct PartialReduceLowering : public OpRewritePattern<nova::ReduceOp> {
     toTensor.setRestrict(true);
 
     if (finalFusedOp) {
+      // Replace only the final fused op; predecessors become dead naturally.
       rewriter.replaceOp(finalFusedOp, toTensor.getResult());
-
-      for (auto it = allFusedOps.rbegin(); it != allFusedOps.rend(); ++it) {
-        if (*it != finalFusedOp) {
-          rewriter.eraseOp(*it);
-        }
-      }
-
-      // The original reduce op is now dead.
-      rewriter.eraseOp(op);
+      rewriter.replaceOp(op, toTensor.getResult());
     } else {
       rewriter.replaceOp(op, toTensor.getResult());
     }
@@ -797,21 +791,9 @@ struct NovaFusionKernelEmitterPass
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     patterns.add<FullReduceLowering>(context);
-    patterns.add<PartialReduceLowering>(context);
+     patterns.add<PartialReduceLowering>(context);
 
-    ConversionTarget target(*context);
-    target.addLegalDialect<nova::NovaDialect>();
-    // Mark ALL reduce ops as illegal so both Full and Partial lowerings apply.
-    target.addIllegalOp<nova::ReduceOp>();
-    target.addLegalDialect<gpu::GPUDialect, arith::ArithDialect,
-                           scf::SCFDialect, memref::MemRefDialect,
-                           math::MathDialect, linalg::LinalgDialect,
-                           func::FuncDialect, tensor::TensorDialect,
-                           bufferization::BufferizationDialect>();
-    target.addLegalOp<ModuleOp, func::FuncOp, func::ReturnOp>();
-
-    if (failed(applyPartialConversion(getOperation(), target,
-                                      std::move(patterns))))
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       signalPassFailure();
   }
 };
