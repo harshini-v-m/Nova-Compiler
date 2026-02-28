@@ -51,15 +51,59 @@ public:
   LogicalResult matchAndRewrite(memref::DeallocOp op,
                                 PatternRewriter &rewriter) const override {
     Value memref = op.getMemref();
-    MemRefType type = llvm::dyn_cast<MemRefType>(memref.getType());
-    // if (!type || !isMemorySpaceOne(type.getMemorySpace()))
-    //   return failure();
+    Block *allocBlock = op->getBlock();
+    Operation *lastUser = nullptr;
+    bool safeToDeallocEarly = true;
 
-    rewriter.replaceOpWithNewOp<gpu::DeallocOp>(op, TypeRange{}, ValueRange{},
-                                                memref);
+    // Helper to find all users, including those of aliases (subviews, casts, etc.)
+    std::function<void(Value)> findAllUsers;
+    findAllUsers = [&](Value v) {
+      for (Operation *user : v.getUsers()) {
+        if (user == op) continue;
+
+        // If the user produces another memref (alias), recursively check its users
+        bool isAlias = isa<memref::CastOp, memref::SubViewOp, memref::CollapseShapeOp, 
+                           memref::ExpandShapeOp, memref::ReshapeOp, memref::TransposeOp, 
+                           memref::ReinterpretCastOp>(user);
+        
+        if (isAlias) {
+          for (Value result : user->getResults()) {
+            if (llvm::isa<MemRefType>(result.getType())) {
+              findAllUsers(result);
+            }
+          }
+        }
+
+        // Find ancestor of user that is in the same block as the dealloc
+        Operation *ancestor = user;
+        while (ancestor && ancestor->getBlock() != allocBlock) {
+          ancestor = ancestor->getParentOp();
+        }
+
+        if (!ancestor) {
+          safeToDeallocEarly = false;
+          continue; 
+        }
+
+        if (!lastUser || lastUser->isBeforeInBlock(ancestor)) {
+          lastUser = ancestor;
+        }
+      }
+    };
+
+    findAllUsers(memref);
+
+    if (safeToDeallocEarly && lastUser) {
+      // Insert right after the last user in the same block
+      rewriter.setInsertionPointAfter(lastUser);
+      rewriter.replaceOpWithNewOp<gpu::DeallocOp>(op, TypeRange{}, ValueRange{}, memref);
+    } else {
+      rewriter.replaceOpWithNewOp<gpu::DeallocOp>(op, TypeRange{}, ValueRange{}, memref);
+    }
     return success();
   }
 };
+
 class ConvertMemrefOp : public OpRewritePattern<memref::CopyOp> {
 public:
   using OpRewritePattern<memref::CopyOp>::OpRewritePattern;
