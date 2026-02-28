@@ -330,7 +330,7 @@ LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module,
 
   if (options.runFullPipeline) {
     // Add the Nova optimization pipeline based on target device
-    if (options.device == "gpu") {
+    if (options.device == "gpu" || options.device == "cuda") {
       createNovaGPUPipelines(pm);
     } else {
       createNovaPipelines(pm);
@@ -344,17 +344,18 @@ LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module,
     }
   }
 
-  return pm.run(module);
+  if (failed(pm.run(module))) {
+    llvm::errs() << "Pipeline failed. Dumping IR to failed_module.mlir\n";
+    std::error_code ec;
+    llvm::raw_fd_ostream dest("failed_module.mlir", ec, llvm::sys::fs::OF_Text);
+    if (!ec) {
+      module.print(dest);
+      dest.flush();
+    }
+    return failure();
+  }
+  return success();
 }
-
-std::string NovaCompilerAPI::moduleToString(ModuleOp module) {
-  std::string output;
-  llvm::raw_string_ostream os(output);
-  module.print(os);
-  os.flush();
-  return output;
-}
-
 //----------------------------------------------------------------------------//
 // NovaCompilerSystemAPI Implementation
 //----------------------------------------------------------------------------//

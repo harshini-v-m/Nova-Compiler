@@ -120,7 +120,11 @@ static LogicalResult BinaryTypePromotionReturnType(
   }
 
   if (resultbitwidth == 64) {
-    resulType = builder.getF64Type();
+        if ((flhstype && !frhstype) || (!flhstype && frhstype)) {
+      resulType = builder.getF32Type(); // Prefer f32 for mixed float/int
+    } else {
+      resulType = builder.getF64Type();
+    }
   } else if (resultbitwidth == 32) {
     resulType = builder.getF32Type();
   } else if (resultbitwidth == 16) {
@@ -1593,7 +1597,10 @@ static Type getHigherHierarchyType(Type t1, Type t2, MLIRContext *context) {
   Builder builder(context);
   if (resultIsFloat) {
     if (maxBitwidth == 64)
-      return builder.getF64Type();
+          if (maxBitwidth == 64) {
+      if (isFloat1 && isFloat2) return builder.getF64Type();
+      return builder.getF32Type(); // Prefer f32 for mixed float/int
+    }
     if (maxBitwidth == 32)
       return builder.getF32Type();
 

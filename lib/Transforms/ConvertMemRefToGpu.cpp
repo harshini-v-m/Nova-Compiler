@@ -60,6 +60,7 @@ public:
     return success();
   }
 };
+
 class ConvertMemrefOp : public OpRewritePattern<memref::CopyOp> {
 public:
   using OpRewritePattern<memref::CopyOp>::OpRewritePattern;
