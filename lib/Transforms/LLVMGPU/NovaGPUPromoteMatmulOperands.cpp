@@ -123,19 +123,12 @@ static void promoteOperandToShared(OpBuilder &builder,
   Value stage1Result = stage1Copy.getResult(0);
 
   // -----------------------------------------------------------------------
-  // Fusion barrier: prevents Stage 1 from being fused into Stage 2's loop.
-  // Mirrors: IREE::Codegen::FusionBarrierOp::create(rewriter, loc, ...)
-  // -----------------------------------------------------------------------
-  Value fenced =
-      FusionBarrierOp::create(builder, loc, stage1Result.getType(), stage1Result)
-          .getResult();
-
-  // -----------------------------------------------------------------------
   // Stage 2: per-thread copy from shared memory.
-  // The fusion analysis sees %fenced (not %stage1Result) as a producer, so it
-  // will never fuse Stage 1 into Stage 2's tiled loop.
+  // No fusion barrier needed: with promotion moved after K-reduction tiling,
+  // both Stage 1 (global→shared) and Stage 2 (shared→private) are already
+  // inside the K-loop body. There is no risk of Stage 1 fusing across loops.
   // -----------------------------------------------------------------------
-  Value promoted = buildPerThreadCopy(builder, loc, fenced);
+  Value promoted = buildPerThreadCopy(builder, loc, stage1Result);
 
   // Replace this operand of the linalg op with the promoted per-thread copy.
   linalgOp->setOperand(

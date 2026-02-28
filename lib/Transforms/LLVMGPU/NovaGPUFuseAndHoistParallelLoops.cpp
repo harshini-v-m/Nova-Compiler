@@ -44,6 +44,8 @@
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/IR/Dominance.h"
 
 using namespace mlir;
 
@@ -379,6 +381,86 @@ struct FuseExtractSliceConsumers final
     rewriter.replaceOp(
         fusionResult->origConsumerOperands.front()->getOwner(),
         fusionResult->tiledOps.front());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pattern 6: FuseTilableForallConsumers
+//
+// Fuse TilingInterface consumers of scf.forall results into the forall body.
+// This is critical for fusing epilogue ops (bias/relu) into the thread forall
+// so that each thread operates on its small tile (e.g., 4x4) instead of the
+// full workgroup tile (e.g., 128x128), avoiding oversized private allocas.
+//
+// Mirrors IREE's FuseTilableForallConsumers from Transforms.cpp:40-106.
+//===----------------------------------------------------------------------===//
+
+struct FuseTilableForallConsumers final
+    : OpInterfaceRewritePattern<TilingInterface> {
+  using OpInterfaceRewritePattern::OpInterfaceRewritePattern;
+
+  LogicalResult matchAndRewrite(TilingInterface tilableOp,
+                                PatternRewriter &rewriter) const override {
+    // Consumer fusion currently requires DPS ops.
+    auto dpsOp = dyn_cast<DestinationStyleOpInterface>(*tilableOp);
+    if (!dpsOp)
+      return failure();
+
+    // Find a scf.forall producer among the DPS inputs.
+    scf::ForallOp forallProducer;
+    for (auto operand : dpsOp.getDpsInputs()) {
+      auto forallOp = operand.getDefiningOp<scf::ForallOp>();
+      if (!forallOp)
+        continue;
+      // Must be in the same block (not nested).
+      if (forallOp->getBlock() != tilableOp->getBlock())
+        continue;
+      forallProducer = forallOp;
+      break;
+    }
+
+    if (!forallProducer)
+      return rewriter.notifyMatchFailure(
+          tilableOp, "no scf.forall producer to fuse into");
+
+    // Collect the parallel_insert_slice ops from the forall's terminator.
+    // These are needed by tileAndFuseConsumerOfSlices.
+    scf::InParallelOp parallelTerminator = forallProducer.getTerminator();
+    SmallVector<Operation *> insertSlices;
+    for (Operation &yieldingOp : parallelTerminator.getYieldingOps()) {
+      insertSlices.push_back(&yieldingOp);
+    }
+    if (insertSlices.empty())
+      return failure();
+
+    // Move the tilable consumer right after the forall producer to ensure
+    // proper dominance (other users of the forall result may be in between).
+    DominanceInfo domInfo;
+    llvm::SetVector<Operation *> slice;
+    BackwardSliceOptions opts;
+    opts.filter = [&](Operation *op) {
+      return domInfo.properlyDominates(forallProducer.getOperation(), op);
+    };
+    opts.inclusive = true;
+    opts.omitUsesFromAbove = false;
+    opts.omitBlockArguments = true;
+    if (succeeded(getBackwardSlice(tilableOp, &slice, opts))) {
+      Block *block = forallProducer->getBlock();
+      Block::iterator insertPt =
+          std::next(forallProducer->getIterator());
+      for (Operation *op : llvm::reverse(slice)) {
+        op->moveBefore(block, insertPt);
+      }
+    }
+
+    SmallVector<LoopLikeOpInterface> loops = {
+        cast<LoopLikeOpInterface>(forallProducer.getOperation())};
+    auto fusionResult = scf::tileAndFuseConsumerOfSlices(
+        rewriter, insertSlices, loops);
+    if (failed(fusionResult))
+      return failure();
+
     return success();
   }
 };
@@ -752,6 +834,7 @@ struct NovaGPUFuseAndHoistParallelLoopsPass
       if (maybeFlatWorkgroupSize) {
         patterns.add<FuseForalls>(ctx, *maybeFlatWorkgroupSize, /*benefit=*/2);
       }
+      patterns.add<FuseTilableForallConsumers>(ctx);
       patterns.add<HoistForallFromFor>(ctx);
       tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
       tensor::populateFoldTensorEmptyPatterns(patterns);
@@ -770,6 +853,7 @@ struct NovaGPUFuseAndHoistParallelLoopsPass
       RewritePatternSet patterns(ctx);
       patterns.add<FuseTilableDestinationProducers>(ctx);
       patterns.add<FuseUnitLoopDestination>(ctx);
+      patterns.add<FuseTilableForallConsumers>(ctx);
       patterns.add<FuseExtractSliceConsumers>(ctx);
       tensor::populateFoldTensorEmptyPatterns(patterns);
       scf::ForallOp::getCanonicalizationPatterns(patterns, ctx);

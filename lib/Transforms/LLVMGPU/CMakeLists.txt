@@ -25,6 +25,10 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaGPUSelectLoweringStrategy.cpp
   # Phase 6: Fuse and hoist parallel loops (mirrors IREE GPUFuseAndHoistParallelLoops)
   NovaGPUFuseAndHoistParallelLoops.cpp
+  # Normalize scf.forall bounds to lb=0, step=1 (mirrors IREE NormalizeLoopBounds)
+  NovaNormalizeLoopBounds.cpp
+  # Convert workgroup memref.alloc → memref.global + drop deallocs (mirrors IREE)
+  NovaConvertSharedMemAllocs.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include
@@ -59,8 +63,15 @@ add_mlir_library(NovaLLVMGPUTransforms
   MLIROpenMPDialect
   MLIRAnalysis
   MLIRTensorTransforms
+  MLIRTransformDialect
+  MLIRTransformDialectTransforms
+  MLIRLinalgTransformOps
+  MLIRSCFToControlFlow
+  MLIRAffineToStandard
   
   # IREE Dependencies (Using existing Nova linkage/vendored paths if available, otherwise adapting)
   # For now, assuming we implement simplified versions or link against IREE libraries if setup.
   # Given previous context, we likely reimplement simplified passes.
 )
+
+add_compile_definitions(NOVA_SOURCE_DIR="${PROJECT_SOURCE_DIR}")

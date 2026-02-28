@@ -37,6 +37,16 @@ static bool hasThreadMapping(scf::ForallOp forall) {
   });
 }
 
+/// Returns true if the given scf.forall has a block-level mapping attribute
+/// (i.e., a workgroup-level distribution loop).
+static bool isWorkgroupForall(scf::ForallOp forall) {
+  if (!forall.getMapping().has_value())
+    return false;
+  return llvm::any_of(*forall.getMapping(), [](Attribute attr) {
+    return isa<gpu::GPUBlockMappingAttr>(attr);
+  });
+}
+
 /// Returns true when `alloc` is *definitely* shared memory.
 /// This mirrors IREE's isDefinitelyShared():
 ///   - The alloc is used as the initial value for the shared_outs of ≥1
@@ -52,6 +62,28 @@ static bool isDefinitelyShared(bufferization::AllocTensorOp alloc) {
     return false;
   }
   return true;
+}
+
+/// Returns true when `alloc` is used across workgroup boundaries.
+/// Such buffers must live in global memory (no address space tag).
+/// A buffer is cross-workgroup if:
+///   - It is defined at the function body level (not inside any forall), AND
+///   - At least one user is a workgroup-level scf.forall (it feeds as
+///     shared_outs init for workgroup distribution).
+static bool isCrossWorkgroupUsed(bufferization::AllocTensorOp alloc) {
+  // If defined inside a forall, it's local to that scope.
+  auto parentForall = alloc->getParentOfType<scf::ForallOp>();
+  if (parentForall)
+    return false;
+
+  // Check if any user is a workgroup-level forall.
+  for (auto *user : alloc->getUsers()) {
+    if (auto forallOp = dyn_cast<scf::ForallOp>(user)) {
+      if (isWorkgroupForall(forallOp))
+        return true;
+    }
+  }
+  return false;
 }
 
 struct NovaGPUInferMemorySpacePass
@@ -92,6 +124,9 @@ struct NovaGPUInferMemorySpacePass
       // Infer based on usage pattern.
       if (isDefinitelyShared(alloc)) {
         alloc.setMemorySpaceAttr(workgroupSpace);
+      } else if (isCrossWorkgroupUsed(alloc)) {
+        // Cross-workgroup buffer: leave without memory space (global memory).
+        // The allocation function will emit a plain memref.alloc.
       } else {
         alloc.setMemorySpaceAttr(privateSpace);
       }

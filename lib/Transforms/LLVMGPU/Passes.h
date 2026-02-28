@@ -107,6 +107,25 @@ void addNovaGPUBufferizePasses(OpPassManager &pm);
 std::unique_ptr<Pass> createNovaGPUComprehensiveBufferizePass();
 void registerNovaGPUComprehensiveBufferizePass();
 
+// Inserts gpu.barrier before/after memref.copy ops involving workgroup memory.
+// Must run AFTER bufferization (gpu.barrier breaks OneShotBufferize analysis).
+std::unique_ptr<Pass> createNovaGPUInsertWorkgroupBarriersPass();
+void registerNovaGPUInsertWorkgroupBarriersPass();
+
+// Normalizes scf.forall loop bounds to lb=0, step=1.
+// Inserts affine.apply ops to compute denormalized induction variable values.
+// Must run before GPU distribution (map_forall_to_blocks requires normalized foralls).
+// Mirrors IREE's NormalizeLoopBoundsPass.
+std::unique_ptr<Pass> createNovaNormalizeLoopBoundsPass();
+void registerNovaNormalizeLoopBoundsPass();
+
+// Converts workgroup memref.alloc → memref.global + memref.get_global and
+// erases workgroup memref.dealloc. GPU shared memory must be statically
+// declared at module level (not dynamically allocated via malloc).
+// Ported from IREE's ConvertSharedMemAllocOp + DropSharedMemoryDeallocOp.
+std::unique_ptr<Pass> createNovaConvertSharedMemAllocsPass();
+void registerNovaConvertSharedMemAllocsPass();
+
 } // namespace nova
 } // namespace mlir
 

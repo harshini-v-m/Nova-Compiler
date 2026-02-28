@@ -24,6 +24,27 @@ static bool isComputeOp(Operation *op) {
   return isa<TilingInterface>(op);
 }
 
+/// Returns true if the op is a contraction-like op (e.g. matmul).
+static bool isContractionOp(Operation *op) {
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  return linalgOp && linalg::isaContractionOpInterface(linalgOp);
+}
+
+/// Returns true if the op is already inside any scf.forall distribution loop.
+static bool isInsideWorkgroupForall(Operation *op) {
+  auto parent = op->getParentOfType<scf::ForallOp>();
+  while (parent) {
+    auto mapping = parent.getMappingAttr();
+    if (mapping && llvm::any_of(mapping.getValue(), [](Attribute attr) {
+          return isa<gpu::GPUBlockMappingAttr>(attr);
+        })) {
+      return true;
+    }
+    parent = parent->getParentOfType<scf::ForallOp>();
+  }
+  return false;
+}
+
 /// Collects all compute operations in the function.
 static SmallVector<Operation *> getComputeOps(func::FuncOp funcOp) {
   SmallVector<Operation *> computeOps;
@@ -192,134 +213,160 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
     func::FuncOp funcOp = getOperation();
     IRRewriter rewriter(&getContext());
 
-    // 1. Find Root Op.
-    // Matches IREE's heuristic: select the last compute op that has a workgroup
-    // tiling level. Since Nova lacks LoweringConfigAttr, we select the last
-    // compute op (IREE selects last op with a lowering config).
-    SmallVector<Operation *> computeOps = getComputeOps(funcOp);
-    Operation *rootOp = computeOps.empty() ? nullptr : computeOps.back();
-    if (!rootOp) return;
+    // =========================================================================
+    // Two-pass tiling strategy (mirrors IREE's dispatch formation):
+    //
+    // Pass 1: Tile contraction ops (matmuls) in FORWARD order. After tiling
+    //         each matmul, fuse downstream elementwise consumers (bias, relu)
+    //         as epilogues. This gives: matmul+bias+relu per kernel.
+    //
+    // Pass 2: Tile any remaining unfused compute ops (standalone elementwise
+    //         ops that are not consumers of any matmul).
+    //
+    // Previously we iterated in REVERSE, which caused elementwise ops between
+    // two matmuls (relu1 between matmul1 and matmul2) to be fused as
+    // PRODUCERS of the later matmul — causing redundant recomputation.
+    // =========================================================================
 
-    // 2. Info
-    auto infoOr = getTiledAndDistributionInfo(rewriter, rootOp);
-    if (failed(infoOr)) return;
-    TilingInfo info = *infoOr;
-    auto tilingInterface = cast<TilingInterface>(rootOp);
+    // --- Helper lambda: tile a root op, fuse producers + consumers -----------
+    auto tileRoot = [&](Operation *rootOp) -> LogicalResult {
+      // 2. Info
+      auto infoOr = getTiledAndDistributionInfo(rewriter, rootOp);
+      if (failed(infoOr))
+        return success(); // skip non-tilable ops gracefully
+      TilingInfo info = *infoOr;
+      auto tilingInterface = cast<TilingInterface>(rootOp);
 
-    // 2b. Collect Fusion Cluster
-    llvm::SmallDenseSet<Operation *> tiledAndFusedOps;
-    collectTiledAndFusedOps(rootOp, tiledAndFusedOps);
-    
-    DominanceInfo dominanceInfo(rootOp);
-    llvm::DenseSet<Operation *> yieldReplacementsFor;
-    for (auto op : tiledAndFusedOps) {
-        // Require replacement for values that are used after the main tilable op or
-        // by ops that will definitely not be fused. Note that if a value is used as
-        // an init of a DPS op, the user currently cannot be fused. Having a
-        // replacement for it would attempt fusion and fail, so avoid such cases.
+      // 2b. Collect Fusion Cluster
+      llvm::SmallDenseSet<Operation *> tiledAndFusedOps;
+      collectTiledAndFusedOps(rootOp, tiledAndFusedOps);
+
+      DominanceInfo dominanceInfo(rootOp);
+      llvm::DenseSet<Operation *> yieldReplacementsFor;
+      for (auto op : tiledAndFusedOps) {
         if (llvm::any_of(op->getUsers(), [&](Operation *user) {
-              if (isUsedAsInit(op, user)) {
+              if (isUsedAsInit(op, user))
                 return false;
-              }
               return dominanceInfo.properlyDominates(rootOp, user) ||
                      !tiledAndFusedOps.contains(user);
             })) {
           yieldReplacementsFor.insert(op);
         }
-    }
+      }
 
-    // 3. Configure Options
-    scf::SCFTilingOptions tilingOptions;
-    tilingOptions.setTileSizes(info.tileSizes);
-    
-    auto mapping = getMapping(&getContext(), info.tileSizes);
-    tilingOptions.setMapping(mapping);
-    tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
-    
-    // TODO: Implement WorkgroupReorderingStrategy (see missing_functionality_analysis.md #8)
-    // Support custom loop generation for advanced workgroup iteration orders (e.g., Z-order curves).
-    // if (workgroupReorderingStrategy) {
-    //   tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::CustomOp);
-    //   tilingOptions.setCustomLoopGenerationFns(loopHeaderFn, terminatorFn);
-    // }
+      // 3. Configure Options
+      scf::SCFTilingOptions tilingOptions;
+      tilingOptions.setTileSizes(info.tileSizes);
+      auto mapping = getMapping(&getContext(), info.tileSizes);
+      tilingOptions.setMapping(mapping);
+      tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
 
-    // 4. Fusion Options
-    scf::SCFTileAndFuseOptions tileAndFuseOptions;
-    tileAndFuseOptions.setTilingOptions(tilingOptions);
-    
-    // Control Fn - Skip Pad fusion, use yieldReplacementsFor
-    tileAndFuseOptions.setFusionControlFn([&](tensor::ExtractSliceOp sliceOp, OpResult producer, bool isDest) 
-                                           -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
-        Operation* producerOp = producer.getOwner();
-        if (isa<tensor::PadOp>(producerOp)) return std::nullopt; 
-        bool yieldProducerReplacement = yieldReplacementsFor.contains(producerOp);
-        return scf::SCFTileAndFuseOptions::ControlFnResult{yieldProducerReplacement}; 
-    });
+      // 4. Fusion Options
+      scf::SCFTileAndFuseOptions tileAndFuseOptions;
+      tileAndFuseOptions.setTilingOptions(tilingOptions);
 
-    // 5. Cleanup Patterns
-    RewritePatternSet cleanupPatterns(&getContext());
-    tensor::ExtractSliceOp::getCanonicalizationPatterns(cleanupPatterns, &getContext());
-    tensor::DimOp::getCanonicalizationPatterns(cleanupPatterns, &getContext());
-    tensor::populateMergeConsecutiveInsertExtractSlicePatterns(cleanupPatterns);
-    
-    // Add ExtractSliceOfPadTensorSwapPattern without zero guard
-    cleanupPatterns.add<linalg::ExtractSliceOfPadTensorSwapPattern>(
+      tileAndFuseOptions.setFusionControlFn(
+          [&](tensor::ExtractSliceOp sliceOp, OpResult producer,
+              bool isDest)
+              -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+            Operation *producerOp = producer.getOwner();
+            if (isa<tensor::PadOp>(producerOp))
+              return std::nullopt;
+            // Block contraction fusion — GEMMs stay as independent roots.
+            if (isContractionOp(producerOp))
+              return std::nullopt;
+            bool yieldProducerReplacement =
+                yieldReplacementsFor.contains(producerOp);
+            return scf::SCFTileAndFuseOptions::ControlFnResult{
+                yieldProducerReplacement};
+          });
+
+      // 5. Cleanup Patterns
+      RewritePatternSet cleanupPatterns(&getContext());
+      tensor::ExtractSliceOp::getCanonicalizationPatterns(cleanupPatterns,
+                                                         &getContext());
+      tensor::DimOp::getCanonicalizationPatterns(cleanupPatterns,
+                                                &getContext());
+      tensor::populateMergeConsecutiveInsertExtractSlicePatterns(
+          cleanupPatterns);
+      cleanupPatterns.add<linalg::ExtractSliceOfPadTensorSwapPattern>(
           &getContext(), [](tensor::ExtractSliceOp) { return false; });
-    
-    // TODO: Add additional cleanup patterns (see missing_functionality_analysis.md #9)
-    // populateSwapExtractWithExpandPattern(cleanupPatterns);
-    // populateFoldExtractSliceOfBroadcastPattern(cleanupPatterns);
+      tileAndFuseOptions.cleanupPatterns =
+          FrozenRewritePatternSet(std::move(cleanupPatterns));
 
-    tileAndFuseOptions.cleanupPatterns = FrozenRewritePatternSet(std::move(cleanupPatterns));
+      // 6. Execute Tile & Fuse (Producer Fusion)
+      FailureOr<scf::SCFTileAndFuseResult> result;
+      if (rootOp->getNumResults() > 0) {
+        result = scf::tileConsumerAndFuseProducersUsingSCF(
+            rewriter, tilingInterface, tileAndFuseOptions);
+      } else {
+        auto tileResult =
+            scf::tileUsingSCF(rewriter, tilingInterface, tilingOptions);
+        if (succeeded(tileResult))
+          rewriter.eraseOp(rootOp);
+        return success();
+      }
 
-    // 6. Execute Tile & Fuse (Producer Fusion)
-    FailureOr<scf::SCFTileAndFuseResult> result;
-    if (rootOp->getNumResults() > 0) {
-        result = scf::tileConsumerAndFuseProducersUsingSCF(rewriter, tilingInterface, tileAndFuseOptions);
-    } else {
-        auto tileResult = scf::tileUsingSCF(rewriter, tilingInterface, tilingOptions);
-        if (succeeded(tileResult)) {
-            rewriter.eraseOp(rootOp);
-        }
-        return; 
-    }
+      if (failed(result))
+        return failure();
 
-    if (failed(result)) {
-        signalPassFailure();
-        return;
-    }
-
-    // Replace results (with dominance check)
-    for (auto [origValue, replacement] : result->replacements) {
+      // Replace results (with dominance check)
+      for (auto [origValue, replacement] : result->replacements) {
         Value replacementCopy = replacement;
-        rewriter.replaceUsesWithIf(origValue, replacement, [&](OpOperand &use) {
-            Operation *user = use.getOwner();
-            return !isa<tensor::DimOp>(user) &&
-                   dominanceInfo.dominates(replacementCopy, user);
-        });
-    }
+        rewriter.replaceUsesWithIf(
+            origValue, replacement, [&](OpOperand &use) {
+              Operation *user = use.getOwner();
+              return !isa<tensor::DimOp>(user) &&
+                     dominanceInfo.dominates(replacementCopy, user);
+            });
+      }
 
-    // 7. Execute Consumer Fusion
-    SmallVector<LoopLikeOpInterface> loops = result->loops;
-    if (!result->tiledAndFusedOps.empty() && !loops.empty()) {
-         FailureOr<std::queue<Operation *>> newFusionOpportunities =
+      // 7. Execute Consumer Fusion (epilogue: bias, relu, etc.)
+      SmallVector<LoopLikeOpInterface> loops = result->loops;
+      if (!result->tiledAndFusedOps.empty() && !loops.empty()) {
+        FailureOr<std::queue<Operation *>> newFusionOpportunities =
             fuseConsumersIntoForall(
-                rewriter, result->tiledAndFusedOps.getArrayRef(),
-                loops, [&](Operation *op) {
+                rewriter, result->tiledAndFusedOps.getArrayRef(), loops,
+                [&](Operation *op) {
+                  // Only fuse non-contraction consumers. Contraction ops
+                  // (matmuls) must remain independent roots — fusing them
+                  // as consumers would collapse all layers into one forall.
+                  if (isContractionOp(op))
+                    return false;
                   return tiledAndFusedOps.contains(op);
                 });
-
-         if (succeeded(newFusionOpportunities)) {
-            fuseProducersOfSlices(rewriter, *newFusionOpportunities,
-                                tileAndFuseOptions, loops);
-        } else {
-            // Verify that consumer fusion didn't leave compute ops outside
-            if (!verifyComputeOpsAfterDistribution(funcOp)) {
-                funcOp.emitOpError("failed to fuse all consumers into scf.forall");
-                signalPassFailure();
-                return;
-            }
+        if (succeeded(newFusionOpportunities)) {
+          fuseProducersOfSlices(rewriter, *newFusionOpportunities,
+                               tileAndFuseOptions, loops);
         }
+      }
+      return success();
+    };
+
+    // --- Pass 1: Tile contraction ops (matmuls) in forward order -------------
+    // Consumer fusion will pull bias+relu into each matmul's forall.
+    SmallVector<Operation *> computeOps = getComputeOps(funcOp);
+    for (Operation *rootOp : computeOps) {
+      if (isInsideWorkgroupForall(rootOp))
+        continue;
+      if (!isContractionOp(rootOp))
+        continue;
+      if (failed(tileRoot(rootOp))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // --- Pass 2: Tile remaining unfused compute ops --------------------------
+    // Handles standalone elementwise ops that weren't fused as consumers.
+    SmallVector<Operation *> remainingOps = getComputeOps(funcOp);
+    for (Operation *rootOp : remainingOps) {
+      if (isInsideWorkgroupForall(rootOp))
+        continue;
+      if (failed(tileRoot(rootOp))) {
+        signalPassFailure();
+        return;
+      }
     }
     
     // TODO: Implement transpose workgroup support (see missing_functionality_analysis.md #10)
@@ -360,6 +407,12 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       }
     }
 
+    // Final verification: Ensure all compute ops are now inside workgroup loops.
+    if (!verifyComputeOpsAfterDistribution(funcOp)) {
+        funcOp.emitOpError("failed to distribute all compute ops to workgroups");
+        signalPassFailure();
+        return;
+    }
   }
 
   StringRef getArgument() const override { return "nova-tile-and-distribute"; }

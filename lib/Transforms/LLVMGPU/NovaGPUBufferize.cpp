@@ -1,27 +1,29 @@
 // Nova GPU Comprehensive Bufferize Pass
 //
 // This is Nova's equivalent of IREE's IREEComprehensiveBufferizePass.
-// It performs three jobs in one pass:
+// It performs two jobs:
 //
-//  1. GAP 2 — Erase nova.fusion_barrier ops (they are pure identities that
-//             only block fusion analysis during tiling; they have no
-//             bufferized form and must be removed before bufferization).
+//  1. Erase nova.fusion_barrier ops (they are pure identities that
+//     only block fusion analysis during tiling; they have no
+//     bufferized form and must be removed before bufferization).
 //
-//  2. GAP 3 — Run OneShotBufferize with GPU-aware allocation + copy functions:
-//
-//     allocationFn (mirrors IREE's gpuRequireMemSpaceAllocationFn):
+//  2. Run OneShotBufferize on the whole module with:
+//     - bufferizeFunctionBoundaries = true
+//       → converts function signature from tensors to memrefs
+//     - function-boundary-type-conversion = identity-layout-map
+//       → uses contiguous memref types (no strided layouts)
+//       → produces clean `memref<NxMxf32>` function args for GPU kernels
+//     - GPU-aware allocation function:
 //       * #gpu.address_space<workgroup>  → memref.alloc  (shared SRAM)
-//       * #gpu.address_space<private>   → memref.alloca (per-thread register)
-//       * no memory space specified     → memref.alloca (default, no space tag)
-//
-//     memCpyFn:
+//       * #gpu.address_space<private>   → memref.alloc  (per-thread, dealloc'd later)
+//       * no memory space specified     → memref.alloc  (default)
+//     - GPU-aware copy function:
 //       * emits memref.copy
 //       * wraps the copy with gpu.barrier when either operand is in
 //         workgroup (shared) memory.
 //
 // IREE reference:
 //   IREEComprehensiveBufferizePass::runOnOperation()
-//   (iree/compiler/src/iree/compiler/Codegen/Common/IREEComprehensiveBufferizePass.cpp)
 
 #include "Passes.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
@@ -45,6 +47,9 @@ namespace mlir::nova {
 // ---------------------------------------------------------------------------
 // GPU allocation function — mirrors IREE's gpuRequireMemSpaceAllocationFn
 // ---------------------------------------------------------------------------
+// Routes the allocation to the right MLIR op based on memory space.
+// With bufferizeFunctionBoundaries=true, this is called for ALL allocations
+// including function result buffers.
 static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
                                                         Location loc,
                                                         MemRefType memRefType,
@@ -54,33 +59,33 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
   if (memSpace && !isa<gpu::AddressSpaceAttr>(memSpace))
     return failure();
 
-  auto privSpace = gpu::AddressSpaceAttr::get(
+  auto privateSpace = gpu::AddressSpaceAttr::get(
       builder.getContext(), gpu::GPUDialect::getPrivateAddressSpace());
   auto wkgpSpace = gpu::AddressSpaceAttr::get(
       builder.getContext(), gpu::GPUDialect::getWorkgroupAddressSpace());
 
-  // No explicit GPU address space → default to private (per-thread).
-  // Note: This may create large private allocas for the output buffer.
-  // This is resolved later when scf.forall → gpu.launch converts
-  // the function into a kernel where output is in global memory.
-  if (!memSpace) {
+  // Workgroup (shared) memory → heap allocated for the whole workgroup.
+  if (memSpace && cast<gpu::AddressSpaceAttr>(memSpace).getValue() ==
+                      gpu::GPUDialect::getWorkgroupAddressSpace()) {
     auto allocType =
         MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
-                        AffineMap(), privSpace);
+                        AffineMap(), wkgpSpace);
+    return memref::AllocOp::create(builder, loc, allocType, dynamicSizes)
+        .getResult();
+  }
+
+  // Private → memref.alloca (stack/register)
+  if (memSpace) {
+    auto allocType =
+        MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
+                        AffineMap(), privateSpace);
     return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
         .getResult();
   }
 
-  // Explicit private → per-thread register/stack.
-  if (memSpace == privSpace)
-    return memref::AllocaOp::create(builder, loc, memRefType, dynamicSizes)
-        .getResult();
-
-  // Workgroup (shared) memory → heap allocated for the whole workgroup.
-  auto allocType =
-      MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
-                      AffineMap(), wkgpSpace);
-  return memref::AllocOp::create(builder, loc, allocType, dynamicSizes)
+  // No memory space → default (global memory for cross-kernel buffers).
+  // These are managed by buffer-deallocation-pipeline.
+  return memref::AllocOp::create(builder, loc, memRefType, dynamicSizes)
       .getResult();
 }
 
@@ -91,25 +96,24 @@ static bool isWorkgroupMemref(MemRefType t) {
          space.getValue() == gpu::GPUDialect::getWorkgroupAddressSpace();
 }
 
-// GPU copy function — inserts gpu.barrier before/after workgroup copies.
+// GPU copy function — emits a plain memref.copy.
+// NOTE: gpu.barrier is NOT inserted here because it breaks OneShotBufferize
+// analysis for multi-op functions (barrier has "unknown memory side effects").
+// Barriers around workgroup memory copies are inserted post-bufferization
+// in addNovaGPUBufferizePasses.
+// This matches IREE's TileAndFuse pipeline which also uses a plain copy.
 static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
                                Value to) {
-  bool needsBarrier = isWorkgroupMemref(cast<MemRefType>(from.getType())) ||
-                      isWorkgroupMemref(cast<MemRefType>(to.getType()));
-  if (needsBarrier)
-    gpu::BarrierOp::create(builder, loc);
   memref::CopyOp::create(builder, loc, from, to);
-  if (needsBarrier)
-    gpu::BarrierOp::create(builder, loc);
   return success();
 }
 
 // ---------------------------------------------------------------------------
-// Pass definition — operates on func::FuncOp
+// Pass definition — operates on ModuleOp for function boundary bufferization
 // ---------------------------------------------------------------------------
 struct NovaGPUComprehensiveBufferizePass
     : public PassWrapper<NovaGPUComprehensiveBufferizePass,
-                         OperationPass<func::FuncOp>> {
+                         OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
       NovaGPUComprehensiveBufferizePass)
 
@@ -124,26 +128,32 @@ struct NovaGPUComprehensiveBufferizePass
   }
 
   void runOnOperation() override {
-    func::FuncOp funcOp = getOperation();
+    ModuleOp moduleOp = getOperation();
 
-    // --- GAP 2: Erase nova.fusion_barrier ops. ----------------------------
-    IRRewriter rewriter(funcOp.getContext());
+    // Erase nova.fusion_barrier ops across all functions.
+    IRRewriter rewriter(moduleOp.getContext());
     SmallVector<FusionBarrierOp> barriers;
-    funcOp.walk([&](FusionBarrierOp b) { barriers.push_back(b); });
+    moduleOp.walk([&](FusionBarrierOp b) { barriers.push_back(b); });
     for (FusionBarrierOp b : barriers)
       rewriter.replaceOp(b, b.getSource());
 
-    // --- GAP 3: GPU-aware OneShotBufferize. --------------------------------
+    // GPU-aware OneShotBufferize on the whole module.
     bufferization::OneShotBufferizationOptions opts;
     opts.allocationFn = gpuRequireMemSpaceAllocationFn;
     opts.memCpyFn = gpuCopyFn;
-    opts.bufferizeFunctionBoundaries = false;
+    // Bufferize function boundaries: convert function signatures from
+    // tensors to memrefs, eliminating bufferization.to_buffer/to_tensor.
+    opts.bufferizeFunctionBoundaries = true;
+    // Use identity layout: produces clean contiguous memref types
+    // (memref<NxMxf32>) instead of strided types for function args/results.
+    opts.setFunctionBoundaryTypeConversion(
+        bufferization::LayoutMapOption::IdentityLayoutMap);
     opts.checkParallelRegions = false;
 
     bufferization::BufferizationState bufState;
     if (failed(
-            bufferization::runOneShotBufferize(funcOp, opts, bufState))) {
-      funcOp.emitOpError("GPU-aware bufferization failed");
+            bufferization::runOneShotBufferize(moduleOp, opts, bufState))) {
+      moduleOp.emitOpError("GPU-aware bufferization failed");
       return signalPassFailure();
     }
   }
@@ -153,8 +163,8 @@ struct NovaGPUComprehensiveBufferizePass
   }
   StringRef getDescription() const override {
     return "Erases nova.fusion_barrier ops then runs OneShotBufferize with "
-           "GPU-aware allocation (workgroup=memref.alloc, "
-           "private=memref.alloca) and barrier-fenced copies";
+           "GPU-aware allocation, identity layout map for function boundaries, "
+           "and barrier-fenced copies for workgroup memory";
   }
 };
 
@@ -164,6 +174,146 @@ std::unique_ptr<Pass> createNovaGPUComprehensiveBufferizePass() {
 
 void registerNovaGPUComprehensiveBufferizePass() {
   PassRegistration<NovaGPUComprehensiveBufferizePass>();
+}
+
+// ---------------------------------------------------------------------------
+// Post-bufferization barrier insertion pass
+// Walks memref.copy ops and inserts gpu.barrier before/after copies
+// involving workgroup (shared) memory. This must run AFTER bufferization
+// because gpu.barrier has "unknown side effects" that break
+// OneShotBufferize analysis.
+// ---------------------------------------------------------------------------
+
+/// Returns true if `op` (or any op nested inside it) stores to workgroup memory.
+static bool hasWorkgroupStores(Operation *op) {
+  bool found = false;
+  op->walk([&](memref::StoreOp storeOp) {
+    if (isWorkgroupMemref(cast<MemRefType>(storeOp.getMemRef().getType())))
+      found = true;
+  });
+  if (!found) {
+    op->walk([&](memref::CopyOp copyOp) {
+      if (isWorkgroupMemref(cast<MemRefType>(copyOp.getTarget().getType())))
+        found = true;
+    });
+  }
+  return found;
+}
+
+/// Returns true if `op` (or any op nested inside it) loads from workgroup memory.
+static bool hasWorkgroupLoads(Operation *op) {
+  bool found = false;
+  op->walk([&](memref::LoadOp loadOp) {
+    if (isWorkgroupMemref(cast<MemRefType>(loadOp.getMemRef().getType())))
+      found = true;
+  });
+  if (!found) {
+    op->walk([&](memref::CopyOp copyOp) {
+      if (isWorkgroupMemref(cast<MemRefType>(copyOp.getSource().getType())))
+        found = true;
+    });
+  }
+  return found;
+}
+
+struct NovaGPUInsertWorkgroupBarriersPass
+    : public PassWrapper<NovaGPUInsertWorkgroupBarriersPass,
+                         OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      NovaGPUInsertWorkgroupBarriersPass)
+
+  NovaGPUInsertWorkgroupBarriersPass() = default;
+  NovaGPUInsertWorkgroupBarriersPass(
+      const NovaGPUInsertWorkgroupBarriersPass &) = default;
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect>();
+  }
+
+  void runOnOperation() override {
+    func::FuncOp funcOp = getOperation();
+    OpBuilder builder(funcOp.getContext());
+
+    // Strategy: walk inside gpu.launch bodies and find transition points
+    // where workgroup stores are followed by workgroup loads. Insert
+    // gpu.barrier at each such transition.
+    //
+    // The pattern in the K-loop body is:
+    //   scf.for { store to workgroup }    // global → shared copy
+    //   scf.for { load from workgroup }   // shared → private copy
+    //   scf.for { store to workgroup }    // global → shared copy (op B)
+    //   scf.for { load from workgroup }   // shared → private copy (op B)
+    //   scf.for { compute }               // matmul from private
+    //
+    // We need barriers between write-then-read transitions.
+
+    funcOp.walk([&](gpu::LaunchOp launchOp) {
+      // Walk all scf.for ops to find K-loops or any loop with workgroup
+      // write→read transitions in its body.
+      launchOp.walk([&](scf::ForOp forOp) {
+        insertBarriersAtTransitions(builder, forOp);
+      });
+    });
+
+    // Also handle memref.copy ops (in case any remain un-lowered).
+    funcOp.walk([&](memref::CopyOp copyOp) {
+      bool needsBarrier = false;
+      if (isWorkgroupMemref(cast<MemRefType>(copyOp.getSource().getType())))
+        needsBarrier = true;
+      if (isWorkgroupMemref(cast<MemRefType>(copyOp.getTarget().getType())))
+        needsBarrier = true;
+
+      if (!needsBarrier)
+        return;
+
+      builder.setInsertionPoint(copyOp);
+      gpu::BarrierOp::create(builder, copyOp.getLoc());
+      builder.setInsertionPointAfter(copyOp);
+      gpu::BarrierOp::create(builder, copyOp.getLoc());
+    });
+  }
+
+  /// Walk the body of `forOp` and insert gpu.barrier between consecutive
+  /// top-level ops where the first writes to workgroup memory and the
+  /// next reads from workgroup memory.
+  void insertBarriersAtTransitions(OpBuilder &builder, scf::ForOp forOp) {
+    Block *body = forOp.getBody();
+    SmallVector<std::pair<Operation *, Operation *>> transitions;
+
+    Operation *prevOp = nullptr;
+    for (Operation &op : body->getOperations()) {
+      // Skip the yield terminator.
+      if (isa<scf::YieldOp>(op))
+        continue;
+
+      if (prevOp && hasWorkgroupStores(prevOp) && hasWorkgroupLoads(&op)) {
+        transitions.push_back({prevOp, &op});
+      }
+      prevOp = &op;
+    }
+
+    // Insert barriers (in reverse to avoid invalidating iterators).
+    for (auto [writerOp, readerOp] : llvm::reverse(transitions)) {
+      builder.setInsertionPoint(readerOp);
+      gpu::BarrierOp::create(builder, readerOp->getLoc());
+    }
+  }
+
+  StringRef getArgument() const override {
+    return "nova-gpu-insert-workgroup-barriers";
+  }
+  StringRef getDescription() const override {
+    return "Inserts gpu.barrier at workgroup memory write→read transitions "
+           "inside gpu.launch bodies. Runs post-bufferization.";
+  }
+};
+
+std::unique_ptr<Pass> createNovaGPUInsertWorkgroupBarriersPass() {
+  return std::make_unique<NovaGPUInsertWorkgroupBarriersPass>();
+}
+
+void registerNovaGPUInsertWorkgroupBarriersPass() {
+  PassRegistration<NovaGPUInsertWorkgroupBarriersPass>();
 }
 
 } // namespace mlir::nova

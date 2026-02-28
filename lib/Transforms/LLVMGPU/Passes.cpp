@@ -1,5 +1,6 @@
 #include "Passes.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
+#include "Compiler/Transforms/Passes.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
@@ -10,6 +11,22 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Vector/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
+#include "mlir/Dialect/Transform/Transforms/Passes.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
+// LLVM lowering
+#include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
+#include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
+#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+#include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
 
 using namespace mlir;
 
@@ -41,93 +58,221 @@ namespace mlir::nova {
 
 void addNovaGPUOptimizedPipeline(OpPassManager &pm,
                                   StringRef cudaArch) {
+  // All custom Nova passes operate on func::FuncOp, so we nest them
+  // inside a func-level pass manager when the outer PM is module-level.
+
   // -------------------------------------------------------------------------
   // Step 0: Select lowering strategy
-  // Computes tile sizes / MMA intrinsic / promoted operands for every linalg
-  // matmul and attaches #nova.lowering_config dict attribute.
-  // Mirrors IREE's LLVMGPUSelectLoweringStrategy.
   // -------------------------------------------------------------------------
-  pm.addPass(createNovaGPUSelectLoweringStrategyPass(cudaArch));
+  pm.addNestedPass<func::FuncOp>(
+      createNovaGPUSelectLoweringStrategyPass(cudaArch));
 
   // -------------------------------------------------------------------------
-  // Step 1: Tile and distribute to workgroups using scf.forall {block_id}
-  // Fuses producers/consumers into the forall loop.
-  // Mirrors IREE's tileAndDistributeToWorkgroup(useForall=true).
+  // Step 1: Tile and distribute to workgroups
   // -------------------------------------------------------------------------
-  pm.addPass(createNovaTileAndDistributeToWorkgroupsPass());
-  // Config-tracking canonicalize: after tile-and-distribute, the original root
-  // op is replaced by a new op inside the forall — propagate its config.
-  pm.addPass(createNovaConfigTrackingCanonicalizerPass());
+  pm.addNestedPass<func::FuncOp>(
+      createNovaTileAndDistributeToWorkgroupsPass());
+  pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
   pm.addPass(createCSEPass());
 
   // -------------------------------------------------------------------------
-  // Step 2: Pad operands to static tile sizes
-  // Enables aligned shared memory copies and better vectorization.
-  // Mirrors IREE's createGPUPadOperandsPass().
+  // Step 2: Pad operands
   // -------------------------------------------------------------------------
-  pm.addPass(createNovaGPUPadOperandsPass());
-  pm.addPass(createNovaConfigTrackingCanonicalizerPass());
+  pm.addNestedPass<func::FuncOp>(createNovaGPUPadOperandsPass());
+  pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
   pm.addPass(createCSEPass());
 
   // -------------------------------------------------------------------------
-  // Step 3: Promote matmul A/B operands to shared memory
-  // Inserts two-stage copy (global→shared) + nova.fusion_barrier.
-  // Mirrors IREE's createGPUPromoteMatmulOperandsPass().
+  // Step 3: Tile reduction (K) dimension   [MOVED BEFORE PROMOTION]
+  // After K-tiling, the matmul operates on [wgM × kStep] and [kStep × wgN]
+  // slices. Promotion in Step 4 then allocates only K-tile-sized shared mem.
   // -------------------------------------------------------------------------
-  pm.addPass(createNovaGPUPromoteMatmulOperandsPass());
-  pm.addPass(createNovaConfigTrackingCanonicalizerPass());
+  pm.addNestedPass<func::FuncOp>(
+      createNovaGPUApplyTilingLevelReductionPass());
+  pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
   pm.addPass(createCSEPass());
 
   // -------------------------------------------------------------------------
-  // Step 4: Tile reduction (K) dimension → sequential scf.for
-  // Fuses A/B linalg.copy producers into the K-loop.
-  // Mirrors IREE's GPUApplyTilingLevel(Reduction).
-  // NOTE: After this pass, the linalg.matmul moves inside scf.for.
-  //       The ConfigTrackingCanonalize below propagates the config into the
-  //       new inner matmul so Thread tiling can read tile sizes from it.
+  // Step 4: Promote matmul A/B operands to shared memory  [MOVED AFTER K-TILE]
+  // Now inside the K-loop, so shared memory holds only one K-tile at a time.
   // -------------------------------------------------------------------------
-  pm.addPass(createNovaGPUApplyTilingLevelReductionPass());
-  // CRITICAL: this canonicalize MUST be config-tracking — the matmul inside
-  // the K-loop is a NEW op without the config attr until we propagate it.
-  pm.addPass(createNovaConfigTrackingCanonicalizerPass());
+  pm.addNestedPass<func::FuncOp>(createNovaGPUPromoteMatmulOperandsPass());
+  pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
   pm.addPass(createCSEPass());
 
   // -------------------------------------------------------------------------
-  // Step 5: Tile thread-level M/N dimensions → per-thread register tiles
-  // Creates a scf.for (or scf.forall) loop over the per-thread M/N tile.
-  // Mirrors IREE's GPUApplyTilingLevel(Thread).
+  // Step 5: Tile thread-level M/N dimensions
   // -------------------------------------------------------------------------
-  pm.addPass(createNovaGPUApplyTilingLevelThreadPass());
-  pm.addPass(createNovaConfigTrackingCanonicalizerPass());
+  pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelThreadPass());
+  pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
   pm.addPass(createCSEPass());
 
   // -------------------------------------------------------------------------
-  // Step 6: Tile subgroup (warp) M/N dimensions → per-warp tiles
-  // Mirrors IREE's GPUApplyTilingLevel(Subgroup).
+  // Step 6: Tile subgroup (warp) M/N dimensions
   // -------------------------------------------------------------------------
-  pm.addPass(createNovaGPUApplyTilingLevelSubgroupPass());
-  pm.addPass(createNovaConfigTrackingCanonicalizerPass());
-  pm.addPass(createCSEPass());
+//   pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelSubgroupPass());
+//   pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
+//   pm.addPass(createCSEPass());
 
   // -------------------------------------------------------------------------
   // Step 7: Fuse and hoist parallel loops
-  // After thread/subgroup tiling we have multiple producer scf.forall {thread}
-  // and consumer scf.forall {thread} ops. This pass greedily merges them into
-  // a single flat forall and hoists foralls out of the K-loop when safe.
-  // CRITICAL: must run BEFORE bufferization (uses tensor-level IR).
-  // Mirrors IREE's createGPUFuseAndHoistParallelLoopsPass().
   // -------------------------------------------------------------------------
-  pm.addPass(createNovaGPUFuseAndHoistParallelLoopsPass());
+  pm.addNestedPass<func::FuncOp>(
+      createNovaGPUFuseAndHoistParallelLoopsPass());
 
   // -------------------------------------------------------------------------
-  // Step 7 (was TODO): GPU-aware bufferization
-  // Erases nova.fusion_barrier, infers memory spaces, bufferizes with GPU
-  // allocation function. Mirrors IREE's addGPUBufferizePasses().
+  // Step 7.5: Normalize forall loop bounds
+  // -------------------------------------------------------------------------
+  pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+
+  // -------------------------------------------------------------------------
+  // Step 8: GPU-aware bufferization
   // -------------------------------------------------------------------------
   addNovaGPUBufferizePasses(pm);
 
-  // TODO: DistributeForall (IREE: GPUDistributeForallPass)
-  // Lowers scf.forall {gpu.thread} → gpu.thread_id indexing.
+  // -------------------------------------------------------------------------
+  // Step 9: scf.forall → gpu.launch via Transform Dialect
+  // -------------------------------------------------------------------------
+  std::string transformFileName =
+      std::string(NOVA_SOURCE_DIR) +
+      "/lib/Transforms/LLVMGPU/gpu_forall_to_launch.mlir";
+  mlir::transform::PreloadLibraryPassOptions preloadOptions;
+  preloadOptions.transformLibraryPaths = {transformFileName};
+  pm.addPass(mlir::transform::createPreloadLibraryPass(preloadOptions));
+
+  mlir::transform::InterpreterPassOptions interpOptions;
+  pm.addPass(mlir::transform::createInterpreterPass(interpOptions));
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+
+  // -------------------------------------------------------------------------
+  // Step 10: Lower remaining linalg → scf loops, affine → arith
+  // -------------------------------------------------------------------------
+  pm.addPass(createConvertLinalgToLoopsPass());
+  pm.addPass(createLowerAffinePass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+
+  // -------------------------------------------------------------------------
+  // Step 11: Insert gpu.barrier at workgroup memory write→read transitions
+  // Must run AFTER linalg-to-loops (so scalar store/load ops are visible)
+  // and AFTER forall→gpu.launch and bufferization.
+  // -------------------------------------------------------------------------
+  pm.addNestedPass<func::FuncOp>(createNovaGPUInsertWorkgroupBarriersPass());
+
+  // -------------------------------------------------------------------------
+  // Step 12: Outline gpu.launch bodies into gpu.module kernels.
+  // This must happen BEFORE the shared-mem conversion so that the
+  // memref.global + memref.get_global for workgroup memory are created
+  // INSIDE the gpu.module (matching IREE's ConvertSharedMemAllocOp flow)
+  // rather than in the outer host module where finalize-memref-to-llvm
+  // cannot lower #gpu.address_space<workgroup> types.
+  // -------------------------------------------------------------------------
+  pm.addPass(createGpuKernelOutliningPass());
+  pm.addPass(createCanonicalizerPass());
+
+  // -------------------------------------------------------------------------
+  // Step 12.5: Inside the gpu.module, convert workgroup memref.alloc ops
+  // to memref.global + memref.get_global and drop workgroup memref.dealloc.
+  // Ported from IREE's ConvertSharedMemAllocOp + DropSharedMemoryDeallocOp
+  // (ConvertToLLVM.cpp:152-203 / GPUPatterns.cpp:211-223).
+  // Running inside gpu.module ensures the globals are scoped to the kernel
+  // and never appear in the outer host module.
+  // -------------------------------------------------------------------------
+  {
+    auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
+    gpuPm.addPass(createNovaConvertSharedMemAllocsPass());
+    gpuPm.addPass(createCanonicalizerPass());
+  }
+
+  // -------------------------------------------------------------------------
+  // Step 12.75: Convert host-side cross-kernel allocations to GPU allocations.
+  // This handles intermediate buffers (e.g. `%alloc = memref.alloc()`) on
+  // the host side that are passed into GPU kernels, converting them from
+  // default memory space `memref.alloc` to `gpu.alloc` (which lowers to
+  // `cudaMalloc`).
+  // -------------------------------------------------------------------------
+  pm.addPass(nova::createConvertMemRefToGpuPass());
+  pm.addPass(createCanonicalizerPass());
+
+  // -------------------------------------------------------------------------
+  // Step 13: Full CUDA/NVVM LLVM lowering
+  // Lowers gpu.module → PTX binary, then lowers host code → LLVM IR.
+  // Mirrors IREE's addLowerToLLVMGPUPasses (LLVMGPU/Passes.cpp).
+  // -------------------------------------------------------------------------
+
+  // 13.0 — Attach an NVVM target descriptor to each gpu.module so that
+  // createGpuModuleToBinaryPass knows how to compile it to PTX.
+  GpuNVVMAttachTargetOptions nvvmTargetOptions;
+  nvvmTargetOptions.triple = "nvptx64-nvidia-cuda";
+  nvvmTargetOptions.chip = cudaArch.empty() ? "sm_80" : cudaArch.str();
+  nvvmTargetOptions.optLevel = 3;
+  nvvmTargetOptions.fastFlag = true;
+  nvvmTargetOptions.ftzFlag  = true;
+  pm.addPass(createGpuNVVMAttachTarget(nvvmTargetOptions));
+
+  // 13.1 — Async gpu region: wrap gpu.launch_func in async token chains
+  //         (required by GpuModuleToBinaryPass).
+  pm.addPass(createGpuAsyncRegionPass());
+
+  // 13.2 — Lower the contents of each gpu.module to NVVM / LLVM.
+  //
+  // Pass ordering is critical here:
+  //   1. expand-strided-metadata: decompose memref.subview → 
+  //      memref.extract_strided_metadata + affine.apply + reinterpret_cast.
+  //      Must run while operands are still memref types (before gpu-to-nvvm).
+  //   2. lower-affine: convert affine.apply → arith ops.
+  //   3. finalize-memref-to-llvm: convert all memref ops to LLVM structs.
+  //   4. scf-to-cf: lower scf control flow.
+  //   5. gpu-to-nvvm: convert gpu.func signature + gpu ops to NVVM.
+  //   6. remaining dialect conversions (index, arith, math).
+  //   7. reconcile-unrealized-casts: erase conversion cast chains.
+  {
+    auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
+    // Phase 1: Decompose and lower memrefs while types are still memrefs.
+    gpuPm.addPass(memref::createExpandStridedMetadataPass());
+    gpuPm.addNestedPass<gpu::GPUFuncOp>(createLowerAffinePass());
+    gpuPm.addPass(createFinalizeMemRefToLLVMConversionPass());
+    // Phase 2: Lower control flow and GPU ops.
+    gpuPm.addPass(createSCFToControlFlowPass());
+    ConvertGpuOpsToNVVMOpsOptions nvvmOpts;
+    gpuPm.addPass(createConvertGpuOpsToNVVMOps(nvvmOpts));
+    // Phase 3: Lower remaining dialects to LLVM.
+    gpuPm.addPass(createConvertIndexToLLVMPass());
+    gpuPm.addPass(createArithToLLVMConversionPass());
+    gpuPm.addPass(createConvertMathToLLVMPass());
+    gpuPm.addPass(createReconcileUnrealizedCastsPass());
+  }
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+
+  // 13.3 — Compile the gpu.module blobs to a PTX ISA binary embedded in the IR.
+  GpuModuleToBinaryPassOptions binaryOptions;
+  binaryOptions.toolkitPath = "/usr/local/cuda-13.0";
+  binaryOptions.compilationTarget = "isa";
+  pm.addPass(createGpuModuleToBinaryPass(binaryOptions));
+
+  // 13.4 — Lower gpu.* host ops (gpu.alloc, gpu.launch_func, etc.) to LLVM
+  //         runtime calls (mgpuMemAlloc, mgpuLaunchKernel, etc.).
+  GpuToLLVMConversionPassOptions hostOpts;
+  pm.addPass(createGpuToLLVMConversionPass(hostOpts));
+  pm.addPass(createReconcileUnrealizedCastsPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+
+  // 13.5 — Lower remaining host dialects to LLVM.
+  pm.addPass(createSCFToControlFlowPass());
+  pm.addPass(createConvertControlFlowToLLVMPass());
+  pm.addPass(createArithToLLVMConversionPass());
+  pm.addPass(memref::createExpandStridedMetadataPass());
+  pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+  pm.addPass(createConvertFuncToLLVMPass());
+  pm.addPass(createReconcileUnrealizedCastsPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+
 }
 
 // --- Pass Registration ---
@@ -145,7 +290,17 @@ void registerNovaLLVMGPUPasses() {
     registerNovaGPUEraseFusionBarriersPass();
     registerNovaGPUInferMemorySpacePass();
     registerNovaGPUComprehensiveBufferizePass();
+    registerNovaGPUInsertWorkgroupBarriersPass();
+    registerNovaNormalizeLoopBoundsPass();
     registerNovaEliminateEmptyTensorsPass();
+    registerNovaConvertSharedMemAllocsPass();
+
+    // Register the full optimized pipeline as a named pipeline.
+    PassPipelineRegistration<>(
+        "nova-gpu-optimized-pipeline",
+        "Nova GPU Optimized Pipeline (tile+fuse → normalize → bufferize → "
+        "gpu.launch → linalg-to-loops)",
+        [](OpPassManager &pm) { addNovaGPUOptimizedPipeline(pm, ""); });
 }
 
 // ---------------------------------------------------------------------------
@@ -160,20 +315,33 @@ void registerNovaLLVMGPUPasses() {
 //     (GAP 2) then run OneShotBufferize with GPU-aware alloc/copy fns (GAP 3).
 // ---------------------------------------------------------------------------
 void addNovaGPUBufferizePasses(OpPassManager &pm) {
-  // Pre-bufferize passes.
-  pm.addPass(createNovaEliminateEmptyTensorsPass());
-  pm.addPass(bufferization::createEmptyTensorToAllocTensorPass());
-  pm.addPass(createNovaGPUInferMemorySpacePass());
+  // Pre-bufferize passes (per-function).
+  pm.addNestedPass<func::FuncOp>(createNovaEliminateEmptyTensorsPass());
+  pm.addNestedPass<func::FuncOp>(
+      bufferization::createEmptyTensorToAllocTensorPass());
+  pm.addNestedPass<func::FuncOp>(createNovaGPUInferMemorySpacePass());
 
-  // GPU-aware comprehensive bufferize: erases nova.fusion_barrier (GAP 2)
-  // and runs OneShotBufferize with GPU alloc/copy fns (GAP 3).
+  // GPU-aware comprehensive bufferize (module-level).
+  // Erases nova.fusion_barrier, converts function boundaries with identity
+  // layout map, and runs OneShotBufferize with GPU alloc/copy functions.
   pm.addPass(createNovaGPUComprehensiveBufferizePass());
 
-  // Post-bufferization cleanup.
-  pm.addPass(memref::createResolveShapedTypeResultDimsPass());
-  pm.addPass(createCanonicalizerPass());
-  pm.addPass(createCSEPass());
-  pm.addPass(createCanonicalizerPass());
+  // Post-bufferization cleanup (per-function).
+  pm.addNestedPass<func::FuncOp>(
+      memref::createResolveShapedTypeResultDimsPass());
+  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+  pm.addNestedPass<func::FuncOp>(createCSEPass());
+  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+
+  // Hoist memref.alloc ops out of loops where possible. This moves shared
+  // memory allocations out of the K-reduction loop so they are reused
+  // across iterations instead of being allocated/deallocated each step.
+  pm.addNestedPass<func::FuncOp>(
+      bufferization::createBufferLoopHoistingPass());
+
+  // Insert memref.dealloc for all memref.alloc ops.
+  bufferization::BufferDeallocationPipelineOptions deallocOpts;
+  bufferization::buildBufferDeallocationPipeline(pm, deallocOpts);
 }
 
 } // namespace mlir::nova

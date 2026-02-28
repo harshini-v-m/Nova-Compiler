@@ -34,8 +34,8 @@ public:
   LogicalResult matchAndRewrite(memref::AllocOp op,
                                 PatternRewriter &rewriter) const override {
     MemRefType type = op.getType();
-    // if (!isMemorySpaceOne(type.getMemorySpace()))
-    //   return failure();
+    if (mlir::isa_and_present<gpu::AddressSpaceAttr>(type.getMemorySpace()))
+      return failure();
 
     rewriter.replaceOpWithNewOp<gpu::AllocOp>(
         op, type, /*asyncToken=*/Type(), /*asyncDependencies=*/ValueRange{},
@@ -52,8 +52,8 @@ public:
                                 PatternRewriter &rewriter) const override {
     Value memref = op.getMemref();
     MemRefType type = llvm::dyn_cast<MemRefType>(memref.getType());
-    // if (!type || !isMemorySpaceOne(type.getMemorySpace()))
-    //   return failure();
+    if (type && mlir::isa_and_present<gpu::AddressSpaceAttr>(type.getMemorySpace()))
+      return failure();
 
     rewriter.replaceOpWithNewOp<gpu::DeallocOp>(op, TypeRange{}, ValueRange{},
                                                 memref);

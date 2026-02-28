@@ -139,6 +139,13 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   wgN   = std::min(wgN, dims.N);
   kStep = std::min(kStep, dims.K);
 
+  // Ensure thread count (workgroupSize) doesn't exceed 1024.
+  // Thread count = (wgM / 4) * (wgN / 4) since thread tiles are hardcoded to 4x4.
+  // 1024 threads = (32 * 32).
+  while ((wgM / 4) * (wgN / 4) > 1024 && wgN > 4) {
+    wgN /= 2;
+  }
+
   // Build per-loop tile size arrays (remaining dims tiled to 1 or 0).
   auto contractionDims = mlir::linalg::inferContractionDims(matmul);
   SmallVector<int64_t> workgroupTiles(numLoops, 0);
@@ -213,6 +220,15 @@ static void setSimtConfig(linalg::LinalgOp matmul,
   if (!chosen)
     chosen = &kSimtTable[std::size(kSimtTable) - 1];
 
+  int64_t wgM = chosen->tileMNK[0];
+  int64_t wgN = chosen->tileMNK[1];
+
+  // Ensure thread count stays <= 1024.
+  // Thread tiles are hardcoded to 4x4 below.
+  while ((wgM / 4) * (wgN / 4) > 1024 && wgN > 4) {
+    wgN /= 2;
+  }
+
   auto contractionDims = mlir::linalg::inferContractionDims(matmul);
 
   SmallVector<int64_t> workgroupTiles(numLoops, 0);
@@ -237,8 +253,8 @@ static void setSimtConfig(linalg::LinalgOp matmul,
   }
   for (int64_t k : llvm::drop_end(contractionDims->k)) reductionTiles[k] = 1;
 
-  workgroupTiles[contractionDims->m.back()] = chosen->tileMNK[0];
-  workgroupTiles[contractionDims->n.back()] = chosen->tileMNK[1];
+  workgroupTiles[contractionDims->m.back()] = wgM;
+  workgroupTiles[contractionDims->n.back()] = wgN;
   reductionTiles[contractionDims->k.back()] = chosen->tileMNK[2];
   threadTiles[contractionDims->m.back()] = 4;
   threadTiles[contractionDims->n.back()] = 4;
