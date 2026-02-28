@@ -1,14 +1,16 @@
-#include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 #include "Compiler/Dialect/nova/NovaDialect.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
+#include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -16,6 +18,627 @@
 namespace mlir {
 namespace nova {
 
+// ============================================================================
+// Scalar CUDA-core path (used for f64 or as fallback)
+// ============================================================================
+static LogicalResult lowerScalarMatmul(nova::MatmulOp op,
+                                       PatternRewriter &rewriter,
+                                       Value lhsFlat, Value rhsFlat,
+                                       Value resFlat,
+                                       int64_t M, int64_t K, int64_t N,
+                                       int64_t totalBatches,
+                                       int64_t lhsBatchStride,
+                                       int64_t rhsBatchStride,
+                                       int64_t resBatchStride,
+                                       RankedTensorType resultType,
+                                       SmallVector<int64_t> resultShape,
+                                       Value resultMemRef) {
+  Location loc = op.getLoc();
+  int64_t tileSize = 16;
+  int64_t elemByteSize =
+      cast<RankedTensorType>(op.getLhs().getType()).getElementType().getIntOrFloatBitWidth() / 8;
+  int64_t tileByteSize = tileSize * tileSize * elemByteSize;
+  int64_t totalSharedBytes = 2 * tileByteSize;
+
+  Value cM = rewriter.create<arith::ConstantIndexOp>(loc, M);
+  Value cN = rewriter.create<arith::ConstantIndexOp>(loc, N);
+  Value cK = rewriter.create<arith::ConstantIndexOp>(loc, K);
+  Value cTileSize = rewriter.create<arith::ConstantIndexOp>(loc, tileSize);
+  Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+  Value cTileBytes = rewriter.create<arith::ConstantIndexOp>(loc, tileByteSize);
+  Value cTotalBatches = rewriter.create<arith::ConstantIndexOp>(loc, totalBatches);
+  Value cLhsBatchStride = rewriter.create<arith::ConstantIndexOp>(loc, lhsBatchStride);
+  Value cRhsBatchStride = rewriter.create<arith::ConstantIndexOp>(loc, rhsBatchStride);
+  Value cResBatchStride = rewriter.create<arith::ConstantIndexOp>(loc, resBatchStride);
+  Value cLhsKStride = rewriter.create<arith::ConstantIndexOp>(loc, K);
+  Value cRhsNStride = rewriter.create<arith::ConstantIndexOp>(loc, N);
+
+  Value dynamicSharedMemSize = rewriter.create<arith::IndexCastOp>(
+      loc, rewriter.getI32Type(),
+      rewriter.create<arith::ConstantIndexOp>(loc, totalSharedBytes));
+
+  Value gridX = rewriter.create<arith::DivUIOp>(loc,
+      rewriter.create<arith::AddIOp>(loc, cN,
+          rewriter.create<arith::ConstantIndexOp>(loc, tileSize - 1)), cTileSize);
+  Value gridY = rewriter.create<arith::DivUIOp>(loc,
+      rewriter.create<arith::AddIOp>(loc, cM,
+          rewriter.create<arith::ConstantIndexOp>(loc, tileSize - 1)), cTileSize);
+  Value gridZ = cTotalBatches;
+
+  auto launchOp = rewriter.create<gpu::LaunchOp>(
+      loc,
+      gridX, gridY, gridZ,
+      cTileSize, cTileSize, c1,
+      /*dynamicSharedMemorySize=*/dynamicSharedMemSize);
+
+  rewriter.setInsertionPointToStart(&launchOp.getBody().front());
+
+  MLIRContext *ctx = rewriter.getContext();
+  auto workgroupAddrSpace = gpu::AddressSpaceAttr::get(
+      ctx, gpu::GPUDialect::getWorkgroupAddressSpace());
+  auto i8DynMemRefType = MemRefType::get({ShapedType::kDynamic},
+                                         rewriter.getIntegerType(8),
+                                         AffineMap{},
+                                         workgroupAddrSpace);
+  Value shmem = rewriter.create<gpu::DynamicSharedMemoryOp>(loc, i8DynMemRefType);
+
+  auto tileMemRefType = MemRefType::get({tileSize, tileSize},
+                                        cast<RankedTensorType>(op.getLhs().getType()).getElementType(),
+                                        AffineMap{},
+                                        workgroupAddrSpace);
+  Value c0k = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  Value tileA = rewriter.create<memref::ViewOp>(loc, tileMemRefType, shmem, c0k, ValueRange{});
+  Value tileB = rewriter.create<memref::ViewOp>(loc, tileMemRefType, shmem, cTileBytes, ValueRange{});
+
+  Value tx = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+  Value ty = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::y);
+  Value bx = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x);
+  Value by = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::y);
+  Value bz = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::z);
+
+  Value col = rewriter.create<arith::AddIOp>(loc, rewriter.create<arith::MulIOp>(loc, bx, cTileSize), tx);
+  Value row = rewriter.create<arith::AddIOp>(loc, rewriter.create<arith::MulIOp>(loc, by, cTileSize), ty);
+
+  Value lhsBatchOff = rewriter.create<arith::MulIOp>(loc, bz, cLhsBatchStride);
+  Value rhsBatchOff = rewriter.create<arith::MulIOp>(loc, bz, cRhsBatchStride);
+  Value resBatchOff = rewriter.create<arith::MulIOp>(loc, bz, cResBatchStride);
+
+  Value sum_init = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getZeroAttr(resultType.getElementType()));
+
+  auto kLoop = rewriter.create<scf::ForOp>(loc, c0k, cK, cTileSize, ValueRange{sum_init});
+  rewriter.setInsertionPointToStart(kLoop.getBody());
+
+  Value kOffset = kLoop.getInductionVar();
+  Value currentSum = kLoop.getRegionIterArgs()[0];
+
+  Value aCol = rewriter.create<arith::AddIOp>(loc, kOffset, tx);
+  Value aInBounds = rewriter.create<arith::AndIOp>(loc,
+      rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, row, cM),
+      rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, aCol, cK));
+
+  auto ifA = rewriter.create<scf::IfOp>(loc, aInBounds, true);
+  rewriter.setInsertionPointToStart(ifA.thenBlock());
+  {
+    Value rowOffset = rewriter.create<arith::MulIOp>(loc, row, cLhsKStride);
+    Value aLinear = rewriter.create<arith::AddIOp>(loc,
+                      rewriter.create<arith::AddIOp>(loc, lhsBatchOff, rowOffset), aCol);
+    Value aVal = rewriter.create<memref::LoadOp>(loc, lhsFlat, ValueRange{aLinear});
+    rewriter.create<memref::StoreOp>(loc, aVal, tileA, ValueRange{ty, tx});
+  }
+  rewriter.setInsertionPointToStart(ifA.elseBlock());
+  rewriter.create<memref::StoreOp>(loc, sum_init, tileA, ValueRange{ty, tx});
+  rewriter.setInsertionPointAfter(ifA);
+
+  Value bRow = rewriter.create<arith::AddIOp>(loc, kOffset, ty);
+  Value bInBounds = rewriter.create<arith::AndIOp>(loc,
+      rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, bRow, cK),
+      rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, col, cN));
+
+  auto ifB = rewriter.create<scf::IfOp>(loc, bInBounds, true);
+  rewriter.setInsertionPointToStart(ifB.thenBlock());
+  {
+    Value bRowOffset = rewriter.create<arith::MulIOp>(loc, bRow, cRhsNStride);
+    Value bLinear = rewriter.create<arith::AddIOp>(loc,
+                      rewriter.create<arith::AddIOp>(loc, rhsBatchOff, bRowOffset), col);
+    Value bVal = rewriter.create<memref::LoadOp>(loc, rhsFlat, ValueRange{bLinear});
+    rewriter.create<memref::StoreOp>(loc, bVal, tileB, ValueRange{ty, tx});
+  }
+  rewriter.setInsertionPointToStart(ifB.elseBlock());
+  rewriter.create<memref::StoreOp>(loc, sum_init, tileB, ValueRange{ty, tx});
+  rewriter.setInsertionPointAfter(ifB);
+
+  rewriter.create<NVVM::Barrier0Op>(loc);
+
+  auto innerLoop = rewriter.create<scf::ForOp>(loc, c0k, cTileSize, c1, ValueRange{currentSum});
+  Block *kBlock = kLoop.getBody();
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    Block *innerBody = innerLoop.getBody();
+    if (!innerBody->empty() && innerBody->back().hasTrait<mlir::OpTrait::IsTerminator>())
+      rewriter.eraseOp(&innerBody->back());
+    rewriter.setInsertionPointToEnd(innerBody);
+
+    Value i   = innerLoop.getInductionVar();
+    Value acc = innerLoop.getRegionIterArgs()[0];
+    Value tA  = rewriter.create<memref::LoadOp>(loc, tileA, ValueRange{ty, i});
+    Value tB  = rewriter.create<memref::LoadOp>(loc, tileB, ValueRange{i, tx});
+
+    Value mul, nextAcc;
+    if (llvm::isa<FloatType>(resultType.getElementType())) {
+      mul     = rewriter.create<arith::MulFOp>(loc, tA, tB);
+      nextAcc = rewriter.create<arith::AddFOp>(loc, acc, mul);
+    } else {
+      mul     = rewriter.create<arith::MulIOp>(loc, tA, tB);
+      nextAcc = rewriter.create<arith::AddIOp>(loc, acc, mul);
+    }
+    rewriter.create<scf::YieldOp>(loc, nextAcc);
+  }
+
+  Value loopResult = innerLoop.getResult(0);
+
+  {
+    if (!kBlock->empty() && kBlock->back().hasTrait<mlir::OpTrait::IsTerminator>())
+      rewriter.eraseOp(&kBlock->back());
+    rewriter.setInsertionPoint(kBlock, kBlock->end());
+  }
+  rewriter.create<NVVM::Barrier0Op>(loc);
+  rewriter.create<scf::YieldOp>(loc, loopResult);
+
+  rewriter.setInsertionPointAfter(kLoop);
+  Value finalResult = kLoop.getResult(0);
+
+  Value outBounds = rewriter.create<arith::AndIOp>(loc,
+      rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, row, cM),
+      rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, col, cN));
+
+  auto ifOut = rewriter.create<scf::IfOp>(loc, outBounds, false);
+  rewriter.setInsertionPointToStart(ifOut.thenBlock());
+  {
+    Value rowOffsetR = rewriter.create<arith::MulIOp>(loc, row, cRhsNStride);
+    Value rLinear    = rewriter.create<arith::AddIOp>(loc,
+                          rewriter.create<arith::AddIOp>(loc, resBatchOff, rowOffsetR), col);
+    rewriter.create<memref::StoreOp>(loc, finalResult, resFlat, ValueRange{rLinear});
+  }
+  rewriter.setInsertionPointAfter(ifOut);
+
+  rewriter.create<gpu::TerminatorOp>(loc);
+  rewriter.setInsertionPointAfter(launchOp);
+
+  Value resultTensor = rewriter.create<bufferization::ToTensorOp>(
+      loc, resultType, resultMemRef, true).getResult();
+  rewriter.replaceOp(op, resultTensor);
+  return success();
+}
+
+// ============================================================================
+// Tensor Core path — V18-style Pointer Induction Edition
+//
+// Key changes vs. previous version:
+//  - All thread-invariant math (laneId/4, warpId*WARP_N, rowBase, etc.) 
+//    is hoisted BEFORE the loop — computed once, reused forever.
+//  - aPtr / bPtr (flat offsets into global memory) are carried as
+//    scf.for iter_args and incremented by TILE_K each iteration.
+//    No multiply-heavy index recomputation inside the loop body.
+//  - 3-stage async pipeline with prolog loads before loop entry.
+// ============================================================================
+static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
+                                           PatternRewriter &rewriter,
+                                           Value lhsFlat, Value rhsFlat,
+                                           Value resFlat,
+                                           int64_t M, int64_t K, int64_t N,
+                                           int64_t totalBatches,
+                                           int64_t lhsBatchStride,
+                                           int64_t rhsBatchStride,
+                                           int64_t resBatchStride,
+                                           RankedTensorType resultType,
+                                           SmallVector<int64_t> resultShape,
+                                           Value resultMemRef,
+                                           bool useTF32) {
+  Location loc = op.getLoc();
+  MLIRContext *ctx = rewriter.getContext();
+
+  // ── Tile / warp constants ──
+  const int64_t TILE_M  = 16;
+  const int64_t WARP_N  = 8;
+  const int64_t WARPS   = 8;
+  const int64_t TILE_N  = WARP_N * WARPS;  // 64
+  const int64_t TILE_K  = useTF32 ? 8 : 16;
+  const int64_t THREADS = 256;
+  const int64_t STAGES  = 3;
+
+  // Each thread loads one element: A has TILE_M*TILE_K elems, B has TILE_K*TILE_N.
+  // A: 16*8=128 elems, B: 8*64=512 elems. Total 640 < 256 threads, so threads
+  // each handle multiple elements in two separate in-bounds-guarded loads.
+  const int64_t A_ELEMS = TILE_M * TILE_K;    // 128 (TF32) or 256 (FP16)
+  const int64_t B_ELEMS = TILE_K * TILE_N;    // 512 (TF32) or 1024 (FP16)
+
+  Type inputElemTy = cast<RankedTensorType>(op.getLhs().getType()).getElementType();
+  Type mmaInputTy  = useTF32 ? rewriter.getF32Type() : rewriter.getF16Type();
+  Type mmaAccTy    = rewriter.getF32Type();
+
+  int64_t aK = useTF32 ? 1 : 2;
+  int64_t bK = useTF32 ? 1 : 2;
+  auto aFragTy = VectorType::get({4, aK}, mmaInputTy);
+  auto bFragTy = VectorType::get({2, bK}, mmaInputTy);
+  auto cFragTy = VectorType::get({2, 2}, mmaAccTy);
+
+  SmallVector<int64_t> mmaShapeVals = {TILE_M, WARP_N, TILE_K};
+
+  // Shared memory per stage: A tile + B tile
+  int64_t inputElemBytes = mmaInputTy.getIntOrFloatBitWidth() / 8;
+  int64_t stageABytes    = A_ELEMS * inputElemBytes;
+  int64_t stageBBytes    = B_ELEMS * inputElemBytes;
+  int64_t stageTotalBytes = stageABytes + stageBBytes;
+  int64_t totalSmemBytes  = STAGES * stageTotalBytes;
+
+  // ── Index constants emitted ONCE (fully hoisted) ──
+  auto ci = [&](int64_t v) { return rewriter.create<arith::ConstantIndexOp>(loc, v); };
+  Value c0 = ci(0), c1 = ci(1), c2 = ci(2), c3 = ci(3);
+  Value cTileK  = ci(TILE_K),  cTileM  = ci(TILE_M),  cTileN  = ci(TILE_N);
+  Value cWarpN  = ci(WARP_N),  cThreads = ci(THREADS), c32 = ci(32);
+  Value cM = ci(M), cN = ci(N), cK = ci(K);
+  Value cNStride     = ci(N);
+  Value cKStride     = ci(K);
+  Value cStages      = ci(STAGES);
+  Value cStageTot    = ci(stageTotalBytes);
+  Value cStageABytes = ci(stageABytes);
+  Value cAElems      = ci(A_ELEMS);
+  Value cBElems      = ci(B_ELEMS);
+  // Pointer induction strides (in elements)
+  Value cAStride = cTileK;            // per K-step advance for A
+  Value cBStride = ci(TILE_K * N);    // per K-step advance for B (row-major)
+
+  // Launch grid / block
+  Value dynamicSmem = rewriter.create<arith::IndexCastOp>(
+      loc, rewriter.getI32Type(), ci(totalSmemBytes));
+  Value gridX = rewriter.create<arith::DivUIOp>(loc,
+      rewriter.create<arith::AddIOp>(loc, cN, ci(TILE_N - 1)), cTileN);
+  Value gridY = rewriter.create<arith::DivUIOp>(loc,
+      rewriter.create<arith::AddIOp>(loc, cM, ci(TILE_M - 1)), cTileM);
+  Value gridZ = ci(totalBatches);
+
+  auto launchOp = rewriter.create<gpu::LaunchOp>(
+      loc, gridX, gridY, gridZ, cThreads, c1, c1,
+      /*dynamicSharedMemorySize=*/dynamicSmem);
+
+  rewriter.setInsertionPointToStart(&launchOp.getBody().front());
+
+  // ── Shared memory ──
+  auto workgroupAS = gpu::AddressSpaceAttr::get(
+      ctx, gpu::GPUDialect::getWorkgroupAddressSpace());
+  auto i8SmemTy = MemRefType::get(
+      {ShapedType::kDynamic}, rewriter.getIntegerType(8), AffineMap{}, workgroupAS);
+  Value shmem = rewriter.create<gpu::DynamicSharedMemoryOp>(loc, i8SmemTy);
+
+  auto sATy = MemRefType::get({TILE_M, TILE_K}, mmaInputTy, AffineMap{}, workgroupAS);
+  auto sBTy = MemRefType::get({TILE_K, TILE_N}, mmaInputTy, AffineMap{}, workgroupAS);
+
+  // Get shared memory views for a given stage index (returns sA, sB views)
+  auto getStageViews = [&](OpBuilder &b, Value stageIdx) -> std::pair<Value, Value> {
+    Value stageBase = b.create<arith::MulIOp>(loc, stageIdx, cStageTot);
+    Value bBase     = b.create<arith::AddIOp>(loc, stageBase, cStageABytes);
+    Value vA = b.create<memref::ViewOp>(loc, sATy, shmem, stageBase, ValueRange{});
+    Value vB = b.create<memref::ViewOp>(loc, sBTy, shmem, bBase,     ValueRange{});
+    return {vA, vB};
+  };
+
+  // ── Thread/warp IDs — hoisted, computed once ──
+  Value tid    = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+  Value bx     = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x);
+  Value by     = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::y);
+  Value laneId = rewriter.create<arith::RemUIOp>(loc, tid, c32);
+  Value warpId = rewriter.create<arith::DivUIOp>(loc, tid, c32);
+
+  // Batch offset (loop-invariant)
+  Value bz          = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::z);
+  Value lhsBatchOff = rewriter.create<arith::MulIOp>(loc, bz, ci(lhsBatchStride));
+  Value rhsBatchOff = rewriter.create<arith::MulIOp>(loc, bz, ci(rhsBatchStride));
+  Value resBatchOff = rewriter.create<arith::MulIOp>(loc, bz, ci(resBatchStride));
+
+  // Block base coordinates (loop-invariant)
+  Value rowBase      = rewriter.create<arith::MulIOp>(loc, by, cTileM);  // block row start
+  Value blockColBase = rewriter.create<arith::MulIOp>(loc, bx, cTileN);  // block col start
+  Value warpColOff   = rewriter.create<arith::MulIOp>(loc, warpId, cWarpN);
+  Value warpColBase  = rewriter.create<arith::AddIOp>(loc, blockColBase, warpColOff);
+
+  // ── Per-thread tile load offsets for A (hoisted) ──
+  // Each thread loads one element of the A tile per stage.
+  // Thread linearization within shared mem A tile:
+  Value aTid       = rewriter.create<arith::RemUIOp>(loc, tid, cAElems);
+  Value aInBounds  = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, tid, cAElems);
+  Value aTileRow   = rewriter.create<arith::DivUIOp>(loc, aTid, cTileK);
+  Value aTileCol   = rewriter.create<arith::RemUIOp>(loc, aTid, cTileK);
+  Value aGlobalRow = rewriter.create<arith::AddIOp>(loc, rowBase, aTileRow);
+
+  // ── Per-thread tile load offsets for B (hoisted) ──
+  Value bTid       = rewriter.create<arith::RemUIOp>(loc, tid, cBElems);
+  Value bInBounds  = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, tid, cBElems);
+  Value bTileRow   = rewriter.create<arith::DivUIOp>(loc, bTid, cTileN);
+  Value bTileCol   = rewriter.create<arith::RemUIOp>(loc, bTid, cTileN);
+  Value bGlobalCol = rewriter.create<arith::AddIOp>(loc, blockColBase, bTileCol);
+
+  // ── Pointer induction initial values (flat element offsets into lhsFlat / rhsFlat) ──
+  // aPtr0 = lhsBatchOff + aGlobalRow * K + aTileCol  (points to k=0)
+  // bPtr0 = rhsBatchOff + bTileRow * N + bGlobalCol  (start offset, updated each iter)
+  Value aPtr0 = rewriter.create<arith::AddIOp>(loc, lhsBatchOff,
+      rewriter.create<arith::AddIOp>(loc,
+          rewriter.create<arith::MulIOp>(loc, aGlobalRow, cKStride),
+          aTileCol));
+  Value bPtr0 = rewriter.create<arith::AddIOp>(loc, rhsBatchOff,
+      rewriter.create<arith::AddIOp>(loc,
+          rewriter.create<arith::MulIOp>(loc, bTileRow, cNStride),
+          bGlobalCol));
+
+  // ── Helper: async copy one element from global to shared ──
+  // Loads lhsFlat[aPtr] into sA[aTileRow, aTileCol] if in bounds.
+  // ── Async copy helpers — always emit a valid copy (dstElements >= 1) ──
+  // When out of bounds, clamp the src offset to 0 (reads a garbage value but
+  // the MMA accumulator is not written to for those threads in the epilogue).
+  // This matches the real CUDA cp.async behaviour with a clamped byte count.
+  auto asyncCopyA = [&](OpBuilder &b, Value sA, Value aPtr,
+                        Value inBoundsRow, Value inBoundsK) {
+    Value inBounds = b.create<arith::AndIOp>(loc,
+        aInBounds,
+        b.create<arith::AndIOp>(loc, inBoundsRow, inBoundsK));
+    // Clamp src to 0 when out of bounds
+    Value safePtr = b.create<arith::SelectOp>(loc, inBounds, aPtr, c0);
+    Value tok = b.create<nvgpu::DeviceAsyncCopyOp>(
+        loc, sA, ValueRange{aTileRow, aTileCol},
+        lhsFlat, ValueRange{safePtr},
+        rewriter.getIndexAttr(inputElemBytes), Value{}, nullptr);
+    return tok;
+  };
+
+  auto asyncCopyB = [&](OpBuilder &b, Value sB, Value bPtr,
+                        Value inBoundsRow, Value inBoundsCol) {
+    Value inBounds = b.create<arith::AndIOp>(loc,
+        bInBounds,
+        b.create<arith::AndIOp>(loc, inBoundsRow, inBoundsCol));
+    Value safePtr = b.create<arith::SelectOp>(loc, inBounds, bPtr, c0);
+    Value tok = b.create<nvgpu::DeviceAsyncCopyOp>(
+        loc, sB, ValueRange{bTileRow, bTileCol},
+        rhsFlat, ValueRange{safePtr},
+        rewriter.getIndexAttr(inputElemBytes), Value{}, nullptr);
+    return tok;
+  };
+
+  // ── Helper: load one stage from global into shared mem using current pointers ──
+  // Returns the committed async token and does NOT advance the pointers.
+  // Pointer advancing is done by the caller as an iter_arg increment.
+  auto issueStageLoad = [&](OpBuilder &b, Value stageIdx,
+                             Value aPtr, Value bPtr) -> Value {
+    auto [sA, sB] = getStageViews(b, stageIdx);
+
+    // Bounds for this load: check A row and K col
+    Value aRowOk = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
+                                            aGlobalRow, cM);
+    Value aColOk = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
+                                            aPtr,
+                                            b.create<arith::AddIOp>(loc, lhsBatchOff,
+                                                ci(lhsBatchStride > 0 ? lhsBatchStride : M * K)));
+    Value tokA = asyncCopyA(b, sA, aPtr, aRowOk,
+                             b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
+                                 aTileCol, cTileK));
+
+    Value bColOk = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
+                                            bGlobalCol, cN);
+    Value bRowOk = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
+                                            bTileRow, cTileK);
+    Value tokB = asyncCopyB(b, sB, bPtr, bRowOk, bColOk);
+
+    SmallVector<Value> tokens{tokA, tokB};
+    Value groupTok = b.create<nvgpu::DeviceAsyncCreateGroupOp>(
+        loc, nvgpu::DeviceAsyncTokenType::get(ctx), tokens);
+    return groupTok;
+  };
+
+  // ── Bounds helper: check if k-pointer is still in range for A ──
+  // We use K-column == aPtr - lhsBatchOff - aGlobalRow*K
+  // Simplified: just check stageNum < ceil(K/TILE_K)
+  // We parameterize by stage number instead.
+
+  // ── Prolog: Load stages 0 and 1 ──
+  // Stage 0: k=0, aPtr=aPtr0, bPtr=bPtr0
+  Value tok0 = issueStageLoad(rewriter, c0, aPtr0, bPtr0);
+  rewriter.create<nvgpu::DeviceAsyncCreateGroupOp>(   // commit group 0
+      loc, nvgpu::DeviceAsyncTokenType::get(ctx), ValueRange{tok0});
+
+  // Stage 1: k=TILE_K — only if K > TILE_K
+  Value aPtr1 = rewriter.create<arith::AddIOp>(loc, aPtr0, cAStride);
+  Value bPtr1 = rewriter.create<arith::AddIOp>(loc, bPtr0, cBStride);
+  Value hasStage1 = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ugt, cK, cTileK);
+  auto ifS1 = rewriter.create<scf::IfOp>(loc, nvgpu::DeviceAsyncTokenType::get(ctx),
+                                          hasStage1, /*withElse=*/true);
+  {
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointToStart(ifS1.thenBlock());
+    if (!ifS1.thenBlock()->empty()) rewriter.eraseOp(&ifS1.thenBlock()->back());
+    Value t1 = issueStageLoad(rewriter, c1, aPtr1, bPtr1);
+    rewriter.create<scf::YieldOp>(loc, t1);
+
+    rewriter.setInsertionPointToStart(ifS1.elseBlock());
+    if (!ifS1.elseBlock()->empty()) rewriter.eraseOp(&ifS1.elseBlock()->back());
+    rewriter.create<scf::YieldOp>(loc, tok0);  // reuse tok0 as dummy
+  }
+  Value prologToken = ifS1.getResult(0);
+
+  // ── Accumulator init ──
+  Value cZeroAcc = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(mmaAccTy));
+  Value cInit    = rewriter.create<vector::SplatOp>(loc, cFragTy, cZeroAcc);
+
+  // Pointer induction starting values for the loop:
+  // At k=0, we already issued k=0 and k=TILE_K.
+  // The loop will issue k+2*TILE_K at each iteration.
+  Value aPtr2 = rewriter.create<arith::AddIOp>(loc, aPtr1, cAStride);  // k=2*TILE_K
+  Value bPtr2 = rewriter.create<arith::AddIOp>(loc, bPtr1, cBStride);
+
+  // ── Main K-loop — iter_args carry (acc, token, writeStage, readStage, aPtr, bPtr) ──
+  // aPtr/bPtr point to the NEXT stage to be written (k+2*TILE_K at entry).
+  Value cWriteStage0 = rewriter.create<arith::RemUIOp>(loc, c2, cStages);  // =2
+  Value cReadStage0  = c0;
+
+  auto mainLoop = rewriter.create<scf::ForOp>(
+      loc, c0, cK, cTileK,
+      ValueRange{cInit, prologToken, cWriteStage0, cReadStage0, aPtr2, bPtr2});
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(mainLoop.getBody());
+    if (!mainLoop.getBody()->empty())
+      rewriter.eraseOp(&mainLoop.getBody()->back());
+
+    Value k           = mainLoop.getInductionVar();
+    Value acc         = mainLoop.getRegionIterArgs()[0];
+    Value currToken   = mainLoop.getRegionIterArgs()[1];
+    Value writeStage  = mainLoop.getRegionIterArgs()[2];
+    Value readStage   = mainLoop.getRegionIterArgs()[3];
+    Value aPtr        = mainLoop.getRegionIterArgs()[4];  // points to k+2*TILE_K
+    Value bPtr        = mainLoop.getRegionIterArgs()[5];
+
+    // Issue next stage load (k + 2*TILE_K) if still in range
+    Value nextK       = rewriter.create<arith::AddIOp>(loc, k, ci(2 * TILE_K));
+    Value hasNext     = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, nextK, cK);
+    auto ifNext = rewriter.create<scf::IfOp>(loc,
+        nvgpu::DeviceAsyncTokenType::get(ctx), hasNext, true);
+    {
+      OpBuilder::InsertionGuard g2(rewriter);
+      rewriter.setInsertionPointToStart(ifNext.thenBlock());
+      if (!ifNext.thenBlock()->empty()) rewriter.eraseOp(&ifNext.thenBlock()->back());
+      Value nt = issueStageLoad(rewriter, writeStage, aPtr, bPtr);
+      rewriter.create<scf::YieldOp>(loc, nt);
+
+      rewriter.setInsertionPointToStart(ifNext.elseBlock());
+      if (!ifNext.elseBlock()->empty()) rewriter.eraseOp(&ifNext.elseBlock()->back());
+      rewriter.create<scf::YieldOp>(loc, currToken);
+    }
+    Value nextToken = ifNext.getResult(0);
+
+    // Wait for current read stage to arrive (allow 1 in-flight group)
+    rewriter.create<nvgpu::DeviceAsyncWaitOp>(
+        loc, TypeRange{}, nextToken, rewriter.getI32IntegerAttr(1));
+    rewriter.create<NVVM::Barrier0Op>(loc);
+
+    // Get shared mem views for read stage
+    auto [vA, vB] = getStageViews(rewriter, readStage);
+
+    // ── Load MMA fragments from shared memory ──
+    // A fragment: shape [4, aK] — thread layout follows warp-level MMA indexing
+    // Row select: lane / (TILE_K / aK)  -- for K=8,aK=1: lane/8
+    // Col select: lane % (TILE_K / aK)  -- for K=8,aK=1: lane%8
+    Value laneDiv  = rewriter.create<arith::DivUIOp>(loc, laneId, ci(TILE_K / aK));
+    Value laneMod  = rewriter.create<arith::RemUIOp>(loc, laneId, ci(TILE_K / aK));
+
+    Value aFrag = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(aFragTy));
+    for (int r = 0; r < 4; ++r) {
+      for (int c = 0; c < aK; ++c) {
+        // sA row: warp row group (TILE_M/4 per quarter-tile) + lane contribution
+        Value sR = rewriter.create<arith::AddIOp>(loc,
+            ci(r * (TILE_M / 4)), laneDiv);
+        // sA col: c*(TILE_K/aK) + lane%...
+        Value sC = rewriter.create<arith::AddIOp>(loc,
+            ci(c * (TILE_K / aK)), laneMod);
+        Value e = rewriter.create<memref::LoadOp>(loc, vA, ValueRange{sR, sC});
+        if (e.getType() != mmaInputTy)
+          e = rewriter.create<arith::TruncFOp>(loc, mmaInputTy, e);
+        aFrag = rewriter.create<vector::InsertOp>(loc, e, aFrag,
+                    SmallVector<int64_t>{r, c});
+      }
+    }
+
+    // B fragment: shape [2, bK] — layout for col-major B
+    // K dimension: lane / 4, col group: warpColOff + lane%4 * 2
+    Value kLane    = rewriter.create<arith::DivUIOp>(loc, laneId, ci(4));
+    Value colLane  = rewriter.create<arith::MulIOp>(loc,
+        rewriter.create<arith::RemUIOp>(loc, laneId, ci(4)), ci(2));
+
+    Value bFrag = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(bFragTy));
+    for (int r = 0; r < 2; ++r) {
+      for (int c = 0; c < bK; ++c) {
+        Value sR = rewriter.create<arith::RemUIOp>(loc,
+            rewriter.create<arith::AddIOp>(loc, ci(r * (TILE_K / 2)), kLane),
+            cTileK);
+        Value sC = rewriter.create<arith::AddIOp>(loc,
+            rewriter.create<arith::AddIOp>(loc, warpColOff, ci(c * (WARP_N / bK))),
+            colLane);
+        Value e = rewriter.create<memref::LoadOp>(loc, vB, ValueRange{sR, sC});
+        if (e.getType() != mmaInputTy)
+          e = rewriter.create<arith::TruncFOp>(loc, mmaInputTy, e);
+        bFrag = rewriter.create<vector::InsertOp>(loc, e, bFrag,
+                    SmallVector<int64_t>{r, c});
+      }
+    }
+
+    // MMA
+    Value nextAcc = rewriter.create<nvgpu::MmaSyncOp>(
+        loc, aFrag, bFrag, acc, mmaShapeVals, useTF32).getResult();
+
+    // Advance stage indices and pointers (lightweight: just add constants)
+    Value nextWriteStage = rewriter.create<arith::RemUIOp>(loc,
+        rewriter.create<arith::AddIOp>(loc, writeStage, c1), cStages);
+    Value nextReadStage = rewriter.create<arith::RemUIOp>(loc,
+        rewriter.create<arith::AddIOp>(loc, readStage, c1), cStages);
+    // Pointer induction: advance by one TILE_K step (no multiply!)
+    Value nextAPtr = rewriter.create<arith::AddIOp>(loc, aPtr, cAStride);
+    Value nextBPtr = rewriter.create<arith::AddIOp>(loc, bPtr, cBStride);
+
+    rewriter.create<scf::YieldOp>(loc,
+        ValueRange{nextAcc, nextToken, nextWriteStage, nextReadStage, nextAPtr, nextBPtr});
+  }
+
+  Value fAcc = mainLoop.getResult(0);
+
+  // ── Epilogue: store results (hoisted row/col base calculations) ──
+  // MMA result: 2x2 output tiles covering rows [rowBase + fr*8 + laneId/4]
+  //             cols [warpColBase + fc + (laneId%4)*2]
+  Value laneDiv4 = rewriter.create<arith::DivUIOp>(loc, laneId, ci(4));
+  Value laneMod4 = rewriter.create<arith::MulIOp>(loc,
+      rewriter.create<arith::RemUIOp>(loc, laneId, ci(4)), ci(2));
+
+  for (int fr = 0; fr < 2; ++fr) {
+    for (int fc = 0; fc < 2; ++fc) {
+      Value e = rewriter.create<vector::ExtractOp>(loc, fAcc,
+                    SmallVector<int64_t>{fr, fc});
+      Value tW = e;
+      if (resultType.getElementType() != mmaAccTy &&
+          llvm::isa<FloatType>(resultType.getElementType()))
+        tW = rewriter.create<arith::TruncFOp>(loc, resultType.getElementType(), e);
+
+      // oR = rowBase + fr*8 + laneId/4
+      Value oR = rewriter.create<arith::AddIOp>(loc, rowBase,
+          rewriter.create<arith::AddIOp>(loc, ci(fr * 8), laneDiv4));
+      // oC = warpColBase + fc + (laneId%4)*2
+      Value oC = rewriter.create<arith::AddIOp>(loc, warpColBase,
+          rewriter.create<arith::AddIOp>(loc, ci(fc), laneMod4));
+
+      Value inR = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, oR, cM);
+      Value inC = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, oC, cN);
+      auto sIf = rewriter.create<scf::IfOp>(loc,
+          rewriter.create<arith::AndIOp>(loc, inR, inC), false);
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(sIf.thenBlock());
+        if (!sIf.thenBlock()->empty()) rewriter.eraseOp(&sIf.thenBlock()->back());
+        // Flat index = resBatchOff + oR*N + oC
+        Value fI = rewriter.create<arith::AddIOp>(loc, resBatchOff,
+            rewriter.create<arith::AddIOp>(loc,
+                rewriter.create<arith::MulIOp>(loc, oR, cNStride), oC));
+        rewriter.create<memref::StoreOp>(loc, tW, resFlat, ValueRange{fI});
+        rewriter.create<scf::YieldOp>(loc);
+      }
+    }
+  }
+
+  rewriter.create<gpu::TerminatorOp>(loc);
+  rewriter.setInsertionPointAfter(launchOp);
+
+  Value rT = rewriter.create<bufferization::ToTensorOp>(
+      loc, resultType, resultMemRef, true).getResult();
+  rewriter.replaceOp(op, rT);
+  return success();
+}
+// ============================================================================
+// Pattern entry point: three-way dispatch based on element type
+// ============================================================================
 struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
   using OpRewritePattern<nova::MatmulOp>::OpRewritePattern;
 
@@ -31,65 +654,43 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
     int64_t lhsRank = lhsType.getRank();
     int64_t rhsRank = rhsType.getRank();
 
-    // Require at least 2D on LHS and at least 1D on RHS.
     if (lhsRank < 2 || rhsRank < 1)
       return rewriter.notifyMatchFailure(op, "Unsupported matmul rank");
 
-    // The last two dims of LHS are [M, K], last two dims of RHS are [K, N].
     int64_t M = lhsType.getShape()[lhsRank - 2];
     int64_t K = lhsType.getShape()[lhsRank - 1];
     int64_t N = rhsType.getShape()[rhsRank - 1];
 
-    // --- Batch dimension flattening ---
     ArrayRef<int64_t> lhsBatchDims = lhsType.getShape().drop_back(2);
-
     int64_t totalBatches = 1;
-    for (int64_t d : lhsBatchDims)
-      totalBatches *= d;
+    for (int64_t d : lhsBatchDims) totalBatches *= d;
 
-    // Stride = number of elements to advance per batch
     int64_t lhsBatchStride = (lhsRank > 2 && totalBatches > 1) ? (M * K) : 0;
     int64_t rhsBatchStride = 0;
     if (rhsRank > 2) {
       int64_t rhsBatches = 1;
-      for (int64_t d : rhsType.getShape().drop_back(2)) {
-        if (d != ShapedType::kDynamic) {
-          rhsBatches *= d;
-        }
-      }
-      if (rhsBatches > 1) {
-        rhsBatchStride = K * N;
-      }
+      for (int64_t d : rhsType.getShape().drop_back(2))
+        if (d != ShapedType::kDynamic) rhsBatches *= d;
+      if (rhsBatches > 1) rhsBatchStride = K * N;
     }
-
-
     int64_t resBatchStride = M * N;
 
-    // Result shape: [totalBatches, M, N] if batched, else [M, N]
     SmallVector<int64_t> resultShape;
-    if (totalBatches > 1)
-      resultShape.push_back(totalBatches);
+    if (totalBatches > 1) resultShape.push_back(totalBatches);
     resultShape.push_back(M);
     resultShape.push_back(N);
 
-    // ---- MemRef types (GPU global memory, addr space 1) ----
-    // Flatten LHS + RHS to 2D for clean indexing inside the kernel.
-    // For batched: lhsFlat=[totalBatches*M, K], rhsFlat=[totalBatches*K, N]
-    // We actually keep them as-is at the type level; we'll index manually.
-    // Use 1D flat memrefs for the batch + matrix index arithmetic.
+    auto i1Attr = rewriter.getI64IntegerAttr(1);
     int64_t lhsFlatSize = totalBatches * M * K;
     int64_t rhsFlatSize = (rhsRank > 2 ? totalBatches : 1) * K * N;
     int64_t resFlatSize = totalBatches * M * N;
 
-    auto i1Attr = rewriter.getI64IntegerAttr(1);
     auto lhsFlatType = MemRefType::get({lhsFlatSize}, lhsType.getElementType(),
                                        MemRefLayoutAttrInterface{}, i1Attr);
     auto rhsFlatType = MemRefType::get({rhsFlatSize}, rhsType.getElementType(),
                                        MemRefLayoutAttrInterface{}, i1Attr);
     auto resFlatType = MemRefType::get({resFlatSize}, resultType.getElementType(),
                                        MemRefLayoutAttrInterface{}, i1Attr);
-
-    // Original typed memrefs for bufferization
     auto lhsMemRefType = MemRefType::get(lhsType.getShape(), lhsType.getElementType(),
                                          MemRefLayoutAttrInterface{}, i1Attr);
     auto rhsMemRefType = MemRefType::get(rhsType.getShape(), rhsType.getElementType(),
@@ -99,235 +700,43 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
 
     Value lhsMemRef = rewriter.create<bufferization::ToBufferOp>(loc, lhsMemRefType, lhs).getResult();
     Value rhsMemRef = rewriter.create<bufferization::ToBufferOp>(loc, rhsMemRefType, rhs).getResult();
-
-    // Allocate result
     Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultShape, resultType.getElementType());
     Value resultMemRef = rewriter.create<bufferization::ToBufferOp>(loc, resultMemRefType, emptyTensor).getResult();
 
-    // Cast lhs, rhs, and result to flat 1D views for index arithmetic
     Value lhsFlat = rewriter.create<memref::ReinterpretCastOp>(
-        loc, lhsFlatType, lhsMemRef,
-        /*offset=*/(int64_t)0,
-        /*sizes=*/ArrayRef<int64_t>{lhsFlatSize},
-        /*strides=*/ArrayRef<int64_t>{1});
+        loc, lhsFlatType, lhsMemRef, (int64_t)0,
+        ArrayRef<int64_t>{lhsFlatSize}, ArrayRef<int64_t>{1});
     Value rhsFlat = rewriter.create<memref::ReinterpretCastOp>(
-        loc, rhsFlatType, rhsMemRef,
-        /*offset=*/(int64_t)0,
-        /*sizes=*/ArrayRef<int64_t>{rhsFlatSize},
-        /*strides=*/ArrayRef<int64_t>{1});
+        loc, rhsFlatType, rhsMemRef, (int64_t)0,
+        ArrayRef<int64_t>{rhsFlatSize}, ArrayRef<int64_t>{1});
     Value resFlat = rewriter.create<memref::ReinterpretCastOp>(
-        loc, resFlatType, resultMemRef,
-        /*offset=*/(int64_t)0,
-        /*sizes=*/ArrayRef<int64_t>{resFlatSize},
-        /*strides=*/ArrayRef<int64_t>{1});
+        loc, resFlatType, resultMemRef, (int64_t)0,
+        ArrayRef<int64_t>{resFlatSize}, ArrayRef<int64_t>{1});
 
-    // ---- Shared memory constants ----
-    int64_t tileSize = 16;
-    int64_t elemByteSize = lhsType.getElementType().getIntOrFloatBitWidth() / 8;
-    int64_t tileByteSize = tileSize * tileSize * elemByteSize;
-    int64_t totalSharedBytes = 2 * tileByteSize;
+    Type elemType = lhsType.getElementType();
 
-    Value cM         = rewriter.create<arith::ConstantIndexOp>(loc, M);
-    Value cN         = rewriter.create<arith::ConstantIndexOp>(loc, N);
-    Value cK         = rewriter.create<arith::ConstantIndexOp>(loc, K);
-    Value cTileSize  = rewriter.create<arith::ConstantIndexOp>(loc, tileSize);
-    Value c1         = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value cTileBytes = rewriter.create<arith::ConstantIndexOp>(loc, tileByteSize);
-    Value cTotalBatches = rewriter.create<arith::ConstantIndexOp>(loc, totalBatches);
-    Value cLhsBatchStride = rewriter.create<arith::ConstantIndexOp>(loc, lhsBatchStride);
-    Value cRhsBatchStride = rewriter.create<arith::ConstantIndexOp>(loc, rhsBatchStride);
-    Value cResBatchStride = rewriter.create<arith::ConstantIndexOp>(loc, resBatchStride);
-    Value cLhsKStride     = rewriter.create<arith::ConstantIndexOp>(loc, K);   // stride along K for A
-    Value cRhsNStride     = rewriter.create<arith::ConstantIndexOp>(loc, N);   // stride along N for B
-
-    Value dynamicSharedMemSize = rewriter.create<arith::IndexCastOp>(
-        loc, rewriter.getI32Type(),
-        rewriter.create<arith::ConstantIndexOp>(loc, totalSharedBytes));
-
-    Value gridX = rewriter.create<arith::DivUIOp>(loc,
-        rewriter.create<arith::AddIOp>(loc, cN,
-            rewriter.create<arith::ConstantIndexOp>(loc, tileSize - 1)), cTileSize);
-    Value gridY = rewriter.create<arith::DivUIOp>(loc,
-        rewriter.create<arith::AddIOp>(loc, cM,
-            rewriter.create<arith::ConstantIndexOp>(loc, tileSize - 1)), cTileSize);
-    // Grid Z = totalBatches (1 for pure 2D matmul, >1 for batched)
-    Value gridZ = cTotalBatches;
-
-    // ---- GPU Launch ----
-    auto launchOp = rewriter.create<gpu::LaunchOp>(
-        loc,
-        gridX, gridY, gridZ,
-        cTileSize, cTileSize, c1,
-        /*dynamicSharedMemorySize=*/dynamicSharedMemSize);
-
-    rewriter.setInsertionPointToStart(&launchOp.getBody().front());
-
-    // ---- Inside the kernel ----
-    MLIRContext *ctx = rewriter.getContext();
-    auto workgroupAddrSpace = gpu::AddressSpaceAttr::get(
-        ctx, gpu::GPUDialect::getWorkgroupAddressSpace());
-    auto i8DynMemRefType = MemRefType::get({ShapedType::kDynamic},
-                                           rewriter.getIntegerType(8),
-                                           AffineMap{},
-                                           workgroupAddrSpace);
-    Value shmem = rewriter.create<gpu::DynamicSharedMemoryOp>(loc, i8DynMemRefType);
-
-    auto tileMemRefType = MemRefType::get({tileSize, tileSize},
-                                          lhsType.getElementType(),
-                                          AffineMap{},
-                                          workgroupAddrSpace);
-    Value c0k = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value tileA = rewriter.create<memref::ViewOp>(
-        loc, tileMemRefType, shmem, c0k, /*sizes=*/ValueRange{});
-    Value tileB = rewriter.create<memref::ViewOp>(
-        loc, tileMemRefType, shmem, cTileBytes, /*sizes=*/ValueRange{});
-
-    // Thread/block indices
-    Value tx = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-    Value ty = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::y);
-    Value bx = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x);
-    Value by = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::y);
-    Value bz = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::z); // batch index
-
-    // Global output row/col for this thread
-    Value col = rewriter.create<arith::AddIOp>(loc, rewriter.create<arith::MulIOp>(loc, bx, cTileSize), tx);
-    Value row = rewriter.create<arith::AddIOp>(loc, rewriter.create<arith::MulIOp>(loc, by, cTileSize), ty);
-
-    // Compute batch base offsets for each operand
-    Value lhsBatchOff = rewriter.create<arith::MulIOp>(loc, bz, cLhsBatchStride);
-    Value rhsBatchOff = rewriter.create<arith::MulIOp>(loc, bz, cRhsBatchStride);
-    Value resBatchOff = rewriter.create<arith::MulIOp>(loc, bz, cResBatchStride);
-
-    Value sum_init = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getZeroAttr(resultType.getElementType()));
-
-    // ---- Main tiling loop over K ----
-    auto kLoop = rewriter.create<scf::ForOp>(loc, c0k, cK, cTileSize, ValueRange{sum_init});
-    rewriter.setInsertionPointToStart(kLoop.getBody());
-
-    Value kOffset    = kLoop.getInductionVar();
-    Value currentSum = kLoop.getRegionIterArgs()[0];
-
-    // A element linear index = lhsBatchOff + row*K + aCol
-    Value aCol = rewriter.create<arith::AddIOp>(loc, kOffset, tx);
-    Value aInBounds = rewriter.create<arith::AndIOp>(loc,
-        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, row, cM),
-        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, aCol, cK));
-
-    auto ifA = rewriter.create<scf::IfOp>(loc, aInBounds, /*withElse=*/true);
-    rewriter.setInsertionPointToStart(ifA.thenBlock());
-    {
-      // lhsFlat[ lhsBatchOff + row*K + aCol ]
-      Value rowOffset  = rewriter.create<arith::MulIOp>(loc, row, cLhsKStride);
-      Value aLinear    = rewriter.create<arith::AddIOp>(loc,
-                            rewriter.create<arith::AddIOp>(loc, lhsBatchOff, rowOffset), aCol);
-      Value aVal = rewriter.create<memref::LoadOp>(loc, lhsFlat, ValueRange{aLinear});
-      rewriter.create<memref::StoreOp>(loc, aVal, tileA, ValueRange{ty, tx});
+    // ── Three-way dispatch ──
+    if (elemType.isF64()) {
+      // f64: no Tensor Core support → scalar CUDA core tiled matmul
+      return lowerScalarMatmul(op, rewriter, lhsFlat, rhsFlat, resFlat,
+                               M, K, N, totalBatches, lhsBatchStride,
+                               rhsBatchStride, resBatchStride,
+                               resultType, resultShape, resultMemRef);
+    } else if (elemType.isF32()) {
+      // f32: TF32 Tensor Cores (Ampere sm_80+), mmaShape=[16,8,8]
+      return lowerTensorCoreMatmul(op, rewriter, lhsFlat, rhsFlat, resFlat,
+                                   M, K, N, totalBatches, lhsBatchStride,
+                                   rhsBatchStride, resBatchStride,
+                                   resultType, resultShape, resultMemRef,
+                                   /*useTF32=*/true);
+    } else {
+      // f16 / bf16: FP16 Tensor Cores, mmaShape=[16,8,16], no casting
+      return lowerTensorCoreMatmul(op, rewriter, lhsFlat, rhsFlat, resFlat,
+                                   M, K, N, totalBatches, lhsBatchStride,
+                                   rhsBatchStride, resBatchStride,
+                                   resultType, resultShape, resultMemRef,
+                                   /*useTF32=*/false);
     }
-    rewriter.setInsertionPointToStart(ifA.elseBlock());
-    rewriter.create<memref::StoreOp>(loc, sum_init, tileA, ValueRange{ty, tx});
-    rewriter.setInsertionPointAfter(ifA);
-
-    // B element linear index = rhsBatchOff + bRow*N + col
-    Value bRow = rewriter.create<arith::AddIOp>(loc, kOffset, ty);
-    Value bInBounds = rewriter.create<arith::AndIOp>(loc,
-        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, bRow, cK),
-        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, col, cN));
-
-    auto ifB = rewriter.create<scf::IfOp>(loc, bInBounds, /*withElse=*/true);
-    rewriter.setInsertionPointToStart(ifB.thenBlock());
-    {
-      // rhsFlat[ rhsBatchOff + bRow*N + col ]
-      Value bRowOffset = rewriter.create<arith::MulIOp>(loc, bRow, cRhsNStride);
-      Value bLinear    = rewriter.create<arith::AddIOp>(loc,
-                            rewriter.create<arith::AddIOp>(loc, rhsBatchOff, bRowOffset), col);
-      Value bVal = rewriter.create<memref::LoadOp>(loc, rhsFlat, ValueRange{bLinear});
-      rewriter.create<memref::StoreOp>(loc, bVal, tileB, ValueRange{ty, tx});
-    }
-    rewriter.setInsertionPointToStart(ifB.elseBlock());
-    rewriter.create<memref::StoreOp>(loc, sum_init, tileB, ValueRange{ty, tx});
-    rewriter.setInsertionPointAfter(ifB);
-
-    // Barrier 1: all threads done loading shared memory tiles
-    {
-      rewriter.create<NVVM::Barrier0Op>(loc);
-    }
-
-    // Compute partial dot product from shared memory tiles.
-    // Use InsertionGuard to safely scope the innerLoop body build.
-    auto innerLoop = rewriter.create<scf::ForOp>(loc, c0k, cTileSize, c1, ValueRange{currentSum});
-    // Save the kLoop body block before entering innerLoop scope
-    Block *kBlock = kLoop.getBody();
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      // The ForOp block might already have an implicit yield — erase it only if present
-      Block *innerBody = innerLoop.getBody();
-      if (!innerBody->empty() && innerBody->back().hasTrait<mlir::OpTrait::IsTerminator>())
-        rewriter.eraseOp(&innerBody->back());
-      rewriter.setInsertionPointToEnd(innerBody);
-
-      Value i   = innerLoop.getInductionVar();
-      Value acc = innerLoop.getRegionIterArgs()[0];
-      Value tA  = rewriter.create<memref::LoadOp>(loc, tileA, ValueRange{ty, i});
-      Value tB  = rewriter.create<memref::LoadOp>(loc, tileB, ValueRange{i, tx});
-
-      Value mul, nextAcc;
-      if (llvm::isa<FloatType>(resultType.getElementType())) {
-        mul     = rewriter.create<arith::MulFOp>(loc, tA, tB);
-        nextAcc = rewriter.create<arith::AddFOp>(loc, acc, mul);
-      } else {
-        mul     = rewriter.create<arith::MulIOp>(loc, tA, tB);
-        nextAcc = rewriter.create<arith::AddIOp>(loc, acc, mul);
-      }
-      rewriter.create<scf::YieldOp>(loc, nextAcc);
-    } // InsertionGuard restores insertion point
-
-    Value loopResult = innerLoop.getResult(0);
-
-    // EXPLICITLY insert barrier 2 and kLoop yield into kBlock using Block iterator.
-    // This guarantees correct placement regardless of InsertionGuard restore.
-    {
-      // Erase implicit kLoop yield if it already exists
-      if (!kBlock->empty() && kBlock->back().hasTrait<mlir::OpTrait::IsTerminator>())
-        rewriter.eraseOp(&kBlock->back());
-      // Set insertion point explicitly to the END of kBlock
-      rewriter.setInsertionPoint(kBlock, kBlock->end());
-    }
-    // Barrier 2: all threads done using shared-memory tiles before next K-tile iteration.
-    {
-      rewriter.create<NVVM::Barrier0Op>(loc);
-    }
-
-    rewriter.create<scf::YieldOp>(loc, loopResult);
-
-    // ---- Store result ----
-    rewriter.setInsertionPointAfter(kLoop);
-    Value finalResult = kLoop.getResult(0);
-
-    Value outBounds = rewriter.create<arith::AndIOp>(loc,
-        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, row, cM),
-        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, col, cN));
-
-    auto ifOut = rewriter.create<scf::IfOp>(loc, outBounds, /*withElse=*/false);
-    rewriter.setInsertionPointToStart(ifOut.thenBlock());
-    {
-      // resFlat[ resBatchOff + row*N + col ]
-      Value rowOffsetR = rewriter.create<arith::MulIOp>(loc, row, cRhsNStride); // N stride
-      Value rLinear    = rewriter.create<arith::AddIOp>(loc,
-                            rewriter.create<arith::AddIOp>(loc, resBatchOff, rowOffsetR), col);
-      rewriter.create<memref::StoreOp>(loc, finalResult, resFlat, ValueRange{rLinear});
-    }
-    rewriter.setInsertionPointAfter(ifOut);
-
-    rewriter.create<gpu::TerminatorOp>(loc);
-    rewriter.setInsertionPointAfter(launchOp);
-
-    // ---- Wrap result memref back to tensor ----
-    Value resultTensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, resultType, resultMemRef, /*restrict=*/true).getResult();
-    rewriter.replaceOp(op, resultTensor);
-
-    return success();
   }
 };
 

@@ -14,6 +14,7 @@
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/TransformOps/FuncTransformOps.h"
 #include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
 #include "mlir/Dialect/MemRef/TransformOps/MemRefTransformOps.h"
 #include "mlir/Dialect/SCF/TransformOps/SCFTransformOps.h"
@@ -73,6 +74,40 @@ struct BarrierOpMemEffectModel
     // No memory effects (synchronization only)
   }
 };
+
+struct DeviceAsyncCreateGroupOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          DeviceAsyncCreateGroupOpMemEffectModel, mlir::nvgpu::DeviceAsyncCreateGroupOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // No direct memory effects (commits async groups)
+  }
+};
+
+struct DeviceAsyncWaitOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          DeviceAsyncWaitOpMemEffectModel, mlir::nvgpu::DeviceAsyncWaitOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // No direct memory effects (waits for async groups)
+  }
+};
+
+struct DeviceAsyncCopyOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          DeviceAsyncCopyOpMemEffectModel, mlir::nvgpu::DeviceAsyncCopyOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // Portably report Read and Write effects without binding to a specific Value
+    effects.emplace_back(mlir::MemoryEffects::Read::get(),
+                         mlir::SideEffects::DefaultResource::get());
+    effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                         mlir::SideEffects::DefaultResource::get());
+  }
+};
 } // namespace
 
 int main(int argc, char **argv) {
@@ -85,6 +120,16 @@ int main(int argc, char **argv) {
                             mlir::gpu::GPUDialect *dialect) {
     mlir::gpu::AllReduceOp::attachInterface<AllReduceOpMemEffectModel>(*ctx);
     mlir::gpu::BarrierOp::attachInterface<BarrierOpMemEffectModel>(*ctx);
+  });
+
+  registry.addExtension(+[](mlir::MLIRContext *ctx,
+                            mlir::nvgpu::NVGPUDialect *dialect) {
+    mlir::nvgpu::DeviceAsyncCreateGroupOp::attachInterface<
+        DeviceAsyncCreateGroupOpMemEffectModel>(*ctx);
+    mlir::nvgpu::DeviceAsyncWaitOp::attachInterface<
+        DeviceAsyncWaitOpMemEffectModel>(*ctx);
+    mlir::nvgpu::DeviceAsyncCopyOp::attachInterface<
+        DeviceAsyncCopyOpMemEffectModel>(*ctx);
   });
 
   // Register the AddGpuMemoryCopies pass

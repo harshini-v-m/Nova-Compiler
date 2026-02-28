@@ -12,6 +12,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -913,7 +915,8 @@ struct NovaToGpuPass
     registry.insert<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect,
                     memref::MemRefDialect, tensor::TensorDialect,
                     bufferization::BufferizationDialect, math::MathDialect,
-                    func::FuncDialect, NVVM::NVVMDialect>();
+                    func::FuncDialect, NVVM::NVVMDialect, nvgpu::NVGPUDialect,
+                    vector::VectorDialect>();
 
     // Register the side-effect interface for nvvm.barrier0.
     registry.addExtension(
@@ -931,7 +934,7 @@ struct NovaToGpuPass
         arith::ArithDialect, gpu::GPUDialect, scf::SCFDialect,
         memref::MemRefDialect, func::FuncDialect, math::MathDialect,
         tensor::TensorDialect, bufferization::BufferizationDialect,
-        NVVM::NVVMDialect>();
+        NVVM::NVVMDialect, nvgpu::NVGPUDialect, vector::VectorDialect>();
     target.addLegalOp<gpu::BarrierOp>();
     target.addIllegalOp<nova::ToDeviceOp, nova::SceOp, nova::MatmulOp,
                         nova::GatherOp, nova::ScatterAddOp>();

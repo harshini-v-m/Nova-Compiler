@@ -108,6 +108,7 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgFoldUnitExtentDimsPass());
 
             // Tiling is handled in Section 6 after parallel loop conversion
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgFoldIntoElementwisePass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgElementwiseOpFusionPass());
             // pm.addNestedPass<mlir::func::FuncOp>(
             //     mlir::createLinalgGeneralizeNamedOpsPass());
@@ -207,6 +208,8 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
             auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
             gpuPm.addPass(mlir::createLowerAffinePass());
             gpuPm.addPass(mlir::createSCFToControlFlowPass());
+            // Convert nvgpu.mma.sync -> nvvm.mma.sync BEFORE the GPU→NVVM pass
+            gpuPm.addPass(mlir::createConvertNVGPUToNVVMPass());
             mlir::ConvertGpuOpsToNVVMOpsOptions nvvmOptions;
             // nvvmOptions.useBarePtrCallConv = true; // Disabled to match dynamic wrapper
             gpuPm.addPass(mlir::createConvertGpuOpsToNVVMOps(nvvmOptions));
