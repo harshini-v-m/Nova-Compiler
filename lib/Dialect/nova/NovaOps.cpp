@@ -16,7 +16,6 @@ using namespace mlir::nova;
 
 // Helper Functions
 
-
 // type promotion for result type -heirarchy
 static LogicalResult BinaryTypePromotionReturnType(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
@@ -1027,7 +1026,7 @@ LogicalResult CompareOp::inferReturnTypes(
   if (!broadcastedShape) {
     if (location) {
       mlir::emitError(*location) << "incompatible shapes for broadcasting - "
-                            << lhsType << " and " << rhsType;
+                                 << lhsType << " and " << rhsType;
     }
     return failure();
   }
@@ -2010,12 +2009,105 @@ LogicalResult LayerNormOp::inferReturnTypes(
       inputType.getShape(), inputType.getElementType()));
   return success();
 }
+LogicalResult LayerNormBackwardOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto gyType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
+  auto xType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
+  auto meanType = llvm::dyn_cast<RankedTensorType>(operands[2].getType());
+  auto rstdType = llvm::dyn_cast<RankedTensorType>(operands[3].getType());
+  auto gammaType = llvm::dyn_cast<RankedTensorType>(operands[4].getType());
+
+  if (!gyType || !xType || !meanType || !rstdType || !gammaType)
+    return failure();
+
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(xType.getShape(), xType.getElementType()));
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(gammaType.getShape(), gammaType.getElementType()));
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(gammaType.getShape(), gammaType.getElementType()));
+
+  return success();
+}
+LogicalResult LinearOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+                           llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto inputtype = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
+  auto weighttype = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
+  auto biasType = llvm::dyn_cast<RankedTensorType>(operands[2].getType());
+
+  if (!inputtype || !weighttype || !biasType)
+    return failure();
+  // input = [A,B] weight =[B,C] bias =[C]
+//output =[A,C]
+//if it is 2d tensor 
+if(inputtype.getShape().size() == 2){
+  inferredReturnTypes.push_back(
+      RankedTensorType::get({inputtype.getShape()[0], weighttype.getShape()[1]}, inputtype.getElementType()));
+  }
+ //if it is 3d tensor
+ else if(inputtype.getShape().size() == 3){
+    inferredReturnTypes.push_back(
+      RankedTensorType::get({inputtype.getShape()[0], inputtype.getShape()[1], weighttype.getShape()[1]}, inputtype.getElementType()));
+}
+else{
+  //print error
+  llvm::errs() << "LinearOp: input tensor must be 2d or 3d,only supports 2d,3d for now.";
+    return failure();
+  }
+  return success();
+}
+
+LogicalResult LinearBackwardOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto gradOutType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
+  auto inputType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
+  auto weightType = llvm::dyn_cast<RankedTensorType>(operands[2].getType());
+
+  if (!gradOutType || !inputType || !weightType)
+    return failure();
+
+  // grad_input has the same shape as input
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(inputType.getShape(), inputType.getElementType()));
+  // grad_weight has the same shape as weight
+  inferredReturnTypes.push_back(RankedTensorType::get(
+      weightType.getShape(), weightType.getElementType()));
+  // grad_bias has shape bias =[C]. weight=[B,C]. Therefore
+  // weightType.getShape()[1];
+  inferredReturnTypes.push_back(RankedTensorType::get(
+      {weightType.getShape()[1]}, weightType.getElementType()));
+
+  return success();
+}
+
+LogicalResult GeluBackwardOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto gradOutType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
+  auto inputType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
+
+  if (!gradOutType || !inputType)
+    return failure();
+
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(inputType.getShape(), inputType.getElementType()));
+
+  return success();
+}
+
 // SceBackwardOp
 LogicalResult
 SceBackwardOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
                                 ValueRange operands, DictionaryAttr attributes,
                                 OpaqueProperties properties, RegionRange regions,
-                                llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
   auto logitsType = dyn_cast<RankedTensorType>(operands[0].getType());
   if (!logitsType)
     return failure();

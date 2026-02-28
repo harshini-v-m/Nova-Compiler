@@ -785,6 +785,14 @@ def Nova_GeluOp : Op<Nova_Dialect,"gelu", [Pure, DeclareOpInterfaceMethods<Infer
     $lhs attr-dict `:` type($lhs) }];
   
 }
+def Nova_GeluBackwardOp : Op<Nova_Dialect,"gelu_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                NoComplexOperands]> {
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$input);
+  let results = (outs Nova_Tensor:$result);
+   
+  let assemblyFormat = [{
+    $grad_out `,` $input attr-dict `:` type($grad_out) `,` type($input) }];
+}
 def Nova_SoftmaxOp:Op<Nova_Dialect,"softmax",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>,NoComplexOperands]>{
   let arguments=(ins Nova_Tensor:$input,
    OptionalAttr<I32Attr>:$dimension);
@@ -1004,6 +1012,33 @@ def LayerNormOp :Op<Nova_Dialect,"layer_norm",[Pure,DeclareOpInterfaceMethods<In
   //let hasVerifier=1;
     let assemblyFormat = [{
     $input `,` $gamma `,` $beta attr-dict `:` type($input) `,` type($gamma) `,` type($beta) 
+  }];
+}
+def LayerNormBackwardOp :Op<Nova_Dialect,"layer_norm_backward",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary ="Layer norm backward has calculating gradient for gamma,beta and input";
+  let arguments = (ins Nova_Tensor:$grad_y, Nova_Tensor:$x, Nova_Tensor:$mean, Nova_Tensor:$rstd, Nova_Tensor:$gamma);
+  let results=(outs Nova_Tensor:$grad_x, Nova_Tensor:$grad_gamma, Nova_Tensor:$grad_beta);
+  //let hasVerifier=1;
+    let assemblyFormat = [{
+    $grad_y `,` $x `,` $mean `,` $rstd `,` $gamma attr-dict `:` type($grad_y) `,` type($x) `,` type($mean) `,` type($rstd) `,` type($gamma) 
+  }];
+}
+def LinearOp :Op<Nova_Dialect,"linear",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary ="Linear operation(matmul+add)";
+  let arguments = (ins Nova_Tensor:$input, Nova_Tensor:$weight, Nova_Tensor:$bias);
+  let results=(outs Nova_Tensor:$output);
+  //let hasVerifier=1;
+    let assemblyFormat = [{
+    $input `,` $weight `,` $bias attr-dict `:` type($input) `,` type($weight) `,` type($bias) 
+  }];
+}
+def LinearBackwardOp :Op<Nova_Dialect,"linear_backward",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary ="Linear backward operation calculating gradient for input, weight, and bias";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$input, Nova_Tensor:$weight);
+  let results=(outs Nova_Tensor:$grad_input, Nova_Tensor:$grad_weight, Nova_Tensor:$grad_bias);
+  //let hasVerifier=1;
+    let assemblyFormat = [{
+    $grad_out `,` $input `,` $weight attr-dict `:` type($grad_out) `,` type($input) `,` type($weight) 
   }];
 }
 def Nova_SceBackwardOp : Op<Nova_Dialect, "sce_backward",
