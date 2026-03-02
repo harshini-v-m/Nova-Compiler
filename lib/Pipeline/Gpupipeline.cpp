@@ -85,6 +85,7 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
   pm.addNestedPass<mlir::func::FuncOp>(
       mlir::nova::createNovaFusionKernelEmitterPass());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToGpuPass());
+  pm.addPass(mlir::createLoopInvariantCodeMotionPass());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgPass());
 
             // 2. TOSA TO LINALG (Named and regular)
@@ -187,6 +188,7 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
 
+            pm.addPass(mlir::createLoopInvariantCodeMotionPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createAddGpuMemoryCopiesPass());
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
 

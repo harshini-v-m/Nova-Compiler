@@ -118,6 +118,39 @@ struct BarrierOpMemEffectModel
   }
 };
 
+struct DeviceAsyncCreateGroupOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          DeviceAsyncCreateGroupOpMemEffectModel, mlir::nvgpu::DeviceAsyncCreateGroupOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // No direct memory effects (commits async groups)
+  }
+};
+
+struct DeviceAsyncWaitOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          DeviceAsyncWaitOpMemEffectModel, mlir::nvgpu::DeviceAsyncWaitOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // No direct memory effects (waits for async groups)
+  }
+};
+
+struct DeviceAsyncCopyOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          DeviceAsyncCopyOpMemEffectModel, mlir::nvgpu::DeviceAsyncCopyOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // Portably report Read and Write effects without binding to a specific Value
+    effects.emplace_back(mlir::MemoryEffects::Read::get(),
+                         mlir::SideEffects::DefaultResource::get());
+    effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                         mlir::SideEffects::DefaultResource::get());
+  }
+};
 
 NovaCompilerAPI::NovaCompilerAPI() {
   // Register all MLIR passes globally so they can be parsed from strings
@@ -280,6 +313,16 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
     mlir::gpu::AllReduceOp::attachInterface<AllReduceOpMemEffectModel>(*ctx);
     mlir::gpu::DynamicSharedMemoryOp::attachInterface<DynamicSharedMemoryOpMemEffectModel>(*ctx);
     mlir::gpu::BarrierOp::attachInterface<BarrierOpMemEffectModel>(*ctx);
+  });
+
+  registry.addExtension(+[](mlir::MLIRContext *ctx,
+                            mlir::nvgpu::NVGPUDialect *dialect) {
+    mlir::nvgpu::DeviceAsyncCreateGroupOp::attachInterface<
+        DeviceAsyncCreateGroupOpMemEffectModel>(*ctx);
+    mlir::nvgpu::DeviceAsyncWaitOp::attachInterface<
+        DeviceAsyncWaitOpMemEffectModel>(*ctx);
+    mlir::nvgpu::DeviceAsyncCopyOp::attachInterface<
+        DeviceAsyncCopyOpMemEffectModel>(*ctx);
   });
 }
 

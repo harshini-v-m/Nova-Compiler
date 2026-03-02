@@ -358,6 +358,11 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
   Value bTileCol   = rewriter.create<arith::RemUIOp>(loc, bTid, cTileN);
   Value bGlobalCol = rewriter.create<arith::AddIOp>(loc, blockColBase, bTileCol);
 
+  // Second B-row per thread: covers rows [B_ROWS_PER_PASS .. TILE_K-1] of sB.
+  // With THREADS=256, TILE_N=64: B_ROWS_PER_PASS=4, bTileRow2 max=7 < TILE_K=8.
+  const int64_t B_ROWS_PER_PASS = THREADS / TILE_N;  // = 4
+  Value bTileRow2 = rewriter.create<arith::AddIOp>(loc, bTileRow, ci(B_ROWS_PER_PASS));
+
   // ── Pointer induction initial values (flat element offsets into lhsFlat / rhsFlat) ──
   // aPtr0 = lhsBatchOff + aGlobalRow * K + aTileCol  (points to k=0)
   // bPtr0 = rhsBatchOff + bTileRow * N + bGlobalCol  (start offset, updated each iter)
@@ -369,6 +374,9 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
       rewriter.create<arith::AddIOp>(loc,
           rewriter.create<arith::MulIOp>(loc, bTileRow, cNStride),
           bGlobalCol));
+  // Second B pointer: same column, B_ROWS_PER_PASS rows further in K-dim.
+  Value bPtr0_2 = rewriter.create<arith::AddIOp>(loc, bPtr0,
+      rewriter.create<arith::MulIOp>(loc, ci(B_ROWS_PER_PASS), cNStride));
 
   // ── Helper: async copy one element from global to shared ──
   // Loads lhsFlat[aPtr] into sA[aTileRow, aTileCol] if in bounds.
@@ -403,11 +411,23 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
     return tok;
   };
 
+  // Second B-row copy: uses bTileRow2 = bTileRow + B_ROWS_PER_PASS.
+  // bTileRow2 < TILE_K is always true for 256-thread block, so only check col.
+  auto asyncCopyB2 = [&](OpBuilder &b, Value sB, Value bPtr2,
+                         Value inBoundsCol) {
+    Value safePtr = b.create<arith::SelectOp>(loc, inBoundsCol, bPtr2, c0);
+    Value tok = b.create<nvgpu::DeviceAsyncCopyOp>(
+        loc, sB, ValueRange{bTileRow2, bTileCol},
+        rhsFlat, ValueRange{safePtr},
+        rewriter.getIndexAttr(inputElemBytes), Value{}, nullptr);
+    return tok;
+  };
+
   // ── Helper: load one stage from global into shared mem using current pointers ──
   // Returns the committed async token and does NOT advance the pointers.
   // Pointer advancing is done by the caller as an iter_arg increment.
   auto issueStageLoad = [&](OpBuilder &b, Value stageIdx,
-                             Value aPtr, Value bPtr) -> Value {
+                             Value aPtr, Value bPtr, Value bPtr2) -> Value {
     auto [sA, sB] = getStageViews(b, stageIdx);
 
     // Bounds for this load: check A row and K col
@@ -425,9 +445,11 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
                                             bGlobalCol, cN);
     Value bRowOk = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
                                             bTileRow, cTileK);
-    Value tokB = asyncCopyB(b, sB, bPtr, bRowOk, bColOk);
+    Value tokB  = asyncCopyB(b, sB, bPtr,  bRowOk, bColOk);
+    // Second B-row copy: covers sB rows [B_ROWS_PER_PASS..TILE_K-1].
+    Value tokB2 = asyncCopyB2(b, sB, bPtr2, bColOk);
 
-    SmallVector<Value> tokens{tokA, tokB};
+    SmallVector<Value> tokens{tokA, tokB, tokB2};
     Value groupTok = b.create<nvgpu::DeviceAsyncCreateGroupOp>(
         loc, nvgpu::DeviceAsyncTokenType::get(ctx), tokens);
     return groupTok;
@@ -440,13 +462,14 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
 
   // ── Prolog: Load stages 0 and 1 ──
   // Stage 0: k=0, aPtr=aPtr0, bPtr=bPtr0
-  Value tok0 = issueStageLoad(rewriter, c0, aPtr0, bPtr0);
+  Value tok0 = issueStageLoad(rewriter, c0, aPtr0, bPtr0, bPtr0_2);
   rewriter.create<nvgpu::DeviceAsyncCreateGroupOp>(   // commit group 0
       loc, nvgpu::DeviceAsyncTokenType::get(ctx), ValueRange{tok0});
 
   // Stage 1: k=TILE_K — only if K > TILE_K
-  Value aPtr1 = rewriter.create<arith::AddIOp>(loc, aPtr0, cAStride);
-  Value bPtr1 = rewriter.create<arith::AddIOp>(loc, bPtr0, cBStride);
+  Value aPtr1   = rewriter.create<arith::AddIOp>(loc, aPtr0,   cAStride);
+  Value bPtr1   = rewriter.create<arith::AddIOp>(loc, bPtr0,   cBStride);
+  Value bPtr1_2 = rewriter.create<arith::AddIOp>(loc, bPtr0_2, cBStride);
   Value hasStage1 = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ugt, cK, cTileK);
   auto ifS1 = rewriter.create<scf::IfOp>(loc, nvgpu::DeviceAsyncTokenType::get(ctx),
                                           hasStage1, /*withElse=*/true);
@@ -454,7 +477,7 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPointToStart(ifS1.thenBlock());
     if (!ifS1.thenBlock()->empty()) rewriter.eraseOp(&ifS1.thenBlock()->back());
-    Value t1 = issueStageLoad(rewriter, c1, aPtr1, bPtr1);
+    Value t1 = issueStageLoad(rewriter, c1, aPtr1, bPtr1, bPtr1_2);
     rewriter.create<scf::YieldOp>(loc, t1);
 
     rewriter.setInsertionPointToStart(ifS1.elseBlock());
@@ -470,8 +493,9 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
   // Pointer induction starting values for the loop:
   // At k=0, we already issued k=0 and k=TILE_K.
   // The loop will issue k+2*TILE_K at each iteration.
-  Value aPtr2 = rewriter.create<arith::AddIOp>(loc, aPtr1, cAStride);  // k=2*TILE_K
-  Value bPtr2 = rewriter.create<arith::AddIOp>(loc, bPtr1, cBStride);
+  Value aPtr2   = rewriter.create<arith::AddIOp>(loc, aPtr1,   cAStride);  // k=2*TILE_K
+  Value bPtr2   = rewriter.create<arith::AddIOp>(loc, bPtr1,   cBStride);
+  Value bPtr2_2 = rewriter.create<arith::AddIOp>(loc, bPtr1_2, cBStride);  // second-row, k=2*TILE_K
 
   // ── Main K-loop — iter_args carry (acc, token, writeStage, readStage, aPtr, bPtr) ──
   // aPtr/bPtr point to the NEXT stage to be written (k+2*TILE_K at entry).
@@ -480,7 +504,7 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
 
   auto mainLoop = rewriter.create<scf::ForOp>(
       loc, c0, cK, cTileK,
-      ValueRange{cInit, prologToken, cWriteStage0, cReadStage0, aPtr2, bPtr2});
+      ValueRange{cInit, prologToken, cWriteStage0, cReadStage0, aPtr2, bPtr2, bPtr2_2});
   {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(mainLoop.getBody());
@@ -494,6 +518,7 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
     Value readStage   = mainLoop.getRegionIterArgs()[3];
     Value aPtr        = mainLoop.getRegionIterArgs()[4];  // points to k+2*TILE_K
     Value bPtr        = mainLoop.getRegionIterArgs()[5];
+    Value bPtr2_arg   = mainLoop.getRegionIterArgs()[6];  // second B-row pointer
 
     // Issue next stage load (k + 2*TILE_K) if still in range
     Value nextK       = rewriter.create<arith::AddIOp>(loc, k, ci(2 * TILE_K));
@@ -504,7 +529,7 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
       OpBuilder::InsertionGuard g2(rewriter);
       rewriter.setInsertionPointToStart(ifNext.thenBlock());
       if (!ifNext.thenBlock()->empty()) rewriter.eraseOp(&ifNext.thenBlock()->back());
-      Value nt = issueStageLoad(rewriter, writeStage, aPtr, bPtr);
+      Value nt = issueStageLoad(rewriter, writeStage, aPtr, bPtr, bPtr2_arg);
       rewriter.create<scf::YieldOp>(loc, nt);
 
       rewriter.setInsertionPointToStart(ifNext.elseBlock());
@@ -578,11 +603,12 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
     Value nextReadStage = rewriter.create<arith::RemUIOp>(loc,
         rewriter.create<arith::AddIOp>(loc, readStage, c1), cStages);
     // Pointer induction: advance by one TILE_K step (no multiply!)
-    Value nextAPtr = rewriter.create<arith::AddIOp>(loc, aPtr, cAStride);
-    Value nextBPtr = rewriter.create<arith::AddIOp>(loc, bPtr, cBStride);
+    Value nextAPtr  = rewriter.create<arith::AddIOp>(loc, aPtr,      cAStride);
+    Value nextBPtr  = rewriter.create<arith::AddIOp>(loc, bPtr,      cBStride);
+    Value nextBPtr2 = rewriter.create<arith::AddIOp>(loc, bPtr2_arg, cBStride);
 
     rewriter.create<scf::YieldOp>(loc,
-        ValueRange{nextAcc, nextToken, nextWriteStage, nextReadStage, nextAPtr, nextBPtr});
+        ValueRange{nextAcc, nextToken, nextWriteStage, nextReadStage, nextAPtr, nextBPtr, nextBPtr2});
   }
 
   Value fAcc = mainLoop.getResult(0);
