@@ -1530,8 +1530,16 @@ struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
 
     // Map for Bias to Broadcast: bias is 1D -> (C)
     // Result is [A, B, ..., C]
-    SmallVector<AffineExpr> biasExprs = {
-        rewriter.getAffineDimExpr(inputRank - 1)};
+    // Instead of hardcoding 1 dimension:
+    SmallVector<AffineExpr> biasExprs;
+    if (biasType.getRank() == 1) {
+        biasExprs.push_back(rewriter.getAffineDimExpr(inputRank - 1));
+    } else if (biasType.getRank() == 2) {
+    // For [1, C] shape
+    biasExprs.push_back(rewriter.getAffineConstantExpr(0)); 
+    biasExprs.push_back(rewriter.getAffineDimExpr(inputRank - 1));
+    }
+
     AffineMap biasMap =
         AffineMap::get(inputRank, 0, biasExprs, rewriter.getContext());
     AffineMap resultMap = rewriter.getMultiDimIdentityMap(inputRank);
