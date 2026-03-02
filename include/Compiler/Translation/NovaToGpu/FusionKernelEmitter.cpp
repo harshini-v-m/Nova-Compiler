@@ -312,21 +312,9 @@ struct FullReduceLowering : public OpRewritePattern<nova::ReduceOp> {
     rewriter.setInsertionPointToStart(ifOp.thenBlock());
 
     IRMapping mapper;
-    // For FullReduce, indices is empty (or just zeroes if needed, but it's a
-    // full reduce so shape is usually a scalar block) Actually, full reduce
-    // over all elements. The indices for the element that resulted in 'reduced'
-    // is not well-defined. Full reduce usually just produces a scalar. If there
-    // is a fusion that requires the input, it's a bit ambiguous what index it
-    // wants. However, if the fused op operates pointwise with the original
-    // input, we'd need a two-phase loop. Let's pass empty indices for now, but
-    // note that FullReduce + Binary might need a full 2-phase loop structure
-    // which we haven't built into FullReduceLowering yet.
-    SmallVector<Value> emptyIndices;
-    auto fusionResult =
-        AbsorbElementwise(op.getOutput(), reduced, input, emptyIndices, mapper,
-                          launchOp, rewriter);
-    Value resultToStore = fusionResult.first;
-    SmallVector<Operation *> fusedOps = fusionResult.second;
+    Value resultToStore = reduced;
+    SmallVector<Operation *> fusedOps;
+
 
     // For MEAN, divide by numElements before storing
     if (kind == ReductionKind::MEAN) {
@@ -470,8 +458,14 @@ struct PartialReduceLowering : public OpRewritePattern<nova::ReduceOp> {
     // 2. Prepare Buffers
     SmallPtrSet<Value, 4> mappedTensors;
     auto analysis = analyzeFusion(op.getOutput(), input, mappedTensors);
-    Operation *finalFusedOp = analysis.first;
-    bool isTwoPhase = analysis.second;
+    Operation *finalFusedOp = nullptr; // analysis.first;
+    bool isTwoPhase = false; // analysis.second;
+    // Disable fusion: the greedy linalg.generic consumer matching in analyzeFusion
+    // can accidentally absorb ops from unrelated chains (e.g. SCE backward),
+    // and since we replaced the store path with a direct AtomicRMW to the
+    // reduce result, we must ensure alloc and to_tensor use the reduce output shape.
+
+
 
     RankedTensorType fusionOutputType = outputType;
     if (finalFusedOp) {
@@ -479,8 +473,13 @@ struct PartialReduceLowering : public OpRewritePattern<nova::ReduceOp> {
           cast<RankedTensorType>(finalFusedOp->getResults()[0].getType());
     }
 
+    // Fix: For two-phase fusion, alloc must be sized for outputType (the reduce
+    // output), NOT fusionOutputType. In two-phase mode we store per-row results
+    // at output coords, so the buffer shape must match outputType.
+    auto allocShape = isTwoPhase ? outputType.getShape() : fusionOutputType.getShape();
+    auto allocElem  = isTwoPhase ? outputType.getElementType() : fusionOutputType.getElementType();
     auto accMemRefType = MemRefType::get(
-        fusionOutputType.getShape(), fusionOutputType.getElementType(),
+        allocShape, allocElem,
         MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
     Value alloc = rewriter
                       .create<gpu::AllocOp>(loc, accMemRefType, ValueRange{},
@@ -634,126 +633,49 @@ struct PartialReduceLowering : public OpRewritePattern<nova::ReduceOp> {
       reduced = meanVal;
     }
 
-    // 4. Fusion and Store
+    // 4. Store: AtomicRMW at the output coordinates for this block.
+    // Fusion via AbsorbElementwise is disabled: it generates loads with 0
+    // indices on N-D tensors and incorrectly absorbs unrelated linalg ops.
     Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0).getResult();
-    SmallVector<Operation *> allFusedOps;
-    if (!isTwoPhase) {
-      Value isMaster =
-          rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, tid, c0)
-              .getResult();
-      auto ifOp = rewriter.create<scf::IfOp>(loc, isMaster, false);
-      rewriter.setInsertionPointToStart(ifOp.thenBlock());
+    SmallVector<Operation *> allFusedOps; // kept for op replacement below
 
-      IRMapping mapper;
-      SmallVector<Value> emptyIndices;
-      auto fusionResult =
-          AbsorbElementwise(op.getOutput(), reduced, input, emptyIndices,
-                            mapper, launchOp, rewriter);
-      Value resultToStore = fusionResult.first;
-      allFusedOps = fusionResult.second;
-      // We only use fused ops for erasing later. We can rely on finalFusedOp
-      // for type.
-
-      // Store index: Delinearize bid again to match output shape
-      SmallVector<Value> storeIdx;
-      Value remStore = bid;
-      auto outputShape = outputType.getShape();
-      storeIdx.resize(outputShape.size());
-      for (int i = outputShape.size() - 1; i >= 0; --i) {
-        int64_t dimSize = outputShape[i];
-        Value dimSizeVal =
-            rewriter.create<arith::ConstantIndexOp>(loc, dimSize).getResult();
-        if (i > 0) {
-          storeIdx[i] =
-              rewriter.create<arith::RemUIOp>(loc, remStore, dimSizeVal)
-                  .getResult();
-          remStore = rewriter.create<arith::DivUIOp>(loc, remStore, dimSizeVal)
-                         .getResult();
-        } else {
-          storeIdx[i] = remStore;
-        }
-      }
-
-      rewriter.create<memref::StoreOp>(loc, resultToStore, alloc, storeIdx);
-
-      rewriter.setInsertionPointAfter(ifOp);
-    } else {
-      // Two-Phase Fusion
-      rewriter.create<gpu::BarrierOp>(loc);
-
-      // We run a second loop where ALL threads participate to perform
-      // elementwise ops.
-      auto loop2 = rewriter.create<scf::ForOp>(loc, tid, cNumReduction, bdim,
-                                               ValueRange{});
-      {
-        OpBuilder::InsertionGuard guard2(rewriter);
-        rewriter.setInsertionPointToStart(loop2.getBody());
-        Value reduceLinearIdx2 = loop2.getInductionVar();
-
-        SmallVector<Value> inputIndices2(inputRank);
-
-        // Delinearize Parallel (Output) Index
-        Value remParallel2 = bid;
-        for (int i = parallelDims.size() - 1; i >= 0; --i) {
-          int64_t dimIdx = parallelDims[i];
-          int64_t dimSize = inputType.getDimSize(dimIdx);
-          Value dimSizeVal =
-              rewriter.create<arith::ConstantIndexOp>(loc, dimSize).getResult();
-
-          if (i > 0) {
-            Value coord =
-                rewriter.create<arith::RemUIOp>(loc, remParallel2, dimSizeVal)
-                    .getResult();
-            inputIndices2[dimIdx] = coord;
-            remParallel2 =
-                rewriter.create<arith::DivUIOp>(loc, remParallel2, dimSizeVal)
-                    .getResult();
-          } else {
-            inputIndices2[dimIdx] = remParallel2;
-          }
-        }
-
-        // Delinearize Reduction Index
-        Value remReduce2 = reduceLinearIdx2;
-        for (int i = reducedDims.size() - 1; i >= 0; --i) {
-          int64_t dimIdx = reducedDims[i];
-          int64_t dimSize = inputType.getDimSize(dimIdx);
-          Value dimSizeVal =
-              rewriter.create<arith::ConstantIndexOp>(loc, dimSize).getResult();
-
-          if (i > 0) {
-            Value coord =
-                rewriter.create<arith::RemUIOp>(loc, remReduce2, dimSizeVal)
-                    .getResult();
-            inputIndices2[dimIdx] = coord;
-            remReduce2 =
-                rewriter.create<arith::DivUIOp>(loc, remReduce2, dimSizeVal)
-                    .getResult();
-          } else {
-            inputIndices2[dimIdx] = remReduce2;
-          }
-        }
-
-        IRMapping mapper2;
-        auto fusionResult2 =
-            AbsorbElementwise(op.getOutput(), reduced, input, inputIndices2,
-                              mapper2, launchOp, rewriter);
-        Value resultToStore2 = fusionResult2.first;
-        allFusedOps = fusionResult2.second;
-
-        // In a two-phase fusion, the output shape perfectly matches the input
-        // shape, so we can directly store the result at the inputIndices!
-        rewriter.create<memref::StoreOp>(loc, resultToStore2, alloc,
-                                         inputIndices2);
+    // Delinearize bid → output indices
+    SmallVector<Value> storeIdx;
+    auto outputShape = outputType.getShape();
+    storeIdx.resize(outputShape.size());
+    Value remStore = bid;
+    for (int i = (int)outputShape.size() - 1; i >= 0; --i) {
+      int64_t dimSize = outputShape[i];
+      Value dimSizeVal =
+          rewriter.create<arith::ConstantIndexOp>(loc, dimSize).getResult();
+      if (i > 0) {
+        storeIdx[i] =
+            rewriter.create<arith::RemUIOp>(loc, remStore, dimSizeVal).getResult();
+        remStore =
+            rewriter.create<arith::DivUIOp>(loc, remStore, dimSizeVal).getResult();
+      } else {
+        storeIdx[i] = remStore;
       }
     }
+
+    // Only thread 0 of each block writes (AllReduce already gave every thread the result)
+    Value isMaster =
+        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, tid, c0).getResult();
+    auto ifOp = rewriter.create<scf::IfOp>(loc, isMaster, false);
+    rewriter.setInsertionPointToStart(ifOp.thenBlock());
+    rewriter.create<memref::AtomicRMWOp>(loc, rmwKind, reduced, alloc, storeIdx);
+    rewriter.setInsertionPointAfter(ifOp);
+
 
     rewriter.create<gpu::TerminatorOp>(loc);
     rewriter.setInsertionPointAfter(launchOp);
 
+    // alloc is always sized with outputType in this path.
+    RankedTensorType toTensorType = outputType;
     auto toTensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, fusionOutputType, alloc);
+        loc, toTensorType, alloc);
     toTensor.setRestrict(true);
+
 
     if (finalFusedOp) {
       // Replace only the final fused op; predecessors become dead naturally.
@@ -791,7 +713,7 @@ struct NovaFusionKernelEmitterPass
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     patterns.add<FullReduceLowering>(context);
-     patterns.add<PartialReduceLowering>(context);
+    patterns.add<PartialReduceLowering>(context);
 
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       signalPassFailure();

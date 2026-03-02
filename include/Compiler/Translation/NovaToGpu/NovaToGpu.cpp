@@ -683,7 +683,21 @@ struct NovaToGpuGatherPattern : public OpRewritePattern<nova::GatherOp> {
     SmallVector<Value> inputIndices;
     for (int64_t i = 0; i < axis; ++i)
       inputIndices.push_back(outIndices[i]); // before axis
-    inputIndices.push_back(gatherIdx);       // at axis (gathered)
+
+    // Clamp the gathered index to prevent OOB access and ILLEGAL_ADDRESS errors
+    int64_t axisDimSize = inputType.getShape()[axis];
+    Value cAxisDim = rewriter.create<arith::ConstantIndexOp>(loc, axisDimSize);
+    Value cZero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value cMaxIdx = rewriter.create<arith::ConstantIndexOp>(loc, axisDimSize - 1);
+
+    // signed comparison for negative check
+    Value isNeg = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, gatherIdx, cZero);
+    Value clampedPos = rewriter.create<arith::SelectOp>(loc, isNeg, cZero, gatherIdx);
+    Value isOOB = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, clampedPos, cAxisDim);
+    Value finalIdx = rewriter.create<arith::SelectOp>(loc, isOOB, cMaxIdx, clampedPos);
+
+    inputIndices.push_back(finalIdx);       // at axis (gathered and clamped)
+
     for (int64_t i = axis + 1; i < inputType.getRank(); ++i)
       inputIndices.push_back(outIndices[i + indicesRank - 1]); // after axis
     // Load from input, store to output

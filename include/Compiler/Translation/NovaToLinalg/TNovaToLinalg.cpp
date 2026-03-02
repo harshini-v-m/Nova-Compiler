@@ -805,14 +805,26 @@ public:
       return rewriter.notifyMatchFailure(op, "expected ranked tensor result");
     // each element type
     auto resultDataType = resultType.getElementType();
-    // Create output tensor
-    Value out = rewriter.create<tensor::EmptyOp>(
-        op.getLoc(), resultType.getShape(), resultDataType);
+    
+    // Check for in_place attribute for DPS (Destination-Passing Style)
+    bool isInPlace = op->template hasAttrOfType<BoolAttr>("in_place") &&
+                     op->template getAttrOfType<BoolAttr>("in_place").getValue();
+
+    SmallVector<Value> insOperands;
+    Value out;
+    if (isInPlace && operands.size() == 2) {
+      insOperands = {operands[1]}; // rhs is the explicit input (the new gradient values)
+      out = operands[0];           // lhs is the destination (the persistent parameter buffer)
+    } else {
+      insOperands = operands;
+      out = rewriter.create<tensor::EmptyOp>(
+          op.getLoc(), resultType.getShape(), resultDataType);
+    }
 
     // Prepare affine maps
     int64_t rank = resultType.getRank();
     SmallVector<AffineMap> maps;
-    for (Value v : operands) {
+    for (Value v : insOperands) {
       auto vType = cast<RankedTensorType>(v.getType());
       auto vShape = vType.getShape();
       auto vRank = vType.getRank();
@@ -827,11 +839,12 @@ public:
       }
       maps.push_back(AffineMap::get(rank, 0, exprs, rewriter.getContext()));
     }
+    // Output map
     maps.push_back(rewriter.getMultiDimIdentityMap(rank));
 
     // Create Linalg generic
     auto linalgOp = rewriter.create<linalg::GenericOp>(
-        op.getLoc(), out.getType(), operands, out, maps,
+        op.getLoc(), out.getType(), insOperands, out, maps,
         getNParallelLoopsAttrs(rank),
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Type elemType = getElementTypeOrSelf(out);
