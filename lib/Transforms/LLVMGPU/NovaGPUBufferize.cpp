@@ -34,6 +34,7 @@
 #include "mlir/Dialect/Bufferization/Transforms/Transforms.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
@@ -96,15 +97,27 @@ static bool isWorkgroupMemref(MemRefType t) {
          space.getValue() == gpu::GPUDialect::getWorkgroupAddressSpace();
 }
 
-// GPU copy function — emits a plain memref.copy.
-// NOTE: gpu.barrier is NOT inserted here because it breaks OneShotBufferize
-// analysis for multi-op functions (barrier has "unknown memory side effects").
+// GPU copy function — mirrors IREE's defaultMemCpyFn.
+//
+// Emits a linalg.copy op instead of memref.copy. This is critical for GPU
+// kernels:
+//
+//   memref.copy → FinalizeMemRefToLLVM emits llvm.call @memrefCopy (a HOST
+//                 runtime symbol) which does not exist inside a gpu.func.
+//                 This causes a missing-symbol error during NVVM lowering.
+//
+//   linalg.copy → createConvertLinalgToLoopsPass (Step 11 in Passes.cpp)
+//                 expands it into scf.for + memref.load/store loops that
+//                 compile cleanly to PTX load/store instructions inside the
+//                 kernel. This is exactly how IREE handles padding copies.
+//
+// NOTE: gpu.barrier is NOT inserted here for the same reason as before
+// ("unknown memory side effects" break OneShotBufferize analysis).
 // Barriers around workgroup memory copies are inserted post-bufferization
-// in addNovaGPUBufferizePasses.
-// This matches IREE's TileAndFuse pipeline which also uses a plain copy.
+// by NovaGPUInsertWorkgroupBarriersPass.
 static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
                                Value to) {
-  memref::CopyOp::create(builder, loc, from, to);
+  linalg::CopyOp::create(builder, loc, from, to);
   return success();
 }
 

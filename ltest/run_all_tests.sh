@@ -27,7 +27,7 @@ for file in "$TEST_DIR"/*.mlir; do
     echo "Testing $file..."
     
     # Run the pipeline command, discarding output unless there is an error
-    "$NOVA_OPT" --nova-gpu-pipeline "$file" > /dev/null 2>&1
+    "$NOVA_OPT" --nova-gpu-optimized-pipeline "$file" > /dev/null 2>&1
     
     # Check return code
     if [ $? -ne 0 ]; then

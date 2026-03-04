@@ -228,8 +228,15 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
     // PRODUCERS of the later matmul — causing redundant recomputation.
     // =========================================================================
 
+    llvm::SmallPtrSet<Operation *, 16> handledOps;
+
     // --- Helper lambda: tile a root op, fuse producers + consumers -----------
-    auto tileRoot = [&](Operation *rootOp) -> LogicalResult {
+    // Returns failure() on error. Sets didTile=true if tiling actually happened,
+    // false if the op was skipped (not a LinalgOp, etc.).
+    auto tileRoot = [&](Operation *rootOp, bool &didTile) -> LogicalResult {
+      didTile = false;
+      if (handledOps.count(rootOp))
+        return success();
       // 2. Info
       auto infoOr = getTiledAndDistributionInfo(rewriter, rootOp);
       if (failed(infoOr))
@@ -304,11 +311,19 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
             scf::tileUsingSCF(rewriter, tilingInterface, tilingOptions);
         if (succeeded(tileResult))
           rewriter.eraseOp(rootOp);
+        didTile = true;
         return success();
       }
 
-      if (failed(result))
+      if (succeeded(result)) {
+        didTile = true;
+        handledOps.insert(rootOp);
+        for (auto op : result->tiledAndFusedOps) {
+          handledOps.insert(op);
+        }
+      } else {
         return failure();
+      }
 
       // Replace results (with dominance check)
       for (auto [origValue, replacement] : result->replacements) {
@@ -345,27 +360,70 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
 
     // --- Pass 1: Tile contraction ops (matmuls) in forward order -------------
     // Consumer fusion will pull bias+relu into each matmul's forall.
-    SmallVector<Operation *> computeOps = getComputeOps(funcOp);
-    for (Operation *rootOp : computeOps) {
-      if (isInsideWorkgroupForall(rootOp))
-        continue;
-      if (!isContractionOp(rootOp))
-        continue;
-      if (failed(tileRoot(rootOp))) {
-        signalPassFailure();
-        return;
+    // Re-collect after each matmul tile because consumer fusion may delete
+    // downstream elementwise ops that were in the snapshot list.
+    // Safe pattern: collect fresh list at top of each while iteration, then
+    // process exactly ONE untiled matmul per outer loop.
+    {
+      bool foundOne = true;
+      while (foundOne) {
+        foundOne = false;
+        SmallVector<Operation *> computeOps = getComputeOps(funcOp);
+        for (Operation *rootOp : computeOps) {
+          if (!isContractionOp(rootOp))
+            continue;
+          if (isInsideWorkgroupForall(rootOp))
+            continue;
+          if (handledOps.count(rootOp))
+            continue;
+          bool didTile = false;
+          if (failed(tileRoot(rootOp, didTile))) {
+            signalPassFailure();
+            return;
+          }
+          if (didTile) {
+            foundOne = true; // Processed one; re-collect at top of while.
+            break;
+          }
+          // Even if it didn't tile (skipped), mark it handled to avoid infinite loop
+          handledOps.insert(rootOp);
+        }
       }
     }
 
-    // --- Pass 2: Tile remaining unfused compute ops --------------------------
-    // Handles standalone elementwise ops that weren't fused as consumers.
-    SmallVector<Operation *> remainingOps = getComputeOps(funcOp);
-    for (Operation *rootOp : remainingOps) {
-      if (isInsideWorkgroupForall(rootOp))
-        continue;
-      if (failed(tileRoot(rootOp))) {
-        signalPassFailure();
-        return;
+    // --- Pass 2: Tile remaining unfused elementwise ops (REVERSE order) ------
+    // Mirrors IREE's tileConsumerAndFuseProducersUsingSCF contract:
+    //   - Tile the LAST (sink) op in a chain as the "consumer/root".
+    //   - Let producer fusion (inside tileConsumerAndFuseProducersUsingSCF)
+    //     pull all chained producers up into the same scf.forall.
+    //
+    // This avoids the consumer fusion path entirely for elementwise chains,
+    // eliminating the stale-tiledAndFusedOps iterator-invalidation bug.
+    {
+      SmallVector<Operation *> remainingOps = getComputeOps(funcOp);
+      // Process in REVERSE so the last (sink) op is tiled first.
+      for (Operation *rootOp : llvm::reverse(remainingOps)) {
+        if (isInsideWorkgroupForall(rootOp))
+          continue;
+        // Only tile each "sink": skip if this op's result feeds another
+        // untiled compute op (it will be fused as a producer of that op).
+        bool hasTilableConsumer = llvm::any_of(rootOp->getUsers(), [](Operation *user) {
+          return isa<TilingInterface>(user);
+        });
+        // If this op has a tilable consumer that is still outside a forall,
+        // defer it — it will be fused as a producer when that consumer is tiled.
+        if (hasTilableConsumer) {
+          bool consumerPending = llvm::any_of(rootOp->getUsers(), [](Operation *user) {
+            return isa<TilingInterface>(user) && !user->getParentOfType<scf::ForallOp>();
+          });
+          if (consumerPending)
+            continue;
+        }
+        bool didTile = false;
+        if (failed(tileRoot(rootOp, didTile))) {
+          signalPassFailure();
+          return;
+        }
       }
     }
     

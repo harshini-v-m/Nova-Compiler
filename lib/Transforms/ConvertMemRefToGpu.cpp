@@ -73,16 +73,26 @@ public:
     if (!srcType || !dstType)
       return failure();
 
-    // Convert to gpu.memcpy if either source or destination is in memory space
-    // 1
-    // if (isMemorySpaceOne(srcType.getMemorySpace()) ||
-    //     isMemorySpaceOne(dstType.getMemorySpace())) {
-      // Synchronous memcpy (no async token)
+    // Guard: do NOT convert copies that involve a GPU-specific address space
+    // (private or workgroup). Those are intra-kernel copies (e.g. padding
+    // copies from a plain memref into a thread-private register tile, or
+    // shared-memory fills). After GpuKernelOutliningPass these end up inside
+    // gpu.func where gpu.memcpy has no PTX equivalent and is marked illegal
+    // by createConvertGpuOpsToNVVMOps.
+    // Plain memref.copy ops in GPU address spaces are correctly lowered by
+    // FinalizeMemRefToLLVM via load/store sequences.
+    auto isGpuAddrSpace = [](MemRefType t) {
+      return mlir::isa_and_present<gpu::AddressSpaceAttr>(t.getMemorySpace());
+    };
+    if (isGpuAddrSpace(srcType) || isGpuAddrSpace(dstType))
+      return failure();
+
+    // Only convert plain (no GPU address space) host-side copies to
+    // gpu.memcpy — these are cross-kernel host↔device transfers produced
+    // after ConvertMemRefToGpu promotes memref.alloc → gpu.alloc.
     rewriter.replaceOpWithNewOp<gpu::MemcpyOp>(
-          op, TypeRange{}, ValueRange{}, op.getTarget(), op.getSource());
+        op, TypeRange{}, ValueRange{}, op.getTarget(), op.getSource());
     return success();
-    //}
-   // return failure();
   }
 };
 struct ConvertMemRefToGpuPass

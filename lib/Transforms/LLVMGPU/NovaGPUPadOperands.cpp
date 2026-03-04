@@ -1,7 +1,14 @@
 // Nova GPU Pad Operands Pass
 // Ported from IREE's GPUPadOperands.cpp
+//
+// Key fix vs the original: the K (reduction) dimension is now padded to the
+// next multiple of the reduction tile size read from the op's LoweringConfig.
+// Without this, a non-aligned K causes the K-reduction loop to silently
+// truncate the last (K % reductionTile) elements, producing wrong results,
+// and also causes dynamic alloca in the GPU kernel, rejected by NVPTX.
 
 #include "Passes.h"
+#include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -48,28 +55,51 @@ static LogicalResult padLinalgOpToStaticSizes(RewriterBase &rewriter,
   return success();
 }
 
-// Returns heuristic padding sizes for contraction ops (matmul, batch_matmul).
-// Pads M and N dims to 128 to match workgroup tile sizes.
+// Returns padding sizes for contraction ops, reading tile sizes from the op's
+// LoweringConfig attribute.
 //
-// TODO: Replace with LoweringConfig-based padding sizes. In IREE this is:
-//   auto cfg = getLoweringConfig<IREE::GPU::LoweringConfigAttr>(op);
-//   std::optional<SmallVector<int64_t>> sizes = getPaddingList(cfg);
+// - Parallel dims (M, N):   padded to the matching workgroup tile size.
+// - Reduction dims (K):     padded to the matching reduction tile size.
+//   → prevents K-truncation when K is not a multiple of the reduction step.
+//   → makes all tile sizes static so PTX doesn't need dynamic alloca.
+//
+// Falls back to heuristic (M/N=128, K=1) when no config is present (e.g.
+// when called on an op that wasn't annotated by the strategy pass).
 static std::optional<SmallVector<int64_t>>
-getHeuristicPaddingSizes(linalg::LinalgOp linalgOp) {
+getPaddingSizes(linalg::LinalgOp linalgOp) {
   if (!linalg::isaContractionOpInterface(linalgOp))
     return std::nullopt;
 
+  // Read tile sizes from the op's LoweringConfig attribute.
+  DictionaryAttr config = getLoweringConfig(linalgOp);
+  SmallVector<int64_t> wgTiles  = getLoweringConfigTileSizes(config, kWorkgroupKey);
+  SmallVector<int64_t> redTiles = getLoweringConfigTileSizes(config, kReductionKey);
+
   int numLoops = linalgOp.getNumLoops();
   SmallVector<int64_t> padding(numLoops, 1);
+  auto iterTypes = linalgOp.getIteratorTypesArray();
 
-  int dimCount = 0;
+  // Walk loops in reverse so we visit N before M (innermost first).
+  int parallelIdx  = 0; // 0=N, 1=M, ... (outermost last)
+  int reductionIdx = 0; // 0=K (usually only one)
+
   for (int i = numLoops - 1; i >= 0; --i) {
-    if (linalg::isParallelIterator(linalgOp.getIteratorTypesArray()[i])) {
-      if (dimCount == 0 || dimCount == 1)
-        padding[i] = 128; // M and N dims -> align to workgroup tile size
-      dimCount++;
+    if (linalg::isParallelIterator(iterTypes[i])) {
+      // Map reverse parallel index to forward wgTiles index.
+      int wgIdx = (int)wgTiles.size() - 1 - parallelIdx;
+      if (!wgTiles.empty() && wgIdx >= 0 && wgTiles[wgIdx] > 0)
+        padding[i] = wgTiles[wgIdx];
+      else
+        padding[i] = 128; // heuristic fallback
+      ++parallelIdx;
+    } else {
+      // Reduction dim: pad to the reduction tile step (e.g. 8 for K-step=8).
+      int redIdx = (int)redTiles.size() - 1 - reductionIdx;
+      if (!redTiles.empty() && redIdx >= 0 && redTiles[redIdx] > 0)
+        padding[i] = redTiles[redIdx];
+      // else leave at 1 (no-op pad for unrecognized reduction dims).
+      ++reductionIdx;
     }
-    // Reduction dims (K) stay at 1; not tiled at workgroup level.
   }
   return padding;
 }
@@ -133,8 +163,7 @@ struct NovaGPUPadOperandsPass
     // Walk all linalg ops and pad those with a padding config.
     // IREE reads sizes from LoweringConfig; Nova uses heuristic sizes.
     funcOp.walk([&](linalg::LinalgOp op) {
-      std::optional<SmallVector<int64_t>> paddingSizes =
-          getHeuristicPaddingSizes(op);
+      std::optional<SmallVector<int64_t>> paddingSizes = getPaddingSizes(op);
       if (!paddingSizes)
         return WalkResult::advance();
 

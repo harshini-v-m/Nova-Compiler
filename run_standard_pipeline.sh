@@ -7,7 +7,7 @@
 MLIR_OPT="./build/tools/nova-opt/nova-opt"
 MLIR_TRANSLATE="../../llvm-project/build/bin/mlir-translate"
 LLC="../llvm-project/build/bin/llc"
-INPUT_FILE="ltest/test.mlir"
+INPUT_FILE="test/bufferized.mlir"
 
 echo "=== MLIR to LLVM IR Conversion Pipeline (using Nova Compiler) ==="
 echo ""
@@ -16,7 +16,7 @@ echo ""
 echo "Step 1: Running optimization and lowering passes..."
 # Using --nova-gpu-pipeline directly!
 $MLIR_OPT $INPUT_FILE \
-  --nova-gpu-pipeline \
+  --nova-gpu-optimized-pipeline \
   -o intermediate.mlir
 
 if [ $? -eq 0 ]; then

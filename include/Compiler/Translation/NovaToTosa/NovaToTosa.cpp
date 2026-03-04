@@ -1048,7 +1048,7 @@ void populateNovaToTosaConversionPatterns(RewritePatternSet &patterns) {
                NovaToTosaLoweringTemplate<nova::MseOp>,
                NovaToTosaLoweringTemplate<nova::CceOp>,
                NovaToTosaLoweringTemplate<nova::BceOp>,
-
+               NovaToTosaLoweringTemplate<nova::SceOp>,
                NovaToTosaLoweringTemplate<nova::SigmoidOp>,
                NovaToTosaLoweringTemplate<nova::CastOp>>(patterns.getContext());
 }

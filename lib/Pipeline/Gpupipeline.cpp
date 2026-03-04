@@ -90,9 +90,6 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
             // 2. TOSA TO LINALG (Named and regular)
             pm.addNestedPass<mlir::func::FuncOp>(mlir::tosa::createTosaToLinalgNamed());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::tosa::createTosaToLinalg());
-            // This enables the 2:4 structured sparsity hardware path on your RTX 3060.
-            // pm.addPass(mlir::createSparsificationPass());
-            // pm.addPass(mlir::createSparseTensorConversionPass());
 
             // 3. TOSA TO ARITH/TENSOR/SCF
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createTosaToArithPass());

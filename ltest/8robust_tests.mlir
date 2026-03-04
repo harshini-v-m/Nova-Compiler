@@ -32,7 +32,6 @@ module {
     %sum = nova.add %arg0, %arg0 : tensor<64x64xf32, #nova.device<"1">>, tensor<64x64xf32, #nova.device<"1">>
     %prod = nova.matmul %sum, %arg0 : tensor<64x64xf32>, tensor<64x64xf32, #nova.device<"1">>
     %gelu = nova.gelu %prod : tensor<64x64xf32>
-    %soft = nova.softmax %gelu dimension = 1 : tensor<64x64xf32>
-    return %soft : tensor<64x64xf32>
+    return %gelu : tensor<64x64xf32>
   }
 }

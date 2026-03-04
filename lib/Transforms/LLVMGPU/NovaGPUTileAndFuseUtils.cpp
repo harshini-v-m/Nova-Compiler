@@ -183,13 +183,17 @@ FailureOr<std::queue<Operation *>> fuseConsumersIntoForall(
     }
 
     // Replace the original consumer operation with the tiled implementation.
-    rewriter.replaceOp(fusedResult->origConsumerOperands.front()->getOwner(),
-                       fusedResult->tiledOps.front());
+    if (!fusedResult->origConsumerOperands.empty() && !fusedResult->tiledOps.empty()) {
+      rewriter.replaceOp(fusedResult->origConsumerOperands.front()->getOwner(),
+                         fusedResult->tiledOps.front());
+    }
 
     DominanceInfo dominanceInfo;
-    addCandidateSlices(
-        fusedResult->tiledAndFusedConsumerOperands.front()->getOwner(),
-        dominanceInfo);
+    if (!fusedResult->tiledAndFusedConsumerOperands.empty()) {
+      addCandidateSlices(
+          fusedResult->tiledAndFusedConsumerOperands.front()->getOwner(),
+          dominanceInfo);
+    }
 
     // Add the list of new producer fusion opportunities.
     for (auto tiledOp : fusedResult.value().tiledOps) {
