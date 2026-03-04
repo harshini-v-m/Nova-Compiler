@@ -585,15 +585,15 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
     auto [vA, vB] = getStageViews(rewriter, readStage);
 
     // ── MMA: 4 (M-frags) x 4 (N-frags) per warp ──
-    // For TF32 m16n8k8: A frag = [4,1], B frag = [2,1], C frag = [2,2]
-    // Lane decomposition for MMA fragment loading
-    //   A frag: row = r*4 + laneId/(TILE_K/aK),  col = laneId%(TILE_K/aK)
-    //   B frag: k-row from kLane,  n-col from colLane
-    Value laneDiv  = rewriter.create<arith::DivUIOp>(loc, laneId, ci(TILE_K / aK));
-    Value laneMod  = rewriter.create<arith::RemUIOp>(loc, laneId, ci(TILE_K / aK));
-    const int64_t bLaneDivisor = TILE_K / bK;
-    Value kLane    = rewriter.create<arith::DivUIOp>(loc, laneId, ci(bLaneDivisor));
-    Value colLane  = rewriter.create<arith::RemUIOp>(loc, laneId, ci(bLaneDivisor));
+    // PTX ISA layout for mma.sync.m16n8k8 (TF32) / m16n8k16 (FP16):
+    //   A[r][c]: row = warpRow + fi*16 + (r%2)*8 + laneId/4
+    //            col = (r/2)*(TILE_K/2) + c*4 + laneId%4
+    //   B[r][c]: k-row = r*4 + c*(TILE_K/2) + laneId%4
+    //            n-col = warpColOff + fj*MMA_N + laneId/4
+    Value aLaneRow = rewriter.create<arith::DivUIOp>(loc, laneId, ci(4));  // T/4
+    Value aLaneCol = rewriter.create<arith::RemUIOp>(loc, laneId, ci(4));  // T%4
+    Value bLaneRow = rewriter.create<arith::RemUIOp>(loc, laneId, ci(4));  // T%4 (k-row)
+    Value bLaneCol = rewriter.create<arith::DivUIOp>(loc, laneId, ci(4));  // T/4 (n-col)
 
     Value nextAcc = acc;
 
@@ -602,12 +602,13 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
       Value aFrag = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(aFragTy));
       for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < (int)aK; ++c) {
-          // Row in sA: warp M-offset + fragment M-offset + lane contribution
+          // PTX: row = T/4 + (r%2)*8, k-col = (r/2)*(TILE_K/2) + c*4 + T%4
+          int rowAdd  = (r % 2) * 8;
+          int colBase = (r / 2) * ((int)TILE_K / 2) + c * 4;
           Value sR = rewriter.create<arith::AddIOp>(loc, warpRowOff,
               rewriter.create<arith::AddIOp>(loc,
-                  ci(fi * (int)MMA_M + r * ((int)MMA_M / 4)), laneDiv));
-          Value sC = rewriter.create<arith::AddIOp>(loc,
-              ci(c * ((int)TILE_K / (int)aK)), laneMod);
+                  ci(fi * (int)MMA_M + rowAdd), aLaneRow));
+          Value sC = rewriter.create<arith::AddIOp>(loc, ci(colBase), aLaneCol);
           // Apply A-tile read swizzle (must match write-side: col ^ ((row & 3) * 2))
           Value sRMod  = rewriter.create<arith::AndIOp>(loc, sR, rewriter.create<arith::ConstantIndexOp>(loc, 3));
           Value sXorA  = rewriter.create<arith::MulIOp>(loc, sRMod, rewriter.create<arith::ConstantIndexOp>(loc, 2));
@@ -625,14 +626,11 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
         Value bFrag = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(bFragTy));
         for (int r = 0; r < 2; ++r) {
           for (int c = 0; c < (int)bK; ++c) {
-            // B-register layout: k-row from kLane with r offset, n-col from colLane
-            Value sR = rewriter.create<arith::RemUIOp>(loc,
-                rewriter.create<arith::AddIOp>(loc, ci(r * ((int)TILE_K / 2)), kLane),
-                cTileK);
+            // PTX: k-row = r*4 + c*(TILE_K/2) + T%4, n-col = T/4
+            int kRowBase = r * 4 + c * ((int)TILE_K / 2);
+            Value sR = rewriter.create<arith::AddIOp>(loc, ci(kRowBase), bLaneRow);
             Value sC = rewriter.create<arith::AddIOp>(loc, warpColOff,
-                rewriter.create<arith::AddIOp>(loc,
-                    ci(fj * (int)MMA_N + c * ((int)TILE_N / (int)bK)),
-                    colLane));
+                rewriter.create<arith::AddIOp>(loc, ci(fj * (int)MMA_N), bLaneCol));
             // XOR swizzle (must match write-side: col ^ ((row & (TILE_K-1)) * (TILE_N/TILE_K)))
             // TF32: (row & 7) * 16,  FP16: (row & 15) * 8
             Value sRMod = rewriter.create<arith::AndIOp>(loc, sR,
