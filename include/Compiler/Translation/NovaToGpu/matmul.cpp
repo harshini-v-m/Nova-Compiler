@@ -405,90 +405,85 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
           rewriter.create<arith::MulIOp>(loc, bTileRow, cNStride),
           bGlobalCol));
 
-  // ── Async copy helpers ──
-  // asyncCopyA: copies one A element from global to shared (bounds-clamped).
-  auto asyncCopyA = [&](OpBuilder &b, Value sA, Value aPtr,
-                        Value inBoundsRow, Value inBoundsK) {
-    Value inBounds = b.create<arith::AndIOp>(loc,
-        aInBounds,
-        b.create<arith::AndIOp>(loc, inBoundsRow, inBoundsK));
-    Value safePtr = b.create<arith::SelectOp>(loc, inBounds, aPtr, c0);
-    return b.create<nvgpu::DeviceAsyncCopyOp>(
-        loc, sA, ValueRange{aTileRow, aTileCol},
-        lhsFlat, ValueRange{safePtr},
-        rewriter.getIndexAttr(1), Value{}, nullptr);
-  };
-
-  // asyncCopyB: copies one B element into swizzled shared mem position.
-  auto asyncCopyB = [&](OpBuilder &b, Value sB, Value bPtr,
-                        Value inBoundsRow, Value inBoundsCol) {
-    Value inBounds = b.create<arith::AndIOp>(loc,
-        bInBounds,
-        b.create<arith::AndIOp>(loc, inBoundsRow, inBoundsCol));
-    Value safePtr = b.create<arith::SelectOp>(loc, inBounds, bPtr, c0);
-    // XOR swizzle: swizzled_col = col ^ ((row & 15) * 8)
-    // For TILE_N=128 (7 bits): XOR by values 0,8,16..120 keeps result in [0,127].
-    Value bRowMod16 = b.create<arith::AndIOp>(loc, bTileRow,
-                          b.create<arith::ConstantIndexOp>(loc, 15));
-    Value bXorMask  = b.create<arith::MulIOp>(loc, bRowMod16,
-                          b.create<arith::ConstantIndexOp>(loc, 8));
-    Value bColSwiz  = b.create<arith::XOrIOp>(loc, bTileCol, bXorMask);
-    return b.create<nvgpu::DeviceAsyncCopyOp>(
-        loc, sB, ValueRange{bTileRow, bColSwiz},
-        rhsFlat, ValueRange{safePtr},
-        rewriter.getIndexAttr(1), Value{}, nullptr);
-  };
-
   // ── issueStageLoad: loads one async stage from global → shared ──
-  // Emits B_LOAD_ITERS passes to cover all TILE_K rows of sB.
-  // Pass i covers sB rows [i*B_ROWS_PER_PASS .. (i+1)*B_ROWS_PER_PASS - 1].
-  // bPtr points to the K-step base (row bTileRow of B in global mem).
-  // For pass i the global src offset is bPtr + i*B_ROWS_PER_PASS*N.
-  auto issueStageLoad = [&](OpBuilder &b, Value stageIdx,
-                             Value aPtr, Value bPtr) -> Value {
+  // kBase = absolute column index in Matrix A where this tile's K-dimension starts.
+  // - A: 4 passes (A_ELEMS/THREADS = 4 TF32, 8 FP16), per-pass address computed
+  //        from scratch as lhsBatchOff + (rowBase + tileRow_i) * K + kBase + tileCol_i
+  //        to avoid any misaligned pointer arithmetic issues.
+  // - B: B_LOAD_ITERS passes (already correct), padded with srcElements=0 instead
+  //        of pointer-clamping to rhsFlat[0].
+  const int64_t A_PASSES = A_ELEMS / THREADS;  // 4 (TF32) or 8 (FP16)
+  auto issueStageLoad = [&](OpBuilder &b, Value stageIdx, Value kBase) -> Value {
     auto [sA, sB] = getStageViews(b, stageIdx);
 
-    // A copy (one element per thread)
-    Value aRowOk = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
-                                            aGlobalRow, cM);
-    Value tokA = asyncCopyA(b, sA, aPtr, aRowOk,
-                             b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
-                                 aTileCol, cTileK));
+    // ── A copies: A_PASSES passes, each thread handles a different tile element ──
+    SmallVector<Value> tokens;
+    for (int64_t i = 0; i < A_PASSES; ++i) {
+      // Linear element index for this pass
+      Value linIdx = b.create<arith::AddIOp>(loc, tid, b.create<arith::ConstantIndexOp>(loc, i * THREADS));
+      // Decompose into tile-local row/col
+      Value aTileRowI  = b.create<arith::DivUIOp>(loc, linIdx, cTileK);
+      Value aTileColI  = b.create<arith::RemUIOp>(loc, linIdx, cTileK);
+      Value aGlobalRowI = b.create<arith::AddIOp>(loc, rowBase, aTileRowI);
 
-    Value bColOk = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
-                                            bGlobalCol, cN);
+      // Bounds check: both the matrix row AND the absolute K column must be valid
+      Value aKColI  = b.create<arith::AddIOp>(loc, kBase, aTileColI);  // absolute K index
+      Value aRowOkI = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, aGlobalRowI, cM);
+      Value aColOkI = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, aKColI, cK);
+      Value aInBoundsI = b.create<arith::AndIOp>(loc, aRowOkI, aColOkI);
 
-    // B copies: unrolled over B_LOAD_ITERS passes
-    SmallVector<Value> tokens{tokA};
+      // From-scratch global address: no offset arithmetic on a non-stride pointer
+      Value aPtrI = b.create<arith::AddIOp>(loc, lhsBatchOff,
+          b.create<arith::AddIOp>(loc,
+              b.create<arith::MulIOp>(loc, aGlobalRowI, cKStride),
+              aKColI));
+
+      // srcElements=0 → hardware zero-fills SMEM, no global load issued (zero-padding)
+      Value aSrcElems = b.create<arith::SelectOp>(loc, aInBoundsI, c1, c0);
+
+      // A-tile XOR swizzle: col ^ ((row & 3) * 2)
+      // Keeps access within TILE_K columns; disperses across SMEM banks.
+      Value aRowMod   = b.create<arith::AndIOp>(loc, aTileRowI, b.create<arith::ConstantIndexOp>(loc, 3));
+      Value aXorMask  = b.create<arith::MulIOp>(loc, aRowMod,   b.create<arith::ConstantIndexOp>(loc, 2));
+      Value aColSwiz  = b.create<arith::XOrIOp>(loc, aTileColI, aXorMask);
+
+      tokens.push_back(b.create<nvgpu::DeviceAsyncCopyOp>(
+          loc, sA, ValueRange{aTileRowI, aColSwiz},
+          lhsFlat, ValueRange{aPtrI},
+          rewriter.getIndexAttr(1), aSrcElems, nullptr));
+    }
+
+    // ── B copies: unrolled over B_LOAD_ITERS passes (unchanged structure) ──
+    Value bColOk = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, bGlobalCol, cN);
     for (int64_t i = 0; i < B_LOAD_ITERS; ++i) {
-      // Shared mem destination row for this pass
       Value bRowI = b.create<arith::AddIOp>(loc, bTileRow,
                         b.create<arith::ConstantIndexOp>(loc, i * B_ROWS_PER_PASS));
-      // XOR swizzle for bank-conflict-free store
-      // Pattern: col ^ ((row & (TILE_K-1)) * (TILE_N / TILE_K))
-      // With TILE_K=8, TILE_N=128: col ^ ((row & 7) * 16)
-      int64_t swizzleStride = TILE_N / TILE_K; // 16 for TF32, 8 for FP16
-      Value bRowMod = b.create<arith::AndIOp>(loc, bRowI,
-                          b.create<arith::ConstantIndexOp>(loc, TILE_K - 1));
+      // XOR swizzle for B: col ^ ((row & (TILE_K-1)) * (TILE_N/TILE_K))
+      int64_t swizzleStride = TILE_N / TILE_K;
+      Value bRowMod  = b.create<arith::AndIOp>(loc, bRowI,
+                           b.create<arith::ConstantIndexOp>(loc, TILE_K - 1));
       Value bXorMask = b.create<arith::MulIOp>(loc, bRowMod,
                            b.create<arith::ConstantIndexOp>(loc, swizzleStride));
       Value bColSwiz = b.create<arith::XOrIOp>(loc, bTileCol, bXorMask);
-      // Global source: bPtr + i * B_ROWS_PER_PASS * N elements from base
-      Value bPtrI = (i == 0) ? bPtr
-                              : b.create<arith::AddIOp>(loc, bPtr,
-                                    b.create<arith::ConstantIndexOp>(loc, i * B_ROWS_PER_PASS * N));
-      // B row bounds: row i must be < TILE_K (always true by construction)
-      Value bRowOk = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
-                                              bRowI, cTileK);
-      // Combined in-bounds for this element
-      Value inBounds = b.create<arith::AndIOp>(loc,
-          bInBounds,
-          b.create<arith::AndIOp>(loc, bRowOk, bColOk));
-      Value safePtr = b.create<arith::SelectOp>(loc, inBounds, bPtrI, c0);
+
+      // Global source: base bPtr + i * B_ROWS_PER_PASS * N
+      Value bKColI  = b.create<arith::AddIOp>(loc, kBase, bRowI);  // absolute K index for B
+      Value bGlobal = b.create<arith::AddIOp>(loc, rhsBatchOff,
+          b.create<arith::AddIOp>(loc,
+              b.create<arith::MulIOp>(loc, bKColI, cNStride),
+              bGlobalCol));
+
+      // Bounds: B row index (absolute K) and B col must be in-range
+      Value bKOkI   = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, bKColI, cK);
+      Value inBounds = b.create<arith::AndIOp>(loc, bInBounds,
+                           b.create<arith::AndIOp>(loc, bKOkI, bColOk));
+      // srcElements=0 zero-fills; no pointer clamping to rhsFlat[0]
+      Value bSrcElems = b.create<arith::SelectOp>(loc, inBounds, c1, c0);
+
       tokens.push_back(b.create<nvgpu::DeviceAsyncCopyOp>(
           loc, sB, ValueRange{bRowI, bColSwiz},
-          rhsFlat, ValueRange{safePtr},
-          rewriter.getIndexAttr(1), Value{}, nullptr));
+          rhsFlat, ValueRange{bGlobal},
+          rewriter.getIndexAttr(1), bSrcElems, nullptr));
     }
 
     return b.create<nvgpu::DeviceAsyncCreateGroupOp>(
@@ -497,9 +492,9 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
 
 
   // ── Prolog: Load stages 0 and 1 ──
-  Value tok0 = issueStageLoad(rewriter, c0, aPtr0, bPtr0);
-  rewriter.create<nvgpu::DeviceAsyncCreateGroupOp>(
-      loc, nvgpu::DeviceAsyncTokenType::get(ctx), ValueRange{tok0});
+  // kBase is the absolute K-column where the tile begins (0 for stage 0, TILE_K for stage 1)
+  // issueStageLoad already calls DeviceAsyncCreateGroupOp internally — no extra commit needed.
+  Value tok0 = issueStageLoad(rewriter, c0, c0);
 
   Value aPtr1 = rewriter.create<arith::AddIOp>(loc, aPtr0, cAStride);
   Value bPtr1 = rewriter.create<arith::AddIOp>(loc, bPtr0, cBStride);
@@ -511,7 +506,7 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPointToStart(ifS1.thenBlock());
     if (!ifS1.thenBlock()->empty()) rewriter.eraseOp(&ifS1.thenBlock()->back());
-    Value t1 = issueStageLoad(rewriter, c1, aPtr1, bPtr1);
+    Value t1 = issueStageLoad(rewriter, c1, cTileK);
     rewriter.create<scf::YieldOp>(loc, t1);
 
     rewriter.setInsertionPointToStart(ifS1.elseBlock());
@@ -524,17 +519,14 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
   Value cZeroAcc = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(mmaAccTy));
   Value cInit    = rewriter.create<vector::SplatOp>(loc, cFragTy, cZeroAcc);
 
-  // Starting pointer values for k=2*TILE_K (what the loop will issue first)
-  Value aPtr2 = rewriter.create<arith::AddIOp>(loc, aPtr1, cAStride);
-  Value bPtr2 = rewriter.create<arith::AddIOp>(loc, bPtr1, cBStride);
-
-  // ── Main K-loop — iter_args: (acc, token, writeStage, readStage, aPtr, bPtr) ──
+  // ── Main K-loop — iter_args: (acc, token, writeStage, readStage) ──
+  // aPtr/bPtr iter_args are no longer needed: issueStageLoad now uses kBase directly.
   Value cWriteStage0 = rewriter.create<arith::RemUIOp>(loc, c2, cStages);  // =2
   Value cReadStage0  = c0;
 
   auto mainLoop = rewriter.create<scf::ForOp>(
       loc, c0, cK, cTileK,
-      ValueRange{cInit, prologToken, cWriteStage0, cReadStage0, aPtr2, bPtr2});
+      ValueRange{cInit, prologToken, cWriteStage0, cReadStage0});
   {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(mainLoop.getBody());
@@ -546,46 +538,62 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
     Value currToken  = mainLoop.getRegionIterArgs()[1];
     Value writeStage = mainLoop.getRegionIterArgs()[2];
     Value readStage  = mainLoop.getRegionIterArgs()[3];
-    Value aPtr       = mainLoop.getRegionIterArgs()[4];
-    Value bPtr       = mainLoop.getRegionIterArgs()[5];
 
     // Issue next stage load (k + 2*TILE_K) if still in range
     Value nextK   = rewriter.create<arith::AddIOp>(loc, k, ci(2 * TILE_K));
     Value hasNext = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, nextK, cK);
+    // ifNext yields no SSA result — the wait+barrier are emitted inside each
+    // branch with the correct static count, so no token is needed afterward.
     auto ifNext = rewriter.create<scf::IfOp>(loc,
-        nvgpu::DeviceAsyncTokenType::get(ctx), hasNext, true);
+        TypeRange{}, hasNext, /*withElse=*/true);
     {
       OpBuilder::InsertionGuard g2(rewriter);
       rewriter.setInsertionPointToStart(ifNext.thenBlock());
       if (!ifNext.thenBlock()->empty()) rewriter.eraseOp(&ifNext.thenBlock()->back());
-      rewriter.create<scf::YieldOp>(loc, issueStageLoad(rewriter, writeStage, aPtr, bPtr));
+      {
+        // kBase = k + 2*TILE_K  (the tile this stage is prefetching)
+        Value newTok = issueStageLoad(rewriter, writeStage, nextK);
+        // Pipeline is running normally: allow STAGES-2 = 1 group to remain
+        // in-flight (the one we just issued) while we process the read stage.
+        rewriter.create<nvgpu::DeviceAsyncWaitOp>(
+            loc, TypeRange{}, newTok,
+            rewriter.getI32IntegerAttr(STAGES - 2));
+        rewriter.create<NVVM::Barrier0Op>(loc);
+        rewriter.create<scf::YieldOp>(loc);
+      }
 
       rewriter.setInsertionPointToStart(ifNext.elseBlock());
       if (!ifNext.elseBlock()->empty()) rewriter.eraseOp(&ifNext.elseBlock()->back());
-      rewriter.create<scf::YieldOp>(loc, currToken);
+      {
+        // Tail iterations: no new tile to prefetch. Emit an empty group so
+        // cp.async.wait_group group-counter stays consistent, then drain ALL
+        // in-flight groups (wait = 0) to guarantee SMEM coherence before MMA.
+        // The old fixed wait (STAGES-1 = 2) was too permissive here — it
+        // allowed 2 groups in-flight without actually waiting, so MMA read
+        // stale/zero SMEM for the last tile → wrong results for small K.
+        Value emptyTok = rewriter.create<nvgpu::DeviceAsyncCreateGroupOp>(
+            loc, nvgpu::DeviceAsyncTokenType::get(ctx), ValueRange{});
+        rewriter.create<nvgpu::DeviceAsyncWaitOp>(
+            loc, TypeRange{}, emptyTok,
+            rewriter.getI32IntegerAttr(0));  // drain all — SMEM must be ready
+        rewriter.create<NVVM::Barrier0Op>(loc);
+        rewriter.create<scf::YieldOp>(loc);
+      }
     }
-    Value nextToken = ifNext.getResult(0);
-
-    // Wait for the read stage to be ready
-    rewriter.create<nvgpu::DeviceAsyncWaitOp>(
-        loc, TypeRange{}, nextToken, rewriter.getI32IntegerAttr(1));
-    rewriter.create<NVVM::Barrier0Op>(loc);
+    // (wait + barrier are now emitted inside the ifNext branches above)
 
     auto [vA, vB] = getStageViews(rewriter, readStage);
 
     // ── MMA: 4 (M-frags) x 4 (N-frags) per warp ──
     // For TF32 m16n8k8: A frag = [4,1], B frag = [2,1], C frag = [2,2]
-    // Lane layout (same as V18):
-    //   A: laneDiv = lane/(TILE_K/aK), laneMod = lane%(TILE_K/aK)
-    //      sR = warpRowFrag*MMA_M + r*(MMA_M/4) + laneDiv
-    //      sC = laneMod
-    //   B: kLane = lane/4, colLane = (lane%4)*2
-    //      sR = kLane + bK_shift, sC_swizzled
+    // Lane decomposition for MMA fragment loading
+    //   A frag: row = r*4 + laneId/(TILE_K/aK),  col = laneId%(TILE_K/aK)
+    //   B frag: k-row from kLane,  n-col from colLane
     Value laneDiv  = rewriter.create<arith::DivUIOp>(loc, laneId, ci(TILE_K / aK));
     Value laneMod  = rewriter.create<arith::RemUIOp>(loc, laneId, ci(TILE_K / aK));
-    Value kLane    = rewriter.create<arith::DivUIOp>(loc, laneId, ci(4));
-    Value colLane  = rewriter.create<arith::MulIOp>(loc,
-        rewriter.create<arith::RemUIOp>(loc, laneId, ci(4)), ci(2));
+    const int64_t bLaneDivisor = TILE_K / bK;
+    Value kLane    = rewriter.create<arith::DivUIOp>(loc, laneId, ci(bLaneDivisor));
+    Value colLane  = rewriter.create<arith::RemUIOp>(loc, laneId, ci(bLaneDivisor));
 
     Value nextAcc = acc;
 
@@ -595,14 +603,16 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
       for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < (int)aK; ++c) {
           // Row in sA: warp M-offset + fragment M-offset + lane contribution
-          // warpRowOff was computed above (warpRow * WARP_M)
-          // within this warp: fi * MMA_M + r*(MMA_M/4) + laneDiv
           Value sR = rewriter.create<arith::AddIOp>(loc, warpRowOff,
               rewriter.create<arith::AddIOp>(loc,
                   ci(fi * (int)MMA_M + r * ((int)MMA_M / 4)), laneDiv));
           Value sC = rewriter.create<arith::AddIOp>(loc,
               ci(c * ((int)TILE_K / (int)aK)), laneMod);
-          Value e = rewriter.create<memref::LoadOp>(loc, vA, ValueRange{sR, sC});
+          // Apply A-tile read swizzle (must match write-side: col ^ ((row & 3) * 2))
+          Value sRMod  = rewriter.create<arith::AndIOp>(loc, sR, rewriter.create<arith::ConstantIndexOp>(loc, 3));
+          Value sXorA  = rewriter.create<arith::MulIOp>(loc, sRMod, rewriter.create<arith::ConstantIndexOp>(loc, 2));
+          Value sCSwizA = rewriter.create<arith::XOrIOp>(loc, sC, sXorA);
+          Value e = rewriter.create<memref::LoadOp>(loc, vA, ValueRange{sR, sCSwizA});
           if (e.getType() != mmaInputTy)
             e = rewriter.create<arith::TruncFOp>(loc, mmaInputTy, e);
           aFrag = rewriter.create<vector::InsertOp>(loc, e, aFrag,
@@ -615,13 +625,13 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
         Value bFrag = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(bFragTy));
         for (int r = 0; r < 2; ++r) {
           for (int c = 0; c < (int)bK; ++c) {
+            // B-register layout: k-row from kLane with r offset, n-col from colLane
             Value sR = rewriter.create<arith::RemUIOp>(loc,
                 rewriter.create<arith::AddIOp>(loc, ci(r * ((int)TILE_K / 2)), kLane),
                 cTileK);
-            // sC within warp's N-fragment: fj*MMA_N + c*(WARP_N/bK) + colLane
             Value sC = rewriter.create<arith::AddIOp>(loc, warpColOff,
                 rewriter.create<arith::AddIOp>(loc,
-                    ci(fj * (int)MMA_N + c * ((int)WARP_N / (int)bK)),
+                    ci(fj * (int)MMA_N + c * ((int)TILE_N / (int)bK)),
                     colLane));
             // XOR swizzle (must match write-side: col ^ ((row & (TILE_K-1)) * (TILE_N/TILE_K)))
             // TF32: (row & 7) * 16,  FP16: (row & 15) * 8
@@ -648,16 +658,14 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
       }
     }
 
-    // Advance stage indices and pointers
+    // Advance stage indices (aPtr/bPtr iter_args removed — issueStageLoad uses kBase)
     Value nextWriteStage = rewriter.create<arith::RemUIOp>(loc,
         rewriter.create<arith::AddIOp>(loc, writeStage, c1), cStages);
     Value nextReadStage = rewriter.create<arith::RemUIOp>(loc,
         rewriter.create<arith::AddIOp>(loc, readStage, c1), cStages);
-    Value nextAPtr  = rewriter.create<arith::AddIOp>(loc, aPtr, cAStride);
-    Value nextBPtr  = rewriter.create<arith::AddIOp>(loc, bPtr, cBStride);
 
     rewriter.create<scf::YieldOp>(loc,
-        ValueRange{nextAcc, nextToken, nextWriteStage, nextReadStage, nextAPtr, nextBPtr});
+        ValueRange{nextAcc, currToken, nextWriteStage, nextReadStage});
   }
 
   Value fAcc = mainLoop.getResult(0);
@@ -800,6 +808,16 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
 
     Type elemType = lhsType.getElementType();
 
+    // ── Tensor Core tile-size thresholds ──
+    // lowerTensorCoreMatmul needs at least one full TILE_M × TILE_N block to
+    // be useful, and the 3-stage async pipeline requires K ≥ TILE_K.  For
+    // matrices smaller than a single tile on any relevant dimension, fall back
+    // to the scalar CUDA-core path which handles all boundary sizes correctly.
+    const int64_t TC_TILE_M  = 128;
+    const int64_t TC_TILE_N  = 128;
+    const int64_t TC_TILE_K_TF32 = 8;
+    const int64_t TC_TILE_K_FP16 = 16;
+
     // ── Three-way dispatch ──
     if (elemType.isF64()) {
       // f64: no Tensor Core support → scalar CUDA core tiled matmul
@@ -809,6 +827,13 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
                                resultType, resultShape, resultMemRef);
     } else if (elemType.isF32()) {
       // f32: TF32 Tensor Cores (Ampere sm_80+), mmaShape=[16,8,8]
+      // Fall back to scalar for sub-tile dimensions to avoid pipeline issues.
+      bool tcViable = (M >= TC_TILE_M) && (N >= TC_TILE_N) && (K >= TC_TILE_K_TF32);
+      if (!tcViable)
+        return lowerScalarMatmul(op, rewriter, lhsFlat, rhsFlat, resFlat,
+                                 M, K, N, totalBatches, lhsBatchStride,
+                                 rhsBatchStride, resBatchStride,
+                                 resultType, resultShape, resultMemRef);
       return lowerTensorCoreMatmul(op, rewriter, lhsFlat, rhsFlat, resFlat,
                                    M, K, N, totalBatches, lhsBatchStride,
                                    rhsBatchStride, resBatchStride,
@@ -816,6 +841,13 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
                                    /*useTF32=*/true);
     } else {
       // f16 / bf16: FP16 Tensor Cores, mmaShape=[16,8,16], no casting
+      // Fall back to scalar for sub-tile dimensions.
+      bool tcViable = (M >= TC_TILE_M) && (N >= TC_TILE_N) && (K >= TC_TILE_K_FP16);
+      if (!tcViable)
+        return lowerScalarMatmul(op, rewriter, lhsFlat, rhsFlat, resFlat,
+                                 M, K, N, totalBatches, lhsBatchStride,
+                                 rhsBatchStride, resBatchStride,
+                                 resultType, resultShape, resultMemRef);
       return lowerTensorCoreMatmul(op, rewriter, lhsFlat, rhsFlat, resFlat,
                                    M, K, N, totalBatches, lhsBatchStride,
                                    rhsBatchStride, resBatchStride,
