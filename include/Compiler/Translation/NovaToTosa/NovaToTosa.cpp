@@ -646,6 +646,44 @@ struct NovaConstantToArithConstPattern
     return success();
   }
 };
+
+struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
+  using OpConversionPattern<nova::LinearOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::LinearOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto operands = adaptor.getOperands();
+    if (operands.size() != 3) {
+      return rewriter.notifyMatchFailure(op, "expected exactly 3 operands");
+    }
+
+    Value input = operands[0];
+    Value weight = operands[1];
+    Value bias = operands[2];
+
+    auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
+    auto weightType = llvm::dyn_cast<RankedTensorType>(weight.getType());
+    auto biasType = llvm::dyn_cast<RankedTensorType>(bias.getType());
+
+    auto resultType = llvm::dyn_cast<RankedTensorType>(op.getType());
+    if (!inputType || !weightType || !biasType || !resultType) {
+      return rewriter.notifyMatchFailure(op, "expected ranked tensor types");
+    }
+
+    auto loc = op.getLoc();
+    auto elementType = resultType.getElementType();
+    int64_t inputRank = inputType.getRank();
+
+    //create nova::matmul and nova::add 
+    auto matmulOperation = rewriter.create<mlir::nova::MatmulOp>(loc, input, weight).getResult();
+    auto addOperation = rewriter.create<mlir::nova::AddOp>(loc, matmulOperation, bias);
+    rewriter.replaceOp(op, addOperation);
+    return success();
+  }
+};
+
+
 // layer norm lowering with nova operations
 struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
   using OpConversionPattern<nova::LayerNormOp>::OpConversionPattern;
@@ -1060,6 +1098,7 @@ struct NovaToTosaLoweringPass
     target.addIllegalOp<nova::GeluBackwardOp>();
     target.addIllegalOp<nova::MaeOp>();
     target.addIllegalOp<nova::CastOp>();
+    target.addIllegalOp<nova::LinearOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     TypeConverter typeConverter;
     typeConverter.addConversion([](Type type) { return type; });
@@ -1076,7 +1115,7 @@ struct NovaToTosaLoweringPass
 
 void populateNovaToTosaConversionPatterns(RewritePatternSet &patterns) {
   patterns
-      .add<NovaReluOpLowering, NovaGeluOpLowering, NovaGeluBackwardPattern,
+      .add<NovaReluOpLowering, NovaGeluOpLowering, NovaGeluBackwardPattern, NovaLinearOpLowering,
                NovaSoftmaxLoweringPattern, NovaConstantToArithConstPattern,
                NovaSceBackwardOpLowering, NovaLayerNormPattern,
                NovaLayerNormBackwardPattern, NovaLinearBackwardPattern,
