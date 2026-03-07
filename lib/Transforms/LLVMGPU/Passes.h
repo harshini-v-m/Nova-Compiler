@@ -125,6 +125,11 @@ void registerNovaNormalizeLoopBoundsPass();
 // Ported from IREE's ConvertSharedMemAllocOp + DropSharedMemoryDeallocOp.
 std::unique_ptr<Pass> createNovaConvertSharedMemAllocsPass();
 void registerNovaConvertSharedMemAllocsPass();
+// Wrapper around GpuMapParallelLoops and ConvertParallelLoopToGpu that skips
+// existing gpu.launch blocks to prevent illegal nested launches.
+std::unique_ptr<Pass> createNovaGpuMapParallelLoopPass();
+void registerNovaGpuMapParallelLoopPass();
+
 
 } // namespace nova
 } // namespace mlir

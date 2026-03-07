@@ -39,7 +39,7 @@ struct NovaGPUSelectLoweringStrategyPass
   // Pass option: which CUDA arch to target (e.g. "sm_80", "sm_75", "ampere").
   Option<std::string> cudaArch{*this, "cuda-arch",
       llvm::cl::desc("CUDA SM architecture (e.g. sm_80, sm_75, volta)."),
-      llvm::cl::init("sm_80")};
+      llvm::cl::init("sm_86")};
 
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
@@ -50,7 +50,7 @@ struct NovaGPUSelectLoweringStrategyPass
           << "[nova-gpu-select-lowering-strategy] Unrecognized CUDA arch '"
           << cudaArch
           << "'; falling back to sm_80 defaults.";
-      target = getNVIDIATargetInfo("sm_80");
+      target = getNVIDIATargetInfo("sm_86");
     }
 
     LLVM_DEBUG(llvm::dbgs()

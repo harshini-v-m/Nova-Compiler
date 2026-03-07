@@ -128,6 +128,12 @@ struct TilingInfo {
   SmallVector<int64_t> interchange;  // TODO: Implement loop interchange support (see missing_functionality_analysis.md #7)
 };
 
+bool dividesEvenly(int64_t inputSize, int64_t tileSize) {
+  if (inputSize == ShapedType::kDynamic) return false;
+  if (tileSize == ShapedType::kDynamic) return false;
+  return (inputSize % tileSize) == 0;
+}
+
 static FailureOr<TilingInfo> getTiledAndDistributionInfo(RewriterBase &rewriter,
                                                           Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
@@ -180,17 +186,20 @@ static FailureOr<TilingInfo> getTiledAndDistributionInfo(RewriterBase &rewriter,
     }
 
     // Zero out full-tile dims from innermost outward, keeping at least 1.
-    for (int i = (int)tileSizes.size() - 1; i >= 0; --i) {
-      if (numNonZero <= 1) break;
-      auto tsCst = getConstantIntValue(tileSizes[i]);
-      if (!tsCst || *tsCst == 0) continue;
-      if (i >= (int)bounds.size()) continue;
-      auto boundCst = getConstantIntValue(bounds[i].size);
-      if (boundCst && *boundCst == *tsCst) {
+    for (int i = 0; i < (int)tileSizes.size(); ++i) {
+    if (numNonZero <= 1) break; // Critical: Stop if we only have one tile left
+    if (i >= (int)bounds.size()) continue;
+
+    auto tileCst = getConstantIntValue(tileSizes[i]);
+    auto boundCst = getConstantIntValue(bounds[i].size);
+
+    if (tileCst && boundCst && *tileCst != 0) {
+      if (dividesEvenly(*boundCst, *tileCst)) {
         tileSizes[i] = rewriter.getIndexAttr(0);
-        --numNonZero;
+        numNonZero--; // Decrement correctly
       }
     }
+  }
   }
 
   return TilingInfo{op, tileSizes, {}};

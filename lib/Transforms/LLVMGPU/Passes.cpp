@@ -16,10 +16,13 @@
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
+#include "mlir/Conversion/TensorToLinalg/TensorToLinalg.h"
 // Nova frontend translation passes
 #include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
 #include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
+#include "Compiler/Translation/NovaToArith/NovaToArith.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
+//  
 // TOSA conversion passes
 #include "mlir/Conversion/TosaToLinalg/TosaToLinalg.h"
 #include "mlir/Conversion/TosaToArith/TosaToArith.h"
@@ -70,6 +73,7 @@ namespace mlir::nova
                                    StringRef cudaArch)
   {
     pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::nova::createNovaToArithLoweringPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
     pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaElementwiseToLinalgPass());
@@ -190,7 +194,7 @@ namespace mlir::nova
     // -------------------------------------------------------------------------
     // Step 10: Lower remaining linalg → scf loops, affine → arith
     // -------------------------------------------------------------------------
-    pm.addPass(createConvertLinalgToLoopsPass());
+    pm.addPass(createConvertLinalgToParallelLoopsPass());
     pm.addPass(createLowerAffinePass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
@@ -201,6 +205,21 @@ namespace mlir::nova
     // and AFTER forall→gpu.launch and bufferization.
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUInsertWorkgroupBarriersPass());
+
+
+    // -------------------------------------------------------------------------
+    // Step 11.1: Convert host-side cross-kernel allocations to GPU allocations.
+    // This handles intermediate buffers (e.g. `%alloc = memref.alloc()`) on
+    // the host side that are passed into GPU kernels, converting them from
+    // default memory space `memref.alloc` to `gpu.alloc` (which lowers to
+    // `cudaMalloc`).
+    // -------------------------------------------------------------------------
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(nova::createConvertMemRefToGpuPass());
+
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaGpuMapParallelLoopPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
     // Step 12: Outline gpu.launch bodies into gpu.module kernels.
@@ -228,16 +247,6 @@ namespace mlir::nova
     }
 
     // -------------------------------------------------------------------------
-    // Step 12.75: Convert host-side cross-kernel allocations to GPU allocations.
-    // This handles intermediate buffers (e.g. `%alloc = memref.alloc()`) on
-    // the host side that are passed into GPU kernels, converting them from
-    // default memory space `memref.alloc` to `gpu.alloc` (which lowers to
-    // `cudaMalloc`).
-    // -------------------------------------------------------------------------
-    pm.addPass(nova::createConvertMemRefToGpuPass());
-    pm.addPass(createCanonicalizerPass());
-
-    // -------------------------------------------------------------------------
     // Step 13: Full CUDA/NVVM LLVM lowering
     // Lowers gpu.module → PTX binary, then lowers host code → LLVM IR.
     // Mirrors IREE's addLowerToLLVMGPUPasses (LLVMGPU/Passes.cpp).
@@ -247,7 +256,7 @@ namespace mlir::nova
     // createGpuModuleToBinaryPass knows how to compile it to PTX.
     GpuNVVMAttachTargetOptions nvvmTargetOptions;
     nvvmTargetOptions.triple = "nvptx64-nvidia-cuda";
-    nvvmTargetOptions.chip = cudaArch.empty() ? "sm_80" : cudaArch.str();
+    nvvmTargetOptions.chip = cudaArch.empty() ? "sm_86" : cudaArch.str();
     nvvmTargetOptions.optLevel = 3;
     nvvmTargetOptions.fastFlag = true;
     nvvmTargetOptions.ftzFlag = true;
@@ -334,6 +343,8 @@ namespace mlir::nova
     registerNovaNormalizeLoopBoundsPass();
     registerNovaEliminateEmptyTensorsPass();
     registerNovaConvertSharedMemAllocsPass();
+    registerNovaGpuMapParallelLoopPass();
+
 
     // Register the full optimized pipeline as a named pipeline.
     PassPipelineRegistration<>(

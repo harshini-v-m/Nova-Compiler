@@ -80,6 +80,31 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
     auto allocType =
         MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
                         AffineMap(), privateSpace);
+
+    // GPU cannot allocate dynamic private memory (illegal on NVIDIA with PTX < 7.3)
+    // If we have dynamic dimensions, allocate a conservative static size instead
+    if (!dynamicSizes.empty()) {
+      // Convert dynamic dimensions to static using maximum thread tile size
+      SmallVector<int64_t> staticShape;
+      for (int d = 0; d < memRefType.getRank(); ++d) {
+        if (memRefType.isDynamicDim(d)) {
+          // Use conservative maximum: 4 (standard thread tile size)
+          // This matches the thread-level tiling configuration used in NovaGPUApplyTilingLevelThreadPass
+          staticShape.push_back(4);
+        } else {
+          staticShape.push_back(memRefType.getDimSize(d));
+        }
+      }
+
+      auto staticAllocType =
+          MemRefType::get(staticShape, memRefType.getElementType(),
+                          AffineMap(), privateSpace);
+      // Create allocation without dynamic sizes - bufferization will handle subview
+      SmallVector<Value> emptyDynamicSizes;
+      return memref::AllocaOp::create(builder, loc, staticAllocType, emptyDynamicSizes)
+          .getResult();
+    }
+
     return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
         .getResult();
   }
@@ -117,7 +142,28 @@ static bool isWorkgroupMemref(MemRefType t) {
 // by NovaGPUInsertWorkgroupBarriersPass.
 static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
                                Value to) {
-  linalg::CopyOp::create(builder, loc, from, to);
+  // If we are inside an scf.forall (which will be lowered to a GPU kernel),
+  // we use linalg.copy. This is expanded into scf.for + memref.load/store
+  // loops that compile cleanly to PTX load/store instructions.
+  //
+  // Outside scf.forall (host side), we use memref.copy, which can be
+  // efficiently handled by the host runtime or lowered to specialized
+  // host-side copy routines.
+  Operation *parent = builder.getInsertionBlock()->getParentOp();
+  bool insideForall = false;
+  while (parent) {
+    if (isa<scf::ForallOp>(parent)) {
+      insideForall = true;
+      break;
+    }
+    parent = parent->getParentOp();
+  }
+
+  if (insideForall) {
+    linalg::CopyOp::create(builder, loc, from, to);
+  } else {
+    memref::CopyOp::create(builder, loc, from, to);
+  }
   return success();
 }
 

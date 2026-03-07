@@ -7,6 +7,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -431,7 +432,7 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
     Type indicesElemType = indicesType.getElementType();
 
     auto genericOp = rewriter.create<linalg::GenericOp>(
-        loc, TypeRange{resultType}, indices, emptyTensor, indexingMaps,
+        loc, TypeRange{resultType}, ValueRange{indices}, emptyTensor, indexingMaps,
         iteratorTypes, [&](OpBuilder &b, Location l, ValueRange args) {
           Value indexVal = args[0];
           if (llvm::isa<FloatType>(indicesElemType)) {
@@ -526,19 +527,37 @@ struct NovaScatterAddOpLowering
                                 /*restrict=*/true)
             .getResult();
 
-    auto zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    auto one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
     // 3. Parallel Loop over ALL dimensions of src
-    SmallVector<Value> lowerBounds(srcRank, zero);
-    SmallVector<Value> upperBounds;
+    SmallVector<OpFoldResult> lbs(srcRank, rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> ubs;
     for (int64_t i = 0; i < srcRank; ++i) {
-      upperBounds.push_back(
-          rewriter.create<arith::ConstantIndexOp>(loc, srcShape[i]));
+      if (srcShape[i] == ShapedType::kDynamic) {
+        Value dim = rewriter.create<memref::DimOp>(loc, srcMem, i);
+        ubs.push_back(dim);
+      } else {
+        ubs.push_back(rewriter.getIndexAttr(srcShape[i]));
+      }
     }
-    SmallVector<Value> steps(srcRank, one);
+    SmallVector<OpFoldResult> steps(srcRank, rewriter.getIndexAttr(1));
 
-    rewriter.create<scf::ParallelOp>(
-        loc, lowerBounds, upperBounds, steps,
+    // For GPU compatibility with the optimized pipeline, we add block mapping.
+    SmallVector<Attribute> mapping;
+    if (srcRank <= 3) {
+      for (int64_t i = 0; i < srcRank; ++i) {
+        gpu::MappingId mappingId;
+        if (i == 0) mappingId = gpu::MappingId::DimX;
+        else if (i == 1) mappingId = gpu::MappingId::DimY;
+        else mappingId = gpu::MappingId::DimZ;
+        mapping.push_back(gpu::GPUBlockMappingAttr::get(rewriter.getContext(), mappingId));
+      }
+    }
+    std::optional<ArrayAttr> mappingAttr = std::nullopt;
+    if (!mapping.empty()) {
+      mappingAttr = rewriter.getArrayAttr(mapping);
+    }
+
+    auto forallOp = rewriter.create<scf::ForallOp>(
+        loc, lbs, ubs, steps, ValueRange{}, mappingAttr,
         [&](OpBuilder &b, Location l, ValueRange ivs) {
           Value updateIdx = ivs[axis];
 
@@ -562,7 +581,7 @@ struct NovaScatterAddOpLowering
                                           ? arith::AtomicRMWKind::addf
                                           : arith::AtomicRMWKind::addi;
           b.create<memref::AtomicRMWOp>(l, kind, val, inputMem, dstCoords);
-          b.create<scf::ReduceOp>(l);
+          b.create<scf::InParallelOp>(l);
         });
 
     Value resultTensor =
@@ -1056,8 +1075,7 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
   if (kind == nova::ReductionKind::ALL || kind == nova::ReductionKind::ANY) {
     reductionElemType = rewriter.getI1Type();
     if (elemType != reductionElemType) {
-      auto boolType =
-          RankedTensorType::get(inputType.getShape(), reductionElemType);
+      auto boolType = RankedTensorType::get(inputType.getShape(), reductionElemType);
       current = rewriter.create<tosa::CastOp>(loc, boolType, current);
     }
   }
@@ -1074,29 +1092,25 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
     return rewriter.notifyMatchFailure(op, "unsupported reduction kind");
   Value identity = rewriter.create<arith::ConstantOp>(loc, identityAttr);
 
-  // Compute keepdims output shape (reduced dims become 1)
-  SmallVector<int64_t> keepdimsShape;
+  // Compute SQUEEZED shape (completely remove reduced dims)
+  // This allows the indexing map to be a valid permuted projection.
+  SmallVector<int64_t> squeezedShape;
   for (int64_t i = 0; i < rank; ++i) {
-    keepdimsShape.push_back(axisSet.contains(i) ? 1 : inputType.getDimSize(i));
+    if (!axisSet.contains(i))
+      squeezedShape.push_back(inputType.getDimSize(i));
   }
+  auto squeezedType = RankedTensorType::get(squeezedShape, reductionElemType);
 
-  // Create output tensor with keepdims shape
-  auto keepdimsType = RankedTensorType::get(keepdimsShape, reductionElemType);
-  Value emptyTensor = rewriter.create<tensor::EmptyOp>(
-      loc, keepdimsShape, reductionElemType, ValueRange{});
-  Value filledTensor =
-      rewriter.create<linalg::FillOp>(loc, identity, emptyTensor).result();
+  // Create squeezed output tensor
+  Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, squeezedShape, reductionElemType, ValueRange{});
+  Value filledTensor = rewriter.create<linalg::FillOp>(loc, identity, emptyTensor).result();
 
-  // Build indexing maps
-  // We want iterators: [parallel_0, ..., parallel_M, reduction_0, ...,
-  // reduction_K]
+  // Map logic remains similar, but output rank is now (rank - axes.size())
   SmallVector<int64_t> parallelAxes;
   SmallVector<int64_t> reductionAxes;
   for (int64_t i = 0; i < rank; ++i) {
-    if (axisSet.contains(i))
-      reductionAxes.push_back(i);
-    else
-      parallelAxes.push_back(i);
+    if (axisSet.contains(i)) reductionAxes.push_back(i);
+    else parallelAxes.push_back(i);
   }
 
   // logicalToLoop[logical_dim] = generic_loop_index
@@ -1111,11 +1125,10 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
     inputExprs.push_back(rewriter.getAffineDimExpr(logicalToLoop[i]));
   }
 
+  //  Only add DimExprs for parallel dims (results in rank N-K)
   SmallVector<AffineExpr> outputExprs;
   for (int64_t i = 0; i < rank; ++i) {
-    if (axisSet.contains(i)) {
-      outputExprs.push_back(rewriter.getAffineConstantExpr(0));
-    } else {
+    if (!axisSet.contains(i)) {
       outputExprs.push_back(rewriter.getAffineDimExpr(logicalToLoop[i]));
     }
   }
@@ -1130,66 +1143,157 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
   auto outputMap = AffineMap::get(rank, 0, outputExprs, rewriter.getContext());
 
   auto genericOp = rewriter.create<linalg::GenericOp>(
-      loc, keepdimsType, current, filledTensor,
+      loc, squeezedType, current, filledTensor,
       SmallVector<AffineMap>{inputMap, outputMap}, iteratorTypes,
       [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
-        Value result = createReduceCombiner(b, nestedLoc, kind, args[0],
-                                            args[1], reductionElemType);
+        Value result = createReduceCombiner(b, nestedLoc, kind, args[0], args[1], reductionElemType);
         b.create<linalg::YieldOp>(nestedLoc, result);
       });
 
   Value reduced = genericOp.getResult(0);
 
-  // Handle MEAN: divide by total reduced elements
+  //  divide by total reduced elements
   if (kind == nova::ReductionKind::MEAN && isa<FloatType>(reductionElemType)) {
     double divisor = static_cast<double>(totalReducedElements);
+    // Scalar constant captured by the region – no extra tensor needed.
     Value divisorVal = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getFloatAttr(reductionElemType, divisor));
 
-    Value divisorTensor = rewriter.create<tensor::EmptyOp>(
-        loc, keepdimsShape, reductionElemType, ValueRange{});
-    Value filledDivisor =
-        rewriter.create<linalg::FillOp>(loc, divisorVal, divisorTensor)
-            .result();
-
-    SmallVector<AffineMap> maps(3, rewriter.getMultiDimIdentityMap(rank));
-    Value outputTensor = rewriter.create<tensor::EmptyOp>(
-        loc, keepdimsShape, reductionElemType, ValueRange{});
+    int64_t squeezedRank = static_cast<int64_t>(squeezedShape.size());
+    // Single identity map: every loop index maps to the same output element.
+    AffineMap identityMap = rewriter.getMultiDimIdentityMap(squeezedRank);
 
     auto divOp = rewriter.create<linalg::GenericOp>(
-        loc, keepdimsType, ValueRange{reduced, filledDivisor}, outputTensor,
-        maps, getNParallelLoopsAttrs(rank),
+        loc, squeezedType,
+        /*inputs=*/ValueRange{},
+        /*outputs=*/ValueRange{reduced},
+        /*indexingMaps=*/SmallVector<AffineMap>{identityMap},
+        /*iteratorTypes=*/getNParallelLoopsAttrs(squeezedRank),
         [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
-          Value result = b.create<arith::DivFOp>(nestedLoc, args[0], args[1]);
-          b.create<linalg::YieldOp>(nestedLoc, result);
+          // args[0] is the accumulated sum element (from outs buffer).
+          Value res = b.create<arith::DivFOp>(nestedLoc, args[0], divisorVal);
+          b.create<linalg::YieldOp>(nestedLoc, res);
         });
     reduced = divOp.getResult(0);
   }
 
-  // Final type cast/reshape if needed
+  //  Reshape back to the resultType (handles keepdims=true or false)
   if (cast<RankedTensorType>(reduced.getType()) != resultType) {
-    auto reducedType = cast<RankedTensorType>(reduced.getType());
-    if (reducedType.getRank() != resultType.getRank()) {
-      auto shapeType = RankedTensorType::get({resultType.getRank()},
-                                             rewriter.getIndexType());
-      auto shapeAttr =
-          DenseIntElementsAttr::get(shapeType, resultType.getShape());
+      auto shapeType = RankedTensorType::get({resultType.getRank()}, rewriter.getIndexType());
+      auto shapeAttr = DenseIntElementsAttr::get(shapeType, resultType.getShape());
       auto shapeConst = rewriter.create<tosa::ConstShapeOp>(
-          loc,
-          mlir::tosa::shapeType::get(rewriter.getContext(),
-                                     resultType.getRank()),
-          shapeAttr);
-      reduced = rewriter.create<tosa::ReshapeOp>(loc, resultType, reduced,
-                                                 shapeConst);
-    } else {
-      reduced = rewriter.create<tensor::CastOp>(loc, resultType, reduced);
-    }
+          loc, mlir::tosa::shapeType::get(rewriter.getContext(), resultType.getRank()), shapeAttr);
+      reduced = rewriter.create<tosa::ReshapeOp>(loc, resultType, reduced, shapeConst);
   }
 
   rewriter.replaceOp(op, reduced);
   return success();
 }
 
+static LogicalResult
+lowerFullReduceMeanToSCF(nova::ReduceOp op, PatternRewriter &rewriter,
+                         Location loc, Value input, RankedTensorType inputType,
+                         RankedTensorType resultType, Type elemType,
+                         int64_t rank, SmallVector<int64_t> &axes) {
+
+  assert(static_cast<int64_t>(axes.size()) == rank &&
+         "lowerFullReduceMeanToSCF expects a full reduction over all axes");
+  assert(isa<FloatType>(elemType) &&
+         "full-reduction MEAN SCF path only supports float types");
+
+  llvm::sort(axes);
+
+  int64_t totalElems = 1;
+  for (int64_t d : axes)
+    totalElems *= inputType.getDimSize(d);
+
+  Value fZero = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getFloatAttr(elemType, 0.0));
+
+  auto scalarMemType = MemRefType::get({}, elemType);
+  Value emptyScalar = rewriter.create<memref::AllocOp>(loc, scalarMemType);
+  rewriter.create<memref::StoreOp>(loc, fZero, emptyScalar, ValueRange{});
+
+  auto scalarTensorType = RankedTensorType::get({}, elemType);
+
+  auto inputMemType = MemRefType::get(inputType.getShape(), elemType);
+  Value inputMem = rewriter.create<ToBufferOp>(
+      loc, inputMemType, input, /*restrict=*/true).getResult();
+
+  Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+  SmallVector<Attribute> mapping;
+  mapping.push_back(gpu::GPUBlockMappingAttr::get(rewriter.getContext(), gpu::MappingId::DimX));
+  ArrayAttr mappingAttr = rewriter.getArrayAttr(mapping);
+
+
+  auto forallOp = rewriter.create<scf::ForallOp>(
+      loc,
+      /*lbs=*/SmallVector<OpFoldResult>{getAsOpFoldResult(c0)},
+      /*ubs=*/SmallVector<OpFoldResult>{getAsOpFoldResult(c1)},
+      /*steps=*/SmallVector<OpFoldResult>{getAsOpFoldResult(c1)},
+      /*outputs=*/ValueRange{},  
+      /*mapping=*/mappingAttr);
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(forallOp.getBody());
+
+    SmallVector<Value> dimUbs(rank);
+    for (int64_t d = 0; d < rank; ++d)
+      dimUbs[d] = rewriter.create<arith::ConstantIndexOp>(
+          loc, inputType.getDimSize(d));
+
+    std::function<Value(int64_t, Value, SmallVectorImpl<Value> &)>
+        buildNest = [&](int64_t level, Value runningSum,
+                        SmallVectorImpl<Value> &ivs) -> Value {
+      if (level == rank) {
+
+        Value elem = rewriter.create<memref::LoadOp>(
+            loc, inputMem, ivs);
+        return rewriter.create<arith::AddFOp>(loc, runningSum, elem);
+      }
+      auto forOp = rewriter.create<scf::ForOp>(
+          loc, c0, dimUbs[axes[level]], c1, ValueRange{runningSum});
+      {
+        OpBuilder::InsertionGuard gLevel(rewriter);
+        rewriter.setInsertionPointToStart(forOp.getBody());
+        Value iv      = forOp.getInductionVar();
+        Value innerIn = forOp.getRegionIterArgs()[0];
+        ivs.push_back(iv);
+        Value innerOut = buildNest(level + 1, innerIn, ivs);
+        ivs.pop_back();
+        rewriter.create<scf::YieldOp>(loc, innerOut);
+      }
+      return forOp.getResult(0);
+    };
+
+    SmallVector<Value> ivs;
+    Value totalSum = buildNest(0, fZero, ivs);
+    Value divisorVal = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(elemType, static_cast<double>(totalElems)));
+    Value mean = rewriter.create<arith::DivFOp>(loc, totalSum, divisorVal);
+    rewriter.create<memref::StoreOp>(loc, mean, emptyScalar, ValueRange{});
+
+  }
+
+  // 5. Convert memref result back to tensor
+  Value resultTensor = rewriter.create<ToTensorOp>(
+      loc, scalarTensorType, emptyScalar, /*restrict=*/true).getResult();
+
+  // Reshape to final result shape if needed
+  Value result = resultTensor;
+  if (cast<RankedTensorType>(result.getType()) != resultType) {
+    auto shapeType = RankedTensorType::get({resultType.getRank()}, rewriter.getIndexType());
+    auto shapeAttr = DenseIntElementsAttr::get(shapeType, resultType.getShape());
+    auto shapeConst = rewriter.create<tosa::ConstShapeOp>(
+        loc, mlir::tosa::shapeType::get(rewriter.getContext(), resultType.getRank()), shapeAttr);
+    result = rewriter.create<tosa::ReshapeOp>(loc, resultType, result, shapeConst);
+  }
+
+  rewriter.replaceOp(op, result);
+  return success();
+}
 class ReduceOpConverter : public OpRewritePattern<nova::ReduceOp> {
 public:
   using OpRewritePattern<nova::ReduceOp>::OpRewritePattern;
@@ -1220,7 +1324,17 @@ public:
         axes.push_back(i);
     }
 
-    // Use linalg.generic path
+    // Full-reduction MEAN → scf.forall (GPU block) + nested scf.for loops.
+    // All other kinds and all partial reductions go through linalg.generic.
+    bool isFullReduction = (static_cast<int64_t>(axes.size()) == rank);
+    if (kind == nova::ReductionKind::MEAN && isFullReduction &&
+        isa<FloatType>(elemType)) {
+      return lowerFullReduceMeanToSCF(op, rewriter, loc, input, inputType,
+                                      resultType, elemType, rank, axes);
+    }
+
+    // Use linalg.generic path for everything else (partial reductions,
+    // other reduction kinds, non-float MEAN, …).
     return lowerWithLinalgGeneric(op, rewriter, loc, input, inputType,
                                   resultType, elemType, rank, kind, axes);
 
@@ -1640,7 +1754,8 @@ struct NovaToLinalgPass
     registry
         .insert<linalg::LinalgDialect, tensor::TensorDialect,
                 arith::ArithDialect, func::FuncDialect, memref::MemRefDialect,
-                bufferization::BufferizationDialect>();
+                bufferization::BufferizationDialect, scf::SCFDialect,
+                gpu::GPUDialect, tosa::TosaDialect>();
   }
 
   StringRef getArgument() const final { return "convert-nova-to-linalg"; }
@@ -1662,6 +1777,9 @@ struct NovaToLinalgPass
     target.addLegalDialect<math::MathDialect>();
     target.addLegalDialect<mlir::memref::MemRefDialect>();
     target.addLegalDialect<mlir::bufferization::BufferizationDialect>();
+    target.addLegalDialect<mlir::scf::SCFDialect>();
+    target.addLegalDialect<mlir::gpu::GPUDialect>();
+    target.addLegalDialect<mlir::tosa::TosaDialect>();
 
     // Only the structural ops this file has patterns for are illegal.
     // Elementwise ops and nova.reduce remain legal here (handled elsewhere).
