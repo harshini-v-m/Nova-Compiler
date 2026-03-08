@@ -99,6 +99,42 @@ static bool isWorkgroupForall(scf::ForallOp forallOp) {
 //       promotion that the K-loop left visible.
 //===----------------------------------------------------------------------===//
 
+/// Returns true if the linalg op is a tiling root: either a contraction op
+/// or any linalg op that has a lowering_config attribute stamped on it.
+/// This allows reduction ops (softmax, layer norm, sum) and elementwise ops
+/// to be recognized as tiling targets alongside matmuls.
+static bool isTilingRoot(linalg::LinalgOp linalgOp) {
+  // Contractions are always roots (backward compatible).
+  if (linalg::isaContractionOpInterface(linalgOp))
+    return true;
+  // Any op with a lowering_config is a root (set by initNovaGPULaunchConfig).
+  if (getLoweringConfig(linalgOp.getOperation()))
+    return true;
+  return false;
+}
+
+/// Returns true if the op has reduction iterators and a lowering_config with
+/// non-zero reduction tile sizes. Used to check whether Reduction-level tiling
+/// should apply to this op.
+static bool hasReductionTiling(linalg::LinalgOp linalgOp) {
+  // Contractions always have a K dimension to tile.
+  if (linalg::isaContractionOpInterface(linalgOp))
+    return true;
+  // For generic ops, check if any iterator is a reduction AND the config
+  // has non-zero reduction tiles.
+  auto iterTypes = linalgOp.getIteratorTypesArray();
+  bool hasReduction = llvm::any_of(iterTypes, linalg::isReductionIterator);
+  if (!hasReduction)
+    return false;
+  // If there's a config, check if reduction tiles are non-zero.
+  if (auto config = getLoweringConfig(linalgOp.getOperation())) {
+    SmallVector<int64_t> redTiles =
+        getLoweringConfigTileSizes(config, kReductionKey);
+    return llvm::any_of(redTiles, [](int64_t t) { return t > 0; });
+  }
+  return false;
+}
+
 static llvm::SmallDenseSet<TilingInterface>
 getTiledOps(func::FuncOp funcOp, NovaTilingLevel tilingLevel) {
   llvm::SmallDenseSet<TilingInterface> targets;
@@ -108,36 +144,31 @@ getTiledOps(func::FuncOp funcOp, NovaTilingLevel tilingLevel) {
     auto tilingOp = dyn_cast<TilingInterface>(op);
     if (!tilingOp)
       return WalkResult::advance();
+    if (!isa<linalg::LinalgOp>(op))
+      return WalkResult::advance();
+    auto linalgOp = cast<linalg::LinalgOp>(op);
 
-    // For Reduction: collect contraction ops inside workgroup foralls.
+    // Must be a recognized tiling root.
+    if (!isTilingRoot(linalgOp))
+      return WalkResult::advance();
+
+    // Must be inside a workgroup forall.
+    auto parentForall = op->getParentOfType<scf::ForallOp>();
+    if (!parentForall || !isWorkgroupForall(parentForall))
+      return WalkResult::advance();
+
     if (tilingLevel == NovaTilingLevel::Reduction) {
-      if (!isa<linalg::LinalgOp>(op))
-        return WalkResult::advance();
-      auto linalgOp = cast<linalg::LinalgOp>(op);
-      if (!linalg::isaContractionOpInterface(linalgOp))
-        return WalkResult::advance();
-      // Only inside a workgroup forall.
-      auto parentForall = op->getParentOfType<scf::ForallOp>();
-      if (!parentForall || !isWorkgroupForall(parentForall))
+      // Only collect ops that actually have reduction dims to tile.
+      if (!hasReductionTiling(linalgOp))
         return WalkResult::advance();
       targets.insert(tilingOp);
       return WalkResult::advance();
     }
 
-    // For Thread / Subgroup: collect contraction ops that are now inside the
-    // K-loop (scf.for) which itself is inside the workgroup forall.
-    // We tile whatever contraction ops remain after Reduction tiling.
+    // For Thread / Subgroup: collect all tiling roots inside workgroup foralls.
+    // This includes both contractions and non-contraction ops with configs.
     if (tilingLevel == NovaTilingLevel::Thread ||
         tilingLevel == NovaTilingLevel::Subgroup) {
-      if (!isa<linalg::LinalgOp>(op))
-        return WalkResult::advance();
-      auto linalgOp = cast<linalg::LinalgOp>(op);
-      if (!linalg::isaContractionOpInterface(linalgOp))
-        return WalkResult::advance();
-      // Must be inside a workgroup forall (possibly nested inside scf.for).
-      auto parentForall = op->getParentOfType<scf::ForallOp>();
-      if (!parentForall || !isWorkgroupForall(parentForall))
-        return WalkResult::advance();
       targets.insert(tilingOp);
       return WalkResult::advance();
     }
@@ -159,22 +190,27 @@ getTileSizes(RewriterBase &rewriter, linalg::LinalgOp op,
   SmallVector<OpFoldResult> tileSizes(numLoops, rewriter.getIndexAttr(0));
 
   if (tilingLevel == NovaTilingLevel::Reduction) {
-    // Tile only reduction (K) dims.
-    // Prefer reading the reduction tile size from the op's lowering_config
-    // attribute (set by NovaGPUSelectLoweringStrategy).  Fall back to the
-    // static kReductionTile constant when no config is present.
-    int64_t kStep = kReductionTile; // default fallback
+    // Tile only reduction dims.
+    // Read per-dim reduction tile sizes from the lowering_config if available.
+    // For contractions, all reduction dims share the same K-step.
+    // For generic reductions (softmax, sum), each reduction dim may have its
+    // own tiling factor (set by setReductionLoweringConfig).
     if (auto config = getLoweringConfig(op.getOperation())) {
       SmallVector<int64_t> redTiles =
           getLoweringConfigTileSizes(config, kReductionKey);
-      // Find the last non-zero entry in the reduction tile array (K dim).
-      for (int64_t t : llvm::reverse(redTiles)) {
-        if (t > 0) { kStep = t; break; }
+      if (redTiles.size() == static_cast<size_t>(numLoops)) {
+        // Use per-dim tile sizes from the config.
+        for (int i = 0; i < numLoops; ++i) {
+          if (redTiles[i] > 0)
+            tileSizes[i] = rewriter.getIndexAttr(redTiles[i]);
+        }
+        return tileSizes;
       }
     }
+    // Fallback: tile all reduction dims with the static default.
     for (int i = 0; i < numLoops; ++i) {
       if (linalg::isReductionIterator(op.getIteratorTypesArray()[i]))
-        tileSizes[i] = rewriter.getIndexAttr(kStep);
+        tileSizes[i] = rewriter.getIndexAttr(kReductionTile);
     }
     return tileSizes;
   }

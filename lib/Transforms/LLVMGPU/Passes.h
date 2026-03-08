@@ -126,6 +126,12 @@ void registerNovaNormalizeLoopBoundsPass();
 std::unique_ptr<Pass> createNovaConvertSharedMemAllocsPass();
 void registerNovaConvertSharedMemAllocsPass();
 
+// Converts #gpu.address_space attributes on memref types to NVVM integer
+// address spaces (private=5, workgroup=3, global=1). Must run inside
+// gpu.module BEFORE finalizeMemRefToLLVMConversionPass.
+std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass();
+void registerNovaGPULowerMemorySpacePass();
+
 } // namespace nova
 } // namespace mlir
 

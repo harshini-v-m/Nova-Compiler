@@ -86,6 +86,13 @@ static bool isCrossWorkgroupUsed(bufferization::AllocTensorOp alloc) {
   return false;
 }
 
+/// Returns true if `op` is nested inside an scf.forall (a GPU kernel).
+/// Private (register/stack) memory is only meaningful inside a kernel —
+/// there must be an active GPU thread to own the per-thread storage.
+static bool isInsideKernel(Operation *op) {
+  return op->getParentOfType<scf::ForallOp>() != nullptr;
+}
+
 struct NovaGPUInferMemorySpacePass
     : public PassWrapper<NovaGPUInferMemorySpacePass,
                          OperationPass<func::FuncOp>> {
@@ -127,9 +134,17 @@ struct NovaGPUInferMemorySpacePass
       } else if (isCrossWorkgroupUsed(alloc)) {
         // Cross-workgroup buffer: leave without memory space (global memory).
         // The allocation function will emit a plain memref.alloc.
-      } else {
+      } else if (isInsideKernel(alloc)) {
+        // Private (register) memory is only valid inside a GPU kernel.
+        // If the alloc_tensor itself is nested inside an scf.forall, the
+        // resulting memref.alloca will also be inside the kernel — correct.
         alloc.setMemorySpaceAttr(privateSpace);
       }
+      // else: alloc is at function scope (outside every kernel).
+      // Leave without a memory-space attribute so gpuRequireMemSpaceAllocationFn
+      // emits a plain memref.alloc (global device memory). The buffer will
+      // remain live across kernel launches, which is exactly what is needed
+      // for function-scope temporaries that are consumed by a later scf.forall.
     });
 
     if (failed)

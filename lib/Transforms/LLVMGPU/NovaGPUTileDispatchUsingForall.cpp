@@ -1,5 +1,6 @@
 #include "Passes.h"
 #include "NovaGPUTileAndFuseUtils.h"
+#include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -60,6 +61,54 @@ static SmallVector<Operation *> getComputeOps(func::FuncOp funcOp) {
 /// E.g., linalg.pack op can only be fused as a consumer in perfect tiling scenario.
 static bool isAllowedToFailOnConsumerFusion(Operation *op) {
   return isa<linalg::PackOp>(op);
+}
+
+/// Returns true if `op` has a lowering_config with at least one non-zero
+/// workgroup tile size. This means the op is intended to be GPU-distributed.
+static bool hasNonZeroWorkgroupTiles(Operation *op) {
+  DictionaryAttr config = getLoweringConfig(op);
+  if (!config)
+    return false;
+  SmallVector<int64_t> wgTiles =
+      getLoweringConfigTileSizes(config, kWorkgroupKey);
+  return llvm::any_of(wgTiles, [](int64_t t) { return t != 0; });
+}
+
+/// Returns true if `op` has at least one consumer that:
+///   (a) implements TilingInterface (is a compute op),
+///   (b) is not yet inside a workgroup forall, AND
+///   (c) has a non-zero workgroup tile in its lowering_config OR is an
+///       elementwise op that will receive heuristic block tiling.
+///
+/// Only if this returns true should we defer `op` as a producer-to-be-fused.
+/// If all pending consumers are non-GPU-distributable (e.g. a full reduction
+/// with workgroup=[0,0]), the current op is effectively the GPU-parallel sink
+/// and should be tiled as a root rather than deferred indefinitely.
+static bool hasGPUDistributableConsumer(Operation *op) {
+  return llvm::any_of(op->getUsers(), [](Operation *user) {
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(user);
+    if (!linalgOp)
+      return false;
+    if (user->getParentOfType<scf::ForallOp>())
+      return false; // already tiled, not pending
+
+    // Pending consumer: check explicit config first.
+    if (hasNonZeroWorkgroupTiles(user))
+      return true;
+
+    // If no config, check if it will get heuristic tiling.
+    // The heuristic in getTiledAndDistributionInfo tiles parallel dims.
+    if (!getLoweringConfig(user)) {
+      int numParallel = 0;
+      for (auto iter : linalgOp.getIteratorTypesArray()) {
+        if (linalg::isParallelIterator(iter)) numParallel++;
+      }
+      // If it has at least one parallel dimension, it will receive heuristic block tiles > 0.
+      if (numParallel > 0) return true;
+    }
+    
+    return false;
+  });
 }
 
 /// Returns true if all the compute ops are within scf.forall distribution
@@ -136,27 +185,42 @@ static FailureOr<TilingInfo> getTiledAndDistributionInfo(RewriterBase &rewriter,
   int numLoops = linalgOp.getNumLoops();
   SmallVector<OpFoldResult> tileSizes(numLoops, rewriter.getIndexAttr(0));
 
-  // Heuristic tile sizes (TODO: replace with LoweringConfigAttr when available).
-  // Tile the two innermost parallel dims to 128 (M->Y, N->X), batch dims to 1.
-  // Reduction dims (K) stay at 0 — not tiled at workgroup level.
-  if (numLoops >= 2) {
+  // Try to read workgroup tile sizes from the lowering_config attribute
+  // stamped by NovaGPUSelectLoweringStrategy. This avoids hardcoded tile sizes.
+  bool usedConfig = false;
+  if (auto config = getLoweringConfig(op)) {
+    SmallVector<int64_t> wgTiles =
+        getLoweringConfigTileSizes(config, kWorkgroupKey);
+    if (wgTiles.size() == static_cast<size_t>(numLoops)) {
+      for (int i = 0; i < numLoops; ++i)
+        tileSizes[i] = rewriter.getIndexAttr(wgTiles[i]);
+      usedConfig = true;
+    }
+  }
+
+  if (!usedConfig) {
+    // Heuristic fallback: tile parallel dims up to 64x64.
+    // We want the innermost parallel dim to get 64, the next to get 64, etc.
     int parallelDimCount = 0;
     for (int i = numLoops - 1; i >= 0; --i) {
-      if (!linalg::isParallelIterator(linalgOp.getIteratorTypesArray()[i]))
+      if (!linalg::isParallelIterator(linalgOp.getIteratorTypesArray()[i])) {
+        tileSizes[i] = rewriter.getIndexAttr(0);
         continue;
-      if (parallelDimCount == 0)
-        tileSizes[i] = rewriter.getIndexAttr(128); // N -> BlockX
-      else if (parallelDimCount == 1)
-        tileSizes[i] = rewriter.getIndexAttr(128); // M -> BlockY
-      else
-        tileSizes[i] = rewriter.getIndexAttr(1);   // Batch -> BlockZ
+      }
+      
+      if (parallelDimCount == 0) {
+        tileSizes[i] = rewriter.getIndexAttr(64); // Innermost parallel dim (BlockX)
+      } else if (parallelDimCount == 1) {
+        tileSizes[i] = rewriter.getIndexAttr(64); // Next parallel dim (BlockY)
+      } else {
+        tileSizes[i] = rewriter.getIndexAttr(1);  // Outer parallel dims (BlockZ / Batch)
+      }
       ++parallelDimCount;
     }
   }
 
-  // PartitionableLoops equivalent: zero out non-parallel (reduction) dims.
-  // IREE uses PartitionableLoopsInterface for this, which is IREE-specific.
-  // We achieve the same by inspecting iterator types directly.
+  // Zero out non-parallel (reduction) dims at workgroup level.
+  // Workgroup distribution is only for parallel dimensions.
   for (int i = 0; i < numLoops; ++i) {
     if (!linalg::isParallelIterator(linalgOp.getIteratorTypesArray()[i]))
       tileSizes[i] = rewriter.getIndexAttr(0);
@@ -164,7 +228,6 @@ static FailureOr<TilingInfo> getTiledAndDistributionInfo(RewriterBase &rewriter,
 
   // Full-tile optimization: zero tile size when staticLoopSize == tileSize.
   // This prevents single-trip scf.forall loops, which can block cleanup patterns.
-  // Mirrors IREE's getTiledAndDistributionInfo (TileDispatchUsingForall.cpp:111-138).
   // Keep at least one non-zero tile size so the forall loop is still created.
   {
     OpBuilder::InsertionGuard g(rewriter);
@@ -214,18 +277,22 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
     IRRewriter rewriter(&getContext());
 
     // =========================================================================
-    // Two-pass tiling strategy (mirrors IREE's dispatch formation):
+    // Three-pass tiling strategy for forming GPU dispatches:
     //
-    // Pass 1: Tile contraction ops (matmuls) in FORWARD order. After tiling
-    //         each matmul, fuse downstream elementwise consumers (bias, relu)
-    //         as epilogues. This gives: matmul+bias+relu per kernel.
+    // Pass 1: Tile heavy compute like matmuls first. We process these in 
+    //         forward order so that after tiling a matmul, we can pull its
+    //         downstream elementwise consumers (like bias and ReLU) right into 
+    //         its new `scf.forall` loop. This gives us fused kernels: 
+    //         [matmul + bias + relu].
     //
-    // Pass 2: Tile any remaining unfused compute ops (standalone elementwise
-    //         ops that are not consumers of any matmul).
+    // Pass 2: Sweep up the leftovers. Any compute operations that didn't get 
+    //         eaten by a matmul in Pass 1 are tiled here. We process these in 
+    //         reverse order to handle long chains of elementwise ops cleanly.
     //
-    // Previously we iterated in REVERSE, which caused elementwise ops between
-    // two matmuls (relu1 between matmul1 and matmul2) to be fused as
-    // PRODUCERS of the later matmul — causing redundant recomputation.
+    // Pass 3: Handle the weird cases. Things like full reductions end up with 
+    //         no parallel dimensions, so they don't get block tiles naturally.
+    //         We wrap these manually into a single-block `scf.forall` so they 
+    //         still act like a proper GPU kernel.
     // =========================================================================
 
     llvm::SmallPtrSet<Operation *, 16> handledOps;
@@ -348,6 +415,13 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
                   // as consumers would collapse all layers into one forall.
                   if (isContractionOp(op))
                     return false;
+                  // Do NOT fuse consumers with all-zero workgroup tile sizes
+                  // (e.g. a full [reduction,reduction] with workgroup=[0,0]).
+                  // Such ops will never produce a GPU-parallel scf.forall and
+                  // fusing them as consumers causes a crash inside
+                  // lower_bound/properlyDominates on freshly-tiled regions.
+                  if (!hasNonZeroWorkgroupTiles(op))
+                    return false;
                   return tiledAndFusedOps.contains(op);
                 });
         if (succeeded(newFusionOpportunities)) {
@@ -358,12 +432,11 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       return success();
     };
 
-    // --- Pass 1: Tile contraction ops (matmuls) in forward order -------------
-    // Consumer fusion will pull bias+relu into each matmul's forall.
-    // Re-collect after each matmul tile because consumer fusion may delete
-    // downstream elementwise ops that were in the snapshot list.
-    // Safe pattern: collect fresh list at top of each while iteration, then
-    // process exactly ONE untiled matmul per outer loop.
+    // --- Pass 1: Tile matrix multiplications in forward order ---
+    // At this stage, we are only looking for matmuls. We tile them, and then 
+    // aggressively fuse any basic elementwise consumers coming after them. 
+    // We have to re-evaluate the graph after every tile because that fusion 
+    // step might swallow up operations that were sitting in our list!
     {
       bool foundOne = true;
       while (foundOne) {
@@ -391,34 +464,37 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       }
     }
 
-    // --- Pass 2: Tile remaining unfused elementwise ops (REVERSE order) ------
-    // Mirrors IREE's tileConsumerAndFuseProducersUsingSCF contract:
-    //   - Tile the LAST (sink) op in a chain as the "consumer/root".
-    //   - Let producer fusion (inside tileConsumerAndFuseProducersUsingSCF)
-    //     pull all chained producers up into the same scf.forall.
-    //
-    // This avoids the consumer fusion path entirely for elementwise chains,
-    // eliminating the stale-tiledAndFusedOps iterator-invalidation bug.
+    // --- Pass 2: Tile the remaining operations in reverse order ---
+    // If an operation survived Pass 1 without getting fused, it needs its own 
+    // kernel now. We tile these starting from the end of the program and move 
+    // backward. That way, if we have a chain of operations (like Reshape -> 
+    // Exp -> Softmax), we tile the final sink first, and it naturally pulls 
+    // all its producers into the same kernel loop.
     {
       SmallVector<Operation *> remainingOps = getComputeOps(funcOp);
       // Process in REVERSE so the last (sink) op is tiled first.
       for (Operation *rootOp : llvm::reverse(remainingOps)) {
         if (isInsideWorkgroupForall(rootOp))
           continue;
-        // Only tile each "sink": skip if this op's result feeds another
-        // untiled compute op (it will be fused as a producer of that op).
-        bool hasTilableConsumer = llvm::any_of(rootOp->getUsers(), [](Operation *user) {
-          return isa<TilingInterface>(user);
-        });
-        // If this op has a tilable consumer that is still outside a forall,
-        // defer it — it will be fused as a producer when that consumer is tiled.
-        if (hasTilableConsumer) {
-          bool consumerPending = llvm::any_of(rootOp->getUsers(), [](Operation *user) {
-            return isa<TilingInterface>(user) && !user->getParentOfType<scf::ForallOp>();
-          });
-          if (consumerPending)
-            continue;
-        }
+        // -----------------------------------------------------------------------
+        // Smart Deferral Logic
+        //
+        // Should we tile this operation right now, or should we wait?
+        // If this op feeds into a consumer that hasn't been tiled yet, BUT that 
+        // consumer is definitely going to be tiled (it has valid block configs),
+        // we skip the current op. We'll let the consumer pull it in later.
+        //
+        // However, if the consumer is something that *can't* be parallelized on 
+        // the GPU (like a full reduction across all dimensions), then waiting 
+        // for it is a trap. The consumer will never spawn a parallel loop, and 
+        // if we wait for it, the current operation will never get tiled at all,
+        // resulting in terrible host-side performance. 
+        // So in that case, we take matters into our own hands and tile the 
+        // current operation right now as its own isolated root.
+        // -----------------------------------------------------------------------
+        if (hasGPUDistributableConsumer(rootOp))
+          continue; // Defer — a real GPU forall will pull us in as a producer.
+
         bool didTile = false;
         if (failed(tileRoot(rootOp, didTile))) {
           signalPassFailure();
@@ -427,11 +503,140 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       }
     }
     
-    // TODO: Implement transpose workgroup support (see missing_functionality_analysis.md #10)
-    // Swap X and Y mapping attributes when transposeWorkgroup option is enabled.
-    // if (transposeWorkgroup && areAllStaticLoopBounds(forallOp) && mappingSize >= 2) {
-    //   std::swap(mappingAttrs[mappingSize - 1], mappingAttrs[mappingSize - 2]);
-    // }
+    // --- Pass 3: Manually wrap full reductions ---
+    // Pure reductions (like summing an entire matrix into a single scalar) 
+    // don't have parallel dimensions, so they sneak through Pass 1 and 2 
+    // without getting distributed. To fix this, we find any of these chains 
+    // left out in the cold and manually stuff them into a 1-trip `scf.forall` 
+    // with a single block mapping. That way, the lowering pipeline still sees 
+    // them as valid GPU kernels.
+    {
+      llvm::SmallPtrSet<Operation *, 16> alreadyWrapped;
+
+      // Find all un-distributed ops and wrap each connected chain.
+      // Process return values: trace back to find chains that need wrapping.
+      auto returnOp = cast<func::ReturnOp>(funcOp.getBody().back().getTerminator());
+
+      for (Value retVal : returnOp.getOperands()) {
+        // Trace back through the chain to find all un-distributed ops.
+        SmallVector<Operation *> opsToMove;
+        SmallVector<Operation *> worklist;
+        llvm::SmallPtrSet<Operation *, 16> visited;
+
+        if (auto defOp = retVal.getDefiningOp()) {
+          if (!isInsideWorkgroupForall(defOp) &&
+              defOp->getParentOp() == funcOp.getOperation())
+            worklist.push_back(defOp);
+        }
+
+        while (!worklist.empty()) {
+          Operation *curr = worklist.pop_back_val();
+          if (!visited.insert(curr).second)
+            continue;
+          if (isInsideWorkgroupForall(curr))
+            continue;
+          if (alreadyWrapped.count(curr))
+            continue;
+          // Skip function arguments (no defining op).
+          if (curr->getParentOp() != funcOp.getOperation())
+            continue;
+
+          opsToMove.push_back(curr);
+          for (Value operand : curr->getOperands()) {
+            if (auto defOp = operand.getDefiningOp()) {
+              if (defOp->getParentOp() == funcOp.getOperation() &&
+                  !isInsideWorkgroupForall(defOp))
+                worklist.push_back(defOp);
+            }
+          }
+        }
+
+        if (opsToMove.empty())
+          continue;
+
+        // Check if this chain contains a full-reduction op (all reduction, no
+        // parallel dims). Only wrap chains that actually need GPU distribution.
+        bool hasFullReduction = false;
+        for (Operation *moveOp : opsToMove) {
+          auto lg = dyn_cast<linalg::LinalgOp>(moveOp);
+          if (!lg) continue;
+          auto iters = lg.getIteratorTypesArray();
+          if (!iters.empty() &&
+              !llvm::any_of(iters, linalg::isParallelIterator) &&
+              llvm::any_of(iters, linalg::isReductionIterator)) {
+            hasFullReduction = true;
+            break;
+          }
+        }
+        if (!hasFullReduction)
+          continue;
+
+        // Sort ops in topological order.
+        llvm::stable_sort(opsToMove, [&](Operation *a, Operation *b) {
+          return a->isBeforeInBlock(b);
+        });
+
+        // Find the last DPS op in the chain to use its result as the
+        // forall's output. If the return value comes from a non-DPS op
+        // (like tensor.expand_shape), use the output type directly.
+        auto retType = dyn_cast<RankedTensorType>(retVal.getType());
+        if (!retType)
+          continue;
+
+        // Use the return value's producer's output as the shared_out.
+        // Create a tensor.empty as the shared_out for the forall.
+        rewriter.setInsertionPoint(opsToMove.front());
+        Location loc = opsToMove.front()->getLoc();
+
+        SmallVector<OpFoldResult> emptySizes;
+        for (int64_t dim = 0; dim < retType.getRank(); ++dim)
+          emptySizes.push_back(rewriter.getIndexAttr(retType.getDimSize(dim)));
+        Value emptyTensor = tensor::EmptyOp::create(
+            rewriter, loc, emptySizes, retType.getElementType());
+
+        SmallVector<OpFoldResult> lbs = {rewriter.getIndexAttr(0)};
+        SmallVector<OpFoldResult> ubs = {rewriter.getIndexAttr(1)};
+        SmallVector<OpFoldResult> steps = {rewriter.getIndexAttr(1)};
+        SmallVector<Attribute> blockMapping = {gpu::GPUBlockMappingAttr::get(
+            &getContext(), gpu::MappingId::DimX)};
+
+        auto forallOp = scf::ForallOp::create(
+            rewriter, loc, lbs, ubs, steps, ValueRange{emptyTensor},
+            ArrayAttr::get(&getContext(), blockMapping));
+
+        Block *body = forallOp.getBody();
+
+        // Move all ops into the forall body (in topological order).
+        for (Operation *moveOp : opsToMove)
+          moveOp->moveBefore(body, body->without_terminator().end());
+
+        // Create parallel_insert_slice in the terminator.
+        rewriter.setInsertionPointToEnd(
+            forallOp.getTerminator().getBody());
+        int64_t rank = retType.getRank();
+        SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
+        SmallVector<OpFoldResult> sizes;
+        for (int64_t dim = 0; dim < rank; ++dim)
+          sizes.push_back(rewriter.getIndexAttr(retType.getDimSize(dim)));
+        SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+
+        tensor::ParallelInsertSliceOp::create(
+            rewriter, loc, retVal,
+            forallOp.getRegionIterArgs()[0],
+            offsets, sizes, strides);
+
+        // Replace the return value with the forall result, but only for
+        // uses OUTSIDE the forall (the parallel_insert_slice inside must
+        // keep referencing the original value).
+        rewriter.replaceUsesWithIf(
+            retVal, forallOp.getResult(0), [&](OpOperand &use) {
+              return !forallOp->isProperAncestor(use.getOwner());
+            });
+
+        for (Operation *moveOp : opsToMove)
+          alreadyWrapped.insert(moveOp);
+      }
+    }
 
     // Cleanup after tiling and consumer fusion.
     // Mirrors IREE's TileDispatchUsingForall cleanup (TileDispatchUsingForall.cpp:306-431).

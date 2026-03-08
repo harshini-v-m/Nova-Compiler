@@ -34,9 +34,22 @@ namespace mlir::nova {
 LogicalResult setMatmulLoweringConfig(linalg::LinalgOp matmul,
                                       const NVIDIATargetInfo &target);
 
-/// Walk all linalg.matmul / linalg.batch_matmul ops inside `funcOp` and call
-/// setMatmulLoweringConfig on each. Ops that already have a "lowering_config"
-/// attribute are skipped.
+/// Sets a lowering config for a linalg.generic op with reduction iterators
+/// (softmax, layer norm, sum, etc.). Tiles parallel dims to workgroups/threads
+/// and reduction dims with a small factor for vectorization.
+/// Mirrors IREE's setTileAndFuseLoweringConfig for non-contraction reductions.
+LogicalResult setReductionLoweringConfig(linalg::LinalgOp op,
+                                         const NVIDIATargetInfo &target);
+
+/// Sets a lowering config for an all-parallel linalg.generic (elementwise ops).
+/// Tiles parallel dims to workgroups and threads.
+LogicalResult setElementwiseLoweringConfig(linalg::LinalgOp op,
+                                           const NVIDIATargetInfo &target);
+
+/// Walk all linalg ops inside `funcOp` and attach lowering configs.
+/// Handles contractions (matmul), reductions (softmax, sum), and elementwise
+/// ops in priority order. Ops that already have a "lowering_config" attribute
+/// are skipped.
 void initNovaGPULaunchConfig(mlir::func::FuncOp funcOp,
                               const NVIDIATargetInfo &target);
 

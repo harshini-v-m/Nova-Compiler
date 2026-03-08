@@ -14,9 +14,11 @@
 //       → uses contiguous memref types (no strided layouts)
 //       → produces clean `memref<NxMxf32>` function args for GPU kernels
 //     - GPU-aware allocation function:
-//       * #gpu.address_space<workgroup>  → memref.alloc  (shared SRAM)
-//       * #gpu.address_space<private>   → memref.alloc  (per-thread, dealloc'd later)
-//       * no memory space specified     → memref.alloc  (default)
+//       * #gpu.address_space<workgroup>  → memref.alloc   (shared SRAM)
+//       * #gpu.address_space<private>   → memref.alloca  (per-thread register)
+//         BUT only when the insertion point is inside an scf.forall kernel;
+//         at function scope, falls back to memref.alloc (global memory).
+//       * no memory space specified     → memref.alloc   (default/global)
 //     - GPU-aware copy function:
 //       * emits memref.copy
 //       * wraps the copy with gpu.barrier when either operand is in
@@ -75,11 +77,70 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
         .getResult();
   }
 
-  // Private → memref.alloca (stack/register)
+  // Private → memref.alloca (per-thread register/stack storage)
+  //
+  // IMPORTANT: memref.alloca with a private address space is only valid *inside*
+  // a GPU kernel (an scf.forall that maps to GPU blocks/threads).  If the
+  // builder insertion point is at function scope (outside every scf.forall),
+  // the alloca would appear between kernels — which is illegal because there is
+  // no active GPU thread to own the private storage at host scope.
+  //
+  // Defence-in-depth guard: if we are outside every scf.forall, demote this
+  // private allocation to a plain global-memory memref.alloc.  The primary
+  // prevention is in NovaGPUInferMemorySpacePass (which now only tags private
+  // for alloc_tensors nested inside kernels), but this guard catches any edge
+  // cases that slip through.
   if (memSpace) {
+    // Check whether the current builder insertion point is inside a kernel.
+    bool insideKernel = false;
+    Operation *insertionParent =
+        builder.getInsertionBlock()->getParentOp();
+    while (insertionParent) {
+      if (isa<scf::ForallOp>(insertionParent)) {
+        insideKernel = true;
+        break;
+      }
+      insertionParent = insertionParent->getParentOp();
+    }
+
+    if (!insideKernel) {
+      // We are at function scope — emit a plain global-memory alloc instead.
+      // Strip the private address space so the resulting memref is compatible
+      // with host-scope ops and survives across kernel launches.
+      auto globalType = MemRefType::get(memRefType.getShape(),
+                                        memRefType.getElementType());
+      return memref::AllocOp::create(builder, loc, globalType, dynamicSizes)
+                 .getResult();
+    }
+
     auto allocType =
         MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
                         AffineMap(), privateSpace);
+
+    // GPU cannot allocate dynamic private memory (illegal on NVIDIA with PTX < 7.3)
+    // If we have dynamic dimensions, allocate a conservative static size instead
+    if (!dynamicSizes.empty()) {
+      // Convert dynamic dimensions to static using maximum thread tile size
+      SmallVector<int64_t> staticShape;
+      for (int d = 0; d < memRefType.getRank(); ++d) {
+        if (memRefType.isDynamicDim(d)) {
+          // Use conservative maximum: 4 (standard thread tile size)
+          // This matches the thread-level tiling configuration used in NovaGPUApplyTilingLevelThreadPass
+          staticShape.push_back(4);
+        } else {
+          staticShape.push_back(memRefType.getDimSize(d));
+        }
+      }
+
+      auto staticAllocType =
+          MemRefType::get(staticShape, memRefType.getElementType(),
+                          AffineMap(), privateSpace);
+      // Create allocation without dynamic sizes - bufferization will handle subview
+      SmallVector<Value> emptyDynamicSizes;
+      return memref::AllocaOp::create(builder, loc, staticAllocType, emptyDynamicSizes)
+          .getResult();
+    }
+
     return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
         .getResult();
   }
@@ -117,7 +178,28 @@ static bool isWorkgroupMemref(MemRefType t) {
 // by NovaGPUInsertWorkgroupBarriersPass.
 static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
                                Value to) {
-  linalg::CopyOp::create(builder, loc, from, to);
+  // If we are inside an scf.forall (which will be lowered to a GPU kernel),
+  // we use linalg.copy. This is expanded into scf.for + memref.load/store
+  // loops that compile cleanly to PTX load/store instructions.
+  //
+  // Outside scf.forall (host side), we use memref.copy, which can be
+  // efficiently handled by the host runtime or lowered to specialized
+  // host-side copy routines.
+  Operation *parent = builder.getInsertionBlock()->getParentOp();
+  bool insideForall = false;
+  while (parent) {
+    if (isa<scf::ForallOp>(parent)) {
+      insideForall = true;
+      break;
+    }
+    parent = parent->getParentOp();
+  }
+
+  if (insideForall) {
+    linalg::CopyOp::create(builder, loc, from, to);
+  } else {
+    memref::CopyOp::create(builder, loc, from, to);
+  }
   return success();
 }
 

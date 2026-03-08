@@ -19,6 +19,7 @@
 // Nova frontend translation passes
 #include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
 #include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
+#include "Compiler/Translation/NovaToArith/NovaToArith.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 // TOSA conversion passes
 #include "mlir/Conversion/TosaToLinalg/TosaToLinalg.h"
@@ -69,7 +70,9 @@ namespace mlir::nova
   void addNovaGPUOptimizedPipeline(OpPassManager &pm,
                                    StringRef cudaArch)
   {
+    StringRef arch = cudaArch.empty() ? "sm_86" : cudaArch;
     pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::nova::createNovaToArithLoweringPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
     pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaElementwiseToLinalgPass());
@@ -82,11 +85,37 @@ namespace mlir::nova
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createTosaToTensorPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createTosaToSCFPass());
     pm.addPass(mlir::createCanonicalizerPass());
+
+    // -------------------------------------------------------------------------
+    // Step -1: Fuse elementwise ops before tiling
+    // Chains like exp→exp2→log→log2→log10 must become a single linalg.generic
+    // BEFORE the tiling pipeline stamps per-op configs and creates per-op
+    // scf.forall loops.  Without this, each elementwise op gets its own
+    // thread-mapped forall and the FuseAndHoist pass may not converge
+    // (non-deterministic pattern ordering causes intermittent stalls).
+    // IREE performs the same fusion before its tile-and-fuse pipeline.
+    // -------------------------------------------------------------------------
+    pm.addPass(createLinalgElementwiseOpFusionPass());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+    // -------------------------------------------------------------------------
+    // Step -0.5: Fold unit-extent dims before tiling
+    // Softmax lowering produces keepdims reductions (e.g. 4x1x8 → 4x1) that
+    // insert tensor.expand_shape between 2D elementwise and 3D reduction ops.
+    // This rank mismatch prevents the tiling pass from fusing all ops into a
+    // single GPU kernel.  Folding unit dims here collapses the reductions to
+    // 2D (matching the elementwise ops), enabling uniform tiling and fusion.
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createLinalgFoldUnitExtentDimsPass());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
     // -------------------------------------------------------------------------
     // Step 0: Select lowering strategy
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(
-        createNovaGPUSelectLoweringStrategyPass(cudaArch));
+        createNovaGPUSelectLoweringStrategyPass(arch));
 
     // -------------------------------------------------------------------------
     // Step 1: Tile and distribute to workgroups
@@ -173,6 +202,17 @@ namespace mlir::nova
     addNovaGPUBufferizePasses(pm);
 
     // -------------------------------------------------------------------------
+    // Step 8.5: Eliminate degenerate single-iteration foralls
+    // After bufferization, some scf.forall ops with bounds (1, 1) may remain
+    // (e.g. from padding small tensors to tile size). These block-mapped
+    // degenerate foralls inside thread-mapped contexts cause the transform
+    // interpreter to fail. Re-running normalize-loop-bounds eliminates them.
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+    // -------------------------------------------------------------------------
     // Step 9: scf.forall → gpu.launch via Transform Dialect
     // -------------------------------------------------------------------------
     std::string transformFileName =
@@ -247,7 +287,7 @@ namespace mlir::nova
     // createGpuModuleToBinaryPass knows how to compile it to PTX.
     GpuNVVMAttachTargetOptions nvvmTargetOptions;
     nvvmTargetOptions.triple = "nvptx64-nvidia-cuda";
-    nvvmTargetOptions.chip = cudaArch.empty() ? "sm_80" : cudaArch.str();
+    nvvmTargetOptions.chip = arch.str();
     nvvmTargetOptions.optLevel = 3;
     nvvmTargetOptions.fastFlag = true;
     nvvmTargetOptions.ftzFlag = true;
@@ -274,6 +314,10 @@ namespace mlir::nova
       // Phase 1: Decompose and lower memrefs while types are still memrefs.
       gpuPm.addPass(memref::createExpandStridedMetadataPass());
       gpuPm.addNestedPass<gpu::GPUFuncOp>(createLowerAffinePass());
+      // Convert #gpu.address_space<private/workgroup/global> to NVVM integer
+      // address spaces (5/3/1) before finalizeMemRefToLLVM, which requires
+      // integer address spaces for LLVM type conversion.
+      gpuPm.addPass(createNovaGPULowerMemorySpacePass());
       gpuPm.addPass(createFinalizeMemRefToLLVMConversionPass());
       // Phase 2: Lower control flow and GPU ops.
       gpuPm.addPass(createSCFToControlFlowPass());
@@ -334,6 +378,7 @@ namespace mlir::nova
     registerNovaNormalizeLoopBoundsPass();
     registerNovaEliminateEmptyTensorsPass();
     registerNovaConvertSharedMemAllocsPass();
+    registerNovaGPULowerMemorySpacePass();
 
     // Register the full optimized pipeline as a named pipeline.
     PassPipelineRegistration<>(

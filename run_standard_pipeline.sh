@@ -53,7 +53,7 @@ if [ $? -eq 0 ]; then
             # Link and produce executable (renamed to a.out as requested to remove 'pipelinecheck' name)
             clang++ driver.o output.o -o a.out \
               -L/usr/local/cuda/lib64 -lcudart -ldl -lm -lmlir_cuda_runtime \
-              -L/home/blu-bridge021/Desktop/mlir/llvm-project/build/lib
+              -L/home/blu-bridge023/Desktop/mlir/llvm-project/build/lib
             
             if [ $? -eq 0 ]; then
                 echo "✓ Build successful! Running executable..."

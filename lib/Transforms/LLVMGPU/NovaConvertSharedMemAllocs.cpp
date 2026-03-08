@@ -20,7 +20,9 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Conversion/LLVMCommon/LoweringOptions.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/SymbolTable.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -76,7 +78,10 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
         // Default to 8 bytes for index types (64-bit).
         alignment = 8;
       } else {
-        alignment = elType.getIntOrFloatBitWidth() / 8;
+        // Alignment must be at least 1 byte and a power of 2.
+        // For sub-byte types (e.g. i1), ceil to 1.
+        alignment = std::max<uint64_t>(
+            llvm::PowerOf2Ceil(elType.getIntOrFloatBitWidth() / 8), 1);
       }
     }
 
@@ -160,14 +165,77 @@ struct NovaConvertSharedMemAllocsPass
   }
 };
 
+/// Pass that converts #gpu.address_space<private> on memref types to NVVM
+/// integer address space 5 (local memory). Workgroup and global address
+/// spaces are left as-is because they are handled by the existing
+/// ConvertSharedMemAllocs and gpu-to-nvvm passes respectively.
+///
+/// Must run inside gpu.module BEFORE finalizeMemRefToLLVMConversionPass,
+/// which requires integer address spaces on all memrefs.
+struct NovaGPULowerMemorySpacePass
+    : public PassWrapper<NovaGPULowerMemorySpacePass,
+                         OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPULowerMemorySpacePass)
+
+  NovaGPULowerMemorySpacePass() = default;
+  NovaGPULowerMemorySpacePass(const NovaGPULowerMemorySpacePass &) = default;
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<memref::MemRefDialect, gpu::GPUDialect>();
+  }
+
+  void runOnOperation() override {
+    MLIRContext *ctx = &getContext();
+    Operation *op = getOperation();
+
+    AttrTypeReplacer replacer;
+    // Only convert private address space in MemRefTypes; leave workgroup/global
+    // for downstream passes (ConvertSharedMemAllocs, gpu-to-nvvm).
+    // Map private to address space 0 (generic). On NVPTX, alloca in AS 0
+    // still lands in local memory, but uses generic pointers that LLVM's
+    // LoopStrengthReduce can optimise.
+    // NOTE: Do not define a global rule to replace gpu::AddressSpaceAttr instances
+    // themselves into IntegerAttr. Doing so causes MLIR custom assembly printers
+    // (like gpu.launch) to crash when printing IR due to strict type constraints.
+    replacer.addReplacement([&](MemRefType type) -> std::optional<Type> {
+      auto space =
+          dyn_cast_if_present<gpu::AddressSpaceAttr>(type.getMemorySpace());
+      if (!space || space.getValue() != gpu::AddressSpace::Private)
+        return std::nullopt;
+      return MemRefType::get(type.getShape(), type.getElementType(),
+                             type.getLayout(),
+                             IntegerAttr::get(IntegerType::get(ctx, 64), 0));
+    });
+    replacer.recursivelyReplaceElementsIn(op, /*replaceAttrs=*/true,
+                                          /*replaceLocs=*/false,
+                                          /*replaceTypes=*/true);
+  }
+
+  StringRef getArgument() const override {
+    return "nova-gpu-lower-memory-space";
+  }
+  StringRef getDescription() const override {
+    return "Converts #gpu.address_space<private> to generic address space 0 "
+           "to avoid LLVM LSR issues with non-default address spaces on NVPTX";
+  }
+};
+
 } // namespace
 
 std::unique_ptr<Pass> createNovaConvertSharedMemAllocsPass() {
   return std::make_unique<NovaConvertSharedMemAllocsPass>();
 }
 
+std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass() {
+  return std::make_unique<NovaGPULowerMemorySpacePass>();
+}
+
 void registerNovaConvertSharedMemAllocsPass() {
   PassRegistration<NovaConvertSharedMemAllocsPass>();
+}
+
+void registerNovaGPULowerMemorySpacePass() {
+  PassRegistration<NovaGPULowerMemorySpacePass>();
 }
 
 } // namespace mlir::nova

@@ -298,17 +298,216 @@ LogicalResult setMatmulLoweringConfig(linalg::LinalgOp matmul,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// Tile-and-fuse config for non-contraction ops (reductions, elementwise)
+//
+// Mirrors IREE's setTileAndFuseLoweringConfig from ConfigUtils.cpp.
+// For linalg.generic ops with reduction iterators (softmax, layer norm, sum):
+//   - Parallel dims → workgroup tiles (distribute across blocks)
+//   - Reduction dims → small tiling factor for vectorization
+//   - Thread tiles → distribute parallel work across threads in a block
+//===----------------------------------------------------------------------===//
+
+/// Returns a small tiling factor for a reduction dimension.
+/// Mirrors IREE's getReductionTilingFactor from Utils.cpp.
+static int64_t getReductionTilingFactor(int64_t dimSize) {
+  if (dimSize <= 0 || ShapedType::isDynamic(dimSize))
+    return 1;
+  if (dimSize % 4 == 0) return 4;
+  if (dimSize % 2 == 0) return 2;
+  // Try small prime factors.
+  static constexpr int primes[] = {3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47};
+  for (int p : primes) {
+    if (dimSize % p == 0) return p;
+  }
+  return 1;
+}
+
+LogicalResult setReductionLoweringConfig(linalg::LinalgOp op,
+                                         const NVIDIATargetInfo &target) {
+  // Must have at least one reduction iterator.
+  auto iterTypes = op.getIteratorTypesArray();
+  bool hasReduction = llvm::any_of(iterTypes, linalg::isReductionIterator);
+  if (!hasReduction)
+    return failure();
+
+  int numLoops = op.getNumLoops();
+  SmallVector<int64_t> loopBounds = op.getStaticLoopRanges();
+  if (loopBounds.size() != static_cast<size_t>(numLoops))
+    return failure();
+
+  // Reject if any loop bound is dynamic.
+  for (int64_t b : loopBounds) {
+    if (ShapedType::isDynamic(b))
+      return failure();
+  }
+
+  const int subgroupSize = target.preferredSubgroupSize; // 32 for NVIDIA
+
+  // Collect parallel and reduction dims.
+  SmallVector<unsigned> parallelDims, reductionDims;
+  for (int i = 0; i < numLoops; ++i) {
+    if (linalg::isParallelIterator(iterTypes[i]))
+      parallelDims.push_back(i);
+    else if (linalg::isReductionIterator(iterTypes[i]))
+      reductionDims.push_back(i);
+  }
+
+  // --- Workgroup tile sizes (distribute parallel dims across blocks) ---
+  SmallVector<int64_t> workgroupTiles(numLoops, 0);
+  SmallVector<int64_t> threadTiles(numLoops, 0);
+  SmallVector<int64_t> reductionTiles(numLoops, 0);
+  SmallVector<int64_t> subgroupTiles(numLoops, 0);
+
+  // Distribute parallel dims: tile innermost parallel dims.
+  // Use 128 for the two innermost parallel dims (matching matmul workgroup
+  // tile), 1 for batch/outer dims.
+  int parallelCount = 0;
+  for (int i = parallelDims.size() - 1; i >= 0; --i) {
+    unsigned dim = parallelDims[i];
+    if (parallelCount < 2) {
+      // Clamp to problem size.
+      int64_t wgTile = std::min((int64_t)128, loopBounds[dim]);
+      workgroupTiles[dim] = wgTile;
+      // Thread tile: distribute the workgroup tile across subgroupSize threads.
+      // Each thread handles wgTile / subgroupSize elements (min 1).
+      int64_t threadTile = std::max((int64_t)1, wgTile / subgroupSize);
+      // Ensure thread tile divides workgroup tile.
+      while (threadTile > 1 && wgTile % threadTile != 0)
+        --threadTile;
+      threadTiles[dim] = threadTile;
+    } else {
+      // Outer/batch dims: tile to 1.
+      workgroupTiles[dim] = 1;
+      threadTiles[dim] = 1;
+    }
+    ++parallelCount;
+  }
+
+  // --- Reduction tile sizes ---
+  for (unsigned dim : reductionDims) {
+    reductionTiles[dim] = getReductionTilingFactor(loopBounds[dim]);
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "[nova-kernel-config] Reduction config for "
+                 << op->getName() << ": workgroup=[";
+    llvm::interleaveComma(workgroupTiles, llvm::dbgs());
+    llvm::dbgs() << "] reduction=[";
+    llvm::interleaveComma(reductionTiles, llvm::dbgs());
+    llvm::dbgs() << "] thread=[";
+    llvm::interleaveComma(threadTiles, llvm::dbgs());
+    llvm::dbgs() << "]\n";
+  });
+
+  MLIRContext *ctx = op.getContext();
+  setMatmulLoweringConfigAttrs(op.getOperation(), ctx,
+                               workgroupTiles, reductionTiles,
+                               threadTiles, subgroupTiles,
+                               static_cast<int32_t>(NVMMAIntrinsicValues::NONE),
+                               /*promotedOperands=*/{});
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Config for elementwise-only ops (all parallel, no reduction)
+//===----------------------------------------------------------------------===//
+
+LogicalResult setElementwiseLoweringConfig(linalg::LinalgOp op,
+                                           const NVIDIATargetInfo &target) {
+  auto iterTypes = op.getIteratorTypesArray();
+  // Must be all-parallel (no reductions).
+  if (!llvm::all_of(iterTypes, linalg::isParallelIterator))
+    return failure();
+
+  int numLoops = op.getNumLoops();
+  SmallVector<int64_t> loopBounds = op.getStaticLoopRanges();
+  if (loopBounds.size() != static_cast<size_t>(numLoops))
+    return failure();
+  for (int64_t b : loopBounds) {
+    if (ShapedType::isDynamic(b))
+      return failure();
+  }
+
+  const int subgroupSize = target.preferredSubgroupSize;
+
+  SmallVector<int64_t> workgroupTiles(numLoops, 0);
+  SmallVector<int64_t> threadTiles(numLoops, 0);
+  SmallVector<int64_t> reductionTiles(numLoops, 0);
+  SmallVector<int64_t> subgroupTiles(numLoops, 0);
+
+  int parallelCount = 0;
+  for (int i = numLoops - 1; i >= 0; --i) {
+    if (parallelCount < 2) {
+      int64_t wgTile = std::min((int64_t)128, loopBounds[i]);
+      workgroupTiles[i] = wgTile;
+      int64_t threadTile = std::max((int64_t)1, wgTile / subgroupSize);
+      while (threadTile > 1 && wgTile % threadTile != 0)
+        --threadTile;
+      threadTiles[i] = threadTile;
+    } else {
+      workgroupTiles[i] = 1;
+      threadTiles[i] = 1;
+    }
+    ++parallelCount;
+  }
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "[nova-kernel-config] Elementwise config for "
+                 << op->getName() << ": workgroup=[";
+    llvm::interleaveComma(workgroupTiles, llvm::dbgs());
+    llvm::dbgs() << "] thread=[";
+    llvm::interleaveComma(threadTiles, llvm::dbgs());
+    llvm::dbgs() << "]\n";
+  });
+
+  MLIRContext *ctx = op.getContext();
+  setMatmulLoweringConfigAttrs(op.getOperation(), ctx,
+                               workgroupTiles, reductionTiles,
+                               threadTiles, subgroupTiles,
+                               static_cast<int32_t>(NVMMAIntrinsicValues::NONE),
+                               /*promotedOperands=*/{});
+  return success();
+}
+
+
 void initNovaGPULaunchConfig(mlir::func::FuncOp funcOp,
                               const NVIDIATargetInfo &target) {
+  // Priority-based root operation selection, mirroring IREE's initGPULaunchConfig
+  // (KernelConfig.cpp lines 2449-2518):
+  //
+  //   1. Named contraction ops (matmul, batch_matmul, matmul_transpose_b)
+  //   2. linalg.generic with reduction iterators (softmax, layer norm, sum, ...)
+  //   3. linalg.generic all-parallel (elementwise ops not fused into a contraction)
+  //
+  // Each op gets a lowering_config attribute that downstream tiling passes read.
+
   funcOp.walk([&](linalg::LinalgOp op) {
-    // Only configure contraction-like ops.
-    if (!isa<linalg::MatmulOp, linalg::BatchMatmulOp,
-             linalg::MatmulTransposeBOp>(op.getOperation()))
-      return;
     // Skip ops that already have a config.
     if (getLoweringConfig(op.getOperation()))
       return;
-    (void)setMatmulLoweringConfig(op, target);
+
+    // Priority 1: Named contraction ops → matmul config (MMA or SIMT).
+    if (linalg::isaContractionOpInterface(op)) {
+      (void)setMatmulLoweringConfig(op, target);
+      return;
+    }
+
+    // Priority 2: Generic ops with reduction iterators.
+    if (auto genericOp = dyn_cast<linalg::GenericOp>(op.getOperation())) {
+      if (genericOp.getNumLoops() != genericOp.getNumParallelLoops()) {
+        (void)setReductionLoweringConfig(op, target);
+        return;
+      }
+    }
+
+    // Priority 3: All-parallel generic ops (standalone elementwise).
+    // These usually get fused as epilogues of contractions during workgroup
+    // tiling, but standalone ones need a config to be tiled properly.
+    if (auto genericOp = dyn_cast<linalg::GenericOp>(op.getOperation())) {
+      (void)setElementwiseLoweringConfig(op, target);
+      return;
+    }
   });
 }
 

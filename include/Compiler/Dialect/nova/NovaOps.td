@@ -1054,7 +1054,7 @@ def Nova_SceBackwardOp : Op<Nova_Dialect, "sce_backward",
 
     logits: tensor<[..., C, ...] x float>
     targets: tensor<[...] x int>           
-
+     
     Example:
       %grad = nova.sce_backward %logits, %targets {dim = -1}
         : tensor<4x128x50304xf32>, tensor<4x128xi32>
@@ -1063,7 +1063,9 @@ def Nova_SceBackwardOp : Op<Nova_Dialect, "sce_backward",
   let arguments = (ins Nova_Tensor:$logits, Nova_Tensor:$targets,
                        DefaultValuedAttr<I64Attr, "-1">:$dim);
   let results = (outs Nova_Tensor:$grad_logits);
-
+  let assemblyFormat = [{
+    $logits `,` $targets attr-dict `:` type($logits) `,` type($targets)
+  }];
   let hasVerifier = 1;
   let hasFolder = 1;
 }
