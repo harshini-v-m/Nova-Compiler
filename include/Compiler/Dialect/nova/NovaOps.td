@@ -1064,6 +1064,10 @@ def Nova_SceBackwardOp : Op<Nova_Dialect, "sce_backward",
                        DefaultValuedAttr<I64Attr, "-1">:$dim);
   let results = (outs Nova_Tensor:$grad_logits);
 
+  let assemblyFormat = [{
+    $logits `,` $targets attr-dict `:` type($logits) `,` type($targets)
+  }];
+
   let hasVerifier = 1;
   let hasFolder = 1;
 }

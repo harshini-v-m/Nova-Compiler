@@ -126,6 +126,18 @@ void registerNovaNormalizeLoopBoundsPass();
 std::unique_ptr<Pass> createNovaConvertSharedMemAllocsPass();
 void registerNovaConvertSharedMemAllocsPass();
 
+// Converts block/thread-mapped scf.forall ops to gpu.launch with dynamic
+// block dims computed from the actual thread forall iteration bounds.
+// Replaces the transform dialect script (gpu_forall_to_launch.mlir).
+std::unique_ptr<Pass> createNovaGPUMapForallToGPUPass();
+void registerNovaGPUMapForallToGPUPass();
+
+// Converts #gpu.address_space attributes on memref types to NVVM integer
+// address spaces (private=5, workgroup=3, global=1). Must run inside
+// gpu.module BEFORE finalizeMemRefToLLVMConversionPass.
+std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass();
+void registerNovaGPULowerMemorySpacePass();
+
 } // namespace nova
 } // namespace mlir
 

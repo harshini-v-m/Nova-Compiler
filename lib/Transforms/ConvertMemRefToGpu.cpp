@@ -37,6 +37,14 @@ public:
     if (mlir::isa_and_present<gpu::AddressSpaceAttr>(type.getMemorySpace()))
       return failure();
 
+    // Inside GPU kernels: convert to memref.alloca (GPU local memory).
+    // gpu.alloc (cudaMalloc) is a host-side op and illegal inside gpu.func.
+    if (op->getParentOfType<gpu::GPUFuncOp>()) {
+      rewriter.replaceOpWithNewOp<memref::AllocaOp>(
+          op, type, op.getDynamicSizes(), op.getSymbolOperands());
+      return success();
+    }
+
     rewriter.replaceOpWithNewOp<gpu::AllocOp>(
         op, type, /*asyncToken=*/Type(), /*asyncDependencies=*/ValueRange{},
         op.getDynamicSizes(), op.getSymbolOperands(), /*hostShared=*/false);
@@ -54,6 +62,12 @@ public:
     MemRefType type = llvm::dyn_cast<MemRefType>(memref.getType());
     if (type && mlir::isa_and_present<gpu::AddressSpaceAttr>(type.getMemorySpace()))
       return failure();
+
+    // Inside GPU kernels: erase deallocs (alloca has automatic lifetime).
+    if (op->getParentOfType<gpu::GPUFuncOp>()) {
+      rewriter.eraseOp(op);
+      return success();
+    }
 
     rewriter.replaceOpWithNewOp<gpu::DeallocOp>(op, TypeRange{}, ValueRange{},
                                                 memref);

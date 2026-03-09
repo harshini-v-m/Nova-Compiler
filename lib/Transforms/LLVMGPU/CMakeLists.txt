@@ -29,6 +29,8 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaNormalizeLoopBounds.cpp
   # Convert workgroup memref.alloc → memref.global + drop deallocs (mirrors IREE)
   NovaConvertSharedMemAllocs.cpp
+  # Convert scf.forall → gpu.launch with dynamic block dims (replaces transform script)
+  NovaGPUMapForallToGPU.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include

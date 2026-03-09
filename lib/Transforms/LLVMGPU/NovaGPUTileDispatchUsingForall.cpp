@@ -1,5 +1,6 @@
 #include "Passes.h"
 #include "NovaGPUTileAndFuseUtils.h"
+#include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -91,18 +92,45 @@ static bool isUsedAsInit(Operation *producer, Operation *user) {
 }
 
 static SmallVector<Attribute> getMapping(MLIRContext *context, ArrayRef<OpFoldResult> tileSizes) {
+  // Count non-zero tile dimensions.
+  int numActiveDims = 0;
+  for (auto tileSize : tileSizes) {
+    std::optional<int64_t> cst = getConstantIntValue(tileSize);
+    if (!cst || *cst != 0)
+      numActiveDims++;
+  }
+
   SmallVector<Attribute> mapping;
+
+  if (numActiveDims > 3) {
+    // >3 active dimensions: use linear block mapping (linearizes all dims).
+    // IREE uses this approach for high-dimensional ops.
+    unsigned idx = 0;
+    for (auto tileSize : tileSizes) {
+      std::optional<int64_t> cst = getConstantIntValue(tileSize);
+      if (cst && *cst == 0)
+        continue;
+      unsigned mappingId =
+          static_cast<unsigned>(gpu::MappingId::LinearDim0) + idx++;
+      mapping.push_back(gpu::GPUBlockMappingAttr::get(
+          context, static_cast<gpu::MappingId>(mappingId)));
+    }
+    // IREE reverses so innermost dim gets LinearDim0.
+    return llvm::to_vector(llvm::reverse(mapping));
+  }
+
+  // ≤3 active dimensions: use 3D block mapping (x, y, z).
   // Iterate in reverse: Inner loop -> Block X, Next -> Block Y, Next -> Block Z
   int dim = 0;
   for (auto tileSize : llvm::reverse(tileSizes)) {
       std::optional<int64_t> cst = getConstantIntValue(tileSize);
       if (cst && *cst == 0) continue; // Skip size 0 tiles
-      
+
       switch (dim) {
           case 0: mapping.push_back(gpu::GPUBlockMappingAttr::get(context, gpu::MappingId::DimX)); break;
           case 1: mapping.push_back(gpu::GPUBlockMappingAttr::get(context, gpu::MappingId::DimY)); break;
           case 2: mapping.push_back(gpu::GPUBlockMappingAttr::get(context, gpu::MappingId::DimZ)); break;
-          default: break; 
+          default: break;
       }
       dim++;
   }
@@ -136,27 +164,35 @@ static FailureOr<TilingInfo> getTiledAndDistributionInfo(RewriterBase &rewriter,
   int numLoops = linalgOp.getNumLoops();
   SmallVector<OpFoldResult> tileSizes(numLoops, rewriter.getIndexAttr(0));
 
-  // Heuristic tile sizes (TODO: replace with LoweringConfigAttr when available).
-  // Tile the two innermost parallel dims to 128 (M->Y, N->X), batch dims to 1.
-  // Reduction dims (K) stay at 0 — not tiled at workgroup level.
-  if (numLoops >= 2) {
+  // Try to read workgroup tile sizes from the lowering_config attribute
+  // stamped by NovaGPUSelectLoweringStrategy. This avoids hardcoded tile sizes.
+  bool usedConfig = false;
+  if (auto config = getLoweringConfig(op)) {
+    SmallVector<int64_t> wgTiles =
+        getLoweringConfigTileSizes(config, kWorkgroupKey);
+    if (wgTiles.size() == static_cast<size_t>(numLoops)) {
+      for (int i = 0; i < numLoops; ++i)
+        tileSizes[i] = rewriter.getIndexAttr(wgTiles[i]);
+      usedConfig = true;
+    }
+  }
+
+  if (!usedConfig) {
+    // Heuristic fallback: tile parallel dims to 128, batch to 1, reduction to 0.
     int parallelDimCount = 0;
     for (int i = numLoops - 1; i >= 0; --i) {
       if (!linalg::isParallelIterator(linalgOp.getIteratorTypesArray()[i]))
         continue;
-      if (parallelDimCount == 0)
-        tileSizes[i] = rewriter.getIndexAttr(128); // N -> BlockX
-      else if (parallelDimCount == 1)
-        tileSizes[i] = rewriter.getIndexAttr(128); // M -> BlockY
+      if (parallelDimCount < 2)
+        tileSizes[i] = rewriter.getIndexAttr(128);
       else
         tileSizes[i] = rewriter.getIndexAttr(1);   // Batch -> BlockZ
       ++parallelDimCount;
     }
   }
 
-  // PartitionableLoops equivalent: zero out non-parallel (reduction) dims.
-  // IREE uses PartitionableLoopsInterface for this, which is IREE-specific.
-  // We achieve the same by inspecting iterator types directly.
+  // Zero out non-parallel (reduction) dims at workgroup level.
+  // Workgroup distribution is only for parallel dimensions.
   for (int i = 0; i < numLoops; ++i) {
     if (!linalg::isParallelIterator(linalgOp.getIteratorTypesArray()[i]))
       tileSizes[i] = rewriter.getIndexAttr(0);
@@ -164,7 +200,6 @@ static FailureOr<TilingInfo> getTiledAndDistributionInfo(RewriterBase &rewriter,
 
   // Full-tile optimization: zero tile size when staticLoopSize == tileSize.
   // This prevents single-trip scf.forall loops, which can block cleanup patterns.
-  // Mirrors IREE's getTiledAndDistributionInfo (TileDispatchUsingForall.cpp:111-138).
   // Keep at least one non-zero tile size so the forall loop is still created.
   {
     OpBuilder::InsertionGuard g(rewriter);
@@ -427,11 +462,139 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       }
     }
     
-    // TODO: Implement transpose workgroup support (see missing_functionality_analysis.md #10)
-    // Swap X and Y mapping attributes when transposeWorkgroup option is enabled.
-    // if (transposeWorkgroup && areAllStaticLoopBounds(forallOp) && mappingSize >= 2) {
-    //   std::swap(mappingAttrs[mappingSize - 1], mappingAttrs[mappingSize - 2]);
-    // }
+    // --- Pass 3: Wrap remaining un-distributed ops in single-block forall ---
+    // Full reductions (all reduction iterators, no parallel dims) and their
+    // consumer chains have all-zero workgroup tiles and are not tiled by
+    // Pass 1 or Pass 2. We find the "sink" op (last in chain) and wrap the
+    // entire producer/consumer chain in a 1-trip scf.forall with block mapping
+    // so they become single-block GPU kernels.
+    {
+      llvm::SmallPtrSet<Operation *, 16> alreadyWrapped;
+
+      // Find all un-distributed ops and wrap each connected chain.
+      // Process return values: trace back to find chains that need wrapping.
+      auto returnOp = cast<func::ReturnOp>(funcOp.getBody().back().getTerminator());
+
+      for (Value retVal : returnOp.getOperands()) {
+        // Trace back through the chain to find all un-distributed ops.
+        SmallVector<Operation *> opsToMove;
+        SmallVector<Operation *> worklist;
+        llvm::SmallPtrSet<Operation *, 16> visited;
+
+        if (auto defOp = retVal.getDefiningOp()) {
+          if (!isInsideWorkgroupForall(defOp) &&
+              defOp->getParentOp() == funcOp.getOperation())
+            worklist.push_back(defOp);
+        }
+
+        while (!worklist.empty()) {
+          Operation *curr = worklist.pop_back_val();
+          if (!visited.insert(curr).second)
+            continue;
+          if (isInsideWorkgroupForall(curr))
+            continue;
+          if (alreadyWrapped.count(curr))
+            continue;
+          // Skip function arguments (no defining op).
+          if (curr->getParentOp() != funcOp.getOperation())
+            continue;
+
+          opsToMove.push_back(curr);
+          for (Value operand : curr->getOperands()) {
+            if (auto defOp = operand.getDefiningOp()) {
+              if (defOp->getParentOp() == funcOp.getOperation() &&
+                  !isInsideWorkgroupForall(defOp))
+                worklist.push_back(defOp);
+            }
+          }
+        }
+
+        if (opsToMove.empty())
+          continue;
+
+        // Check if this chain contains a full-reduction op (all reduction, no
+        // parallel dims). Only wrap chains that actually need GPU distribution.
+        bool hasFullReduction = false;
+        for (Operation *moveOp : opsToMove) {
+          auto lg = dyn_cast<linalg::LinalgOp>(moveOp);
+          if (!lg) continue;
+          auto iters = lg.getIteratorTypesArray();
+          if (!iters.empty() &&
+              !llvm::any_of(iters, linalg::isParallelIterator) &&
+              llvm::any_of(iters, linalg::isReductionIterator)) {
+            hasFullReduction = true;
+            break;
+          }
+        }
+        if (!hasFullReduction)
+          continue;
+
+        // Sort ops in topological order.
+        llvm::stable_sort(opsToMove, [&](Operation *a, Operation *b) {
+          return a->isBeforeInBlock(b);
+        });
+
+        // Find the last DPS op in the chain to use its result as the
+        // forall's output. If the return value comes from a non-DPS op
+        // (like tensor.expand_shape), use the output type directly.
+        auto retType = dyn_cast<RankedTensorType>(retVal.getType());
+        if (!retType)
+          continue;
+
+        // Use the return value's producer's output as the shared_out.
+        // Create a tensor.empty as the shared_out for the forall.
+        rewriter.setInsertionPoint(opsToMove.front());
+        Location loc = opsToMove.front()->getLoc();
+
+        SmallVector<OpFoldResult> emptySizes;
+        for (int64_t dim = 0; dim < retType.getRank(); ++dim)
+          emptySizes.push_back(rewriter.getIndexAttr(retType.getDimSize(dim)));
+        Value emptyTensor = tensor::EmptyOp::create(
+            rewriter, loc, emptySizes, retType.getElementType());
+
+        SmallVector<OpFoldResult> lbs = {rewriter.getIndexAttr(0)};
+        SmallVector<OpFoldResult> ubs = {rewriter.getIndexAttr(1)};
+        SmallVector<OpFoldResult> steps = {rewriter.getIndexAttr(1)};
+        SmallVector<Attribute> blockMapping = {gpu::GPUBlockMappingAttr::get(
+            &getContext(), gpu::MappingId::DimX)};
+
+        auto forallOp = scf::ForallOp::create(
+            rewriter, loc, lbs, ubs, steps, ValueRange{emptyTensor},
+            ArrayAttr::get(&getContext(), blockMapping));
+
+        Block *body = forallOp.getBody();
+
+        // Move all ops into the forall body (in topological order).
+        for (Operation *moveOp : opsToMove)
+          moveOp->moveBefore(body, body->without_terminator().end());
+
+        // Create parallel_insert_slice in the terminator.
+        rewriter.setInsertionPointToEnd(
+            forallOp.getTerminator().getBody());
+        int64_t rank = retType.getRank();
+        SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
+        SmallVector<OpFoldResult> sizes;
+        for (int64_t dim = 0; dim < rank; ++dim)
+          sizes.push_back(rewriter.getIndexAttr(retType.getDimSize(dim)));
+        SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+
+        tensor::ParallelInsertSliceOp::create(
+            rewriter, loc, retVal,
+            forallOp.getRegionIterArgs()[0],
+            offsets, sizes, strides);
+
+        // Replace the return value with the forall result, but only for
+        // uses OUTSIDE the forall (the parallel_insert_slice inside must
+        // keep referencing the original value).
+        rewriter.replaceUsesWithIf(
+            retVal, forallOp.getResult(0), [&](OpOperand &use) {
+              return !forallOp->isProperAncestor(use.getOwner());
+            });
+
+        for (Operation *moveOp : opsToMove)
+          alreadyWrapped.insert(moveOp);
+      }
+    }
 
     // Cleanup after tiling and consumer fusion.
     // Mirrors IREE's TileDispatchUsingForall cleanup (TileDispatchUsingForall.cpp:306-431).

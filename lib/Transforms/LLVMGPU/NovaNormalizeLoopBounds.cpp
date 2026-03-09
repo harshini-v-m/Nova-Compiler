@@ -17,6 +17,7 @@
 
 #include "Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -30,6 +31,62 @@
 #define DEBUG_TYPE "nova-normalize-loop-bounds"
 
 namespace mlir::nova {
+
+//===----------------------------------------------------------------------===//
+// Eliminate degenerate single-iteration scf.forall ops.
+//
+// A scf.forall with all upper bounds == 1 executes its body exactly once.
+// After bufferization (memref mode), these have no results and can be
+// inlined: replace induction variables with constant 0, move body ops
+// before the forall, and erase it.
+//===----------------------------------------------------------------------===//
+static LogicalResult eliminateDegenerateForall(IRRewriter &rewriter,
+                                                scf::ForallOp forallOp) {
+  // Only handle foralls with no results (post-bufferization memref form).
+  if (forallOp.getNumResults() != 0)
+    return failure();
+
+  // Only eliminate degenerate foralls that are nested inside another forall.
+  // Top-level block-mapped foralls must be preserved as GPU launch boundaries,
+  // even when they have a single iteration (e.g. small tensors with 1 block).
+  if (!forallOp->getParentOfType<scf::ForallOp>())
+    return failure();
+
+  // Check that all upper bounds are statically 1.
+  for (OpFoldResult ub : forallOp.getMixedUpperBound()) {
+    std::optional<int64_t> ubVal = getConstantIntValue(ub);
+    if (!ubVal || *ubVal != 1)
+      return failure();
+  }
+
+  // Replace all induction variable uses with constant 0.
+  Location loc = forallOp.getLoc();
+  rewriter.setInsertionPoint(forallOp);
+
+  // Only create the constant if any IV is actually used.
+  Value zero;
+  for (Value iv : forallOp.getInductionVars()) {
+    if (!iv.use_empty()) {
+      if (!zero) {
+        zero = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getIndexAttr(0));
+      }
+      rewriter.replaceAllUsesWith(iv, zero);
+    }
+  }
+
+  // Move all body ops (except the terminator) before the forall.
+  Block *body = forallOp.getBody();
+  Operation *terminator = body->getTerminator();
+  for (auto &op : llvm::make_early_inc_range(*body)) {
+    if (&op == terminator)
+      continue;
+    op.moveBefore(forallOp);
+  }
+
+  rewriter.eraseOp(forallOp);
+  return success();
+}
 
 //===----------------------------------------------------------------------===//
 // Helper: compute ceildiv(ub - lb, step) as the normalized upper bound.
@@ -158,6 +215,14 @@ struct NovaNormalizeLoopBoundsPass
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
     IRRewriter rewriter(funcOp);
+
+    // First pass: eliminate degenerate single-iteration foralls (inner→outer).
+    SmallVector<scf::ForallOp> forallOps;
+    funcOp.walk([&](scf::ForallOp op) { forallOps.push_back(op); });
+    for (auto forallOp : llvm::reverse(forallOps))
+      (void)eliminateDegenerateForall(rewriter, forallOp);
+
+    // Second pass: normalize remaining forall loop bounds.
     funcOp.walk([&](scf::ForallOp forallOp) {
       (void)normalizeLoopBounds(rewriter, forallOp);
     });
