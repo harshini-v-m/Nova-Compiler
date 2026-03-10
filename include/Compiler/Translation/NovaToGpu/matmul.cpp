@@ -274,8 +274,13 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
   // ── Element types and MMA fragment types ──
   Type mmaInputTy  = useTF32 ? rewriter.getF32Type() : rewriter.getF16Type();
   Type mmaAccTy    = rewriter.getF32Type();
-  int64_t aK = useTF32 ? 1 : 2;  // k-tiles per A fragment
-  int64_t bK = useTF32 ? 1 : 2;  // k-tiles per B fragment
+
+  // Fragment dimensions per k-dimension
+  int64_t aK = useTF32 ? 1 : 2;  // k-extent for A fragment
+  int64_t bK = useTF32 ? 1 : 2;  // k-extent for B fragment
+
+  // TF32 (m16n8k8): A=vector<4x1xf32>, B=vector<2x1xf32> (4=m16/4, 1=k8/8, 2=m16/8, 1=k8/8)
+  // FP16 (m16n8k16): A=vector<4x2xf16>, B=vector<2x2xf16> (4=m16/4, 2=k16/8, 2=m16/8, 2=k16/8)
   auto aFragTy = VectorType::get({4, aK}, mmaInputTy);
   auto bFragTy = VectorType::get({2, bK}, mmaInputTy);
   // Accumulator holds FR_M x FR_N MMA output tiles, each is 2x2 floats
@@ -519,6 +524,12 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
   Value cZeroAcc = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(mmaAccTy));
   Value cInit    = rewriter.create<vector::SplatOp>(loc, cFragTy, cZeroAcc);
 
+  // ── Wait for prolog loads to complete before MMA ──
+  rewriter.create<nvgpu::DeviceAsyncWaitOp>(
+      loc, TypeRange{}, prologToken,
+      rewriter.getI32IntegerAttr(0));  // Drain: wait for all prolog async copies
+  rewriter.create<NVVM::Barrier0Op>(loc);  // Sync all warps before MMA
+
   // ── Main K-loop — iter_args: (acc, token, writeStage, readStage) ──
   // aPtr/bPtr iter_args are no longer needed: issueStageLoad now uses kBase directly.
   Value cWriteStage0 = rewriter.create<arith::RemUIOp>(loc, c2, cStages);  // =2
@@ -539,6 +550,14 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
     Value writeStage = mainLoop.getRegionIterArgs()[2];
     Value readStage  = mainLoop.getRegionIterArgs()[3];
 
+    // CRITICAL: sync all warps before issuing new cp.async.
+    // writeStage_k = (k+2)%3 == (k-1)%3 == readStage_{k-1}: the stage we are
+    // about to prefetch into is the SAME stage that was read by MMA in k-1.
+    // Without this barrier, a fast warp racing into iteration k can fire
+    // cp.async into that stage while a slow warp is still reading it for MMA
+    // in k-1 — causing non-deterministic data corruption (inf/NaN in training).
+    rewriter.create<NVVM::Barrier0Op>(loc);
+
     // Issue next stage load (k + 2*TILE_K) if still in range
     Value nextK   = rewriter.create<arith::AddIOp>(loc, k, ci(2 * TILE_K));
     Value hasNext = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, nextK, cK);
@@ -553,11 +572,11 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
       {
         // kBase = k + 2*TILE_K  (the tile this stage is prefetching)
         Value newTok = issueStageLoad(rewriter, writeStage, nextK);
-        // Pipeline is running normally: allow STAGES-2 = 1 group to remain
-        // in-flight (the one we just issued) while we process the read stage.
+        // Drain ALL pending groups to handle grad accumulation where rapid
+        // kernel re-launches leave stale async state in hardware.
         rewriter.create<nvgpu::DeviceAsyncWaitOp>(
             loc, TypeRange{}, newTok,
-            rewriter.getI32IntegerAttr(STAGES - 2));
+            rewriter.getI32IntegerAttr(0));  // Drain all, not wait(STAGES-2)
         rewriter.create<NVVM::Barrier0Op>(loc);
         rewriter.create<scf::YieldOp>(loc);
       }
@@ -581,6 +600,9 @@ static LogicalResult lowerTensorCoreMatmul(nova::MatmulOp op,
       }
     }
     // (wait + barrier are now emitted inside the ifNext branches above)
+    // Additional barrier to ensure all threads are synchronized before MMA
+    // (wait operations may not fully sync across warps in all cases)
+    rewriter.create<NVVM::Barrier0Op>(loc);
 
     auto [vA, vB] = getStageViews(rewriter, readStage);
 

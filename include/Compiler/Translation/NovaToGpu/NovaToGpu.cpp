@@ -72,8 +72,6 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     auto targetsType = cast<RankedTensorType>(targets.getType());
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
 
-    // Generalized Shapes: logits [D1, D2, ..., Dn, C], targets [D1, D2, ...,
-    // Dn]
     auto logitsShape = logitsType.getShape();
     int64_t rank = logitsType.getRank();
     int64_t C = logitsShape[rank - 1];
@@ -83,11 +81,10 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
         N *= logitsShape[i];
     }
 
-    // 1. Allocate memory for the FINAL scalar loss
+    // 1. Allocate scalar loss on device
     auto lossMemRefType = MemRefType::get({1}, resultType.getElementType(),
                                           MemRefLayoutAttrInterface{},
                                           rewriter.getI64IntegerAttr(1));
-
     Value lossMemRef =
         rewriter
             .create<gpu::AllocOp>(loc, lossMemRefType,
@@ -95,6 +92,12 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
                                   /*dynamicSizes=*/ValueRange{},
                                   /*symbolOperands=*/ValueRange{})
             .getMemref();
+
+    // Zero-initialize for atomicAdd accumulation
+    Value zeroInit =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getF32FloatAttr(0.0f));
+    rewriter.create<gpu::MemsetOp>(loc, Type(), ValueRange{}, lossMemRef,
+                                   zeroInit);
 
     // 2. Prepare Inputs
     auto logitsMemRefType =
@@ -110,139 +113,122 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
         rewriter.create<bufferization::ToBufferOp>(loc, targetsMemType, targets)
             .getResult();
 
-    // 3. Single-Block Execution Parameters
-    // We launch exactly one block to ensure total determinism across rows.
+    // Constants
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value c256 = rewriter.create<arith::ConstantIndexOp>(loc, 256);
     Value cN = rewriter.create<arith::ConstantIndexOp>(loc, N);
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
 
+    // ====================================================================
+    // DIAGNOSTIC: 1 thread per block, N blocks. No AllReduce.
+    // Each thread sequentially processes its entire row.
+    // This isolates whether the error is in AllReduce or elsewhere.
+    // ====================================================================
     auto launchOp =
-        rewriter.create<gpu::LaunchOp>(loc, c1, c1, c1, // Grid: 1, 1, 1
-                                       c256, c1, c1     // Block: 256, 1, 1
+        rewriter.create<gpu::LaunchOp>(loc, cN, c1, c1,  // Grid: N, 1, 1
+                                       c1, c1, c1        // Block: 1, 1, 1
         );
 
-    // 4. Kernel Body
     rewriter.setInsertionPointToStart(&launchOp.getBody().front());
-    Value tid = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-    Value bdim = rewriter.create<gpu::BlockDimOp>(loc, gpu::Dimension::x);
+    Value bid = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x);
 
     Value zero_f32 =
         rewriter.create<arith::ConstantOp>(loc, rewriter.getF32FloatAttr(0.0f));
     Value neg_inf = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getF32FloatAttr(-std::numeric_limits<float>::infinity()));
     Value cC = rewriter.create<arith::ConstantIndexOp>(loc, C);
+    Value c0_k = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1_k = rewriter.create<arith::ConstantIndexOp>(loc, 1);
 
-    // Row-wise total unnormalized loss accumulator
-    auto rowLoop = rewriter.create<scf::ForOp>(
-        loc, c0, cN, c1, ValueRange{zero_f32},
-        [&](OpBuilder &b, Location l, Value r, ValueRange args) {
-          Value runningLoss = args[0];
+    // Delinearize block index for multi-dim batch indexing
+    SmallVector<Value> rowIndices;
+    Value rem = bid;
+    for (int i = rank - 2; i >= 0; --i) {
+      Value dSize = rewriter.create<arith::ConstantIndexOp>(loc, logitsShape[i]);
+      if (i > 0) {
+        rowIndices.push_back(rewriter.create<arith::RemUIOp>(loc, rem, dSize));
+        rem = rewriter.create<arith::DivUIOp>(loc, rem, dSize);
+      } else {
+        rowIndices.push_back(rem);
+      }
+    }
+    std::reverse(rowIndices.begin(), rowIndices.end());
 
-          // Delinearize row index 'r' for multi-dim batch indexing
-          SmallVector<Value> rowIndices;
-          Value rem = r;
-          for (int i = rank - 2; i >= 0; --i) {
-            Value dSize = b.create<arith::ConstantIndexOp>(l, logitsShape[i]);
-            if (i > 0) {
-              rowIndices.push_back(b.create<arith::RemUIOp>(l, rem, dSize));
-              rem = b.create<arith::DivUIOp>(l, rem, dSize);
-            } else {
-              rowIndices.push_back(rem);
-            }
-          }
-          std::reverse(rowIndices.begin(), rowIndices.end());
+    // A. Load Target Class index
+    Value targetIdxVal =
+        rewriter.create<memref::LoadOp>(loc, targetsMemRef, rowIndices);
+    Value targetIdx = targetIdxVal;
+    if (!targetIdx.getType().isIndex())
+      targetIdx =
+          rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(),
+                                              targetIdxVal);
 
-          // A. Load Target Class index
-          Value targetIdxVal =
-              b.create<memref::LoadOp>(l, targetsMemRef, rowIndices);
-          Value targetIdx = targetIdxVal;
-          if (!targetIdx.getType().isIndex())
-            targetIdx =
-                b.create<arith::IndexCastOp>(l, b.getIndexType(), targetIdxVal);
-
-          // B. Pass 1: Find Max (Parallel across threads in block)
-          auto maxLoop = b.create<scf::ForOp>(
-              l, tid, cC, bdim, ValueRange{neg_inf},
-              [&](OpBuilder &ib, Location il, Value c_idx, ValueRange iargs) {
-                SmallVector<Value> lIdx = rowIndices;
-                lIdx.push_back(c_idx);
-                Value val = ib.create<memref::LoadOp>(il, logitsMemRef, lIdx);
-                if (val.getType().isF16() || val.getType().isBF16())
-                  val = ib.create<arith::ExtFOp>(il, ib.getF32Type(), val);
-                Value newMax = ib.create<arith::MaximumFOp>(il, iargs[0], val);
-                ib.create<scf::YieldOp>(il, newMax);
-              });
-          Value rowMax =
-              createBlockReduce(b, l, maxLoop.getResult(0),
-                                gpu::AllReduceOperation::MAXIMUMF, 256);
-
-          // C. Pass 2: Find Sum(Exp) and Target Logit
-          auto sumLoop = b.create<scf::ForOp>(
-              l, tid, cC, bdim, ValueRange{zero_f32, zero_f32},
-              [&](OpBuilder &ib, Location il, Value c_idx, ValueRange iargs) {
-                SmallVector<Value> lIdx = rowIndices;
-                lIdx.push_back(c_idx);
-                Value val = ib.create<memref::LoadOp>(il, logitsMemRef, lIdx);
-                if (val.getType().isF16() || val.getType().isBF16())
-                  val = ib.create<arith::ExtFOp>(il, ib.getF32Type(), val);
-
-                Value diff = ib.create<arith::SubFOp>(il, val, rowMax);
-                Value expVal = ib.create<mlir::math::ExpOp>(il, diff);
-                Value newSum = ib.create<arith::AddFOp>(il, iargs[0], expVal);
-
-                Value isTarget = ib.create<arith::CmpIOp>(
-                    il, arith::CmpIPredicate::eq, c_idx, targetIdx);
-                Value zero =
-                    ib.create<arith::ConstantOp>(il, ib.getF32FloatAttr(0.0f));
-                Value valIfTarget =
-                    ib.create<arith::SelectOp>(il, isTarget, val, zero);
-                Value newTargetLogit =
-                    ib.create<arith::AddFOp>(il, iargs[1], valIfTarget);
-
-                ib.create<scf::YieldOp>(il, ValueRange{newSum, newTargetLogit});
-              });
-          Value rowSum = createBlockReduce(b, l, sumLoop.getResult(0),
-                                           gpu::AllReduceOperation::ADD, 256);
-          Value targetLogit = createBlockReduce(
-              b, l, sumLoop.getResult(1), gpu::AllReduceOperation::ADD, 256);
-
-          // D. Compute Row Loss
-          Value logSum = b.create<mlir::math::LogOp>(l, rowSum);
-          Value t2 = b.create<arith::SubFOp>(l, targetLogit, rowMax);
-          Value rowLoss = b.create<arith::SubFOp>(l, logSum, t2);
-
-          Value nextAccum = b.create<arith::AddFOp>(l, runningLoss, rowLoss);
-          b.create<scf::YieldOp>(l, nextAccum);
+    // B. Sequential Pass 1: Find Max over C classes
+    auto maxLoop = rewriter.create<scf::ForOp>(
+        loc, c0_k, cC, c1_k, ValueRange{neg_inf},
+        [&](OpBuilder &ib, Location il, Value c_idx, ValueRange iargs) {
+          SmallVector<Value> lIdx = rowIndices;
+          lIdx.push_back(c_idx);
+          Value val = ib.create<memref::LoadOp>(il, logitsMemRef, lIdx);
+          if (val.getType().isF16() || val.getType().isBF16())
+            val = ib.create<arith::ExtFOp>(il, ib.getF32Type(), val);
+          Value newMax = ib.create<arith::MaximumFOp>(il, iargs[0], val);
+          ib.create<scf::YieldOp>(il, newMax);
         });
+    Value rowMax = maxLoop.getResult(0);
 
-    Value totalUnnormalizedLoss = rowLoop.getResult(0);
+    // C. Sequential Pass 2: Sum(Exp) and Target Logit
+    auto sumLoop = rewriter.create<scf::ForOp>(
+        loc, c0_k, cC, c1_k, ValueRange{zero_f32, zero_f32},
+        [&](OpBuilder &ib, Location il, Value c_idx, ValueRange iargs) {
+          SmallVector<Value> lIdx = rowIndices;
+          lIdx.push_back(c_idx);
+          Value val = ib.create<memref::LoadOp>(il, logitsMemRef, lIdx);
+          if (val.getType().isF16() || val.getType().isBF16())
+            val = ib.create<arith::ExtFOp>(il, ib.getF32Type(), val);
 
-    // 5. Final Normalization and Store (Thread 0)
-    Value isMaster =
-        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, tid, c0);
-    scf::IfOp writeOp = rewriter.create<scf::IfOp>(loc, isMaster, false);
-    rewriter.setInsertionPointToStart(writeOp.thenBlock());
+          Value diff = ib.create<arith::SubFOp>(il, val, rowMax);
+          Value expVal = ib.create<mlir::math::ExpOp>(il, diff);
+          Value newSum = ib.create<arith::AddFOp>(il, iargs[0], expVal);
 
+          Value isTarget = ib.create<arith::CmpIOp>(
+              il, arith::CmpIPredicate::eq, c_idx, targetIdx);
+          Value zero =
+              ib.create<arith::ConstantOp>(il, ib.getF32FloatAttr(0.0f));
+          Value valIfTarget =
+              ib.create<arith::SelectOp>(il, isTarget, val, zero);
+          Value newTargetLogit =
+              ib.create<arith::AddFOp>(il, iargs[1], valIfTarget);
+
+          ib.create<scf::YieldOp>(il, ValueRange{newSum, newTargetLogit});
+        });
+    Value rowSum = sumLoop.getResult(0);
+    Value targetLogit = sumLoop.getResult(1);
+
+    // D. Compute Row Loss: log(sum_exp) - (target_logit - max)
+    Value logSum = rewriter.create<mlir::math::LogOp>(loc, rowSum);
+    Value t2 = rewriter.create<arith::SubFOp>(loc, targetLogit, rowMax);
+    Value rowLoss = rewriter.create<arith::SubFOp>(loc, logSum, t2);
+
+    // E. Atomically add rowLoss / N to the output scalar
     Value cN_f32 = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getF32FloatAttr(static_cast<float>(N)));
-    Value meanLoss =
-        rewriter.create<arith::DivFOp>(loc, totalUnnormalizedLoss, cN_f32);
+    Value contribution =
+        rewriter.create<arith::DivFOp>(loc, rowLoss, cN_f32);
 
-    Value finalResult = meanLoss;
+    Value atomicVal = contribution;
     Type outputElemTy = resultType.getElementType();
     if (outputElemTy.isF16() || outputElemTy.isBF16()) {
-      finalResult =
-          rewriter.create<arith::TruncFOp>(loc, outputElemTy, meanLoss);
+      atomicVal =
+          rewriter.create<arith::TruncFOp>(loc, outputElemTy, contribution);
     }
-    rewriter.create<memref::StoreOp>(loc, finalResult, lossMemRef,
-                                     ValueRange{c0});
 
-    rewriter.setInsertionPointAfter(writeOp);
+    rewriter.create<memref::AtomicRMWOp>(loc, arith::AtomicRMWKind::addf,
+                                         atomicVal, lossMemRef,
+                                         ValueRange{c0_k});
+
     rewriter.create<gpu::TerminatorOp>(loc);
     rewriter.setInsertionPointAfter(launchOp);
 
-    // 6. Result
+    // 3. Result
     auto scalarTensorType =
         RankedTensorType::get({1}, resultType.getElementType());
     Value lossTensor = rewriter.create<bufferization::ToTensorOp>(

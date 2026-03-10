@@ -13,6 +13,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 
 using namespace mlir;
@@ -25,8 +26,15 @@ struct AddGpuMemoryCopiesPass
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AddGpuMemoryCopiesPass)
 
-  // Helper to recursively update memory space of index-aliasing operations
-  void updateMemorySpaceRecursively(Value val, Attribute newSpace, SmallVectorImpl<Operation*>& redundantCopies) {
+  // Helper to recursively update memory space of index-aliasing operations.
+  // Also follows memref::CopyOp chains to promote clone buffers created by
+  // the buffer deallocation pipeline, marking redundant same-space copies.
+  void updateMemorySpaceRecursively(Value val, Attribute newSpace,
+                                    SmallVectorImpl<Operation*>& redundantCopies,
+                                    DenseSet<Value>& visited) {
+    if (!visited.insert(val).second)
+      return;
+
     auto oldType = llvm::dyn_cast<MemRefType>(val.getType());
     if (!oldType)
       return;
@@ -37,11 +45,27 @@ struct AddGpuMemoryCopiesPass
 
     for (auto &use : val.getUses()) {
       Operation *user = use.getOwner();
-      
-      // If the user is a memcpy and both sides are now the same space, mark it redundant
-      if (auto memcpyOp = llvm::dyn_cast<gpu::MemcpyOp>(user)) {
-        // We'll check this later in the main loop to avoid iterator invalidation
+
+      // If the user is a gpu.memcpy, mark it redundant
+      if (llvm::isa<gpu::MemcpyOp>(user)) {
         redundantCopies.push_back(user);
+        continue;
+      }
+
+      // If the user is a memref.copy, propagate space change through the copy
+      // chain — but ONLY for clone buffers (local allocs). Copies to/from
+      // function arguments or globals are meaningful data transfers, not clones.
+      if (auto copyOp = llvm::dyn_cast<memref::CopyOp>(user)) {
+        Value src = copyOp.getSource();
+        Value dst = copyOp.getTarget();
+        Value otherSide = (val == src) ? dst : src;
+        // Only propagate and mark redundant if the other side is a local alloc
+        // (clone pattern). Don't touch function args or globals.
+        if (otherSide.getDefiningOp<memref::AllocOp>()) {
+          updateMemorySpaceRecursively(otherSide, newSpace, redundantCopies, visited);
+          if (val == src)
+            redundantCopies.push_back(user);
+        }
         continue;
       }
 
@@ -49,7 +73,7 @@ struct AddGpuMemoryCopiesPass
               memref::CastOp, memref::ReshapeOp, memref::TransposeOp,
               memref::ReinterpretCastOp, bufferization::ToBufferOp>(user)) {
         for (Value result : user->getResults()) {
-          updateMemorySpaceRecursively(result, newSpace, redundantCopies);
+          updateMemorySpaceRecursively(result, newSpace, redundantCopies, visited);
         }
       }
     }
@@ -142,6 +166,10 @@ struct AddGpuMemoryCopiesPass
         }
     });
 
+    // Ops to erase AFTER the walk completes (erasing during walk causes
+    // iterator invalidation since these ops are in the same block being walked).
+    SmallPtrSet<Operation*, 16> deferredErase;
+
     // Phase 2: Process GPU Launches to swap operands
     func.walk([&](gpu::LaunchOp launchOp) {
       launchOp.getRegion().walk([&](Operation *op) {
@@ -149,7 +177,7 @@ struct AddGpuMemoryCopiesPass
           Value val = operand.get();
           auto memRefType = llvm::dyn_cast<MemRefType>(val.getType());
           if (!memRefType) continue;
-          
+
           Attribute space = memRefType.getMemorySpace();
           // Skip non-integer address spaces (e.g., #gpu.address_space<workgroup>)
           if (space && !llvm::isa<IntegerAttr>(space))
@@ -167,40 +195,45 @@ struct AddGpuMemoryCopiesPass
           SmallVector<Operation*, 4> viewChain;
           Operation *curr = val.getDefiningOp();
           Value hostRoot = val;
-          
+
           while (true) {
               if (!curr) {
                   // It's a BlockArgument
                   if (auto blockArg = llvm::dyn_cast<BlockArgument>(hostRoot)) {
                       if (blockArg.getOwner() == &func.getBody().front()) {
                           // Function Argument
-                          break; 
+                          break;
                       }
                   }
                   // Unknown block arg (e.g. loop iterator?), abort trace
-                  hostRoot = nullptr; 
+                  hostRoot = nullptr;
                   break;
               }
-              
+
               if (llvm::isa<memref::GetGlobalOp>(curr)) {
                   // Found global
                   break;
               }
-              
+
+              if (llvm::isa<memref::AllocOp>(curr)) {
+                  // Found local allocation — will promote to device space
+                  break;
+              }
+
               // View-like ops
               if (isa<memref::CollapseShapeOp, memref::ExpandShapeOp, memref::SubViewOp,
-                      memref::CastOp, memref::ReshapeOp, memref::TransposeOp, 
+                      memref::CastOp, memref::ReshapeOp, memref::TransposeOp,
                       memref::ReinterpretCastOp>(curr)) {
                   viewChain.push_back(curr);
                   hostRoot = curr->getOperand(0);
                   curr = hostRoot.getDefiningOp();
               } else {
                   // Unknown op in chain (maybe load result?), abort
-                  hostRoot = nullptr; 
+                  hostRoot = nullptr;
                   break;
               }
           }
-          
+
           if (!hostRoot) continue;
 
           Value deviceRoot = nullptr;
@@ -223,14 +256,14 @@ struct AddGpuMemoryCopiesPass
                       auto devType = MemRefType::get(
                           hostType.getShape(), hostType.getElementType(),
                           hostType.getLayout(), moduleBuilder.getI64IntegerAttr(1));
-                      
+
                       OpBuilder funcTop(&func.getBody().front().front());
                       deviceRoot = funcTop.create<memref::AllocOp>(getGlobal.getLoc(), devType);
-                      
+
                       // Using a fresh get_global at top to avoid dominance issues or moving original
                       Value hVal = funcTop.create<memref::GetGlobalOp>(getGlobal.getLoc(), hostType, name);
                       funcTop.create<memref::CopyOp>(getGlobal.getLoc(), hVal, deviceRoot);
-                      
+
                       symbolToDeviceAlloc[name] = deviceRoot;
                   }
               }
@@ -249,7 +282,7 @@ struct AddGpuMemoryCopiesPass
                       auto devType = MemRefType::get(
                           hostType.getShape(), hostType.getElementType(),
                           hostType.getLayout(), moduleBuilder.getI64IntegerAttr(1));
-                      
+
                       OpBuilder funcTop(&func.getBody().front().front());
                       deviceRoot = funcTop.create<memref::AllocOp>(defOp.getLoc(), devType);
                       Value hVal = funcTop.create<memref::GetGlobalOp>(defOp.getLoc(), hostType, name);
@@ -259,31 +292,79 @@ struct AddGpuMemoryCopiesPass
                }
           }
 
+          // Case D: Local allocation — promote to device space and eliminate clones
+          if (!deviceRoot && hostRoot && hostRoot.getDefiningOp<memref::AllocOp>()) {
+              SmallVector<Operation*, 4> redundantCopies;
+              DenseSet<Value> visited;
+              updateMemorySpaceRecursively(hostRoot, moduleBuilder.getI64IntegerAttr(1),
+                                           redundantCopies, visited);
+
+              // Eliminate redundant same-space copies and their clone buffers.
+              // The dealloc pipeline creates: clone = alloc; copy src, clone; use clone; dealloc clone
+              // After promoting both sides to space 1, we replace clone with src and remove the copy.
+              // Use-replacements are safe during the walk (they don't invalidate iterators),
+              // but actual erasures are deferred to avoid corrupting the outer func.walk.
+              for (auto *redundant : redundantCopies) {
+                if (auto copyOp = llvm::dyn_cast<memref::CopyOp>(redundant)) {
+                  Value src = copyOp.getSource();
+                  Value dst = copyOp.getTarget();
+
+                  // Collect deallocs of dst BEFORE replacing uses
+                  for (auto *user : dst.getUsers()) {
+                    if (isa<memref::DeallocOp>(user))
+                      deferredErase.insert(user);
+                  }
+
+                  // Replace all uses of clone (dst) with original (src)
+                  dst.replaceAllUsesWith(src);
+
+                  // Mark the copy for deferred erasure
+                  deferredErase.insert(copyOp);
+
+                  // Mark clone's alloc for deferred erasure if now unused
+                  if (Operation *allocOp = dst.getDefiningOp()) {
+                    if (allocOp->use_empty())
+                      deferredErase.insert(allocOp);
+                  }
+                } else {
+                  deferredErase.insert(redundant);
+                }
+              }
+
+              // The alloc is now space 1 — operand already points to the right value
+              continue;
+          }
+
           if (!deviceRoot) continue;
 
           // Rebuild View Chain on Device Root
           OpBuilder launchBuilder(launchOp);
           Value currentDeviceVal = deviceRoot;
-          
+
           // viewChain is Op* list. Iterate reverse (Root -> Leaf)
           for (int i = viewChain.size() - 1; i >= 0; --i) {
               Operation* oldView = viewChain[i];
               IRMapping mapping;
               mapping.map(oldView->getOperand(0), currentDeviceVal);
               Operation* newView = launchBuilder.clone(*oldView, mapping);
-              
+
               auto oldType = llvm::cast<MemRefType>(oldView->getResult(0).getType());
               auto newType = MemRefType::get(oldType.getShape(), oldType.getElementType(),
                                              oldType.getLayout(), moduleBuilder.getI64IntegerAttr(1));
               newView->getResult(0).setType(newType);
               currentDeviceVal = newView->getResult(0);
           }
-          
+
           // Replace usage
           operand.set(currentDeviceVal);
         }
       });
     });
+
+    // Phase 3: Erase redundant ops collected during Phase 2 (deferred to
+    // avoid iterator invalidation in the walk).
+    for (auto *op : deferredErase)
+      op->erase();
 
     // Debug: Dump the module to see changes
     // llvm::errs() << "[[[ IR after AddGpuMemoryCopies ]]]\n";
