@@ -1487,144 +1487,13 @@ struct ReshapeOpConverter : public OpConversionPattern<nova::ReshapeOp> {
   }
 };
 
-struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
-  using OpConversionPattern<nova::LinearOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(nova::LinearOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto operands = adaptor.getOperands();
-    if (operands.size() != 3) {
-      return rewriter.notifyMatchFailure(op, "expected exactly 3 operands");
-    }
-
-    Value input = operands[0];
-    Value weight = operands[1];
-    Value bias = operands[2];
-
-    auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
-    auto weightType = llvm::dyn_cast<RankedTensorType>(weight.getType());
-    auto biasType = llvm::dyn_cast<RankedTensorType>(bias.getType());
-
-    auto resultType = llvm::dyn_cast<RankedTensorType>(op.getType());
-    if (!inputType || !weightType || !biasType || !resultType) {
-      return rewriter.notifyMatchFailure(op, "expected ranked tensor types");
-    }
-
-    auto loc = op.getLoc();
-    auto elementType = resultType.getElementType();
-    int64_t inputRank = inputType.getRank();
-
-    // 1. Initialize output with Bias
-    SmallVector<Value> dynDims;
-    for (int i = 0; i < inputRank; ++i) {
-      if (resultType.isDynamicDim(i)) {
-        // Find dim dynamically. We could just use tensor::DimOp if input has
-        // dynamic dims matching result.
-        dynDims.push_back(rewriter.create<tensor::DimOp>(loc, input, i));
-      }
-    }
-
-    Value empty = rewriter.create<tensor::EmptyOp>(loc, resultType.getShape(),
-                                                   elementType, dynDims);
-
-    // Map for Bias to Broadcast: bias is 1D -> (C)
-    // Result is [A, B, ..., C]
-    // Instead of hardcoding 1 dimension:
-    SmallVector<AffineExpr> biasExprs;
-    if (biasType.getRank() == 1) {
-        biasExprs.push_back(rewriter.getAffineDimExpr(inputRank - 1));
-    } else if (biasType.getRank() == 2) {
-    // For [1, C] shape
-    biasExprs.push_back(rewriter.getAffineConstantExpr(0)); 
-    biasExprs.push_back(rewriter.getAffineDimExpr(inputRank - 1));
-    }
-
-    AffineMap biasMap =
-        AffineMap::get(inputRank, 0, biasExprs, rewriter.getContext());
-    AffineMap resultMap = rewriter.getMultiDimIdentityMap(inputRank);
-
-    SmallVector<utils::IteratorType> broadcastIters(
-        inputRank, utils::IteratorType::parallel);
-
-    auto broadcastBias = rewriter.create<linalg::GenericOp>(
-        loc, empty.getType(), bias, empty,
-        ArrayRef<AffineMap>{biasMap, resultMap}, broadcastIters,
-        [&](OpBuilder &b, Location loc, ValueRange args) {
-          b.create<linalg::YieldOp>(loc, args[0]);
-        });
-
-    Value initTensor = broadcastBias.getResult(0);
-
-    // 2. Fused Matmul+Bias
-    // Iterators: [parallel..., parallel, reduction]
-    SmallVector<utils::IteratorType> matmulIters(inputRank,
-                                                 utils::IteratorType::parallel);
-    matmulIters.push_back(utils::IteratorType::reduction);
-
-    int numLoops = inputRank + 1;
-
-    // Input Map: D, A, B -> [d0, d1, d3] (where d3 is B, the reduction dim)
-    SmallVector<AffineExpr> inputExprs;
-    for (int i = 0; i < inputRank - 1; ++i) {
-      inputExprs.push_back(
-          rewriter.getAffineDimExpr(i)); // Parallel dims of LHS
-    }
-    inputExprs.push_back(
-        rewriter.getAffineDimExpr(inputRank)); // Reduction dim K
-    AffineMap inputMap =
-        AffineMap::get(numLoops, 0, inputExprs, rewriter.getContext());
-
-    // Weight Map: B, C -> [d3, d2] (where d3 is reduction dim K, d2 is C, the
-    // last parallel dim)
-    SmallVector<AffineExpr> weightExprs;
-    weightExprs.push_back(rewriter.getAffineDimExpr(inputRank));     // B (K)
-    weightExprs.push_back(rewriter.getAffineDimExpr(inputRank - 1)); // C (N)
-    AffineMap weightMap =
-        AffineMap::get(numLoops, 0, weightExprs, rewriter.getContext());
-
-    // Output Map: D, A, C -> [d0, d1, d2]
-    SmallVector<AffineExpr> outputExprs;
-    for (int i = 0; i < inputRank; ++i) {
-      outputExprs.push_back(rewriter.getAffineDimExpr(i)); // Parallel dims
-    }
-    AffineMap outputMap =
-        AffineMap::get(numLoops, 0, outputExprs, rewriter.getContext());
-
-    auto genericMatmul = rewriter.create<linalg::GenericOp>(
-        loc, resultType, ValueRange{input, weight}, initTensor,
-        ArrayRef<AffineMap>{inputMap, weightMap, outputMap}, matmulIters,
-        [&](OpBuilder &b, Location loc, ValueRange args) {
-          Value inVal = args[0];
-          Value wtVal = args[1];
-          Value outVal = args[2];
-          Value prod;
-          if (isa<FloatType>(elementType))
-            prod = b.create<arith::MulFOp>(loc, inVal, wtVal);
-          else
-            prod = b.create<arith::MulIOp>(loc, inVal, wtVal);
-
-          Value sum;
-          if (isa<FloatType>(elementType))
-            sum = b.create<arith::AddFOp>(loc, outVal, prod);
-          else
-            sum = b.create<arith::AddIOp>(loc, outVal, prod);
-
-          b.create<linalg::YieldOp>(loc, sum);
-        });
-
-    rewriter.replaceOp(op, genericMatmul.getResult(0));
-    return success();
-  }
-};
-
 void populateNovaToLinalgPatterns(RewritePatternSet &patterns) {
   patterns
       .add<NovaMatmulOpLowering, NovaBroadcastInDimOpLowering,
            NovaTransposeOpLowering, NovaToDeviceOpLowering,
            NovaScatterAddOpLowering, NovaGatherOpLowering, NovaRandomOpLowering,
            ArgMinConverter, ArgMaxConverter, ReduceOpConverter, AdamOpConverter,
-           ReshapeOpConverter, NovaLinearOpLowering>(patterns.getContext());
+           ReshapeOpConverter>(patterns.getContext());
 }
 
 //===----------------------------------------------------------------------===//
@@ -1669,7 +1538,7 @@ struct NovaToLinalgPass
                         nova::TransposeOp, nova::ToDeviceOp, nova::ScatterAddOp,
                         nova::GatherOp, nova::Rndm2DOp, nova::ReshapeOp,
                         nova::ArgMinOp, nova::ArgmaxOp, nova::ReduceOp,
-                        nova::AdamOp, nova::LinearOp>();
+                        nova::AdamOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 
     RewritePatternSet patterns(context);
