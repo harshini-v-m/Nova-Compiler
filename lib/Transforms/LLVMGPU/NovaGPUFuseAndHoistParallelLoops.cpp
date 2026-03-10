@@ -142,8 +142,29 @@ applyPatternsGreedilyWithConfig(func::FuncOp funcOp,
 //
 // When a producer scf.forall has a single consumer that is itself (or leads to)
 // a scf.forall with the same thread mapping + workgroup trip count, merge the
-// producer into the consumer.
+// producer into the consumer by direct body inlining.
+//
+// Mirrors IREE's fuseForallIntoConsumer() but without iree_gpu.barrier_region
+// or affine.delinearize_index. Instead, for matching-trip-count foralls we
+// clone the producer body into the consumer and map producer IVs → consumer IVs
+// directly. This is valid because each thread computes and reads the same
+// element (same offsets in parallel_insert_slice and extract_slice).
 //===----------------------------------------------------------------------===//
+
+/// Returns true if the foralls have matching upper bounds (dimension-wise).
+static bool forallBoundsMatch(scf::ForallOp producer, scf::ForallOp consumer) {
+  auto producerUB = producer.getMixedUpperBound();
+  auto consumerUB = consumer.getMixedUpperBound();
+  if (producerUB.size() != consumerUB.size())
+    return false;
+  for (auto [pUB, cUB] : llvm::zip_equal(producerUB, consumerUB)) {
+    auto pCst = getConstantIntValue(pUB);
+    auto cCst = getConstantIntValue(cUB);
+    if (!pCst || !cCst || *pCst != *cCst)
+      return false;
+  }
+  return true;
+}
 
 struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
   FuseForalls(MLIRContext *ctx, int64_t flatWorkgroupSize, PatternBenefit b = 1)
@@ -157,10 +178,20 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
       return rewriter.notifyMatchFailure(producerForall,
                                          "producer has multiple uses");
 
+    // Only single-result producers.
+    if (producerForall->getNumResults() != 1)
+      return rewriter.notifyMatchFailure(producerForall,
+                                         "multi-result producer");
+
     // Only fuse thread-mapped foralls.
     if (!isThreadMappedForall(producerForall))
       return rewriter.notifyMatchFailure(producerForall,
                                          "producer is not thread-mapped");
+
+    // Both must be normalized.
+    if (!isNormalized(producerForall))
+      return rewriter.notifyMatchFailure(producerForall,
+                                         "producer is not normalized");
 
     // Walk the single-use chain (possibly through reshape ops) to reach the
     // consumer forall.
@@ -184,24 +215,76 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
           producerForall,
           "consumer forall trip count mismatch or not thread-mapped");
 
-    // Find the tensor.extract_slice inside the consumer forall that uses the
-    // producer forall's result, and fuse using tileAndFuseProducerOfSlice.
-    LogicalResult fusionResult = failure();
+    if (!isNormalized(consumerForall))
+      return rewriter.notifyMatchFailure(consumerForall,
+                                         "consumer is not normalized");
+
+    // Require matching dimension-wise bounds so we can map IVs 1:1.
+    if (!forallBoundsMatch(producerForall, consumerForall))
+      return rewriter.notifyMatchFailure(
+          producerForall, "producer/consumer bounds don't match dimension-wise");
+
+    // Find the extract_slice in the consumer that reads from the producer.
+    tensor::ExtractSliceOp consumerSlice;
     consumerForall.walk([&](tensor::ExtractSliceOp sliceOp) {
-      if (failed(fusionResult)) {
-        auto defOp = sliceOp.getSource().getDefiningOp<scf::ForallOp>();
-        if (!defOp || defOp != producerForall)
-          return WalkResult::advance();
-        SmallVector<LoopLikeOpInterface> loops = {consumerForall};
-        auto result =
-            scf::tileAndFuseProducerOfSlice(rewriter, sliceOp, loops);
-        if (result)
-          fusionResult = success();
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
+      if (sliceOp.getSource().getDefiningOp() == producerForall.getOperation())
+        consumerSlice = sliceOp;
     });
-    return fusionResult;
+    if (!consumerSlice)
+      return rewriter.notifyMatchFailure(
+          producerForall, "no extract_slice from producer in consumer");
+
+    // Get the producer's terminator and its parallel_insert_slice.
+    scf::InParallelOp producerTerminator = producerForall.getTerminator();
+    SmallVector<Operation *> producerInserts;
+    for (Operation &op : producerTerminator.getYieldingOps())
+      producerInserts.push_back(&op);
+    if (producerInserts.size() != 1)
+      return rewriter.notifyMatchFailure(producerForall,
+                                         "expected exactly one insert");
+    auto producerInsert =
+        cast<tensor::ParallelInsertSliceOp>(producerInserts[0]);
+
+    // Direct body inlining (mirrors IREE fuseForallIntoConsumer):
+    // Clone producer body ops into the consumer body, mapping:
+    //   producer IVs  → consumer IVs  (same trip counts)
+    //   producer iter args → fresh tensor.empty (or the init value)
+    //
+    // Then replace the consumer's extract_slice(producer_result) with the
+    // cloned producer's computed value (the source of parallel_insert_slice).
+
+    IRMapping mapping;
+    // Map producer induction variables → consumer induction variables.
+    for (auto [pIV, cIV] : llvm::zip_equal(
+             producerForall.getInductionVars(),
+             consumerForall.getInductionVars())) {
+      mapping.map(pIV, cIV);
+    }
+    // Map producer region iter args → producer init values (they flow through).
+    for (auto [iterArg, init] : llvm::zip_equal(
+             producerForall.getRegionIterArgs(),
+             producerForall.getDpsInits())) {
+      mapping.map(iterArg, init);
+    }
+
+    // Clone producer body ops (except the terminator) into the consumer body,
+    // right before the consumer's extract_slice.
+    rewriter.setInsertionPoint(consumerSlice);
+    for (Operation &op : producerForall.getBody()->without_terminator()) {
+      rewriter.clone(op, mapping);
+    }
+
+    // The value that the producer would have inserted is the "source" of
+    // its parallel_insert_slice, now remapped to cloned values.
+    Value fusedValue = mapping.lookupOrDefault(producerInsert.getSource());
+
+    // Replace the consumer's extract_slice with the fused value.
+    rewriter.replaceOp(consumerSlice, fusedValue);
+
+    // Erase the producer forall (it has no more uses after replacement).
+    rewriter.eraseOp(producerForall);
+
+    return success();
   }
 
 private:
@@ -715,6 +798,7 @@ struct NovaGPUFuseAndHoistParallelLoopsPass
     // Round 1: Hoist + fuse foralls
     // -------------------------------------------------------------------
     {
+      // Round 1 entry
       RewritePatternSet patterns(ctx);
       if (maybeFlatWorkgroupSize) {
         patterns.add<FuseForalls>(ctx, *maybeFlatWorkgroupSize, /*benefit=*/2);
@@ -727,12 +811,14 @@ struct NovaGPUFuseAndHoistParallelLoopsPass
       if (failed(applyPatternsGreedilyWithConfig(
               funcOp, std::move(patterns), "round 1 (hoist+fuse foralls)")))
         return signalPassFailure();
+      // Round 1 done
     }
 
     // -------------------------------------------------------------------
     // Round 2: Revealed consumers / destinations
     // -------------------------------------------------------------------
     {
+      // Round 2 entry
       RewritePatternSet patterns(ctx);
       patterns.add<FuseTilableDestinationProducers>(ctx);
       patterns.add<FuseUnitLoopDestination>(ctx);
@@ -749,12 +835,14 @@ struct NovaGPUFuseAndHoistParallelLoopsPass
       if (failed(applyPatternsGreedilyWithConfig(
               funcOp, std::move(patterns), "round 2 (consumer fusion)")))
         return signalPassFailure();
+      // Round 2 done
     }
 
     // -------------------------------------------------------------------
     // Round 3: New producer fusions
     // -------------------------------------------------------------------
     {
+      // Round 3 entry
       RewritePatternSet patterns(ctx);
       patterns.add<FuseTilableDestinationProducers>(ctx);
       patterns.add<FuseTilableSliceProducers>(ctx);
@@ -767,6 +855,7 @@ struct NovaGPUFuseAndHoistParallelLoopsPass
       if (failed(applyPatternsGreedilyWithConfig(
               funcOp, std::move(patterns), "round 3 (producer fusion)")))
         return signalPassFailure();
+      // Round 3 done
     }
   }
 

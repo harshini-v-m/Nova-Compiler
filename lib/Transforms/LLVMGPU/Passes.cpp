@@ -319,7 +319,7 @@ namespace mlir::nova
       // address spaces (5/3/1) before finalizeMemRefToLLVM, which requires
       // integer address spaces for LLVM type conversion.
       gpuPm.addPass(createNovaGPULowerMemorySpacePass());
-      gpuPm.addPass(createFinalizeMemRefToLLVMConversionPass());
+      // gpuPm.addPass(createFinalizeMemRefToLLVMConversionPass());
       // Phase 2: Lower control flow and GPU ops.
       gpuPm.addPass(createSCFToControlFlowPass());
       ConvertGpuOpsToNVVMOpsOptions nvvmOpts;

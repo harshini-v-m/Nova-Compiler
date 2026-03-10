@@ -21,7 +21,7 @@ std::unique_ptr<Pass> createRenameGpuKernelsPass();
 //===----------------------------------------------------------------------===//
 // LLVMGPU Pipeline
 //===----------------------------------------------------------------------===//
-void addNovaGPUOptimizedPipeline(OpPassManager &pm);
+void addNovaGPUOptimizedPipeline(OpPassManager &pm, llvm::StringRef cudaArch);
 void registerNovaLLVMGPUPasses();
 
 }  // namespace nova

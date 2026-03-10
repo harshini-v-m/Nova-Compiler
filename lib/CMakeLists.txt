@@ -17,6 +17,7 @@ install(
         MLIRNovaToArithTransforms
         MLIRNovaToLinalgTransforms
         MLIRNovaToTosaTransforms
+        NovaLLVMGPUTransforms
         NovaCompilerAPI
         #NovaRuntimeCore
     EXPORT mlir-compilerTargets  # Name the export set

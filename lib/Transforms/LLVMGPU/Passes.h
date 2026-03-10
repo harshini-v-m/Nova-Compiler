@@ -11,7 +11,7 @@ namespace nova {
 // Adds the Nova GPU optimized pipeline (strategy → tile → pad → promote → K-tile →...)
 // |cudaArch|: CUDA SM arch string forwarded to the strategy pass, e.g. "sm_80".
 void addNovaGPUOptimizedPipeline(OpPassManager &pm,
-                                  StringRef cudaArch = "sm_80");
+                                  StringRef cudaArch = "sm_86");
 
 // --- Passes ---
 
@@ -28,7 +28,7 @@ void registerNovaConfigTrackingCanonicalizerPass();
 // Mirrors IREE's LLVMGPUSelectLoweringStrategy pass.
 // |cudaArch|: SM architecture string, e.g. "sm_80", "sm_75", "ampere".
 std::unique_ptr<Pass> createNovaGPUSelectLoweringStrategyPass(
-    StringRef cudaArch = "sm_80");
+    StringRef cudaArch = "sm_86");
 void registerNovaGPUSelectLoweringStrategyPass();
 
 // Tiles compute operations and distributes them to workgroups using scf.forall

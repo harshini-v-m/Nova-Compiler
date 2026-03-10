@@ -135,9 +135,9 @@ static bool hasReductionTiling(linalg::LinalgOp linalgOp) {
   return false;
 }
 
-static llvm::SmallDenseSet<TilingInterface>
+static SmallVector<TilingInterface>
 getTiledOps(func::FuncOp funcOp, NovaTilingLevel tilingLevel) {
-  llvm::SmallDenseSet<TilingInterface> targets;
+  SmallVector<TilingInterface> targets;
 
   funcOp.walk([&](Operation *op) {
     // Only ops implementing TilingInterface matter.
@@ -161,7 +161,7 @@ getTiledOps(func::FuncOp funcOp, NovaTilingLevel tilingLevel) {
       // Only collect ops that actually have reduction dims to tile.
       if (!hasReductionTiling(linalgOp))
         return WalkResult::advance();
-      targets.insert(tilingOp);
+      targets.push_back(tilingOp);
       return WalkResult::advance();
     }
 
@@ -169,7 +169,7 @@ getTiledOps(func::FuncOp funcOp, NovaTilingLevel tilingLevel) {
     // This includes both contractions and non-contraction ops with configs.
     if (tilingLevel == NovaTilingLevel::Thread ||
         tilingLevel == NovaTilingLevel::Subgroup) {
-      targets.insert(tilingOp);
+      targets.push_back(tilingOp);
       return WalkResult::advance();
     }
 
@@ -300,7 +300,7 @@ buildFusionControlFn(NovaTilingLevel tilingLevel) {
 
 static LogicalResult
 applyTilingLevelToOps(func::FuncOp funcOp, IRRewriter &rewriter,
-                      llvm::SmallDenseSet<TilingInterface> &targetOps,
+                      SmallVector<TilingInterface> &targetOps,
                       NovaTilingLevel tilingLevel) {
   MLIRContext *ctx = funcOp.getContext();
 

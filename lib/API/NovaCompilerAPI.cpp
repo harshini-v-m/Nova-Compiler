@@ -2,6 +2,7 @@
 #include "Compiler/Dialect/nova/NovaDialect.h"
 #include "Compiler/Pipeline/Gpupipeline.h"
 #include "Compiler/Pipeline/Pipeline.h"
+#include "../Transforms/LLVMGPU/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -10,6 +11,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Transforms/Passes.h"
+
 
 #include "mlir/Dialect/MemRef/Transforms/AllocationOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/Transforms/BufferDeallocationOpInterfaceImpl.h"
@@ -22,6 +24,7 @@
 #include "mlir/Dialect/SCF/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/TensorTilingInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/IR/TensorInferTypeOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/TensorInferTypeOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
@@ -271,6 +274,7 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   mlir::registerConvertComplexToLLVMInterface(registry);
   mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
   mlir::tensor::registerInferTypeOpInterfaceExternalModels(registry);
+  mlir::tensor::registerInferTypeOpInterfaceExternalModels(registry);
 
   registerLLVMDialectTranslation(registry);
   registerAllToLLVMIRTranslations(registry);
@@ -278,6 +282,8 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   registry.addExtension(+[](mlir::MLIRContext *ctx,
                             mlir::gpu::GPUDialect *dialect) {
     mlir::gpu::AllReduceOp::attachInterface<AllReduceOpMemEffectModel>(*ctx);
+    mlir::gpu::DynamicSharedMemoryOp::attachInterface<DynamicSharedMemoryOpMemEffectModel>(*ctx);
+    mlir::gpu::BarrierOp::attachInterface<BarrierOpMemEffectModel>(*ctx);
     mlir::gpu::DynamicSharedMemoryOp::attachInterface<DynamicSharedMemoryOpMemEffectModel>(*ctx);
     mlir::gpu::BarrierOp::attachInterface<BarrierOpMemEffectModel>(*ctx);
   });
@@ -328,14 +334,15 @@ LogicalResult NovaCompilerAPI::runPipeline(ModuleOp module,
                         llvm::errs());
   }
 
-  if (options.runFullPipeline) {
+   if (options.runFullPipeline) {
     // Add the Nova optimization pipeline based on target device
     if (options.device == "gpu" || options.device == "cuda") {
-      createNovaGPUPipelines(pm);
+      addNovaGPUOptimizedPipeline(pm,"sm_86");
     } else {
       createNovaPipelines(pm);
     }
   }
+
 
   // Run custom pipeline if specified
   if (!options.customPipeline.empty()) {

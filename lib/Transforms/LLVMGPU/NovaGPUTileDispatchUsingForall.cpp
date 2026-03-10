@@ -2,6 +2,7 @@
 #include "NovaGPUTileAndFuseUtils.h"
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -472,10 +473,20 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       llvm::SmallPtrSet<Operation *, 16> alreadyWrapped;
 
       // Find all un-distributed ops and wrap each connected chain.
-      // Process return values: trace back to find chains that need wrapping.
+      // Trace back from func.return operands AND from any
+      // bufferization.materialize_in_destination sources. The latter handles
+      // void-return functions (e.g. SCE) where the final computed tensor is
+      // written into a memref argument rather than returned directly, so
+      // returnOp.getOperands() would be empty and the chain would be missed.
+      SmallVector<Value> rootValues;
       auto returnOp = cast<func::ReturnOp>(funcOp.getBody().back().getTerminator());
+      for (Value retVal : returnOp.getOperands())
+        rootValues.push_back(retVal);
+      funcOp.walk([&](bufferization::MaterializeInDestinationOp matOp) {
+        rootValues.push_back(matOp.getSource());
+      });
 
-      for (Value retVal : returnOp.getOperands()) {
+      for (Value retVal : rootValues) {
         // Trace back through the chain to find all un-distributed ops.
         SmallVector<Operation *> opsToMove;
         SmallVector<Operation *> worklist;

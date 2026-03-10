@@ -80,4 +80,5 @@ add_mlir_library(NovaCompilerAPI
   
   MLIRNova
   NovaPipelines
+  NovaLLVMGPUTransforms
 )
