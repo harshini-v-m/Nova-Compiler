@@ -119,6 +119,7 @@ int main(int argc, char **argv) {
 
   mlir::nova::registerNovaPipelines();
   mlir::nova::registerNovaGPUPipelines();
+  mlir::nova::registerNovaLLVMGPUPasses();
   mlir::nova::registerAffinePasses();
 
   mlir::nova::registerNovaToArithLoweringPass();
