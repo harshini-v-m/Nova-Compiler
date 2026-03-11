@@ -97,29 +97,12 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
     auto resultMemRefType = MemRefType::get(resultShape, resultType.getElementType(),
                                             MemRefLayoutAttrInterface{}, i1Attr);
 
-    Value lhsMemRef = rewriter.create<bufferization::ToBufferOp>(loc, lhsMemRefType, lhs).getResult();
-    Value rhsMemRef = rewriter.create<bufferization::ToBufferOp>(loc, rhsMemRefType, rhs).getResult();
+    Value lhsBuffer = rewriter.create<bufferization::ToBufferOp>(loc, lhsMemRefType, lhs).getResult();
+    Value rhsBuffer = rewriter.create<bufferization::ToBufferOp>(loc, rhsMemRefType, rhs).getResult();
 
     // Allocate result
     Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultShape, resultType.getElementType());
-    Value resultMemRef = rewriter.create<bufferization::ToBufferOp>(loc, resultMemRefType, emptyTensor).getResult();
-
-    // Cast lhs, rhs, and result to flat 1D views for index arithmetic
-    Value lhsFlat = rewriter.create<memref::ReinterpretCastOp>(
-        loc, lhsFlatType, lhsMemRef,
-        /*offset=*/(int64_t)0,
-        /*sizes=*/ArrayRef<int64_t>{lhsFlatSize},
-        /*strides=*/ArrayRef<int64_t>{1});
-    Value rhsFlat = rewriter.create<memref::ReinterpretCastOp>(
-        loc, rhsFlatType, rhsMemRef,
-        /*offset=*/(int64_t)0,
-        /*sizes=*/ArrayRef<int64_t>{rhsFlatSize},
-        /*strides=*/ArrayRef<int64_t>{1});
-    Value resFlat = rewriter.create<memref::ReinterpretCastOp>(
-        loc, resFlatType, resultMemRef,
-        /*offset=*/(int64_t)0,
-        /*sizes=*/ArrayRef<int64_t>{resFlatSize},
-        /*strides=*/ArrayRef<int64_t>{1});
+    Value resultBuffer = rewriter.create<bufferization::ToBufferOp>(loc, resultMemRefType, emptyTensor).getResult();
 
     // ---- Shared memory constants ----
     int64_t tileSize = 16;
@@ -187,16 +170,12 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
     Value ty = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::y);
     Value bx = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x);
     Value by = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::y);
-    Value bz = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::z); // batch index
+    // Batch index
+    Value bz = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::z); 
 
     // Global output row/col for this thread
     Value col = rewriter.create<arith::AddIOp>(loc, rewriter.create<arith::MulIOp>(loc, bx, cTileSize), tx);
     Value row = rewriter.create<arith::AddIOp>(loc, rewriter.create<arith::MulIOp>(loc, by, cTileSize), ty);
-
-    // Compute batch base offsets for each operand
-    Value lhsBatchOff = rewriter.create<arith::MulIOp>(loc, bz, cLhsBatchStride);
-    Value rhsBatchOff = rewriter.create<arith::MulIOp>(loc, bz, cRhsBatchStride);
-    Value resBatchOff = rewriter.create<arith::MulIOp>(loc, bz, cResBatchStride);
 
     Value sum_init = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getZeroAttr(resultType.getElementType()));
@@ -217,11 +196,12 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
     auto ifA = rewriter.create<scf::IfOp>(loc, aInBounds, /*withElse=*/true);
     rewriter.setInsertionPointToStart(ifA.thenBlock());
     {
-      // lhsFlat[ lhsBatchOff + row*K + aCol ]
-      Value rowOffset  = rewriter.create<arith::MulIOp>(loc, row, cLhsKStride);
-      Value aLinear    = rewriter.create<arith::AddIOp>(loc,
-                            rewriter.create<arith::AddIOp>(loc, lhsBatchOff, rowOffset), aCol);
-      Value aVal = rewriter.create<memref::LoadOp>(loc, lhsFlat, ValueRange{aLinear});
+      // Load from original memref using multi-dimensional indices
+      SmallVector<Value> lhsIndices;
+      if (lhsRank > 2) lhsIndices.push_back(bz);
+      lhsIndices.push_back(row);
+      lhsIndices.push_back(aCol);
+      Value aVal = rewriter.create<memref::LoadOp>(loc, lhsBuffer, lhsIndices);
       rewriter.create<memref::StoreOp>(loc, aVal, tileA, ValueRange{ty, tx});
     }
     rewriter.setInsertionPointToStart(ifA.elseBlock());
@@ -237,11 +217,12 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
     auto ifB = rewriter.create<scf::IfOp>(loc, bInBounds, /*withElse=*/true);
     rewriter.setInsertionPointToStart(ifB.thenBlock());
     {
-      // rhsFlat[ rhsBatchOff + bRow*N + col ]
-      Value bRowOffset = rewriter.create<arith::MulIOp>(loc, bRow, cRhsNStride);
-      Value bLinear    = rewriter.create<arith::AddIOp>(loc,
-                            rewriter.create<arith::AddIOp>(loc, rhsBatchOff, bRowOffset), col);
-      Value bVal = rewriter.create<memref::LoadOp>(loc, rhsFlat, ValueRange{bLinear});
+      // Load from original memref using multi-dimensional indices
+      SmallVector<Value> rhsIndices;
+      if (rhsRank > 2) rhsIndices.push_back(bz);
+      rhsIndices.push_back(bRow);
+      rhsIndices.push_back(col);
+      Value bVal = rewriter.create<memref::LoadOp>(loc, rhsBuffer, rhsIndices);
       rewriter.create<memref::StoreOp>(loc, bVal, tileB, ValueRange{ty, tx});
     }
     rewriter.setInsertionPointToStart(ifB.elseBlock());
@@ -311,11 +292,12 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
     auto ifOut = rewriter.create<scf::IfOp>(loc, outBounds, /*withElse=*/false);
     rewriter.setInsertionPointToStart(ifOut.thenBlock());
     {
-      // resFlat[ resBatchOff + row*N + col ]
-      Value rowOffsetR = rewriter.create<arith::MulIOp>(loc, row, cRhsNStride); // N stride
-      Value rLinear    = rewriter.create<arith::AddIOp>(loc,
-                            rewriter.create<arith::AddIOp>(loc, resBatchOff, rowOffsetR), col);
-      rewriter.create<memref::StoreOp>(loc, finalResult, resFlat, ValueRange{rLinear});
+      // Store to original memref using multi-dimensional indices
+      SmallVector<Value> resIndices;
+      if (totalBatches > 1) resIndices.push_back(bz);
+      resIndices.push_back(row);
+      resIndices.push_back(col);
+      rewriter.create<memref::StoreOp>(loc, finalResult, resultBuffer, resIndices);
     }
     rewriter.setInsertionPointAfter(ifOut);
 
@@ -324,7 +306,7 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
 
     // ---- Wrap result memref back to tensor ----
     Value resultTensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, resultType, resultMemRef, /*restrict=*/true).getResult();
+        loc, resultType, resultBuffer, /*restrict=*/true).getResult();
     rewriter.replaceOp(op, resultTensor);
 
     return success();

@@ -1,5 +1,4 @@
 
-
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -53,7 +52,11 @@ struct NovaOpTosaOp {
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
     return builder->create<tosa::SigmoidOp>(op.getLoc(), resultType, v);
   }
-
+  static Value mappingtosa(nova::LinearOp op, Type resultType,
+                           ValueRange input, OpBuilder *builder) {
+    auto matmulop= builder->create<nova::MatmulOp>(op.getLoc(), resultType,input[0],input[1]);
+    return builder->create<nova::AddOp>(op.getLoc(),resultType,matmulop.getResult(),input[2]);
+  }
   // MAE lowering pattern
   static Value mappingtosa(nova::MaeOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
@@ -725,14 +728,33 @@ struct NovaLayerNormBackwardPattern
     Location loc = op.getLoc();
     Value gy = adaptor.getGradY();
     Value x = adaptor.getX();
-    Value mean = adaptor.getMean();
-    Value rstd = adaptor.getRstd();
     Value gamma = adaptor.getGamma();
 
     auto xType = cast<RankedTensorType>(x.getType());
-    auto gyType = cast<RankedTensorType>(gy.getType());
     auto gammaType = cast<RankedTensorType>(gamma.getType());
+    
+    //epsilon
+    float eps = 1e-5f;
+    //computing mean
+    int64_t last_dim = xType.getRank() - 1;
+    llvm::SmallVector<int64_t, 1> dims = {last_dim};
+    llvm::SmallVector<int64_t, 4> red_shape(xType.getShape().begin(), xType.getShape().end());
+    red_shape[last_dim] = 1;
+    auto red_type = mlir::RankedTensorType::get(red_shape, xType.getElementType());
+    auto scalarType = mlir::RankedTensorType::get({}, xType.getElementType());
+    auto dim_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)xType.getShape().back())));
+    auto sum_x = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, x, red_type, true, dims, false);
+    auto mean = rewriter.create<mlir::nova::DivOp>(loc, sum_x.getResult(), dim_const.getResult());
     auto meanType = cast<RankedTensorType>(mean.getType());
+   
+    //Computing standard deviation 
+    auto diff = rewriter.create<mlir::nova::SubOp>(loc, x, mean.getResult());
+    auto diff2 = rewriter.create<mlir::nova::MulOp>(loc, diff.getResult(), diff.getResult());
+    auto sum_sq = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, diff2.getResult(), red_type, true, dims, false);
+    auto var = rewriter.create<mlir::nova::DivOp>(loc, sum_sq.getResult(), dim_const.getResult());
+    auto eps_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)eps)));
+    auto var_eps = rewriter.create<mlir::nova::AddOp>(loc, var.getResult(), eps_const.getResult());
+    auto rstd = rewriter.create<mlir::nova::RsqrtOp>(loc, var_eps.getResult());
 
     // 1. Compute x_hat = (x - mean) * rstd
     Value x_minus_mean =
@@ -806,10 +828,12 @@ struct NovaSceBackwardOpLowering
     Location loc = op.getLoc();
     Value logits = adaptor.getLogits();
     Value targets = adaptor.getTargets();
-    auto resultType = cast<RankedTensorType>(op.getType());
-    auto logitsType = cast<RankedTensorType>(logits.getType());
-    auto targetsType = cast<RankedTensorType>(targets.getType());
+    auto logitsType = cast<mlir::RankedTensorType>(logits.getType());
+    auto resultType = cast<mlir::RankedTensorType>(op.getResult().getType());
+    auto targetsType = cast<mlir::RankedTensorType>(targets.getType());
     int64_t rank = logitsType.getRank();
+    if (rank < 2) return failure();
+
     auto resultElemType = resultType.getElementType();
     auto targetIdxElemType = targetsType.getElementType();
 
@@ -844,8 +868,10 @@ struct NovaSceBackwardOpLowering
     for (int64_t i = 0; i < rank; ++i) {
       if (i != dim) N *= logitsType.getDimSize(i);
     }
+    
 
     // Force i64 indices throughout
+
     auto i64Type = rewriter.getI64Type();
     auto offsetsType = RankedTensorType::get({B}, i64Type);
     std::vector<int64_t> offsets(B);
@@ -884,11 +910,40 @@ struct NovaSceBackwardOpLowering
 
 
     // 7. Normalization (divide by N)
-    auto nInvConstType = RankedTensorType::get({}, resultElemType);
-    auto nInvConstAttr = DenseElementsAttr::get(nInvConstType, rewriter.getFloatAttr(resultElemType, 1.0 / N));
-    Value nInvConst = rewriter.create<mlir::nova::ConstantOp>(loc, nInvConstType, nInvConstAttr);
+    // Avoid dynamic tensor.from_elements to prevent Host Stack memory on GPU
+    bool isDynamic = false;
+    for (int64_t i = 0; i < rank; ++i) {
+        if (logitsType.getDimSize(i) == ShapedType::kDynamic) {
+            isDynamic = true; break;
+        }
+    }
 
-    Value finalGrad = rewriter.create<mlir::nova::MulOp>(loc, resultType, diff, nInvConst);
+
+    Value finalGrad;
+    if (!isDynamic && N > 0) {
+        // Use MulOp with a full-shape reciprocal constant (1/N) to avoid
+        // 0D tensor broadcasting issues in the elementwise linalg lowering.
+        // A 0D DivOp was silently dropped because the affine map (d0,d1,d2)->()
+        // was not handled correctly in NovaToLinalgElementwiseConverter.
+        float scale = 1.0f / static_cast<float>(N);
+        auto scaleAttr = DenseElementsAttr::get(resultType, scale);
+        Value scaleTensor = rewriter.create<mlir::nova::ConstantOp>(loc, resultType, scaleAttr);
+        finalGrad = rewriter.create<mlir::nova::MulOp>(loc, resultType, diff, scaleTensor);
+    } else {
+        // Fallback (may result in CUDA Error if used dynamically on GPU without managed memory)
+        Value totalElements = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+        for (int64_t i = 0; i < rank; ++i) {
+            if (i != dim) {
+                Value dimSize = rewriter.create<tensor::DimOp>(loc, logits, i);
+                totalElements = rewriter.create<arith::MulIOp>(loc, totalElements, dimSize);
+            }
+        }
+        Value nVal = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), totalElements);
+        Value nFloat = rewriter.create<arith::UIToFPOp>(loc, resultElemType, nVal);
+        auto tensor0DType = RankedTensorType::get({}, resultElemType);
+        Value nTensor = rewriter.create<tensor::FromElementsOp>(loc, tensor0DType, nFloat);
+        finalGrad = rewriter.create<mlir::nova::DivOp>(loc, resultType, diff, nTensor);
+    }
 
     rewriter.replaceOp(op, finalGrad);
     return success();
@@ -922,45 +977,62 @@ struct NovaLinearBackwardPattern
     Value grad_input =rewriter.create<mlir::nova::MatmulOp>(loc,RankedTensorType::get(xType.getShape(), xType.getElementType()),
       grad_out, wt).getResult();
 
-    // 2. grad_weight = matmul(x^T, grad_out) then reduced
-    auto xShape = xType.getShape().vec();
-    if (xShape.size() >= 2)
-      std::swap(xShape[xShape.size() - 1], xShape[xShape.size() - 2]);
-    auto xtType = RankedTensorType::get(xShape, xType.getElementType());
-    Value xt = rewriter.create<mlir::nova::TransposeOp>(
-                       loc, xtType, x, rewriter.getI32IntegerAttr(-1),
-                       rewriter.getI32IntegerAttr(-2))
-                   .getResult();
-
-    // Calculate intermediate batched dw shape
-    SmallVector<int64_t> dwBatchedShape;
-    for (size_t i = 0; i < xShape.size(); ++i) {
-      if (i == xShape.size() - 2) {
-        dwBatchedShape.push_back(xShape[xShape.size() - 2]); // C
-      } else if (i == xShape.size() - 1) {
-        dwBatchedShape.push_back(
-            gradOutType.getDimSize(gradOutType.getRank() - 1)); // D
-      } else {
-        dwBatchedShape.push_back(xShape[i]); // A
-      }
+    // 2. grad_weight = matmul(x_flat^T, grad_out_flat)
+    // x is (B, T, in). grad_out is (B, T, out)
+    // Reshape to (B*T, in) and (B*T, out)
+    int64_t BT = 1;
+    for (int64_t i = 0; i < xType.getRank() - 1; ++i) {
+        if (xType.getDimSize(i) == ShapedType::kDynamic) {
+             BT = -1; break;
+        }
+        BT *= xType.getDimSize(i);
     }
-    auto dwBatchedType =
-        RankedTensorType::get(dwBatchedShape, wType.getElementType());
-    Value dw_batched =
-        rewriter.create<mlir::nova::MatmulOp>(loc, dwBatchedType, xt, grad_out)
-            .getResult();
-
-    Value grad_weight = dw_batched;
-    if (dwBatchedType.getRank() > wType.getRank()) {
-      SmallVector<int64_t> rdims;
-      for (int64_t i = 0; i < dwBatchedType.getRank() - wType.getRank(); ++i) {
-        rdims.push_back(i);
-      }
-      grad_weight =
-          rewriter
-              .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
-                                            dw_batched, wType, false, rdims)
-              .getResult();
+    
+    int64_t K = xType.getDimSize(xType.getRank() - 1);
+    int64_t N_out = gradOutType.getDimSize(gradOutType.getRank() - 1);
+    
+    Value grad_weight;
+    if (BT != -1) {
+        auto xFlatType = RankedTensorType::get({BT, K}, xType.getElementType());
+        auto gOutFlatType = RankedTensorType::get({BT, N_out}, gradOutType.getElementType());
+        
+        Value xFlat = rewriter.create<mlir::nova::ReshapeOp>(loc, xFlatType, x);
+        Value gOutFlat = rewriter.create<mlir::nova::ReshapeOp>(loc, gOutFlatType, grad_out);
+        
+        // Transpose xFlat to (K, BT)
+        auto xtFlatType = RankedTensorType::get({K, BT}, xType.getElementType());
+        Value xtFlat = rewriter.create<mlir::nova::TransposeOp>(loc, xtFlatType, xFlat, 
+            rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(1)).getResult();
+            
+        grad_weight = rewriter.create<mlir::nova::MatmulOp>(loc, wType, xtFlat, gOutFlat).getResult();
+    } else {
+        // Fallback to batched if shapes are dynamic (though GPT-2 usually fixed)
+        auto xShape = xType.getShape().vec();
+        if (xShape.size() >= 2)
+          std::swap(xShape[xShape.size() - 1], xShape[xShape.size() - 2]);
+        auto xtType = RankedTensorType::get(xShape, xType.getElementType());
+        Value xt = rewriter.create<mlir::nova::TransposeOp>(
+                        loc, xtType, x, rewriter.getI32IntegerAttr(-1),
+                        rewriter.getI32IntegerAttr(-2))
+                    .getResult();
+        
+        SmallVector<int64_t> dwBatchedShape;
+        for (size_t i = 0; i < xShape.size(); ++i) {
+          if (i == xShape.size() - 2) {
+            dwBatchedShape.push_back(xShape[i]);
+          } else if (i == xShape.size() - 1) {
+            dwBatchedShape.push_back(gradOutType.getDimSize(gradOutType.getRank() - 1));
+          } else {
+            dwBatchedShape.push_back(xShape[i]);
+          }
+        }
+        auto dwBatchedType = RankedTensorType::get(dwBatchedShape, wType.getElementType());
+        Value dw_batched = rewriter.create<mlir::nova::MatmulOp>(loc, dwBatchedType, xt, grad_out).getResult();
+        
+        SmallVector<int64_t> rdims;
+        for (int64_t i = 0; i < dwBatchedType.getRank() - wType.getRank(); ++i) rdims.push_back(i);
+        grad_weight = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
+                                              dw_batched, wType, false, rdims).getResult();
     }
 
     // 3. grad_bias = reduce_sum(grad_out, batchDims)
@@ -1016,6 +1088,7 @@ struct NovaToTosaLoweringPass
     target.addIllegalOp<nova::SigmoidOp>();
     target.addIllegalOp<nova::GeluOp>();
     target.addIllegalOp<nova::SoftmaxOp>();
+    target.addIllegalOp<nova::LinearOp>();
     target.addIllegalOp<nova::BceOp>();
     target.addIllegalOp<nova::SceBackwardOp>();
     target.addIllegalOp<nova::LayerNormOp>();
@@ -1048,7 +1121,7 @@ void populateNovaToTosaConversionPatterns(RewritePatternSet &patterns) {
                NovaToTosaLoweringTemplate<nova::MseOp>,
                NovaToTosaLoweringTemplate<nova::CceOp>,
                NovaToTosaLoweringTemplate<nova::BceOp>,
-
+               NovaToTosaLoweringTemplate<nova::LinearOp>,
                NovaToTosaLoweringTemplate<nova::SigmoidOp>,
                NovaToTosaLoweringTemplate<nova::CastOp>>(patterns.getContext());
 }

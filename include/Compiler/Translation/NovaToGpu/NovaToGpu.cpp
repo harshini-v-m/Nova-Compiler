@@ -271,6 +271,27 @@ public:
     }
     Value input = op.getInput();
     auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
+    auto outputType = llvm::dyn_cast<RankedTensorType>(op.getOutput().getType());
+
+    if (!inputType || !outputType)
+      return failure();
+
+    // Only support reduction to scalar for now in this direct GPU mapper
+    // Partial reductions should fall back to NovaToLinalg
+    if (outputType.getRank() != 0) {
+       bool all_dims_reduced = true;
+       if (auto dimensionAttr = op.getDimension()) {
+         if (dimensionAttr->size() != inputType.getRank()) {
+            all_dims_reduced = false;
+         }
+       } else {
+          // If dimension is null, it's a full reduction to scalar (if output rank is 0).
+          // If output rank > 0 but dimension is null, it's weird, but technically full reduction leads to rank 0.
+          all_dims_reduced = (outputType.getRank() == 0);
+       }
+       if (!all_dims_reduced)
+         return failure();
+    }
 
     // 2. Map Reduction Kind to GPU Op attribute
     gpu::AllReduceOperation gpuOp;
@@ -305,7 +326,6 @@ public:
     // Result type is got from output type
     // and we are creating the memref for it
     // (eg: 0-D tensor -> 0-D memref)
-    auto outputType = cast<RankedTensorType>(op.getOutput().getType());
     auto memRefType = MemRefType::get(
         outputType.getShape(), inputType.getElementType(),
         MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
