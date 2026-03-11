@@ -10,7 +10,7 @@ namespace mlir {
 namespace nova {
 
 std::unique_ptr<Pass> createConvertMemRefToGpuPass();
-std::unique_ptr<Pass> createAffineScalarizeAccumulatorPass();
+std::unique_ptr<Pass> createSCFScalarizeAccumulatorPass();
 std::unique_ptr<Pass> createRemDevAttrPass();
 std::unique_ptr<Pass> createVectorOptPass();
 std::unique_ptr<Pass> createRenameGpuKernelsPass();

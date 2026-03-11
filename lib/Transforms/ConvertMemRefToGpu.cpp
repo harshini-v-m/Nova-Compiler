@@ -109,6 +109,85 @@ public:
     return success();
   }
 };
+
+class ConvertStoreOp : public OpRewritePattern<memref::StoreOp> {
+public:
+  using OpRewritePattern<memref::StoreOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::StoreOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op->getParentOfType<gpu::GPUFuncOp>())
+      return failure();
+
+    auto dstType = llvm::dyn_cast<MemRefType>(op.getMemRef().getType());
+    if (!dstType) return failure();
+    
+    bool isGpu = false;
+    if (op.getMemRef().getDefiningOp<gpu::AllocOp>()) {
+      isGpu = true;
+    } else {
+      auto space = dstType.getMemorySpace();
+      if (space && (isa<gpu::AddressSpaceAttr>(space) || 
+                    (isa<IntegerAttr>(space) && cast<IntegerAttr>(space).getInt() == 1))) {
+        isGpu = true;
+      }
+    }
+    
+    if (!isGpu) return failure();
+
+    Location loc = op.getLoc();
+    if (dstType.getRank() == 0) {
+      auto allocaType = MemRefType::get({}, dstType.getElementType());
+      auto allocaOp = rewriter.create<memref::AllocaOp>(loc, allocaType);
+      rewriter.create<memref::StoreOp>(loc, op.getValue(), allocaOp, ValueRange{});
+      rewriter.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{}, op.getMemRef(), allocaOp);
+      rewriter.eraseOp(op);
+      return success();
+    }
+    
+    return failure();
+  }
+};
+
+class ConvertLoadOp : public OpRewritePattern<memref::LoadOp> {
+public:
+  using OpRewritePattern<memref::LoadOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::LoadOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op->getParentOfType<gpu::GPUFuncOp>())
+      return failure();
+
+    auto srcType = llvm::dyn_cast<MemRefType>(op.getMemRef().getType());
+    if (!srcType) return failure();
+    
+    bool isGpu = false;
+    if (op.getMemRef().getDefiningOp<gpu::AllocOp>()) {
+      isGpu = true;
+    } else {
+      auto space = srcType.getMemorySpace();
+      if (space && (isa<gpu::AddressSpaceAttr>(space) || 
+                    (isa<IntegerAttr>(space) && cast<IntegerAttr>(space).getInt() == 1))) {
+        isGpu = true;
+      }
+    }
+    
+    if (!isGpu) return failure();
+
+    Location loc = op.getLoc();
+    if (srcType.getRank() == 0) {
+      auto allocaType = MemRefType::get({}, srcType.getElementType());
+      auto allocaOp = rewriter.create<memref::AllocaOp>(loc, allocaType);
+      rewriter.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{}, allocaOp, op.getMemRef());
+      Value loadedVal = rewriter.create<memref::LoadOp>(loc, allocaOp, ValueRange{});
+      rewriter.replaceOp(op, loadedVal);
+      return success();
+    }
+    
+    return failure();
+  }
+};
+
 struct ConvertMemRefToGpuPass
     : public ::impl::ConvertMemRefToGpuBase<ConvertMemRefToGpuPass> {
   using ::impl::ConvertMemRefToGpuBase<
@@ -186,7 +265,7 @@ struct ConvertMemRefToGpuPass
 
     // 4. Convert memref.alloc/dealloc with memory space 1 to gpu.alloc/dealloc
     RewritePatternSet patterns(ctx);
-    patterns.add<ConvertAllocOp, ConvertDeallocOp, ConvertMemrefOp>(ctx);
+    patterns.add<ConvertAllocOp, ConvertDeallocOp, ConvertMemrefOp, ConvertStoreOp, ConvertLoadOp>(ctx);
 
     if (failed(applyPatternsGreedily(module, std::move(patterns))))
       signalPassFailure();

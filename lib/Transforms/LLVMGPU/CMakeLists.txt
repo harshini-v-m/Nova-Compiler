@@ -4,6 +4,7 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaGPUTileDispatchUsingForall.cpp
   NovaGPUPadOperands.cpp
   NovaGPUPromoteMatmulOperands.cpp
+  SCFScalarizeAccumulator.cpp
   NovaGPUApplyTilingLevelReduction.cpp
   # GAP 2: Erase fusion barriers before bufferization
   NovaGPUEraseFusionBarriers.cpp

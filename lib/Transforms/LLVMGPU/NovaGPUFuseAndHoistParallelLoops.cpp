@@ -31,6 +31,7 @@
 
 #include "Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -458,6 +459,20 @@ struct FuseTilableForallConsumers final
     auto dpsOp = dyn_cast<DestinationStyleOpInterface>(*tilableOp);
     if (!dpsOp)
       return failure();
+
+    // Don't fuse cooperative copies that write to workgroup shared memory.
+    // These are Stage 1 promotion copies (global→shared) that must remain
+    // outside thread foralls so all threads participate in the cooperative
+    // load.  Fusing them into a thread forall would (a) make each thread
+    // copy only its own tile and (b) cause dominance violations when the
+    // alloc_tensor<workgroup> is defined after the producer forall.
+    for (auto init : dpsOp.getDpsInits()) {
+      if (auto allocOp =
+              init.getDefiningOp<bufferization::AllocTensorOp>()) {
+        if (allocOp.getMemorySpace().has_value())
+          return failure();
+      }
+    }
 
     // Find a scf.forall producer among the DPS inputs.
     scf::ForallOp forallProducer;

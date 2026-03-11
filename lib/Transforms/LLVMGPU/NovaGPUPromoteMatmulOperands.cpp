@@ -123,12 +123,18 @@ static void promoteOperandToShared(OpBuilder &builder,
   Value stage1Result = stage1Copy.getResult(0);
 
   // -----------------------------------------------------------------------
-  // Stage 2: per-thread copy from shared memory.
-  // No fusion barrier needed: with promotion moved after K-reduction tiling,
-  // both Stage 1 (global→shared) and Stage 2 (shared→private) are already
-  // inside the K-loop body. There is no risk of Stage 1 fusing across loops.
+  // Fence: insert nova.fusion_barrier to prevent Stage 1 (global→shared
+  // cooperative copy) from fusing into Stage 2's per-thread loop.
+  // Without this barrier, elementwise fusion merges both copies into a
+  // single per-thread loop, defeating shared memory cooperative loading.
+  // The barrier is erased at the start of bufferization.
   // -----------------------------------------------------------------------
-  Value promoted = buildPerThreadCopy(builder, loc, stage1Result);
+  Value fenced = FusionBarrierOp::create(builder, loc, stage1Result).getResult();
+
+  // -----------------------------------------------------------------------
+  // Stage 2: per-thread copy from shared memory.
+  // -----------------------------------------------------------------------
+  Value promoted = buildPerThreadCopy(builder, loc, fenced);
 
   // Replace this operand of the linalg op with the promoted per-thread copy.
   linalgOp->setOperand(

@@ -155,9 +155,9 @@ namespace mlir::nova
     // -------------------------------------------------------------------------
     // Step 5: Tile thread-level M/N dimensions
     // -------------------------------------------------------------------------
-    pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelThreadPass());
-    pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-    pm.addPass(createCSEPass());
+    // pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelThreadPass());
+    // pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
+    // pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
     // Step 6: Tile subgroup (warp) M/N dimensions
@@ -169,8 +169,8 @@ namespace mlir::nova
     // -------------------------------------------------------------------------
     // Step 7: Fuse and hoist parallel loops
     // -------------------------------------------------------------------------
-    pm.addNestedPass<func::FuncOp>(
-        createNovaGPUFuseAndHoistParallelLoopsPass());
+    // pm.addNestedPass<func::FuncOp>(
+    //     createNovaGPUFuseAndHoistParallelLoopsPass());
 
     // -------------------------------------------------------------------------
     // Step 7.5: Normalize forall loop bounds
@@ -233,6 +233,7 @@ namespace mlir::nova
     // Step 10: Lower remaining linalg → scf loops, affine → arith
     // -------------------------------------------------------------------------
     pm.addPass(createConvertLinalgToLoopsPass());
+    pm.addNestedPass<func::FuncOp>(mlir::nova::createSCFScalarizeAccumulatorPass());
     pm.addPass(createLowerAffinePass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
@@ -339,7 +340,7 @@ namespace mlir::nova
     binaryOptions.toolkitPath = "/usr/local/cuda-13.0";
     binaryOptions.compilationTarget = "isa";
     pm.addPass(createGpuModuleToBinaryPass(binaryOptions));
-    //pm.addPass(nova::createGpuRuntimeLoweringPass());
+    pm.addPass(nova::createGpuRuntimeLoweringPass());
 
     // 13.4 — Lower gpu.* host ops (gpu.alloc, gpu.launch_func, etc.) to LLVM
     //         runtime calls (mgpuMemAlloc, mgpuLaunchKernel, etc.).
@@ -360,7 +361,7 @@ namespace mlir::nova
     pm.addPass(createNovaGPULowerMemorySpacePass());
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
     pm.addPass(createConvertFuncToLLVMPass());
-    //pm.addPass(nova::createGenerateDynamicWrapperPass());
+    pm.addPass(nova::createGenerateDynamicWrapperPass());
     pm.addPass(createReconcileUnrealizedCastsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());

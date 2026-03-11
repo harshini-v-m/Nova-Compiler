@@ -72,7 +72,8 @@ enum class NovaTilingLevel {
 static constexpr int64_t kReductionTile = 32;
 
 // Thread-level tile per dimension (register tile per thread).
-static constexpr int64_t kThreadTile = 4;
+// 8 gives (128/8)*(128/8) = 256 threads for 128x128 workgroup tiles.
+static constexpr int64_t kThreadTile = 8;
 
 // Subgroup-level tile per dimension (warp tile).
 static constexpr int64_t kSubgroupTile = 16;

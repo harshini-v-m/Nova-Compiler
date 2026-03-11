@@ -313,6 +313,14 @@ NovaCompilerAPI::compileToLLVMModule(ModuleOp module,
     llvm::errs() << "Pipeline execution failed\n";
     return nullptr;
   }
+   {
+        std::error_code ec1;
+        llvm::raw_fd_ostream dest1("pipeline_res.mlir", ec1, llvm::sys::fs::OF_Text);
+        if (!ec1) {
+            module->print(dest1);
+            dest1.flush();
+        }
+    }
 
   auto llvmModule = translateModuleToLLVMIR(module, llvmContext);
   return llvmModule;

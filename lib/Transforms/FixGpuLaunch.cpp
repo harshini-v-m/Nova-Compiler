@@ -92,9 +92,9 @@ public:
 
     Value one = rewriter.create<LLVM::ConstantOp>(
         loc, int32Ty, rewriter.getI32IntegerAttr(1));
-    // Allocate space on stack for the device pointer (always space 0)
+    // Allocate space on stack for the generic device pointer (always space 0)
     Value ptrVar =
-        rewriter.create<LLVM::AllocaOp>(loc, genericPtrTy, devicePtrTy, one, 8);
+        rewriter.create<LLVM::AllocaOp>(loc, genericPtrTy, genericPtrTy, one, 8);
 
     Value stream = rewriter.create<LLVM::ZeroOp>(loc, genericPtrTy);
     if (!op.getAsyncDependencies().empty()) {
@@ -105,7 +105,8 @@ public:
 
     rewriter.create<LLVM::CallOp>(loc, cudaMalloc,
                                   ValueRange{ptrVar, sizeBytes, stream});
-    Value devicePtr = rewriter.create<LLVM::LoadOp>(loc, devicePtrTy, ptrVar);
+    Value genericDevicePtr = rewriter.create<LLVM::LoadOp>(loc, genericPtrTy, ptrVar);
+    Value devicePtr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, devicePtrTy, genericDevicePtr);
 
     SmallVector<Type> elemTypes;
     elemTypes.push_back(devicePtrTy);
@@ -462,13 +463,37 @@ public:
       sizeBytes = rewriter.create<LLVM::MulOp>(loc, sizeBytes, dimSize);
     }
 
-    // Convert value to i32 (cudaMemset expects a byte or i32 depending on API,
-    // usually byte-wise)
-    // For float 0.0, we can just use 0.
-    Value fillValue = rewriter.create<LLVM::ConstantOp>(
-        loc, int32Ty, rewriter.getI32IntegerAttr(0));
+    // Convert padding/fill value to i32 (cudaMemset expects a byte or i32 depending on API,
+    // usually byte-wise). For F32/F16 types, use Bitcast to I32/I16.
+    Value fillValueRaw = op.getValue(); // Get the actual memref padding value
+    Value fillValue;
+    if (fillValueRaw) {
+      Type fillType = fillValueRaw.getType();
+      if (fillType.isIntOrFloat() && fillType.getIntOrFloatBitWidth() < 32) {
+        // Zero extend/Bitcast up to 32 bits
+        if (fillType.isF16() || fillType.isBF16()) {
+          auto int16Ty = IntegerType::get(ctx, 16);
+          Value bitcast = rewriter.create<LLVM::BitcastOp>(loc, int16Ty, fillValueRaw);
+          fillValue = rewriter.create<LLVM::ZExtOp>(loc, int32Ty, bitcast);
+        } else {
+          fillValue = rewriter.create<LLVM::ZExtOp>(loc, int32Ty, fillValueRaw);
+        }
+      } else if (fillType.isF32()) {
+        fillValue = rewriter.create<LLVM::BitcastOp>(loc, int32Ty, fillValueRaw);
+      } else if (fillType.isIntOrFloat() && fillType.getIntOrFloatBitWidth() == 32) {
+        fillValue = fillValueRaw;
+      } else {
+        // Fallback for unexpected sizes
+        fillValue = rewriter.create<LLVM::ConstantOp>(loc, int32Ty, rewriter.getI32IntegerAttr(0));
+      }
+    } else {
+      fillValue = rewriter.create<LLVM::ConstantOp>(loc, int32Ty, rewriter.getI32IntegerAttr(0));
+    }
 
-    Value stream = rewriter.create<LLVM::ZeroOp>(loc, genericPtrTy);
+    // Fallback stream: 2 (cudaStreamPerThread) instead of 0 (null/default stream)
+    // to avoid full device synchronization when there are no async dependencies.
+    Value streamFallbackInt = rewriter.create<LLVM::ConstantOp>(loc, int64Ty, rewriter.getI64IntegerAttr(2));
+    Value stream = rewriter.create<LLVM::IntToPtrOp>(loc, genericPtrTy, streamFallbackInt);
     if (!op.getAsyncDependencies().empty()) {
        Value token = op.getAsyncDependencies().front();
        auto ptrTy = LLVM::LLVMPointerType::get(ctx);
@@ -691,12 +716,57 @@ public:
 // device memory, but whose address space was erased during gpu-to-llvm
 // lowering.
 static bool isGpuAllocPtr(Value val) {
-  auto callOp = val.getDefiningOp<LLVM::CallOp>();
-  if (!callOp)
-    return false;
-  auto callee = callOp.getCallee();
-  return callee &&
-         (*callee == "mgpuMemAlloc" || *callee == "cudaMallocAsync");
+  llvm::errs() << "[isGpuAllocPtr] Checking value: " << val << "\n";
+  if (val.getDefiningOp()) {
+      llvm::errs() << "[isGpuAllocPtr] Defining op: " << val.getDefiningOp()->getName() << "\n";
+  } else {
+      llvm::errs() << "[isGpuAllocPtr] No defining op (Block argument)\n";
+  }
+
+  // Strip casts that might obscure the source
+  while (auto castOp = val.getDefiningOp()) {
+    if (isa<LLVM::AddrSpaceCastOp>(castOp) || isa<LLVM::BitcastOp>(castOp)) {
+      val = castOp->getOperand(0);
+      llvm::errs() << "[isGpuAllocPtr] Stripped cast, new val: " << val << "\n";
+    } else {
+      break;
+    }
+  }
+
+  // Case 1: Direct CallOp return (fallback/rare in the current MLIR pattern)
+  if (auto callOp = val.getDefiningOp<LLVM::CallOp>()) {
+    auto callee = callOp.getCallee();
+    if (callee) {
+      StringRef name = *callee;
+      llvm::errs() << "[isGpuAllocPtr] Case 1, Callee: " << name << "\n";
+      return name == "mgpuMemAlloc" || name == "cudaMallocAsync";
+    }
+  }
+
+  // Case 2: Standard conversion pattern Alloca -> Call -> Load
+  if (auto loadOp = val.getDefiningOp<LLVM::LoadOp>()) {
+    auto alloca = loadOp.getAddr();
+    llvm::errs() << "[isGpuAllocPtr] Case 2, LoadOp found. Alloca: " << alloca << "\n";
+    // Verify that this exact alloca was passed as the first argument to cudaMallocAsync
+    for (Operation *user : alloca.getUsers()) {
+      llvm::errs() << "  [isGpuAllocPtr] Alloca user: " << user->getName() << "\n";
+      if (auto callOp = dyn_cast<LLVM::CallOp>(user)) {
+        if (callOp.getNumOperands() > 0 && callOp.getOperand(0) == alloca) {
+          auto callee = callOp.getCallee();
+          if (callee) {
+            StringRef name = *callee;
+            llvm::errs() << "  [isGpuAllocPtr] Alloca used in call: " << name << "\n";
+            if (name == "mgpuMemAlloc" || name == "cudaMallocAsync") {
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  llvm::errs() << "[isGpuAllocPtr] Return false.\n";
+  return false;
 }
 
 // Host-side load from a plain GPU pointer (addrspace 0) returned by
@@ -816,26 +886,14 @@ public:
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    module.walk([&](LLVM::LoadOp op) {
-      auto ptrType = llvm::dyn_cast<LLVM::LLVMPointerType>(op.getAddr().getType());
-      if (ptrType) {
-        llvm::errs() << "  [load] addrspace=" << ptrType.getAddressSpace()
-                     << " addr_defop=" << (op.getAddr().getDefiningOp()
-                        ? op.getAddr().getDefiningOp()->getName().getStringRef()
-                        : "blockarg")
-                     << "\n";
-      }
-    });
-
     RewritePatternSet patterns(module.getContext());
     patterns.add<ConvertGpuAllocToCall>(module.getContext());
     patterns.add<ConvertGpuMemcpyToCall>(module.getContext());
     patterns.add<ConvertGpuDeallocToCall>(module.getContext());
     patterns.add<ConvertGpuMemsetToCall>(module.getContext());
+    // FixHostGpuAccess and FixHostGpuStore affect direct host accesses on addrspace 1
     patterns.add<FixHostGpuAccess>(module.getContext());
     patterns.add<FixHostGpuStore>(module.getContext());
-    patterns.add<FixHostMgpuPtrLoad>(module.getContext());
-    patterns.add<FixHostMgpuPtrStore>(module.getContext());
     if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
       signalPassFailure();
     }
@@ -850,6 +908,31 @@ public:
 
 std::unique_ptr<Pass> createGpuRuntimeLoweringPass() {
   return std::make_unique<GpuRuntimeLoweringPass>();
+}
+
+class FixHostGpuMemoryPass
+    : public PassWrapper<FixHostGpuMemoryPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FixHostGpuMemoryPass)
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    RewritePatternSet patterns(module.getContext());
+    patterns.add<FixHostMgpuPtrLoad>(module.getContext());
+    patterns.add<FixHostMgpuPtrStore>(module.getContext());
+    if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
+      signalPassFailure();
+    }
+  }
+
+  StringRef getArgument() const final { return "fix-host-gpu-memory"; }
+  StringRef getDescription() const final {
+    return "Patch host-side access to GPU pointers via cudaMemcpy";
+  }
+};
+
+std::unique_ptr<Pass> createFixHostGpuMemoryPass() {
+  return std::make_unique<FixHostGpuMemoryPass>();
 }
 
 } // namespace nova

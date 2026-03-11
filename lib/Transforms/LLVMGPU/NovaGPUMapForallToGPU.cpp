@@ -153,7 +153,26 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     return failure();
   }
 
-  // ----- Step 3: Create gpu.launch -----
+  // ----- Step 3: Clamp block dims to CUDA's 1024-thread limit -----
+  // CUDA's maximum threads per block is 1024. If the computed blockDims
+  // exceed this (e.g., due to an oversized thread tile from the config),
+  // the PTX JIT rejects the module with CUDA_ERROR_INVALID_PTX.
+  // We redistribute excess threads into the grid (blockDims[0] overflow
+  // goes to gridDims[0]) and hard-clamp blockDims[0] at 1024.
+  static constexpr int64_t kMaxThreadsPerBlock = 1024;
+  if (blockDims[0] > kMaxThreadsPerBlock) {
+    blockForall.emitWarning()
+        << "[nova-gpu-map-forall] blockDims.x=" << blockDims[0]
+        << " exceeds CUDA limit of " << kMaxThreadsPerBlock
+        << "; clamping to " << kMaxThreadsPerBlock
+        << ". Grid will absorb the overflow.";
+    // Overflow factor: push extra work into the block-dim grid.
+    int64_t overflow = (blockDims[0] + kMaxThreadsPerBlock - 1) / kMaxThreadsPerBlock;
+    gridDims[0] *= overflow;
+    blockDims[0] = kMaxThreadsPerBlock;
+  }
+
+  // ----- Step 4: Create gpu.launch -----
   rewriter.setInsertionPoint(blockForall);
   auto cstIdx = [&](int64_t v) {
     return rewriter.create<arith::ConstantIndexOp>(loc, v);
@@ -172,7 +191,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     rewriter.create<gpu::TerminatorOp>(loc);
   }
 
-  // ----- Step 4: Replace block forall IVs -----
+  // ----- Step 5: Replace block forall IVs -----
   {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(&launchBody);
@@ -213,7 +232,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     }
   }
 
-  // ----- Step 5: Erase block forall terminator, move body to launch -----
+  // ----- Step 6: Erase block forall terminator, move body to launch -----
   // The in_parallel terminator (empty after bufferization) must be erased.
   rewriter.eraseOp(blockForall.getTerminator());
 
@@ -221,12 +240,22 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   auto insertPt = launchBody.without_terminator().end();
   launchBody.getOperations().splice(insertPt, forallBody->getOperations());
 
-  // ----- Step 6: Convert thread foralls inside the launch body -----
+  // ----- Step 7: Convert thread foralls inside the launch body -----
   for (auto threadForall : threadForalls) {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(threadForall);
     auto threadMapping = threadForall.getMappingAttr().getValue();
     auto threadUBs = threadForall.getMixedUpperBound();
+
+    // All thread forall bounds must be static constants.  Dynamic bounds
+    // arise from non-aligned dimensions that were not padded.
+    for (auto [idx, ub] : llvm::enumerate(threadUBs)) {
+      if (!getConstantIntValue(ub))
+        return threadForall.emitError(
+            "thread forall upper bound at dim ")
+               << idx << " is not a static constant; "
+               << "ensure all ops are padded to tile-aligned sizes";
+    }
 
     if (isLinearThreadMapping(threadForall)) {
       // Linear thread mapping: tid = threadIdx.x.
@@ -323,7 +352,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     }
   }
 
-  // ----- Step 7: Erase original block forall -----
+  // ----- Step 8: Erase original block forall -----
   rewriter.eraseOp(blockForall);
   return success();
 }

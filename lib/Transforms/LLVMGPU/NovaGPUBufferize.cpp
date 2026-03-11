@@ -134,6 +134,28 @@ static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
   }
 
   if (insideForall) {
+    if (auto memRefType = llvm::dyn_cast<MemRefType>(from.getType())) {
+      if (memRefType.getRank() == 0) {
+        // Only hoist if `from` is defined OUTSIDE the scf.forall loop.
+        bool isDefinedOutside = true;
+        if (Operation *defOp = from.getDefiningOp()) {
+          if (parent->isAncestor(defOp)) isDefinedOutside = false;
+        } else if (auto arg = llvm::dyn_cast<BlockArgument>(from)) {
+          if (parent->isAncestor(arg.getOwner()->getParentOp())) isDefinedOutside = false;
+        }
+
+        if (isDefinedOutside) {
+          Value scalarInit;
+          {
+            OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPoint(parent); // parent is the scf::ForallOp
+            scalarInit = builder.create<memref::LoadOp>(loc, from);
+          }
+          builder.create<memref::StoreOp>(loc, scalarInit, to);
+          return success();
+        }
+      }
+    }
     linalg::CopyOp::create(builder, loc, from, to);
   } else {
     memref::CopyOp::create(builder, loc, from, to);

@@ -32,6 +32,11 @@
 
 namespace mlir::nova {
 
+/// CUDA's maximum number of threads per block (hardware limit).
+/// Exceeding this produces an invalid .maxntid directive in PTX,
+/// causing cuModuleLoadDataEx to return CUDA_ERROR_INVALID_PTX (218).
+static constexpr int64_t kMaxThreadsPerBlock = 1024;
+
 //===----------------------------------------------------------------------===//
 // SIMT fallback tile table
 //===----------------------------------------------------------------------===//
@@ -53,6 +58,62 @@ static constexpr SimtTilePair kSimtTable[] = {
     {{ 16,  64,  4}, {16,  2, 1}},
     {{  1, 128,  8}, {32,  1, 1}},
 };
+
+//===----------------------------------------------------------------------===//
+// clampThreadTilesToMaxThreads — enforce CUDA 1024-thread limit
+//===----------------------------------------------------------------------===//
+
+/// Adjusts `threadTiles` in-place so that the product of (workgroupTile[i] /
+/// threadTile[i]) over all non-zero thread tile entries is at most
+/// `kMaxThreadsPerBlock`. Iteratively halves the largest-contributing
+/// dimension's thread-count factor until the constraint is met.
+/// This prevents the PTX JIT from rejecting the kernel with
+/// CUDA_ERROR_INVALID_PTX when `.maxntid` would exceed 1024.
+static void clampThreadTilesToMaxThreads(ArrayRef<int64_t> workgroupTiles,
+                                         SmallVectorImpl<int64_t> &threadTiles) {
+  int n = (int)threadTiles.size();
+
+  // Compute the per-dim thread counts: ceil(workgroup[i] / thread[i])
+  // Only non-zero thread tiles contribute threads.
+  auto computeTotal = [&]() -> int64_t {
+    int64_t total = 1;
+    for (int i = 0; i < n; ++i) {
+      if (threadTiles[i] <= 0) continue;
+      if (i >= (int)workgroupTiles.size() || workgroupTiles[i] <= 0) continue;
+      // Number of forall iterations = ceil(wgTile / threadTile).
+      int64_t trips = (workgroupTiles[i] + threadTiles[i] - 1) / threadTiles[i];
+      total *= trips;
+    }
+    return total;
+  };
+
+  // Iteratively double the thread tile (halving the forall trip count) for
+  // the dimension with the most trips, until total threads <= limit.
+  while (computeTotal() > kMaxThreadsPerBlock) {
+    // Find dimension with the most forall trips.
+    int worstDim = -1;
+    int64_t worstTrips = 0;
+    for (int i = 0; i < n; ++i) {
+      if (threadTiles[i] <= 0) continue;
+      if (i >= (int)workgroupTiles.size() || workgroupTiles[i] <= 0) continue;
+      int64_t trips = (workgroupTiles[i] + threadTiles[i] - 1) / threadTiles[i];
+      if (trips > worstTrips) {
+        worstTrips = trips;
+        worstDim = i;
+      }
+    }
+    if (worstDim < 0)
+      break; // Nothing to adjust.
+    // Double the thread tile size (each thread does twice as much work).
+    threadTiles[worstDim] *= 2;
+    // Clamp: thread tile can't exceed the workgroup tile.
+    if (worstDim < (int)workgroupTiles.size())
+      threadTiles[worstDim] = std::min(threadTiles[worstDim], workgroupTiles[worstDim]);
+    // Safety: avoid infinite loop if trips can't be reduced further.
+    if (computeTotal() > kMaxThreadsPerBlock && worstTrips <= 1)
+      break;
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // Helper: infer M/N/K dims from contraction op
@@ -140,9 +201,9 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   kStep = std::min(kStep, dims.K);
 
   // Ensure thread count (workgroupSize) doesn't exceed 1024.
-  // Thread count = (wgM / 4) * (wgN / 4) since thread tiles are hardcoded to 4x4.
-  // 1024 threads = (32 * 32).
-  while ((wgM / 4) * (wgN / 4) > 1024 && wgN > 4) {
+  // Thread count = (wgM / 8) * (wgN / 8) since thread tiles are 8x8.
+  // Target: 256 threads = (16 * 16) for optimal RTX 3060 occupancy.
+  while ((wgM / 8) * (wgN / 8) > 1024 && wgN > 8) {
     wgN /= 2;
   }
 
@@ -178,8 +239,9 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   workgroupTiles[contractionDims->m.back()] = wgM;
   workgroupTiles[contractionDims->n.back()] = wgN;
   reductionTiles[contractionDims->k.back()] = kStep;
-  threadTiles[contractionDims->m.back()] = 4;
-  threadTiles[contractionDims->n.back()] = 4;
+  // Thread tile = 8: gives (wgM/8) * (wgN/8) = 16*16 = 256 threads for 128x128.
+  threadTiles[contractionDims->m.back()] = 8;
+  threadTiles[contractionDims->n.back()] = 8;
   subgroupTiles[contractionDims->m.back()] = 16;
   subgroupTiles[contractionDims->n.back()] = 16;
 
@@ -224,8 +286,8 @@ static void setSimtConfig(linalg::LinalgOp matmul,
   int64_t wgN = chosen->tileMNK[1];
 
   // Ensure thread count stays <= 1024.
-  // Thread tiles are hardcoded to 4x4 below.
-  while ((wgM / 4) * (wgN / 4) > 1024 && wgN > 4) {
+  // Thread tiles are 8x8 below, targeting 256 threads per block.
+  while ((wgM / 8) * (wgN / 8) > 1024 && wgN > 8) {
     wgN /= 2;
   }
 
@@ -256,8 +318,9 @@ static void setSimtConfig(linalg::LinalgOp matmul,
   workgroupTiles[contractionDims->m.back()] = wgM;
   workgroupTiles[contractionDims->n.back()] = wgN;
   reductionTiles[contractionDims->k.back()] = chosen->tileMNK[2];
-  threadTiles[contractionDims->m.back()] = 4;
-  threadTiles[contractionDims->n.back()] = 4;
+  // Thread tile = 8: gives (wgM/8) * (wgN/8) threads, targeting 256 per block.
+  threadTiles[contractionDims->m.back()] = 8;
+  threadTiles[contractionDims->n.back()] = 8;
   subgroupTiles[contractionDims->m.back()] = 16;
   subgroupTiles[contractionDims->n.back()] = 16;
 
@@ -342,8 +405,6 @@ LogicalResult setReductionLoweringConfig(linalg::LinalgOp op,
       return failure();
   }
 
-  const int subgroupSize = target.preferredSubgroupSize; // 32 for NVIDIA
-
   // Collect parallel and reduction dims.
   SmallVector<unsigned> parallelDims, reductionDims;
   for (int i = 0; i < numLoops; ++i) {
@@ -362,6 +423,14 @@ LogicalResult setReductionLoweringConfig(linalg::LinalgOp op,
   // Distribute parallel dims: tile innermost parallel dims.
   // Use 128 for the two innermost parallel dims (matching matmul workgroup
   // tile), 1 for batch/outer dims.
+  // Target 256 threads per block total.
+
+  // Count active (non-batch) parallel dims to compute per-dim thread count.
+  int numActiveParallel = std::min((int)parallelDims.size(), 2);
+  // For 2 active dims: 16 threads each → 256 total.
+  // For 1 active dim: 256 threads from that dim.
+  int64_t perDimThreadTarget = (numActiveParallel >= 2) ? 16 : 256;
+
   int parallelCount = 0;
   for (int i = parallelDims.size() - 1; i >= 0; --i) {
     unsigned dim = parallelDims[i];
@@ -369,9 +438,8 @@ LogicalResult setReductionLoweringConfig(linalg::LinalgOp op,
       // Clamp to problem size.
       int64_t wgTile = std::min((int64_t)128, loopBounds[dim]);
       workgroupTiles[dim] = wgTile;
-      // Thread tile: distribute the workgroup tile across subgroupSize threads.
-      // Each thread handles wgTile / subgroupSize elements (min 1).
-      int64_t threadTile = std::max((int64_t)1, wgTile / subgroupSize);
+      // Thread tile: target perDimThreadTarget threads from this dim.
+      int64_t threadTile = std::max((int64_t)1, wgTile / perDimThreadTarget);
       // Ensure thread tile divides workgroup tile.
       while (threadTile > 1 && wgTile % threadTile != 0)
         --threadTile;
@@ -388,6 +456,11 @@ LogicalResult setReductionLoweringConfig(linalg::LinalgOp op,
   for (unsigned dim : reductionDims) {
     reductionTiles[dim] = getReductionTilingFactor(loopBounds[dim]);
   }
+
+  // --- Enforce CUDA 1024-thread-per-block limit ---
+  // The product of (workgroupTile[i] / threadTile[i]) for all active
+  // thread dims must not exceed 1024. Clamp if needed.
+  clampThreadTilesToMaxThreads(workgroupTiles, threadTiles);
 
   LLVM_DEBUG({
     llvm::dbgs() << "[nova-kernel-config] Reduction config for "
@@ -429,19 +502,23 @@ LogicalResult setElementwiseLoweringConfig(linalg::LinalgOp op,
       return failure();
   }
 
-  const int subgroupSize = target.preferredSubgroupSize;
-
   SmallVector<int64_t> workgroupTiles(numLoops, 0);
   SmallVector<int64_t> threadTiles(numLoops, 0);
   SmallVector<int64_t> reductionTiles(numLoops, 0);
   SmallVector<int64_t> subgroupTiles(numLoops, 0);
+
+  // Target 256 threads per block total.
+  int numActiveParallel = std::min(numLoops, 2);
+  // For 2 active dims: 16 threads each → 256 total.
+  // For 1 active dim: 256 threads from that dim.
+  int64_t perDimThreadTarget = (numActiveParallel >= 2) ? 16 : 256;
 
   int parallelCount = 0;
   for (int i = numLoops - 1; i >= 0; --i) {
     if (parallelCount < 2) {
       int64_t wgTile = std::min((int64_t)128, loopBounds[i]);
       workgroupTiles[i] = wgTile;
-      int64_t threadTile = std::max((int64_t)1, wgTile / subgroupSize);
+      int64_t threadTile = std::max((int64_t)1, wgTile / perDimThreadTarget);
       while (threadTile > 1 && wgTile % threadTile != 0)
         --threadTile;
       threadTiles[i] = threadTile;
@@ -451,6 +528,9 @@ LogicalResult setElementwiseLoweringConfig(linalg::LinalgOp op,
     }
     ++parallelCount;
   }
+
+  // --- Enforce CUDA 1024-thread-per-block limit ---
+  clampThreadTilesToMaxThreads(workgroupTiles, threadTiles);
 
   LLVM_DEBUG({
     llvm::dbgs() << "[nova-kernel-config] Elementwise config for "

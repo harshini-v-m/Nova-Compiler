@@ -1130,11 +1130,11 @@ static Value createReduceCombiner(OpBuilder &b, Location loc,
                : b.create<arith::MulIOp>(loc, lhs, rhs).getResult();
   case nova::ReductionKind::MAX:
     return isa<FloatType>(elemType)
-               ? b.create<arith::MaximumFOp>(loc, lhs, rhs).getResult()
+               ? b.create<arith::MaxNumFOp>(loc, lhs, rhs).getResult()
                : b.create<arith::MaxSIOp>(loc, lhs, rhs).getResult();
   case nova::ReductionKind::MIN:
     return isa<FloatType>(elemType)
-               ? b.create<arith::MinimumFOp>(loc, lhs, rhs).getResult()
+               ? b.create<arith::MinNumFOp>(loc, lhs, rhs).getResult()
                : b.create<arith::MinSIOp>(loc, lhs, rhs).getResult();
   case nova::ReductionKind::ALL:
     return b.create<arith::AndIOp>(loc, lhs, rhs).getResult();

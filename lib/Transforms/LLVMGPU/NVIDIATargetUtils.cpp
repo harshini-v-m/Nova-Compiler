@@ -99,9 +99,9 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
     info.mmaIntrinsics = {kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 86) {
-    // Ampere GA102 (RTX 3090, A40, etc.)
+    // Ampere GA106 (RTX 3060 has 28 SMs, RTX 3090 has 84 SMs)
     info.archName = "sm_86";
-    info.smCount  = 84; // RTX 3090 has 84 SMs
+    info.smCount  = 28; // RTX 3060 target
     info.maxWorkgroupMemBytes = 100 * 1024;
     info.mmaIntrinsics = {kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};

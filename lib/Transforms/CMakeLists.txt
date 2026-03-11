@@ -1,6 +1,5 @@
 add_mlir_library(CompilerTransforms
   AddGpuMemoryCopies.cpp
-  AffineScalarizeAccumulator.cpp
   FuseMatmulBias.cpp
   ConvertMemRefToGpu.cpp
   FixGpuLaunch.cpp

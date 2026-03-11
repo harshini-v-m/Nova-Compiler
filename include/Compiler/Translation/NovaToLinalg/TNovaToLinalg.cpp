@@ -257,7 +257,7 @@ private:
   static Value mapOpImpl(MaxOp op, Type resultType, ArrayRef<Value> args,
                          OpBuilder *builder) {
     if (isa<FloatType>(resultType))
-      return builder->create<arith::MaximumFOp>(op.getLoc(), args[0], args[1]);
+      return builder->create<arith::MaxNumFOp>(op.getLoc(), args[0], args[1]);
     if (isa<IntegerType>(resultType))
       return builder->create<arith::MaxSIOp>(op.getLoc(), args[0], args[1]);
     return nullptr;
@@ -266,7 +266,7 @@ private:
   static Value mapOpImpl(MinOp op, Type resultType, ArrayRef<Value> args,
                          OpBuilder *builder) {
     if (isa<FloatType>(resultType))
-      return builder->create<arith::MinimumFOp>(op.getLoc(), args[0], args[1]);
+      return builder->create<arith::MinNumFOp>(op.getLoc(), args[0], args[1]);
     if (isa<IntegerType>(resultType))
       return builder->create<arith::MinSIOp>(op.getLoc(), args[0], args[1]);
     return nullptr;

@@ -138,7 +138,7 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
             pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createLoopFusionPass(1, 1024, true, mlir::affine::FusionMode::Greedy));
             pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createSimplifyAffineStructuresPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createCanonicalizerPass());
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createAffineScalarizeAccumulatorPass());
+            //pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createAffineScalarizeAccumulatorPass());
             // pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineLoopInvariantCodeMotionPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineScalarReplacementPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createRaiseMemrefToAffine());
@@ -234,7 +234,7 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
             
             pm.addPass(mlir::memref::createExpandStridedMetadataPass());
             pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-            
+            pm.addPass(mlir::nova::createFixHostGpuMemoryPass());
             pm.addPass(mlir::createConvertFuncToLLVMPass());
             pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());
