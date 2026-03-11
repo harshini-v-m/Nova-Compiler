@@ -2015,11 +2015,9 @@ LogicalResult LayerNormBackwardOp::inferReturnTypes(
     llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
   auto gyType = llvm::dyn_cast<RankedTensorType>(operands[0].getType());
   auto xType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
-  auto meanType = llvm::dyn_cast<RankedTensorType>(operands[2].getType());
-  auto rstdType = llvm::dyn_cast<RankedTensorType>(operands[3].getType());
-  auto gammaType = llvm::dyn_cast<RankedTensorType>(operands[4].getType());
+  auto gammaType = llvm::dyn_cast<RankedTensorType>(operands[2].getType());
 
-  if (!gyType || !xType || !meanType || !rstdType || !gammaType)
+  if (!gyType || !xType ||  !gammaType)
     return failure();
 
   inferredReturnTypes.push_back(

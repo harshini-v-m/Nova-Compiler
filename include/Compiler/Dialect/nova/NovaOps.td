@@ -964,11 +964,11 @@ def LayerNormOp :Op<Nova_Dialect,"layer_norm",[Pure,DeclareOpInterfaceMethods<In
 }
 def LayerNormBackwardOp :Op<Nova_Dialect,"layer_norm_backward",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary ="Layer norm backward has calculating gradient for gamma,beta and input";
-  let arguments = (ins Nova_Tensor:$grad_y, Nova_Tensor:$x, Nova_Tensor:$mean, Nova_Tensor:$rstd, Nova_Tensor:$gamma);
+  let arguments = (ins Nova_Tensor:$grad_y, Nova_Tensor:$x,  Nova_Tensor:$gamma);
   let results=(outs Nova_Tensor:$grad_x, Nova_Tensor:$grad_gamma, Nova_Tensor:$grad_beta);
   //let hasVerifier=1;
     let assemblyFormat = [{
-    $grad_y `,` $x `,` $mean `,` $rstd `,` $gamma attr-dict `:` type($grad_y) `,` type($x) `,` type($mean) `,` type($rstd) `,` type($gamma) 
+    $grad_y `,` $x `,`  $gamma attr-dict `:` type($grad_y) `,` type($x) `,` type($gamma) 
   }];
 }
 def LinearOp :Op<Nova_Dialect,"linear",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {

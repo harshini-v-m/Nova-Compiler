@@ -649,6 +649,44 @@ struct NovaConstantToArithConstPattern
     return success();
   }
 };
+
+struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
+  using OpConversionPattern<nova::LinearOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::LinearOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto operands = adaptor.getOperands();
+    if (operands.size() != 3) {
+      return rewriter.notifyMatchFailure(op, "expected exactly 3 operands");
+    }
+
+    Value input = operands[0];
+    Value weight = operands[1];
+    Value bias = operands[2];
+
+    auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
+    auto weightType = llvm::dyn_cast<RankedTensorType>(weight.getType());
+    auto biasType = llvm::dyn_cast<RankedTensorType>(bias.getType());
+
+    auto resultType = llvm::dyn_cast<RankedTensorType>(op.getType());
+    if (!inputType || !weightType || !biasType || !resultType) {
+      return rewriter.notifyMatchFailure(op, "expected ranked tensor types");
+    }
+
+    auto loc = op.getLoc();
+    auto elementType = resultType.getElementType();
+    int64_t inputRank = inputType.getRank();
+
+    //create nova::matmul and nova::add 
+    auto matmulOperation = rewriter.create<mlir::nova::MatmulOp>(loc, input, weight).getResult();
+    auto addOperation = rewriter.create<mlir::nova::AddOp>(loc, matmulOperation, bias);
+    rewriter.replaceOp(op, addOperation);
+    return success();
+  }
+};
+
+
 // layer norm lowering with nova operations
 struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
   using OpConversionPattern<nova::LayerNormOp>::OpConversionPattern;
@@ -719,106 +757,122 @@ struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
   }
 };
 struct NovaLayerNormBackwardPattern
-    : public OpConversionPattern<nova::LayerNormBackwardOp> {
-  using OpConversionPattern<nova::LayerNormBackwardOp>::OpConversionPattern;
+   : public OpConversionPattern<nova::LayerNormBackwardOp> {
+ using OpConversionPattern<nova::LayerNormBackwardOp>::OpConversionPattern;
 
-  LogicalResult
-  matchAndRewrite(nova::LayerNormBackwardOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    Value gy = adaptor.getGradY();
-    Value x = adaptor.getX();
-    Value gamma = adaptor.getGamma();
+ LogicalResult
+ matchAndRewrite(nova::LayerNormBackwardOp op, OpAdaptor adaptor,
+                 ConversionPatternRewriter &rewriter) const override {
+   Location loc = op.getLoc();
+   Value gy = adaptor.getGradY();
+   Value x = adaptor.getX();
+   Value gamma = adaptor.getGamma();
 
-    auto xType = cast<RankedTensorType>(x.getType());
-    auto gammaType = cast<RankedTensorType>(gamma.getType());
-    
-    //epsilon
-    float eps = 1e-5f;
-    //computing mean
-    int64_t last_dim = xType.getRank() - 1;
-    llvm::SmallVector<int64_t, 1> dims = {last_dim};
-    llvm::SmallVector<int64_t, 4> red_shape(xType.getShape().begin(), xType.getShape().end());
-    red_shape[last_dim] = 1;
-    auto red_type = mlir::RankedTensorType::get(red_shape, xType.getElementType());
-    auto scalarType = mlir::RankedTensorType::get({}, xType.getElementType());
-    auto dim_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)xType.getShape().back())));
-    auto sum_x = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, x, red_type, true, dims, false);
-    auto mean = rewriter.create<mlir::nova::DivOp>(loc, sum_x.getResult(), dim_const.getResult());
-    auto meanType = cast<RankedTensorType>(mean.getType());
-   
-    //Computing standard deviation 
-    auto diff = rewriter.create<mlir::nova::SubOp>(loc, x, mean.getResult());
-    auto diff2 = rewriter.create<mlir::nova::MulOp>(loc, diff.getResult(), diff.getResult());
-    auto sum_sq = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, diff2.getResult(), red_type, true, dims, false);
-    auto var = rewriter.create<mlir::nova::DivOp>(loc, sum_sq.getResult(), dim_const.getResult());
-    auto eps_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)eps)));
-    auto var_eps = rewriter.create<mlir::nova::AddOp>(loc, var.getResult(), eps_const.getResult());
-    auto rstd = rewriter.create<mlir::nova::RsqrtOp>(loc, var_eps.getResult());
+   auto xType = cast<RankedTensorType>(x.getType());
+   auto gammaType = cast<RankedTensorType>(gamma.getType());
 
-    // 1. Compute x_hat = (x - mean) * rstd
-    Value x_minus_mean =
-        rewriter.create<mlir::nova::SubOp>(loc, xType, x, mean).getResult();
-    Value x_hat =
-        rewriter.create<mlir::nova::MulOp>(loc, xType, x_minus_mean, rstd)
-            .getResult();
 
-    // 3. dgamma = sum(gy * x_hat, over batch dims)
-    Value gy_xhat =
-        rewriter.create<mlir::nova::MulOp>(loc, xType, gy, x_hat).getResult();
-    SmallVector<int64_t> batchDims;
-    for (int64_t i = 0; i < xType.getRank() - 1; ++i)
-      batchDims.push_back(i);
-    Value dgamma =
-        rewriter
-            .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
-                                          gy_xhat, gammaType, false, batchDims)
-            .getResult();
+   // epsilon
+   float eps = 1e-5f;
 
-    // 4. dbeta = sum(gy, over batch dims)
-    Value dbeta =
-        rewriter
-            .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
-                                          gy, gammaType, false, batchDims)
-            .getResult();
 
-    // 5. dx
-    Value gy_gamma =
-        rewriter.create<mlir::nova::MulOp>(loc, xType, gy, gamma).getResult();
+   // calculate mean
+   int64_t last_dim = xType.getRank() - 1;
+   llvm::SmallVector<int64_t, 1> dims = {last_dim};
+   llvm::SmallVector<int64_t, 4> red_shape(xType.getShape().begin(), xType.getShape().end());
+   red_shape[last_dim] = 1;
+   auto red_type = mlir::RankedTensorType::get(red_shape, xType.getElementType());
+   auto scalarType = mlir::RankedTensorType::get({}, xType.getElementType());
+   auto dim_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)xType.getShape().back())));
+   auto sum_x = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, x, red_type, true, dims, false);
+   auto mean = rewriter.create<mlir::nova::DivOp>(loc, sum_x.getResult(), dim_const.getResult());
+   auto meanType = cast<RankedTensorType>(mean.getType());
 
-    Value mean_gy_gamma =
-        rewriter
-            .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::MEAN,
-                                          gy_gamma, meanType, true,
-                                          llvm::ArrayRef<int64_t>{-1})
-            .getResult();
 
-    Value term2 =
-        rewriter.create<mlir::nova::MulOp>(loc, xType, gy_gamma, x_hat)
-            .getResult();
-    Value mean_gy_gamma_xhat =
-        rewriter
-            .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::MEAN,
-                                          term2, meanType, true,
-                                          llvm::ArrayRef<int64_t>{-1})
-            .getResult();
+   // calculate standard deviation
+   auto diff = rewriter.create<mlir::nova::SubOp>(loc, x, mean.getResult());
+   auto diff2 = rewriter.create<mlir::nova::MulOp>(loc, diff.getResult(), diff.getResult());
+   auto sum_sq = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, diff2.getResult(), red_type, true, dims, false);
+   auto var = rewriter.create<mlir::nova::DivOp>(loc, sum_sq.getResult(), dim_const.getResult());
+   auto eps_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)eps)));
+   auto var_eps = rewriter.create<mlir::nova::AddOp>(loc, var.getResult(), eps_const.getResult());
+   auto rstd = rewriter.create<mlir::nova::RsqrtOp>(loc, var_eps.getResult());
 
-    Value t3 =
-        rewriter
-            .create<mlir::nova::MulOp>(loc, xType, x_hat, mean_gy_gamma_xhat)
-            .getResult();
-    Value t4 =
-        rewriter.create<mlir::nova::SubOp>(loc, xType, gy_gamma, mean_gy_gamma)
-            .getResult();
-    Value t5 =
-        rewriter.create<mlir::nova::SubOp>(loc, xType, t4, t3).getResult();
-    Value dx =
-        rewriter.create<mlir::nova::MulOp>(loc, xType, t5, rstd).getResult();
 
-    rewriter.replaceOp(op, {dx, dgamma, dbeta});
-    return success();
-  }
+
+
+   // 1. Compute x_hat = (x - mean) * rstd
+   Value x_minus_mean =
+       rewriter.create<mlir::nova::SubOp>(loc, xType, x, mean).getResult();
+   Value x_hat =
+       rewriter.create<mlir::nova::MulOp>(loc, xType, x_minus_mean, rstd)
+           .getResult();
+
+
+   // 3. dgamma = sum(gy * x_hat, over batch dims)
+   Value gy_xhat =
+       rewriter.create<mlir::nova::MulOp>(loc, xType, gy, x_hat).getResult();
+   SmallVector<int64_t> batchDims;
+   for (int64_t i = 0; i < xType.getRank() - 1; ++i)
+     batchDims.push_back(i);
+   Value dgamma =
+       rewriter
+           .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
+                                         gy_xhat, gammaType, false, batchDims)
+           .getResult();
+
+
+   // 4. dbeta = sum(gy, over batch dims)
+   Value dbeta =
+       rewriter
+           .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
+                                         gy, gammaType, false, batchDims)
+           .getResult();
+
+
+   // 5. dx
+   Value gy_gamma =
+       rewriter.create<mlir::nova::MulOp>(loc, xType, gy, gamma).getResult();
+
+
+   Value mean_gy_gamma =
+       rewriter
+           .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::MEAN,
+                                         gy_gamma, meanType, true,
+                                         llvm::ArrayRef<int64_t>{-1})
+           .getResult();
+
+
+   Value term2 =
+       rewriter.create<mlir::nova::MulOp>(loc, xType, gy_gamma, x_hat)
+           .getResult();
+   Value mean_gy_gamma_xhat =
+       rewriter
+           .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::MEAN,
+                                         term2, meanType, true,
+                                         llvm::ArrayRef<int64_t>{-1})
+           .getResult();
+
+
+   Value t3 =
+       rewriter
+           .create<mlir::nova::MulOp>(loc, xType, x_hat, mean_gy_gamma_xhat)
+           .getResult();
+   Value t4 =
+       rewriter.create<mlir::nova::SubOp>(loc, xType, gy_gamma, mean_gy_gamma)
+           .getResult();
+   Value t5 =
+       rewriter.create<mlir::nova::SubOp>(loc, xType, t4, t3).getResult();
+   Value dx =
+       rewriter.create<mlir::nova::MulOp>(loc, xType, t5, rstd).getResult();
+
+
+   rewriter.replaceOp(op, {dx, dgamma, dbeta});
+   return success();
+ }
 };
+
+
 struct NovaSceBackwardOpLowering
     : public OpConversionPattern<mlir::nova::SceBackwardOp> {
   using OpConversionPattern<mlir::nova::SceBackwardOp>::OpConversionPattern;
@@ -949,6 +1003,7 @@ struct NovaSceBackwardOpLowering
     return success();
   }
 };
+
 struct NovaLinearBackwardPattern
     : public OpConversionPattern<mlir::nova::LinearBackwardOp> {
   using OpConversionPattern<mlir::nova::LinearBackwardOp>::OpConversionPattern;
@@ -1097,6 +1152,7 @@ struct NovaToTosaLoweringPass
     target.addIllegalOp<nova::GeluBackwardOp>();
     target.addIllegalOp<nova::MaeOp>();
     target.addIllegalOp<nova::CastOp>();
+    target.addIllegalOp<nova::LinearOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     TypeConverter typeConverter;
     typeConverter.addConversion([](Type type) { return type; });
@@ -1113,7 +1169,7 @@ struct NovaToTosaLoweringPass
 
 void populateNovaToTosaConversionPatterns(RewritePatternSet &patterns) {
   patterns
-      .add<NovaReluOpLowering, NovaGeluOpLowering, NovaGeluBackwardPattern,
+      .add<NovaReluOpLowering, NovaGeluOpLowering, NovaGeluBackwardPattern, NovaLinearOpLowering,
                NovaSoftmaxLoweringPattern, NovaConstantToArithConstPattern,
                NovaSceBackwardOpLowering, NovaLayerNormPattern,
                NovaLayerNormBackwardPattern, NovaLinearBackwardPattern,
