@@ -443,7 +443,16 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
           continue;
         // Only tile each "sink": skip if this op's result feeds another
         // untiled compute op (it will be fused as a producer of that op).
-        bool hasTilableConsumer = llvm::any_of(rootOp->getUsers(), [](Operation *user) {
+        bool hasTilableConsumer = llvm::any_of(rootOp->getUsers(), [&](Operation *user) {
+          auto userLinalg = dyn_cast<linalg::LinalgOp>(user);
+          auto rootLinalg = dyn_cast<linalg::LinalgOp>(rootOp);
+          if (userLinalg && rootLinalg) {
+            // Prevent deferring to a full reduction (which will be un-distributed).
+            // If the consumer has fewer parallel loops, it will act as a bottleneck
+            // and force the parallel producer into a single block, exploding thread counts.
+            if (userLinalg.getNumParallelLoops() < rootLinalg.getNumParallelLoops())
+              return false;
+          }
           return isa<TilingInterface>(user);
         });
         // If this op has a tilable consumer that is still outside a forall,

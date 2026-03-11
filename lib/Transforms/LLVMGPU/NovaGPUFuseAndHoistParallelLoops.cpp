@@ -710,6 +710,11 @@ struct HoistForallFromFor final : OpRewritePattern<scf::ForOp> {
           newForInits,
           [](OpBuilder &, Location, Value, ValueRange) {});
 
+      Location savedInsertLoc = parallelInsert.getLoc();
+      SmallVector<OpFoldResult> savedOffsets;
+      SmallVector<OpFoldResult> savedSizes;
+      SmallVector<OpFoldResult> savedStrides;
+
       {
         // STEP E: Build the argReplacements for mergeBlocks.
         SmallVector<Value> argReplacements(newForallOp.getInductionVars());
@@ -740,6 +745,14 @@ struct HoistForallFromFor final : OpRewritePattern<scf::ForOp> {
         rewriter.setInsertionPointToEnd(newFor.getBody());
         scf::YieldOp::create(rewriter, loop.getLoc(),
                               parallelInsert.getSource());
+
+        // Snapshot parallelInsert properties AFTER mergeBlocks but BEFORE erasing it.
+        // Reading them before mergeBlocks captures BlockArguments that are destroyed,
+        // causing use-after-free. Reading them after eraseOp also causes use-after-free.
+        savedOffsets = parallelInsert.getMixedOffsets();
+        savedSizes   = parallelInsert.getMixedSizes();
+        savedStrides = parallelInsert.getMixedStrides();
+        
         rewriter.eraseOp(parallelInsert.getOperation());
       }
 
@@ -747,12 +760,12 @@ struct HoistForallFromFor final : OpRewritePattern<scf::ForOp> {
       BlockArgument newForallIterArg = newForallOp.getRegionIterArgs()[0];
       rewriter.setInsertionPointToEnd(newForallOp.getTerminator().getBody());
       tensor::ParallelInsertSliceOp::create(
-          rewriter, parallelInsert.getLoc(),
+          rewriter, savedInsertLoc,
           newFor.getResult(0),
           newForallIterArg,
-          parallelInsert.getMixedOffsets(),
-          parallelInsert.getMixedSizes(),
-          parallelInsert.getMixedStrides());
+          savedOffsets,
+          savedSizes,
+          savedStrides);
       rewriter.eraseOp(parallelTerminator);
     }
 

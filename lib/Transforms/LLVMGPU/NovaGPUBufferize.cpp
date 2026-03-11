@@ -114,10 +114,30 @@ static bool isWorkgroupMemref(MemRefType t) {
 // NOTE: gpu.barrier is NOT inserted here for the same reason as before
 // ("unknown memory side effects" break OneShotBufferize analysis).
 // Barriers around workgroup memory copies are inserted post-bufferization
-// by NovaGPUInsertWorkgroupBarriersPass.
 static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
                                Value to) {
-  linalg::CopyOp::create(builder, loc, from, to);
+  // If we are inside an scf.forall (which will be lowered to a GPU kernel),
+  // we use linalg.copy. This is expanded into scf.for + memref.load/store
+  // loops that compile cleanly to PTX load/store instructions.
+  //
+  // Outside scf.forall (host side), we use memref.copy, which can be
+  // efficiently handled by the host runtime or lowered to specialized
+  // host-side copy routines.
+  Operation *parent = builder.getInsertionBlock()->getParentOp();
+  bool insideForall = false;
+  while (parent) {
+    if (isa<scf::ForallOp>(parent)) {
+      insideForall = true;
+      break;
+    }
+    parent = parent->getParentOp();
+  }
+
+  if (insideForall) {
+    linalg::CopyOp::create(builder, loc, from, to);
+  } else {
+    memref::CopyOp::create(builder, loc, from, to);
+  }
   return success();
 }
 

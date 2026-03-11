@@ -36,6 +36,8 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
+#include "Compiler/Transforms/GenerateDynamicWrapper.h"
+#include "Compiler/Transforms/FixGpuLaunch.h"
 
 using namespace mlir;
 
@@ -294,9 +296,9 @@ namespace mlir::nova
     nvvmTargetOptions.ftzFlag = true;
     pm.addPass(createGpuNVVMAttachTarget(nvvmTargetOptions));
 
-    // 13.1 — Async gpu region: wrap gpu.launch_func in async token chains
+    // 13.1 — Outline GPU kernels and insert async tokens (if any)
     //         (required by GpuModuleToBinaryPass).
-    pm.addPass(createGpuAsyncRegionPass());
+    pm.addNestedPass<func::FuncOp>(createGpuAsyncRegionPass());
 
     // 13.2 — Lower the contents of each gpu.module to NVVM / LLVM.
     //
@@ -319,7 +321,6 @@ namespace mlir::nova
       // address spaces (5/3/1) before finalizeMemRefToLLVM, which requires
       // integer address spaces for LLVM type conversion.
       gpuPm.addPass(createNovaGPULowerMemorySpacePass());
-      // gpuPm.addPass(createFinalizeMemRefToLLVMConversionPass());
       // Phase 2: Lower control flow and GPU ops.
       gpuPm.addPass(createSCFToControlFlowPass());
       ConvertGpuOpsToNVVMOpsOptions nvvmOpts;
@@ -338,6 +339,7 @@ namespace mlir::nova
     binaryOptions.toolkitPath = "/usr/local/cuda-13.0";
     binaryOptions.compilationTarget = "isa";
     pm.addPass(createGpuModuleToBinaryPass(binaryOptions));
+    //pm.addPass(nova::createGpuRuntimeLoweringPass());
 
     // 13.4 — Lower gpu.* host ops (gpu.alloc, gpu.launch_func, etc.) to LLVM
     //         runtime calls (mgpuMemAlloc, mgpuLaunchKernel, etc.).
@@ -358,6 +360,7 @@ namespace mlir::nova
     pm.addPass(createNovaGPULowerMemorySpacePass());
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
     pm.addPass(createConvertFuncToLLVMPass());
+    //pm.addPass(nova::createGenerateDynamicWrapperPass());
     pm.addPass(createReconcileUnrealizedCastsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());

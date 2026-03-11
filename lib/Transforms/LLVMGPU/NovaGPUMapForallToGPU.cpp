@@ -110,7 +110,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   int64_t blockDims[3] = {1, 1, 1};
   SmallVector<scf::ForallOp> threadForalls;
 
-  blockForall.walk([&](scf::ForallOp inner) {
+  auto walkResult = blockForall.walk([&](scf::ForallOp inner) {
     if (inner == blockForall)
       return WalkResult::advance();
     if (!hasThreadMapping(inner))
@@ -118,6 +118,13 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
 
     threadForalls.push_back(inner);
     auto threadUBs = inner.getMixedUpperBound();
+
+    for (auto ub : threadUBs) {
+      if (!getConstantIntValue(ub)) {
+        inner.emitError("non-static thread forall upper bound");
+        return WalkResult::interrupt();
+      }
+    }
 
     if (isLinearThreadMapping(inner)) {
       // Linear mapping: total threads = product → blockDim.x.
@@ -141,6 +148,10 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     }
     return WalkResult::advance();
   });
+
+  if (walkResult.wasInterrupted()) {
+    return failure();
+  }
 
   // ----- Step 3: Create gpu.launch -----
   rewriter.setInsertionPoint(blockForall);

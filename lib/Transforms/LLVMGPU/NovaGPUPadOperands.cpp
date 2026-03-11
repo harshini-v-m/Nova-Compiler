@@ -67,11 +67,12 @@ static LogicalResult padLinalgOpToStaticSizes(RewriterBase &rewriter,
 // when called on an op that wasn't annotated by the strategy pass).
 static std::optional<SmallVector<int64_t>>
 getPaddingSizes(linalg::LinalgOp linalgOp) {
-  if (!linalg::isaContractionOpInterface(linalgOp))
-    return std::nullopt;
-
-  // Read tile sizes from the op's LoweringConfig attribute.
   DictionaryAttr config = getLoweringConfig(linalgOp);
+  if (!config) {
+    if (!linalg::isaContractionOpInterface(linalgOp))
+      return std::nullopt;
+  }
+
   SmallVector<int64_t> wgTiles  = getLoweringConfigTileSizes(config, kWorkgroupKey);
   SmallVector<int64_t> redTiles = getLoweringConfigTileSizes(config, kReductionKey);
 

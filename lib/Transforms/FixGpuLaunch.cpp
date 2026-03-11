@@ -4,6 +4,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 using namespace mlir;
@@ -308,26 +310,46 @@ public:
       sizeBytes = rewriter.create<LLVM::MulOp>(loc, sizeBytes, dimSize);
     }
 
-    auto getAddrSpace = [&](Value val) -> unsigned {
+    auto isDeviceMemRef = [&](Value val) -> bool {
       auto memRefTy = llvm::cast<MemRefType>(val.getType());
       if (auto intAttr =
               llvm::dyn_cast_or_null<IntegerAttr>(memRefTy.getMemorySpace())) {
-        return intAttr.getInt();
+        if (intAttr.getInt() != 0) return true;
       } else if (auto addrSpaceAttr =
                      llvm::dyn_cast_or_null<gpu::AddressSpaceAttr>(
                          memRefTy.getMemorySpace())) {
-        return (unsigned)addrSpaceAttr.getValue();
+        if ((unsigned)addrSpaceAttr.getValue() != 0) return true;
       }
-      return 0;
+      
+      // Trace back the value to see if it comes from `gpu.alloc`
+      Value current = val;
+      while (current) {
+        if (auto expandOp = current.getDefiningOp<memref::ExpandShapeOp>()) {
+          current = expandOp.getSrc();
+        } else if (auto collapseOp = current.getDefiningOp<memref::CollapseShapeOp>()) {
+          current = collapseOp.getSrc();
+        } else if (auto castOp = current.getDefiningOp<memref::CastOp>()) {
+          current = castOp.getSource();
+        } else if (auto subviewOp = current.getDefiningOp<memref::SubViewOp>()) {
+          current = subviewOp.getSource();
+        } else if (auto allocTensor = current.getDefiningOp<bufferization::ToTensorOp>()) {
+          current = allocTensor.getOperand();
+        } else if (auto allocOp = current.getDefiningOp<gpu::AllocOp>()) {
+          return true; // Discovered it originally came from gpu.alloc
+        } else {
+          break;
+        }
+      }
+      return false;
     };
 
-    unsigned dstSpace = getAddrSpace(dst);
-    unsigned srcSpace = getAddrSpace(src);
+    bool dstIsDev = isDeviceMemRef(dst);
+    bool srcIsDev = isDeviceMemRef(src);
     int kindVal = 4; // Default
-    if (dstSpace != 0 && srcSpace == 0) kindVal = 1; // HostToDevice
-    else if (dstSpace == 0 && srcSpace != 0) kindVal = 2; // DeviceToHost
-    else if (dstSpace != 0 && srcSpace != 0) kindVal = 3; // DeviceToDevice
-    else if (dstSpace == 0 && srcSpace == 0) kindVal = 0; // HostToHost
+    if (!dstIsDev && srcIsDev) kindVal = 2; // DeviceToHost
+    else if (dstIsDev && !srcIsDev) kindVal = 1; // HostToDevice
+    else if (dstIsDev && srcIsDev) kindVal = 3; // DeviceToDevice
+    else kindVal = 0; // HostToHost
 
     Value kind = rewriter.create<LLVM::ConstantOp>(
         loc, int32Ty, rewriter.getI32IntegerAttr(kindVal));
@@ -664,6 +686,129 @@ public:
   }
 };
 
+// Returns true when `val` was produced by a call to "mgpuMemAlloc" or
+// "cudaMallocAsync" — i.e. a plain ptr (addrspace 0) that points into CUDA
+// device memory, but whose address space was erased during gpu-to-llvm
+// lowering.
+static bool isGpuAllocPtr(Value val) {
+  auto callOp = val.getDefiningOp<LLVM::CallOp>();
+  if (!callOp)
+    return false;
+  auto callee = callOp.getCallee();
+  return callee &&
+         (*callee == "mgpuMemAlloc" || *callee == "cudaMallocAsync");
+}
+
+// Host-side load from a plain GPU pointer (addrspace 0) returned by
+// mgpuMemAlloc/cudaMallocAsync.  Replaces the load with a synchronous D2H
+// cudaMemcpy into a host stack buffer, then a load from that buffer.
+class FixHostMgpuPtrLoad : public OpRewritePattern<LLVM::LoadOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LLVM::LoadOp op,
+                                PatternRewriter &rewriter) const override {
+    Value ptr = op.getAddr();
+    auto ptrType = llvm::dyn_cast<LLVM::LLVMPointerType>(ptr.getType());
+    if (!ptrType || ptrType.getAddressSpace() != 0)
+      return failure();
+    if (!isGpuAllocPtr(ptr))
+      return failure();
+
+    auto loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto ctx = op.getContext();
+    auto genericPtrTy = LLVM::LLVMPointerType::get(ctx);
+    auto int64Ty = IntegerType::get(ctx, 64);
+    auto int32Ty = IntegerType::get(ctx, 32);
+
+    auto cudaMemcpySync =
+        getOrDeclareFunc(module, rewriter, "cudaMemcpy", int32Ty,
+                         {genericPtrTy, genericPtrTy, int64Ty, int32Ty});
+
+    Type elemTy = op.getType();
+    Value one = rewriter.create<LLVM::ConstantOp>(
+        loc, int32Ty, rewriter.getI32IntegerAttr(1));
+    Value hostBuf =
+        rewriter.create<LLVM::AllocaOp>(loc, genericPtrTy, elemTy, one, 8);
+
+    int64_t elementSize = 0;
+    if (elemTy.isIntOrFloat())
+      elementSize = elemTy.getIntOrFloatBitWidth() / 8;
+    else if (elemTy.isIndex())
+      elementSize = 8;
+    if (elementSize == 0)
+      elementSize = 4;
+
+    Value sizeBytes = rewriter.create<LLVM::ConstantOp>(
+        loc, int64Ty, rewriter.getI64IntegerAttr(elementSize));
+    Value kind = rewriter.create<LLVM::ConstantOp>(
+        loc, int32Ty, rewriter.getI32IntegerAttr(2)); // DeviceToHost
+
+    rewriter.create<LLVM::CallOp>(loc, cudaMemcpySync,
+                                  ValueRange{hostBuf, ptr, sizeBytes, kind});
+    Value hostVal = rewriter.create<LLVM::LoadOp>(loc, elemTy, hostBuf);
+    rewriter.replaceOp(op, hostVal);
+    return success();
+  }
+};
+
+// Host-side store to a plain GPU pointer (addrspace 0) returned by
+// mgpuMemAlloc/cudaMallocAsync.  Replaces the store with a store to a host
+// stack buffer followed by a synchronous H2D cudaMemcpy.
+class FixHostMgpuPtrStore : public OpRewritePattern<LLVM::StoreOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LLVM::StoreOp op,
+                                PatternRewriter &rewriter) const override {
+    Value ptr = op.getAddr();
+    auto ptrType = llvm::dyn_cast<LLVM::LLVMPointerType>(ptr.getType());
+    if (!ptrType || ptrType.getAddressSpace() != 0)
+      return failure();
+    if (!isGpuAllocPtr(ptr))
+      return failure();
+
+    auto loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto ctx = op.getContext();
+    auto genericPtrTy = LLVM::LLVMPointerType::get(ctx);
+    auto int64Ty = IntegerType::get(ctx, 64);
+    auto int32Ty = IntegerType::get(ctx, 32);
+
+    auto cudaMemcpySync =
+        getOrDeclareFunc(module, rewriter, "cudaMemcpy", int32Ty,
+                         {genericPtrTy, genericPtrTy, int64Ty, int32Ty});
+
+    Value value = op.getValue();
+    Type elemTy = value.getType();
+    Value one = rewriter.create<LLVM::ConstantOp>(
+        loc, int32Ty, rewriter.getI32IntegerAttr(1));
+    Value hostBuf =
+        rewriter.create<LLVM::AllocaOp>(loc, genericPtrTy, elemTy, one, 8);
+
+    rewriter.create<LLVM::StoreOp>(loc, value, hostBuf);
+
+    int64_t elementSize = 0;
+    if (elemTy.isIntOrFloat())
+      elementSize = elemTy.getIntOrFloatBitWidth() / 8;
+    else if (elemTy.isIndex())
+      elementSize = 8;
+    if (elementSize == 0)
+      elementSize = 4;
+
+    Value sizeBytes = rewriter.create<LLVM::ConstantOp>(
+        loc, int64Ty, rewriter.getI64IntegerAttr(elementSize));
+    Value kind = rewriter.create<LLVM::ConstantOp>(
+        loc, int32Ty, rewriter.getI32IntegerAttr(1)); // HostToDevice
+
+    rewriter.create<LLVM::CallOp>(loc, cudaMemcpySync,
+                                  ValueRange{ptr, hostBuf, sizeBytes, kind});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 class GpuRuntimeLoweringPass
     : public PassWrapper<GpuRuntimeLoweringPass, OperationPass<ModuleOp>> {
 public:
@@ -671,6 +816,17 @@ public:
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    module.walk([&](LLVM::LoadOp op) {
+      auto ptrType = llvm::dyn_cast<LLVM::LLVMPointerType>(op.getAddr().getType());
+      if (ptrType) {
+        llvm::errs() << "  [load] addrspace=" << ptrType.getAddressSpace()
+                     << " addr_defop=" << (op.getAddr().getDefiningOp()
+                        ? op.getAddr().getDefiningOp()->getName().getStringRef()
+                        : "blockarg")
+                     << "\n";
+      }
+    });
+
     RewritePatternSet patterns(module.getContext());
     patterns.add<ConvertGpuAllocToCall>(module.getContext());
     patterns.add<ConvertGpuMemcpyToCall>(module.getContext());
@@ -678,9 +834,12 @@ public:
     patterns.add<ConvertGpuMemsetToCall>(module.getContext());
     patterns.add<FixHostGpuAccess>(module.getContext());
     patterns.add<FixHostGpuStore>(module.getContext());
+    patterns.add<FixHostMgpuPtrLoad>(module.getContext());
+    patterns.add<FixHostMgpuPtrStore>(module.getContext());
     if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
       signalPassFailure();
     }
+    llvm::errs() << "[GpuRuntimeLowering] Done.\n";
   }
 
   StringRef getArgument() const final { return "gpu-runtime-lowering"; }

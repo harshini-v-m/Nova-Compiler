@@ -7,6 +7,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
@@ -116,9 +118,42 @@ struct NovaToArithOp{
 
     // Step 7: Gather from ORIGINAL logits: gathered[i] = logits[i, targets[i]]
     // This is safe because logits is a function argument (always dominates).
-    Value gatheredLogits =
-        builder->create<nova::GatherOp>(op.getLoc(), logits, targets, lastDim)
-            .getResult();
+    SmallVector<OpFoldResult> gatheredSizes;
+    for (int64_t i = 0; i < batchShape.size(); ++i) {
+      if (ShapedType::isDynamic(batchShape[i])) {
+        Value dimSize = builder->create<tensor::DimOp>(op.getLoc(), targets, i);
+        gatheredSizes.push_back(dimSize);
+      } else {
+        gatheredSizes.push_back(builder->getIndexAttr(batchShape[i]));
+      }
+    }
+    Value emptyGather = builder->create<tensor::EmptyOp>(
+        op.getLoc(), gatheredSizes, targetElemType);
+
+    int64_t numBatchDims = batchShape.size();
+    SmallVector<AffineMap> gatherMaps = {
+        builder->getMultiDimIdentityMap(numBatchDims), // targets
+        builder->getMultiDimIdentityMap(numBatchDims)  // empty (out)
+    };
+    SmallVector<utils::IteratorType> gatherIterTypes(numBatchDims,
+                                                     utils::IteratorType::parallel);
+
+    auto gatherGeneric = builder->create<linalg::GenericOp>(
+        op.getLoc(), TypeRange{batchType}, ValueRange{targets},
+        ValueRange{emptyGather}, gatherMaps, gatherIterTypes,
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value targetVal = args[0];
+          Value targetIdx = b.create<arith::IndexCastOp>(loc, b.getIndexType(),
+                                                         targetVal);
+          SmallVector<Value> extractIndices;
+          for (int i = 0; i < numBatchDims; ++i) {
+            extractIndices.push_back(b.create<linalg::IndexOp>(loc, i));
+          }
+          extractIndices.push_back(targetIdx);
+          Value val = b.create<tensor::ExtractOp>(loc, logits, extractIndices);
+          b.create<linalg::YieldOp>(loc, val);
+        });
+    Value gatheredLogits = gatherGeneric.getResult(0);
 
     // Step 8: per_sample_loss = log_sum_exp + max_val - gathered_logits
     Value lseMaxSum =
