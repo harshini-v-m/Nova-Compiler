@@ -384,6 +384,17 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
                   // as consumers would collapse all layers into one forall.
                   if (isContractionOp(op))
                     return false;
+                  // Do NOT fuse full-reduction consumers (all reduction
+                  // iterators, no parallel dims). They need the FULL
+                  // producer output, not one tile per block. Fusing them
+                  // causes all blocks to race on the same scalar accumulator.
+                  if (auto lg = dyn_cast<linalg::LinalgOp>(op)) {
+                    auto iters = lg.getIteratorTypesArray();
+                    if (!iters.empty() &&
+                        !llvm::any_of(iters, linalg::isParallelIterator) &&
+                        llvm::any_of(iters, linalg::isReductionIterator))
+                      return false;
+                  }
                   return tiledAndFusedOps.contains(op);
                 });
         if (succeeded(newFusionOpportunities)) {
@@ -509,6 +520,16 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
           // Skip function arguments (no defining op).
           if (curr->getParentOp() != funcOp.getOperation())
             continue;
+          // Skip scf.forall ops that already have GPU block mapping —
+          // they are already distributed kernels and must not be moved
+          // into the single-block wrapper.
+          if (auto forallOp = dyn_cast<scf::ForallOp>(curr)) {
+            auto mapping = forallOp.getMappingAttr();
+            if (mapping && llvm::any_of(mapping.getValue(), [](Attribute attr) {
+                  return isa<gpu::GPUBlockMappingAttr>(attr);
+                }))
+              continue;
+          }
 
           opsToMove.push_back(curr);
           for (Value operand : curr->getOperands()) {
@@ -517,6 +538,55 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
                   !isInsideWorkgroupForall(defOp))
                 worklist.push_back(defOp);
             }
+          }
+        }
+
+        if (opsToMove.empty())
+          continue;
+
+        // Filter out ops whose results have uses outside the chain.
+        // These must stay at function level; the wrapper forall will
+        // implicitly capture their values. Without this filter, moving
+        // e.g. bufferization.to_tensor into the wrapper would hide it
+        // from other kernels that also need the same input tensor.
+        //
+        // Exempt: retVal's defining op — its external use will be
+        // replaced by the forall result via replaceUsesWithIf.
+        // Iterative: removing one op may expose another's user as
+        // external, so repeat until stable.
+        {
+          Operation *retDefOp = retVal.getDefiningOp();
+          llvm::SmallPtrSet<Operation *, 16> moveSet(opsToMove.begin(),
+                                                      opsToMove.end());
+          bool changed = true;
+          while (changed) {
+            changed = false;
+            SmallVector<Operation *> filtered;
+            for (Operation *op : opsToMove) {
+              // Never filter the op that defines retVal — its external
+              // use is redirected to the forall result.
+              if (op == retDefOp) {
+                filtered.push_back(op);
+                continue;
+              }
+              bool hasExternalUser = false;
+              for (Value res : op->getResults()) {
+                for (Operation *user : res.getUsers()) {
+                  if (!moveSet.contains(user)) {
+                    hasExternalUser = true;
+                    break;
+                  }
+                }
+                if (hasExternalUser) break;
+              }
+              if (hasExternalUser) {
+                moveSet.erase(op);
+                changed = true;
+              } else {
+                filtered.push_back(op);
+              }
+            }
+            opsToMove = std::move(filtered);
           }
         }
 
@@ -554,7 +624,27 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
 
         // Use the return value's producer's output as the shared_out.
         // Create a tensor.empty as the shared_out for the forall.
-        rewriter.setInsertionPoint(opsToMove.front());
+        // Insert the wrapper AFTER all external operands are defined.
+        // This handles the case where the reduction consumes the result of
+        // an already-distributed forall (e.g. matmul) that wasn't moved.
+        Operation *insertAfter = nullptr;
+        llvm::SmallPtrSet<Operation *, 16> opsToMoveSet(opsToMove.begin(),
+                                                         opsToMove.end());
+        for (Operation *moveOp : opsToMove) {
+          for (Value operand : moveOp->getOperands()) {
+            if (auto defOp = operand.getDefiningOp()) {
+              if (!opsToMoveSet.contains(defOp) &&
+                  defOp->getParentOp() == funcOp.getOperation()) {
+                if (!insertAfter || defOp->isBeforeInBlock(insertAfter) == false)
+                  insertAfter = defOp;
+              }
+            }
+          }
+        }
+        if (insertAfter)
+          rewriter.setInsertionPointAfter(insertAfter);
+        else
+          rewriter.setInsertionPoint(opsToMove.front());
         Location loc = opsToMove.front()->getLoc();
 
         SmallVector<OpFoldResult> emptySizes;

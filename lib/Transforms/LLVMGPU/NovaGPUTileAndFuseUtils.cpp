@@ -104,8 +104,12 @@ FailureOr<std::queue<Operation *>> fuseConsumersIntoForall(
   
   SmallVector<ConsumerFusionQueueEntry> candidates;
   llvm::SmallDenseSet<tensor::ParallelInsertSliceOp> allCandidates;
-  
-  auto addCandidateSlices = [&candidates, &allCandidates,
+  // Track ops erased by replaceOp so we can skip stale candidates.
+  // MLIR bump-allocates ops, so pointer comparison remains valid after
+  // erasure even though the op's contents are destroyed.
+  llvm::SmallPtrSet<Operation *, 8> replacedOps;
+
+  auto addCandidateSlices = [&candidates, &allCandidates, &replacedOps,
                              &filterFn](Operation *fusedOp,
                                         DominanceInfo &dominanceInfo) {
     for (auto *userOp : fusedOp->getResults().getUsers()) {
@@ -149,8 +153,13 @@ FailureOr<std::queue<Operation *>> fuseConsumersIntoForall(
           ConsumerFusionQueueEntry entry(std::move(fusedSlices), fusableUser);
 
           // Comparator that puts the dominating user last.
+          // Guard against replaced/erased ops to avoid accessing
+          // destroyed memory in the dominance check.
           auto comp = [&](const ConsumerFusionQueueEntry &lhs,
                           const ConsumerFusionQueueEntry &rhs) {
+            if (replacedOps.contains(lhs.fusableUser) ||
+                replacedOps.contains(rhs.fusableUser))
+              return false;
             return dominanceInfo.properlyDominates(rhs.fusableUser,
                                                    lhs.fusableUser);
           };
@@ -176,6 +185,10 @@ FailureOr<std::queue<Operation *>> fuseConsumersIntoForall(
   while (!candidates.empty()) {
     ConsumerFusionQueueEntry entry = candidates.pop_back_val();
 
+    // Skip candidates whose fusableUser was already erased by a prior fusion.
+    if (replacedOps.contains(entry.fusableUser))
+      continue;
+
     FailureOr<scf::SCFFuseConsumerOfSliceResult> fusedResult =
         mlir::scf::tileAndFuseConsumerOfSlices(rewriter, entry.slices, loops);
     if (failed(fusedResult)) {
@@ -184,8 +197,10 @@ FailureOr<std::queue<Operation *>> fuseConsumersIntoForall(
 
     // Replace the original consumer operation with the tiled implementation.
     if (!fusedResult->origConsumerOperands.empty() && !fusedResult->tiledOps.empty()) {
-      rewriter.replaceOp(fusedResult->origConsumerOperands.front()->getOwner(),
-                         fusedResult->tiledOps.front());
+      Operation *origConsumer =
+          fusedResult->origConsumerOperands.front()->getOwner();
+      replacedOps.insert(origConsumer);
+      rewriter.replaceOp(origConsumer, fusedResult->tiledOps.front());
     }
 
     DominanceInfo dominanceInfo;

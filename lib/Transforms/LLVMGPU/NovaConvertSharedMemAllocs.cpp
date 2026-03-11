@@ -112,19 +112,15 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
   }
 };
 
-/// Erases memref.dealloc ops targeting workgroup (shared) memory.
-/// Shared memory is statically allocated and freed when the kernel ends.
-///
-/// Ported from IREE's DropSharedMemoryDeallocOp (GPUPatterns.cpp:211-223).
-struct DropSharedMemoryDeallocOp : public OpRewritePattern<memref::DeallocOp> {
+/// Erases ALL memref.dealloc ops inside GPU modules. GPU kernels don't need
+/// explicit deallocation — shared memory is static and private memory is freed
+/// when the kernel terminates. Without this, bufferization-generated deallocs
+/// lower to llvm.call @free which doesn't exist in GPU device code.
+struct DropGPUMemoryDeallocOp : public OpRewritePattern<memref::DeallocOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(memref::DeallocOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!hasSharedMemoryAddressSpace(
-            cast<MemRefType>(op.getMemref().getType()))) {
-      return failure();
-    }
     rewriter.eraseOp(op);
     return success();
   }
@@ -149,7 +145,7 @@ struct NovaConvertSharedMemAllocsPass
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
     patterns.add<ConvertSharedMemAllocOp>(&getContext());
-    patterns.add<DropSharedMemoryDeallocOp>(&getContext());
+    patterns.add<DropGPUMemoryDeallocOp>(&getContext());
     if (failed(
             applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
