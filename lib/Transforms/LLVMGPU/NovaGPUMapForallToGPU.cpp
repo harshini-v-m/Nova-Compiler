@@ -217,6 +217,16 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     auto threadMapping = threadForall.getMappingAttr().getValue();
     auto threadUBs = threadForall.getMixedUpperBound();
 
+    // All thread forall bounds must be static constants.  Dynamic bounds
+    // arise from non-aligned dimensions that were not padded.
+    for (auto [idx, ub] : llvm::enumerate(threadUBs)) {
+      if (!getConstantIntValue(ub))
+        return threadForall.emitError(
+            "thread forall upper bound at dim ")
+               << idx << " is not a static constant; "
+               << "ensure all ops are padded to tile-aligned sizes";
+    }
+
     if (isLinearThreadMapping(threadForall)) {
       // Linear thread mapping: tid = threadIdx.x.
       auto tidX = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);

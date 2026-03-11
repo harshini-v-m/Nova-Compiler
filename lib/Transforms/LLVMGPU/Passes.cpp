@@ -296,7 +296,7 @@ namespace mlir::nova
 
     // 13.1 — Async gpu region: wrap gpu.launch_func in async token chains
     //         (required by GpuModuleToBinaryPass).
-    pm.addPass(createGpuAsyncRegionPass());
+    pm.addNestedPass<func::FuncOp>(createGpuAsyncRegionPass());
 
     // 13.2 — Lower the contents of each gpu.module to NVVM / LLVM.
     //
