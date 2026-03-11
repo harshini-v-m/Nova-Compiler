@@ -2128,12 +2128,10 @@ LogicalResult SceBackwardOp::verify() {
     return emitOpError("logits must have float element type, got ")
            << logitsType.getElementType();
 
-  // Targets must be any integer type (signed, signless, or unsigned)
-  // Note: UInt16 (ui16) is used by the GPT-2 dataloader, so we must accept unsigned types.
-  auto targetElemType = targetsType.getElementType();
-  if (!targetElemType.isIntOrIndex() && !llvm::isa<mlir::IntegerType>(targetElemType))
+  // Targets must be integer
+  if (!targetsType.getElementType().isSignlessInteger())
     return emitOpError("targets must have integer element type, got ")
-           << targetElemType;
+           << targetsType.getElementType();
 
   int64_t logitsRank = logitsType.getRank();
   if (logitsRank < 2)
