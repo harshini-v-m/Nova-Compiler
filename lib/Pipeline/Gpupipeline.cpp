@@ -99,7 +99,7 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
 
 
             // 4. LINALG OPT to linalg generalize pass
-            // pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgGeneralizeNamedOpsPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgGeneralizeNamedOpsPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createFuseMatmulBiasPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgFoldUnitExtentDimsPass());
@@ -234,7 +234,7 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
             
             pm.addPass(mlir::memref::createExpandStridedMetadataPass());
             pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-            pm.addPass(mlir::nova::createFixHostGpuMemoryPass());
+            
             pm.addPass(mlir::createConvertFuncToLLVMPass());
             pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
             pm.addPass(mlir::createReconcileUnrealizedCastsPass());

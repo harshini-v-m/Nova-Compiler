@@ -1,18 +1,38 @@
-// Nova Convert Shared Memory Allocs Pass
+//===- NovaConvertSharedMemAllocs.cpp - Shared memory alloc lowering ------===//
 //
-// Ported from IREE's ConvertSharedMemAllocOp and DropSharedMemoryDeallocOp:
-//   iree/compiler/Codegen/LLVMGPU/ConvertToLLVM.cpp  (lines 152-203)
-//   iree/compiler/Codegen/Common/GPU/GPUPatterns.cpp  (lines 211-223)
+// Two rewrite patterns that handle GPU shared (workgroup) memory:
 //
-// Two rewrite patterns:
-//   1. ConvertSharedMemAllocOp: converts memref.alloc with workgroup address
-//      space into a memref.global + memref.get_global pair. GPU shared memory
-//      must be statically declared at module level, not dynamically allocated.
-//   2. DropSharedMemoryDeallocOp: erases memref.dealloc for workgroup memory
-//      since shared memory is static and freed when the kernel ends.
+//   ConvertSharedMemAllocOp:
+//     Converts memref.alloc with a workgroup address space into a module-level
+//     memref.global declaration + memref.get_global.
 //
-// This pass must run AFTER bufferization (which produces memref.alloc/dealloc)
-// and BEFORE any LLVM lowering (which would try to lower alloc → malloc).
+//     In CUDA, workgroup (shared) memory is represented as a global variable
+//     in address space 3. It cannot be dynamically allocated inside kernels
+//     (address-space 3 has no malloc). Bufferization emits memref.alloc;
+//     this pass converts those to the static declaration form that PTX expects.
+//
+//   DropGPUMemoryDeallocOp:
+//     Erases all memref.dealloc ops inside GPU modules. GPU shared memory is
+//     static and freed automatically when the kernel terminates. Without this,
+//     bufferization-generated deallocs lower to `llvm.call @free` which does
+//     not exist in GPU device code.
+//
+// Also contains NovaGPULowerMemorySpacePass, which converts
+// #gpu.address_space<private> on memref types to generic address space 0
+// before finalizeMemRefToLLVM. This avoids an assertion in
+// LLVM's ScalarEvolutionExpander (via LoopStrengthReduce) that fires on
+// memref ops in non-default address spaces on NVPTX.
+//
+// Run order:
+//   This pass must run AFTER bufferization (which produces the alloc/dealloc
+//   ops) and BEFORE any LLVM lowering (which would incorrectly lower
+//   a workgroup alloc to a malloc call).
+//
+// Ported from IREE:
+//   iree/compiler/Codegen/LLVMGPU/ConvertToLLVM.cpp   lines 152–203
+//   iree/compiler/Codegen/Common/GPU/GPUPatterns.cpp   lines 211–223
+//
+//===----------------------------------------------------------------------===//
 
 #include "Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -30,8 +50,8 @@ using namespace mlir;
 
 namespace mlir::nova {
 
-/// Returns true if the memref type has workgroup (shared) memory address space.
-/// Mirrors IREE's hasSharedMemoryAddressSpace (GPUUtils.cpp:1220-1225).
+/// Returns true if the memref type has a workgroup (shared) memory address
+/// space.  Mirrors IREE's hasSharedMemoryAddressSpace (GPUUtils.cpp:1220).
 static bool hasSharedMemoryAddressSpace(MemRefType memrefType) {
   auto addrSpace =
       dyn_cast_if_present<gpu::AddressSpaceAttr>(memrefType.getMemorySpace());
@@ -41,58 +61,62 @@ static bool hasSharedMemoryAddressSpace(MemRefType memrefType) {
 
 namespace {
 
-/// Converts memref.alloc with workgroup address space into a module-level
-/// memref.global declaration + memref.get_global.
-///
-/// Ported from IREE's ConvertSharedMemAllocOp (ConvertToLLVM.cpp:152-203).
-///
-/// In CUDA, workgroup (shared) memory is represented by a global variable
-/// in address space 3. It cannot be dynamically allocated inside kernels.
+//===----------------------------------------------------------------------===//
+// ConvertSharedMemAllocOp
+//
+// CORE LOGIC — converts memref.alloc with workgroup address space into a
+// module-level memref.global declaration + memref.get_global.
+//
+// Ported from IREE's ConvertSharedMemAllocOp (ConvertToLLVM.cpp:152–203).
+//===----------------------------------------------------------------------===//
 struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(memref::AllocOp allocOp,
                                 PatternRewriter &rewriter) const override {
     // Only handle workgroup (shared) memory allocations.
-    if (!hasSharedMemoryAddressSpace(allocOp.getType())) {
+    if (!hasSharedMemoryAddressSpace(allocOp.getType()))
       return failure();
-    }
 
-    // Shared memory must be statically shaped.
+    // Shared memory must be statically shaped — dynamic shared memory requires
+    // a different lowering path (extern __shared__ arrays) not yet implemented.
     ArrayRef<int64_t> shape = allocOp.getType().getShape();
-    if (ShapedType::isDynamicShape(shape)) {
+    if (ShapedType::isDynamicShape(shape))
       return failure();
-    }
 
-    // Compute alignment.
+    // GPU / MEMORY SENSITIVE — Alignment computation.
+    // The PTX ISA requires that shared memory buffers are aligned to at least
+    // the size of one element.  Under-alignment causes memory access exceptions
+    // in the SM hardware. We prefer the user-supplied alignment; fall back to
+    // element-size alignment otherwise.
     uint64_t alignment;
     if (std::optional<uint64_t> alignmentInfo = allocOp.getAlignment()) {
       alignment = alignmentInfo.value();
     } else {
-      // If no alignment specified, align at least to the size of an element.
       Type elType = allocOp.getType().getElementType();
       if (auto shapeType = dyn_cast<ShapedType>(elType)) {
         alignment =
             shapeType.getNumElements() * shapeType.getElementTypeBitWidth() / 8;
       } else if (elType.isIndex()) {
-        // Default to 8 bytes for index types (64-bit).
-        alignment = 8;
+        alignment = 8; // 64-bit index type
       } else {
         // Alignment must be at least 1 byte and a power of 2.
-        // For sub-byte types (e.g. i1), ceil to 1.
         alignment = std::max<uint64_t>(
             llvm::PowerOf2Ceil(elType.getIntOrFloatBitWidth() / 8), 1);
       }
     }
 
-    // Create a memref.global at the nearest symbol-table scope.
-    // Using SymbolTable::getNearestSymbolTable instead of getParentOfType<ModuleOp>
-    // so this pattern works inside BOTH builtin.module AND gpu.module (which also
-    // implements the SymbolTable trait but is not a ModuleOp subclass).
+    // IMPORTANT: Use SymbolTable::getNearestSymbolTable instead of
+    // getParentOfType<ModuleOp>. This pattern runs nested inside a
+    // gpu::GPUModuleOp (which implements SymbolTable but is NOT a ModuleOp
+    // subclass), so walking up to the parent plain ModuleOp would escape the
+    // gpu.module and place the global in the wrong scope.
     MemRefType allocType = allocOp.getType();
     auto funcOp = allocOp->getParentOfType<mlir::FunctionOpInterface>();
-    Operation *symbolTableOp = SymbolTable::getNearestSymbolTable(funcOp->getParentOp());
+    Operation *symbolTableOp =
+        SymbolTable::getNearestSymbolTable(funcOp->getParentOp());
     SymbolTable symbolTable(symbolTableOp);
+
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(&symbolTableOp->getRegion(0).front().front());
     auto global = memref::GlobalOp::create(
@@ -104,7 +128,8 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
         /*alignment=*/rewriter.getI64IntegerAttr(alignment));
     symbolTable.insert(global);
 
-    // Replace alloc with get_global at the kernel function entry.
+    // Replace the alloc with a get_global at the kernel function entry so the
+    // shared buffer is visible before any intra-kernel use.
     rewriter.setInsertionPointToStart(&(*funcOp.getFunctionBody().begin()));
     rewriter.replaceOpWithNewOp<memref::GetGlobalOp>(allocOp, global.getType(),
                                                      global.getName());
@@ -112,10 +137,15 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
   }
 };
 
-/// Erases ALL memref.dealloc ops inside GPU modules. GPU kernels don't need
-/// explicit deallocation — shared memory is static and private memory is freed
-/// when the kernel terminates. Without this, bufferization-generated deallocs
-/// lower to llvm.call @free which doesn't exist in GPU device code.
+//===----------------------------------------------------------------------===//
+// DropGPUMemoryDeallocOp
+//
+// Erases ALL memref.dealloc ops inside GPU modules.  GPU kernels do not have
+// explicit deallocation semantics — shared memory is freed when the kernel
+// terminates and register/stack memory is managed by the SM hardware.
+// Bufferization-generated deallocs would incorrectly lower to `llvm.call @free`
+// which does not exist in GPU device code (no libc inside kernels).
+//===----------------------------------------------------------------------===//
 struct DropGPUMemoryDeallocOp : public OpRewritePattern<memref::DeallocOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -126,9 +156,13 @@ struct DropGPUMemoryDeallocOp : public OpRewritePattern<memref::DeallocOp> {
   }
 };
 
-/// Pass that converts shared memory allocs to globals and drops deallocs.
-/// Runs on any module-like op (builtin.module or gpu.module) so it can be
-/// nested inside a gpu::GPUModuleOp pass manager after kernel outlining.
+//===----------------------------------------------------------------------===//
+// NovaConvertSharedMemAllocsPass
+//
+// Pass that applies ConvertSharedMemAllocOp + DropGPUMemoryDeallocOp on any
+// module-like op (builtin.module or gpu.module). Nested inside
+// gpu::GPUModuleOp after kernel outlining.
+//===----------------------------------------------------------------------===//
 struct NovaConvertSharedMemAllocsPass
     : public PassWrapper<NovaConvertSharedMemAllocsPass,
                          OperationPass<>> {
@@ -146,10 +180,8 @@ struct NovaConvertSharedMemAllocsPass
     RewritePatternSet patterns(&getContext());
     patterns.add<ConvertSharedMemAllocOp>(&getContext());
     patterns.add<DropGPUMemoryDeallocOp>(&getContext());
-    if (failed(
-            applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       return signalPassFailure();
-    }
   }
 
   StringRef getArgument() const override {
@@ -161,13 +193,21 @@ struct NovaConvertSharedMemAllocsPass
   }
 };
 
-/// Pass that converts #gpu.address_space<private> on memref types to NVVM
-/// integer address space 5 (local memory). Workgroup and global address
-/// spaces are left as-is because they are handled by the existing
-/// ConvertSharedMemAllocs and gpu-to-nvvm passes respectively.
-///
-/// Must run inside gpu.module BEFORE finalizeMemRefToLLVMConversionPass,
-/// which requires integer address spaces on all memrefs.
+//===----------------------------------------------------------------------===//
+// NovaGPULowerMemorySpacePass
+//
+// Converts #gpu.address_space<private> on memref types to generic integer
+// address space 0.
+//
+// IMPORTANT: This mapping (private → AS 0) is intentional.  On NVPTX, alloca
+// in AS 0 still lands in local (register/stack) memory, but uses generic
+// pointers that LLVM's LoopStrengthReduce (via ScalarEvolutionExpander) can
+// optimise without hitting the non-default-AS assertion that fires when private
+// address spaces are still present during that LLVM pass.
+//
+// Workgroup and global address spaces are left unchanged — they are handled
+// by ConvertSharedMemAllocs and gpu-to-nvvm respectively.
+//===----------------------------------------------------------------------===//
 struct NovaGPULowerMemorySpacePass
     : public PassWrapper<NovaGPULowerMemorySpacePass,
                          OperationPass<>> {
@@ -185,18 +225,18 @@ struct NovaGPULowerMemorySpacePass
     Operation *op = getOperation();
 
     AttrTypeReplacer replacer;
-    // Only convert private address space; leave workgroup/global for
-    // downstream passes (ConvertSharedMemAllocs, gpu-to-nvvm).
-    // Map private to address space 0 (generic).  On NVPTX, alloca in AS 0
-    // still lands in local memory, but uses generic pointers that LLVM's
-    // LoopStrengthReduce can optimise without hitting the non-default-AS
-    // assertion in ScalarEvolutionExpander.
+
+    // Map #gpu.address_space<private> → IntegerAttr(64, 0) (generic AS).
+    // Workgroup and global are left as-is for downstream passes.
     replacer.addReplacement(
         [&](gpu::AddressSpaceAttr attr) -> std::optional<Attribute> {
           if (attr.getValue() == gpu::AddressSpace::Private)
             return IntegerAttr::get(IntegerType::get(ctx, 64), /*generic=*/0);
-          return std::nullopt; // keep workgroup/global as-is
+          return std::nullopt;
         });
+
+    // Also remap the MemRefType itself so structural type equality is maintained
+    // after replacing the address-space attribute inside it.
     replacer.addReplacement([&](MemRefType type) -> std::optional<Type> {
       auto space =
           dyn_cast_if_present<gpu::AddressSpaceAttr>(type.getMemorySpace());
@@ -206,6 +246,7 @@ struct NovaGPULowerMemorySpacePass
                              type.getLayout(),
                              IntegerAttr::get(IntegerType::get(ctx, 64), 0));
     });
+
     replacer.recursivelyReplaceElementsIn(op, /*replaceAttrs=*/true,
                                           /*replaceLocs=*/false,
                                           /*replaceTypes=*/true);
@@ -221,6 +262,10 @@ struct NovaGPULowerMemorySpacePass
 };
 
 } // namespace
+
+//===----------------------------------------------------------------------===//
+// Public API
+//===----------------------------------------------------------------------===//
 
 std::unique_ptr<Pass> createNovaConvertSharedMemAllocsPass() {
   return std::make_unique<NovaConvertSharedMemAllocsPass>();

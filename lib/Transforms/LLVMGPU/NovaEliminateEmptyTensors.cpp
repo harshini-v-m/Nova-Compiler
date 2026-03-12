@@ -1,23 +1,27 @@
-// Nova Eliminate Empty Tensors Pass
+//===- NovaEliminateEmptyTensors.cpp - Pre-bufferization empty elimination ===//
 //
 // Pre-bufferization pass that tries to eliminate `tensor.empty` ops by finding
 // an existing destination tensor that can be reused, thus avoiding unnecessary
-// allocations during bufferization.
+// buffer allocations during bufferization.
 //
-// This pass does two things:
-//  1. Runs linalg's "convert to destination-passing style" patterns, which
-//     rewrites ops like linalg.generic with tensor.empty outputs into DPS form
-//     where the output can be reused.
-//  2. Runs bufferization's empty tensor elimination analysis, which replaces
-//     tensor.empty ops with existing destination tensors when the analysis
-//     proves it is safe (the tensor.empty result would alias an existing
-//     buffer after bufferization anyway).
+// Two-step approach:
+//   Step 1 — Convert-to-DPS patterns:
+//     Rewrites ops like linalg.generic with tensor.empty outputs into
+//     destination-passing style (DPS) form where the output can be reused.
+//
+//   Step 2 — Bufferization analysis:
+//     Runs bufferization.OneShotAnalysis and replaces tensor.empty ops with
+//     existing destination tensors wherever the analysis proves the empty
+//     would alias an existing buffer after bufferization anyway.
 //
 // IREE equivalent: EliminateEmptyTensorsPass
-// (iree/compiler/src/iree/compiler/Codegen/Common/IREEComprehensiveBufferizePass.cpp)
+//   (iree/compiler/src/iree/compiler/Codegen/Common/
+//    IREEComprehensiveBufferizePass.cpp)
 //
-// The IREE version also has duplicateTensorEmptyOps and moveUpMemrefReshapeOps
-// which are IREE-HAL specific. We only port the core upstream MLIR parts.
+// IREE also has duplicateTensorEmptyOps and moveUpMemrefReshapeOps which are
+// IREE-HAL specific. We only port the core upstream MLIR parts.
+//
+//===----------------------------------------------------------------------===//
 
 #include "Passes.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -52,9 +56,10 @@ struct NovaEliminateEmptyTensorsPass
     func::FuncOp funcOp = getOperation();
     MLIRContext *context = &getContext();
 
-    // Step 1: Convert ops to destination-passing style.
-    // This rewrites patterns like linalg ops with tensor.empty outputs into
-    // forms where the output tensor can be reused as a destination.
+    // ALGORITHM STEP 1: Convert ops to destination-passing style.
+    // Rewrites patterns like linalg ops with tensor.empty outputs into forms
+    // where the output tensor can be reused as the destination — enabling the
+    // analysis in Step 2 to eliminate the empty.
     {
       RewritePatternSet patterns(context);
       linalg::populateConvertToDestinationStylePatterns(patterns);
@@ -65,24 +70,22 @@ struct NovaEliminateEmptyTensorsPass
       }
     }
 
-    // Step 2: Run bufferization analysis and eliminate empty tensors.
-    // This replaces tensor.empty ops with existing destination tensors
-    // when the analysis proves the empty would alias an existing buffer
-    // after bufferization.
+    // ALGORITHM STEP 2: Run bufferization analysis and eliminate empty tensors.
+    // OneShotAnalysis determines which tensor.empty results would alias an
+    // existing buffer after bufferization. Those empties are replaced with the
+    // existing tensor, saving one allocation per eliminated empty.
     {
       bufferization::OneShotBufferizationOptions opts;
       opts.bufferizeFunctionBoundaries = false;
       bufferization::OneShotAnalysisState state(funcOp, opts);
 
-      if (failed(bufferization::analyzeOp(funcOp, state))) {
+      if (failed(bufferization::analyzeOp(funcOp, state)))
         return signalPassFailure();
-      }
 
       IRRewriter rewriter(context);
       if (failed(
-              bufferization::eliminateEmptyTensors(rewriter, funcOp, state))) {
+              bufferization::eliminateEmptyTensors(rewriter, funcOp, state)))
         return signalPassFailure();
-      }
     }
   }
 

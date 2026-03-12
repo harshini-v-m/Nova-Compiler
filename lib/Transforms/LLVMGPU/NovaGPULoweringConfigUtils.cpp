@@ -1,7 +1,14 @@
-//===- NovaGPULoweringConfigUtils.cpp - Lowering Config helpers -----------===//
+//===- NovaGPULoweringConfigUtils.cpp - Lowering config attribute helpers -===//
 //
-// Implements utilities for reading and writing the Nova GPU lowering
-// configuration DictionaryAttr attached to linalg ops.
+// Implements read and write helpers for the `lowering_config` DictionaryAttr
+// attached to linalg ops by the SelectLoweringStrategy pass.
+//
+// CORE LOGIC: This attribute is the mechanism through which all tiling passes
+// (Reduction, Thread, Subgroup) share configuration.  getLoweringConfig() and
+// setMatmulLoweringConfigAttrs() are called on virtually every linalg op
+// during the pipeline.  Incorrect reads here cause silent wrong-tile-size
+// bugs that are very hard to debug at the PTX level.
+//
 //===----------------------------------------------------------------------===//
 
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
@@ -97,6 +104,10 @@ void appendPromotedOperandsList(MLIRContext *ctx,
 // Op-level helpers
 //===----------------------------------------------------------------------===//
 
+// CORE LOGIC: Reads the lowering_config DictionaryAttr from `op`.
+// Returns an empty DictionaryAttr (evaluates to false) when not present.
+// All tiling passes call this to determine tile sizes; a missing config
+// causes fallback to heuristic values.
 DictionaryAttr getLoweringConfig(Operation *op) {
   if (!op)
     return {};
@@ -115,6 +126,10 @@ void setLoweringConfig(Operation *op, DictionaryAttr configDict) {
   op->setAttr(kLoweringConfigAttrName, configDict);
 }
 
+// CORE LOGIC: Builds a complete lowering_config DictionaryAttr and attaches
+// it to `op`. Called by NovaKernelConfig for every matmul/reduction op
+// during the SelectLoweringStrategy pass. Must match the read layout
+// expected by getLoweringConfigTileSizes (direct loop-index mapping).
 void setMatmulLoweringConfigAttrs(Operation *op,
                                   MLIRContext *ctx,
                                   ArrayRef<int64_t> workgroupTiles,

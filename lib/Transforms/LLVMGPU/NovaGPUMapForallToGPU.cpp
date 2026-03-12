@@ -1,18 +1,21 @@
-//===- NovaGPUMapForallToGPU.cpp - scf.forall → gpu.launch ----------------===//
+//===- NovaGPUMapForallToGPU.cpp - scf.forall → gpu.launch ---------------===//
 //
 // Replaces the gpu_forall_to_launch.mlir transform script with a C++ pass
 // that dynamically computes thread block dimensions from nested thread-mapped
 // forall bounds, instead of hardcoding block_dims = [32, 32, 1].
 //
-// Algorithm:
-//   1. Walk all outermost block-mapped scf.forall ops.
-//   2. For each, compute grid dims from the block forall's upper bounds.
-//   3. Find nested thread-mapped foralls and compute block dims from their
-//      actual iteration bounds (linear mapping → product; 3D → per-dim max).
-//   4. Create gpu.launch with correct grid/block dims.
-//   5. Map block forall IVs → gpu.block_id, thread forall IVs → gpu.thread_id.
-//   6. Add predication for thread IDs when multiple thread foralls share a
-//      launch (block dims = max across all foralls).
+// Algorithm (per outermost block-mapped scf.forall):
+//   Step 1: Compute grid dims from the block forall's upper bounds.
+//   Step 2: Find nested thread-mapped foralls; compute block dims from their
+//           actual iteration bounds (linear mapping → product; 3D → per-dim max).
+//   Step 3: Clamp block dims to CUDA's 1024-thread limit.
+//   Step 4: Create gpu.launch with correct grid/block dims.
+//   Step 5: Map block forall IVs → gpu.block_id.
+//   Step 6: Erase block forall terminator; splice body into launch.
+//   Step 7: Convert thread foralls inside the launch body:
+//           - Replace thread forall IVs → gpu.thread_id.
+//           - Add predication when blockDims > forall bounds (idle threads).
+//   Step 8: Erase original block forall.
 //
 //===----------------------------------------------------------------------===//
 
@@ -80,7 +83,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
                                                  scf::ForallOp blockForall) {
   Location loc = blockForall.getLoc();
 
-  // ----- Step 1: Compute grid dims from block forall mapping -----
+  // ---- ALGORITHM STEP 1: Compute grid dims from block forall mapping ----
   auto blockMapping = blockForall.getMappingAttr().getValue();
   auto blockUBs = blockForall.getMixedUpperBound();
   int64_t gridDims[3] = {1, 1, 1};
@@ -119,7 +122,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     }
   }
 
-  // ----- Step 2: Find thread foralls and compute block dims -----
+  // ---- ALGORITHM STEP 2: Find thread foralls and compute block dims ----
   int64_t blockDims[3] = {1, 1, 1};
   SmallVector<scf::ForallOp> threadForalls;
 
@@ -166,12 +169,13 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     return failure();
   }
 
-  // ----- Step 3: Clamp block dims to CUDA's 1024-thread limit -----
-  // CUDA's maximum threads per block is 1024. If the computed blockDims
-  // exceed this (e.g., due to an oversized thread tile from the config),
-  // the PTX JIT rejects the module with CUDA_ERROR_INVALID_PTX.
-  // We redistribute excess threads into the grid (blockDims[0] overflow
-  // goes to gridDims[0]) and hard-clamp blockDims[0] at 1024.
+  // ---- ALGORITHM STEP 3: Clamp block dims to CUDA's 1024-thread limit ----
+  //
+  // PERFORMANCE CRITICAL: CUDA's maximum threads per block is 1024. If the
+  // computed blockDims exceed this (e.g., due to an oversized thread tile from
+  // the config), the PTX JIT rejects the module with CUDA_ERROR_INVALID_PTX.
+  // Excess threads are redistributed into the grid (blockDims[0] overflow goes
+  // to gridDims[0]) and blockDims[0] is hard-clamped at 1024.
   static constexpr int64_t kMaxThreadsPerBlock = 1024;
   if (blockDims[0] > kMaxThreadsPerBlock) {
     blockForall.emitWarning()
@@ -185,7 +189,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     blockDims[0] = kMaxThreadsPerBlock;
   }
 
-  // ----- Step 4: Create gpu.launch -----
+  // ---- ALGORITHM STEP 4: Create gpu.launch ----
   rewriter.setInsertionPoint(blockForall);
   auto cstIdx = [&](int64_t v) {
     return rewriter.create<arith::ConstantIndexOp>(loc, v);
@@ -204,7 +208,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     rewriter.create<gpu::TerminatorOp>(loc);
   }
 
-  // ----- Step 5: Replace block forall IVs -----
+  // ---- ALGORITHM STEP 5: Replace block forall IVs with gpu.block_id ----
   {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(&launchBody);
@@ -245,7 +249,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     }
   }
 
-  // ----- Step 6: Erase block forall terminator, move body to launch -----
+  // ---- ALGORITHM STEP 6: Erase block forall terminator; move body to launch ----
   // The in_parallel terminator (empty after bufferization) must be erased.
   rewriter.eraseOp(blockForall.getTerminator());
 
@@ -253,15 +257,16 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   auto insertPt = launchBody.without_terminator().end();
   launchBody.getOperations().splice(insertPt, forallBody->getOperations());
 
-  // ----- Step 7: Convert thread foralls inside the launch body -----
+  // ---- ALGORITHM STEP 7: Convert thread foralls inside the launch body ----
   for (auto threadForall : threadForalls) {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(threadForall);
     auto threadMapping = threadForall.getMappingAttr().getValue();
     auto threadUBs = threadForall.getMixedUpperBound();
 
-    // All thread forall bounds must be static constants.  Dynamic bounds
-    // arise from non-aligned dimensions that were not padded.
+    // IMPORTANT: All thread forall bounds must be static constants.
+    // Dynamic bounds arise from non-aligned dimensions that were not padded
+    // (NovaGPUPadOperandsPass). This error indicates a missing padding step.
     for (auto [idx, ub] : llvm::enumerate(threadUBs)) {
       if (!getConstantIntValue(ub))
         return threadForall.emitError(
@@ -304,8 +309,12 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
       rewriter.eraseOp(threadForall.getTerminator());
       Block *threadBody = threadForall.getBody();
 
+      // IMPORTANT: Predication for idle threads.
+      // When the thread forall has fewer threads than the block dim (because
+      // blockDims = max across all foralls in the launch), some threads in the
+      // block have no work to do for this forall. We guard with an if-pred to
+      // prevent out-of-bounds side effects.
       if (totalThreads < blockDims[0]) {
-        // Need predication: some threads are idle.
         Value pred = rewriter.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::ult, linearTid, cstIdx(totalThreads));
         auto ifOp =
@@ -365,7 +374,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     }
   }
 
-  // ----- Step 8: Erase original block forall -----
+  // ---- ALGORITHM STEP 8: Erase original block forall ----
   rewriter.eraseOp(blockForall);
   return success();
 }

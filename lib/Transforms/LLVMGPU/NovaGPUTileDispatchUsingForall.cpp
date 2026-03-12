@@ -25,6 +25,7 @@ namespace mlir::nova {
 static bool isComputeOp(Operation *op) {
   return isa<TilingInterface>(op);
 }
+
 /// Returns true if the op is a contraction-like op (e.g. matmul).
 static bool isContractionOp(Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
@@ -139,6 +140,16 @@ static SmallVector<Attribute> getMapping(MLIRContext *context, ArrayRef<OpFoldRe
 }
 
 /// Checks whether we have static dimension for all the loop bounds and steps.
+static bool areAllStaticLoopBounds(scf::ForallOp forallOp) {
+  for (auto [lb, ub, step] : llvm::zip_equal(forallOp.getMixedLowerBound(),
+                                             forallOp.getMixedUpperBound(),
+                                             forallOp.getMixedStep())) {
+    if (!getConstantIntValue(lb) || !getConstantIntValue(ub) || !getConstantIntValue(step)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 struct TilingInfo {
   Operation *tilableOp;
@@ -191,29 +202,42 @@ static FailureOr<TilingInfo> getTiledAndDistributionInfo(RewriterBase &rewriter,
   // Full-tile optimization: zero tile size when staticLoopSize == tileSize.
   // This prevents single-trip scf.forall loops, which can block cleanup patterns.
   // Keep at least one non-zero tile size so the forall loop is still created.
+  //
+  // EXCEPTION: Skip for ops with reduction iterators. These ops MUST stay
+  // inside a block-mapped forall so they get lowered to GPU kernels. A
+  // single-trip forall is fine — the kernel launches 1 block for the parallel
+  // dim while the reduction runs inside the kernel body.
   {
-    OpBuilder::InsertionGuard g(rewriter);
-    rewriter.setInsertionPoint(op);
-    auto tilingIface = cast<TilingInterface>(op);
-    SmallVector<Range> bounds = tilingIface.getIterationDomain(rewriter);
-
-    // Count current non-zero tile sizes.
-    int numNonZero = 0;
-    for (auto &ts : tileSizes) {
-      if (auto cst = getConstantIntValue(ts))
-        if (*cst != 0) ++numNonZero;
+    bool hasReductionIter = false;
+    if (auto lg = dyn_cast<linalg::LinalgOp>(op)) {
+      hasReductionIter = llvm::any_of(lg.getIteratorTypesArray(),
+                                       linalg::isReductionIterator);
     }
 
-    // Zero out full-tile dims from innermost outward, keeping at least 1.
-    for (int i = (int)tileSizes.size() - 1; i >= 0; --i) {
-      if (numNonZero <= 1) break;
-      auto tsCst = getConstantIntValue(tileSizes[i]);
-      if (!tsCst || *tsCst == 0) continue;
-      if (i >= (int)bounds.size()) continue;
-      auto boundCst = getConstantIntValue(bounds[i].size);
-      if (boundCst && *boundCst == *tsCst) {
-        tileSizes[i] = rewriter.getIndexAttr(0);
-        --numNonZero;
+    if (!hasReductionIter) {
+      OpBuilder::InsertionGuard g(rewriter);
+      rewriter.setInsertionPoint(op);
+      auto tilingIface = cast<TilingInterface>(op);
+      SmallVector<Range> bounds = tilingIface.getIterationDomain(rewriter);
+
+      // Count current non-zero tile sizes.
+      int numNonZero = 0;
+      for (auto &ts : tileSizes) {
+        if (auto cst = getConstantIntValue(ts))
+          if (*cst != 0) ++numNonZero;
+      }
+
+      // Zero out full-tile dims from innermost outward, keeping at least 1.
+      for (int i = (int)tileSizes.size() - 1; i >= 0; --i) {
+        if (numNonZero <= 1) break;
+        auto tsCst = getConstantIntValue(tileSizes[i]);
+        if (!tsCst || *tsCst == 0) continue;
+        if (i >= (int)bounds.size()) continue;
+        auto boundCst = getConstantIntValue(bounds[i].size);
+        if (boundCst && *boundCst == *tsCst) {
+          tileSizes[i] = rewriter.getIndexAttr(0);
+          --numNonZero;
+        }
       }
     }
   }
@@ -296,6 +320,22 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       // 4. Fusion Options
       scf::SCFTileAndFuseOptions tileAndFuseOptions;
       tileAndFuseOptions.setTilingOptions(tilingOptions);
+
+      tileAndFuseOptions.setFusionControlFn(
+          [&](tensor::ExtractSliceOp sliceOp, OpResult producer,
+              bool isDest)
+              -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+            Operation *producerOp = producer.getOwner();
+            if (isa<tensor::PadOp>(producerOp))
+              return std::nullopt;
+            // Block contraction fusion — GEMMs stay as independent roots.
+            if (isContractionOp(producerOp))
+              return std::nullopt;
+            bool yieldProducerReplacement =
+                yieldReplacementsFor.contains(producerOp);
+            return scf::SCFTileAndFuseOptions::ControlFnResult{
+                yieldProducerReplacement};
+          });
 
       // 5. Cleanup Patterns
       RewritePatternSet cleanupPatterns(&getContext());
@@ -485,16 +525,7 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
           continue;
         // Only tile each "sink": skip if this op's result feeds another
         // untiled compute op (it will be fused as a producer of that op).
-        bool hasTilableConsumer = llvm::any_of(rootOp->getUsers(), [&](Operation *user) {
-          auto userLinalg = dyn_cast<linalg::LinalgOp>(user);
-          auto rootLinalg = dyn_cast<linalg::LinalgOp>(rootOp);
-          if (userLinalg && rootLinalg) {
-            // Prevent deferring to a full reduction (which will be un-distributed).
-            // If the consumer has fewer parallel loops, it will act as a bottleneck
-            // and force the parallel producer into a single block, exploding thread counts.
-            if (userLinalg.getNumParallelLoops() < rootLinalg.getNumParallelLoops())
-              return false;
-          }
+        bool hasTilableConsumer = llvm::any_of(rootOp->getUsers(), [](Operation *user) {
           return isa<TilingInterface>(user);
         });
         // If this op has a tilable consumer that is still outside a forall,
@@ -758,10 +789,14 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       // Merge consecutive extract/insert slice ops to simplify later patterns.
       tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
 
-      // Canonicalize extract_slice and forall ops.
+      // Canonicalize extract_slice and dim ops.
       tensor::ExtractSliceOp::getCanonicalizationPatterns(patterns, context);
       tensor::DimOp::getCanonicalizationPatterns(patterns, context);
-      scf::ForallOp::getCanonicalizationPatterns(patterns, context);
+      // NOTE: scf::ForallOp canonicalization is intentionally OMITTED here.
+      // The upstream pattern inlines single-trip foralls, which would pull
+      // reduction ops out of their block-mapped forall and leave them on the
+      // host. The NormalizeLooopBoundsPass (Step 8.5) handles degenerate
+      // foralls after bufferization where it is safe to do so.
 
       if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         funcOp.emitOpError("tiling cleanup failed");

@@ -1,3 +1,20 @@
+//===- NovaGPUTileAndFuseUtils.cpp - Tile-and-fuse loop utilities ---------===//
+//
+// Utility helpers shared by the GPU tiling passes:
+//
+//   fuseProducersOfSlices   — fuses producer ops into a tile-and-fuse loop
+//                            by processing a worklist of extract_slice ops.
+//   collectTiledAndFusedOps — BFS collection of all tilable ops reachable
+//                            from a root op (producers + consumers).
+//   fuseConsumersIntoForall — fuses tilable consumer ops into a scf.forall
+//                            via tileAndFuseConsumerOfSlices. Uses dominance
+//                            ordering to fuse consumers in safe order.
+//
+// Mirrors IREE's mlir::iree_compiler::tileAndFuseProductors / consumers
+// from Codegen/Common/TileAndFuseUtils.cpp.
+//
+//===----------------------------------------------------------------------===//
+
 #include "NovaGPUTileAndFuseUtils.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -20,10 +37,13 @@ static bool isa_and_present(Operation *op) {
   return op && isa<T>(op);
 }
 
+// Processes a worklist of extract_slice ops and attempts to fuse the producer
+// of each slice into the surrounding tiled loop. Newly generated slices from
+// each successful fusion are added to the worklist for transitive fusion.
 void fuseProducersOfSlices(RewriterBase &rewriter,
-                           std::queue<Operation *> &worklist,
-                           scf::SCFTileAndFuseOptions &options,
-                           MutableArrayRef<LoopLikeOpInterface> loops) {
+                            std::queue<Operation *> &worklist,
+                            scf::SCFTileAndFuseOptions &options,
+                            MutableArrayRef<LoopLikeOpInterface> loops) {
   while (!worklist.empty()) {
     auto candidateSlice = cast<tensor::ExtractSliceOp>(worklist.front());
     worklist.pop();
@@ -56,8 +76,12 @@ void fuseProducersOfSlices(RewriterBase &rewriter,
   }
 }
 
+// BFS from `rootOp` collecting all tilable ops reachable via producer
+// (operand-defining TilingInterface) and consumer (result-using TilingInterface)
+// edges. Used to scope the fusion analysis to the compute cluster around
+// the root matmul/reduction op.
 void collectTiledAndFusedOps(Operation *rootOp,
-                             llvm::SmallDenseSet<Operation *> &result) {
+                              llvm::SmallDenseSet<Operation *> &result) {
   SmallVector<Operation *> worklist;
   worklist.push_back(rootOp);
   result.insert(rootOp);
@@ -97,6 +121,18 @@ struct ConsumerFusionQueueEntry {
 };
 } // namespace
 
+// PERFORMANCE CRITICAL — Fuses tilable consumer ops into a scf.forall loop.
+//
+// Finds all parallel-insert-slice-producing consumers of the tiled ops,
+// sorts them in dominance order so that the closest consumer is fused last
+// (this preserves use-def correctness after each replacement), then calls
+// scf::tileAndFuseConsumerOfSlices for each.
+//
+// IMPORTANT: Uses a `replacedOps` set to skip stale candidates.
+// MLIR bump-allocates ops; after replaceOp() the memory is freed but the
+// pointer value still uniquely identifies the erased op for the lifetime of
+// this function (no new op is allocated at the same address within one pass
+// run). Checking the erased set avoids accessing destroyed op memory.
 FailureOr<std::queue<Operation *>> fuseConsumersIntoForall(
     RewriterBase &rewriter, ArrayRef<Operation *> tiledOps,
     MutableArrayRef<LoopLikeOpInterface> loops,

@@ -1,19 +1,21 @@
-//===- NovaConfigTrackingCanonicalizer.cpp - Config-aware canonicalize ----===//
+//===- NovaConfigTrackingCanonicalizer.cpp - Config-preserving canonicalize ===//
 //
 // A canonicalize pass that propagates `lowering_config` attributes to newly
 // created ops when the original op is replaced by a rewrite pattern.
 //
-// Without this: after K-tiling, the original linalg.matmul is replaced by a
-// new one inside the scf.for loop. A plain canonicalize pass drops the
-// `lowering_config` attribute, so Thread and Subgroup tiling passes see no
-// config on the new op and fall back to hardcoded values.
+// Why this is needed:
+//   After K-tiling, the original linalg.matmul is replaced by a new one inside
+//   the scf.for loop. A plain canonicalize pass would drop the `lowering_config`
+//   attribute, so Thread and Subgroup tiling passes see no config on the new op
+//   and fall back to hardcoded heuristic values — producing wrong tile sizes.
 //
-// With this: the `ConfigTrackingListener` detects the replacement, copies the
-// `lowering_config` dict from the old op to the new op, and all subsequent
-// tiling levels can read the config.
+//   The ConfigTrackingListener detects each replacement, copies the
+//   `lowering_config` dict from the old op to the new op (if they share the
+//   same op name), and all subsequent tiling levels can read the config.
 //
-// Mirrors IREE's `ConfigTrackingCanonicalizer.cpp` exactly in mechanism,
+// Mirrors IREE's ConfigTrackingCanonicalizer.cpp exactly in mechanism,
 // using Nova's `kLoweringConfigAttrName` instead of IREE's interface.
+//
 //===----------------------------------------------------------------------===//
 
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
@@ -31,15 +33,18 @@ namespace mlir::nova {
 //===----------------------------------------------------------------------===//
 // ConfigTrackingListener
 //
-// Hooked into the greedy rewriter. When an op is replaced, if the original op
-// carried a `lowering_config` attribution and the replacement op is the same
-// kind (e.g., both linalg.matmul), we copy the config forward.
+// CORE LOGIC — hooked into the greedy rewriter. When an op is replaced,
+// if the original op carried a `lowering_config` attribute AND the replacement
+// op is the same kind (e.g., both linalg.matmul), we copy the config forward.
+//
+// This ensures that tiling configs survive through canonicalization-induced
+// replacements (e.g., fold/propagation rewrites that clone the op).
 //===----------------------------------------------------------------------===//
 
 class ConfigTrackingListener : public RewriterBase::Listener {
 public:
   void notifyOperationReplaced(Operation *op, ValueRange replacements) override {
-    // No replacements → nothing to propagate.
+    // Nothing to propagate if the replacement set is empty.
     if (replacements.empty())
       return;
 
@@ -48,7 +53,9 @@ public:
     if (!cfg)
       return;
 
-    // Walk through cast-like ops to reach the defining op.
+    // IMPORTANT: Walk through tensor.cast-like ops to reach the actual
+    // defining op. Canonicalize sometimes wraps new ops in a cast, so we
+    // peel those off to find the true replacement before doing the name check.
     auto skipCasts = [](Value v) -> Operation * {
       Operation *defOp = v.getDefiningOp();
       if (!defOp) return nullptr;
@@ -58,16 +65,20 @@ public:
     };
 
     Operation *newOp = skipCasts(replacements.front());
+    // Only propagate if the replacement is the same op kind (conservative).
+    // Propagating configs across op-kind boundaries would incorrectly stamp
+    // tiling configs on unrelated ops.
     if (!newOp || newOp->getName() != op->getName())
       return;
 
-    // All replacements must come from the same op (conservative check).
+    // Verify all replacement values come from the same op.
     for (Value v : replacements.drop_front()) {
       if (skipCasts(v) != newOp)
         return;
     }
 
-    // Don't overwrite an existing config.
+    // Don't overwrite an existing config — preserves configs stamped by the
+    // strategy pass over any that would come from a parent op.
     if (getLoweringConfig(newOp))
       return;
 
@@ -76,7 +87,7 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// Pass
+// Pass definition
 //===----------------------------------------------------------------------===//
 
 struct NovaConfigTrackingCanonicalizerPass
@@ -89,6 +100,8 @@ struct NovaConfigTrackingCanonicalizerPass
   NovaConfigTrackingCanonicalizerPass(
       const NovaConfigTrackingCanonicalizerPass &) = default;
 
+  // Collect all canonicalization patterns once per pass instantiation so
+  // they are shared across repeated invocations (e.g., in a pipeline loop).
   LogicalResult initialize(MLIRContext *ctx) override {
     RewritePatternSet owning(ctx);
     for (auto *dialect : ctx->getLoadedDialects())
@@ -103,7 +116,8 @@ struct NovaConfigTrackingCanonicalizerPass
     ConfigTrackingListener listener;
     GreedyRewriteConfig cfg;
     cfg.setListener(&listener);
-    // Non-convergence is not a failure (same as upstream canonicalize).
+    // Non-convergence is not treated as a failure (same policy as the upstream
+    // canonicalize pass — the IR is still valid after the iteration limit).
     (void)applyPatternsGreedily(getOperation(), *patterns, cfg);
   }
 

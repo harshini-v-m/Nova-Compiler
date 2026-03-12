@@ -1,3 +1,13 @@
+//===- Passes.h - Nova GPU LLVM-GPU Transform Pass Declarations -----------===//
+//
+// Public declarations for every individual pass and for the two pipeline
+// builder functions in the Nova GPU LLVM-GPU transform library.
+//
+// Consumers only need to include this header; implementation details and
+// MLIR PassWrapper boilerplate live in the corresponding .cpp files.
+//
+//===----------------------------------------------------------------------===//
+
 #ifndef NOVA_TRANSFORMS_LLVMGPU_PASSES_H_
 #define NOVA_TRANSFORMS_LLVMGPU_PASSES_H_
 
@@ -7,19 +17,34 @@
 namespace mlir {
 namespace nova {
 
-// --- Pipeline ---
-// Adds the Nova GPU optimized pipeline (strategy → tile → pad → promote → K-tile →...)
-// |cudaArch|: CUDA SM arch string forwarded to the strategy pass, e.g. "sm_80".
+//===----------------------------------------------------------------------===//
+// Pipeline builders
+//===----------------------------------------------------------------------===//
+
+// CORE LOGIC — addNovaGPUOptimizedPipeline
+// Adds the entire Nova GPU optimized pipeline to `pm`:
+//   Nova dialect lowering → TOSA → Linalg → tiling & fusion →
+//   GPU-aware bufferization → gpu.launch → NVVM → PTX binary.
+// |cudaArch|: CUDA SM arch string forwarded to the strategy pass, e.g. "sm_86".
+// Defaults to "sm_86" (Ampere / RTX 3060) when empty.
 void addNovaGPUOptimizedPipeline(OpPassManager &pm,
                                   StringRef cudaArch = "sm_86");
 
-// --- Passes ---
+// GPU-aware bufferization helper — mirrors IREE's addGPUBufferizePasses().
+// Called internally by addNovaGPUOptimizedPipeline (Step 8).
+// Order: EliminateEmptyTensors → AllocTensor → InferMemorySpace →
+//        ComprehensiveBufferize → cleanup → BufferLoopHoisting → Deallocation.
+void addNovaGPUBufferizePasses(OpPassManager &pm);
+
+//===----------------------------------------------------------------------===//
+// Individual pass declarations
+//===----------------------------------------------------------------------===//
 
 // Runs the standard canonicalizer but propagates `lowering_config` attrs
 // to replacement ops when the original op is folded/replaced.
-// Mirrors IREE's ConfigTrackingCanonicalizerPass.
-// Must be used instead of createCanonicalizerPass() at all pipeline stages
-// where tiled ops may lose their config during rewriting.
+// Mirrors IREE's ConfigTrackingCanonicalizer.
+// IMPORTANT: Must be used instead of createCanonicalizerPass() at all
+// pipeline stages where tiled ops may lose their config during rewriting.
 std::unique_ptr<Pass> createNovaConfigTrackingCanonicalizerPass();
 void registerNovaConfigTrackingCanonicalizerPass();
 
@@ -31,21 +56,20 @@ std::unique_ptr<Pass> createNovaGPUSelectLoweringStrategyPass(
     StringRef cudaArch = "sm_86");
 void registerNovaGPUSelectLoweringStrategyPass();
 
-// Tiles compute operations and distributes them to workgroups using scf.forall
+// Tiles compute operations and distributes them to workgroups using scf.forall.
 std::unique_ptr<Pass> createNovaTileAndDistributeToWorkgroupsPass();
 void registerNovaTileAndDistributePass();
 
 // Pads linalg operands to static multiples of tile sizes.
 // Ported from IREE's GPUPadOperands.cpp.
-// TODO: When LoweringConfig is available, padding sizes will be read from the
-// config attribute instead of using heuristics.
+// IMPORTANT: Also pads the K (reduction) dimension to the reduction tile
+// size — without this a non-aligned K silently truncates the last elements.
 std::unique_ptr<Pass> createNovaGPUPadOperandsPass();
 void registerNovaGPUPadOperandsPass();
 
 // Promotes matmul A/B operands to GPU shared memory (workgroup address space).
-// Ported/adapted from IREE's GPUPromoteMatmulOperands.cpp.
-// TODO: When LoweringConfig is available, read which operands to promote from
-// the config attribute instead of using heuristics.
+// Uses a two-stage copy pattern (global→shared linalg.copy + nova.fusion_barrier
+// + per-thread linalg.copy). Ported from IREE's GPUPromoteMatmulOperands.cpp.
 std::unique_ptr<Pass> createNovaGPUPromoteMatmulOperandsPass();
 void registerNovaGPUPromoteMatmulOperandsPass();
 
@@ -79,8 +103,8 @@ std::unique_ptr<Pass> createNovaGPUEraseFusionBarriersPass();
 void registerNovaGPUEraseFusionBarriersPass();
 
 // Infers GPU memory spaces for `bufferization.alloc_tensor` ops.
-// Any alloc used as the shared_outs init of a thread-mapped scf.forall is
-// tagged as workgroup (shared) memory; all others become private memory.
+// Decision: alloc used as shared_outs init of a thread-mapped scf.forall →
+// workgroup (shared) memory; all others → private memory.
 // Must run immediately before bufferization.
 // Mirrors IREE's GPUInferMemorySpacePass.
 std::unique_ptr<Pass> createNovaGPUInferMemorySpacePass();
@@ -93,35 +117,30 @@ void registerNovaGPUInferMemorySpacePass();
 std::unique_ptr<Pass> createNovaEliminateEmptyTensorsPass();
 void registerNovaEliminateEmptyTensorsPass();
 
-// GPU-aware bufferization helper.
-// Erases nova.fusion_barrier ops, infers memory spaces, then runs
-// OneShotBufferize with GPU alloc / memcpy functions (workgroup → memref.alloc,
-// private → memref.alloca; barriers inserted around workgroup copies).
-// Mirrors IREE's addGPUBufferizePasses().
-void addNovaGPUBufferizePasses(OpPassManager &pm);
-
 // GPU comprehensive bufferize pass.
-// Erases nova.fusion_barrier (GAP 2) and runs OneShotBufferize with
-// GPU-aware alloc/copy fns (GAP 3). Called by addNovaGPUBufferizePasses.
+// Erases nova.fusion_barrier (step 1) and runs OneShotBufferize with
+// GPU-aware alloc/copy functions (step 2). Called by addNovaGPUBufferizePasses.
 // Mirrors IREE's IREEComprehensiveBufferizePass.
 std::unique_ptr<Pass> createNovaGPUComprehensiveBufferizePass();
 void registerNovaGPUComprehensiveBufferizePass();
 
 // Inserts gpu.barrier before/after memref.copy ops involving workgroup memory.
-// Must run AFTER bufferization (gpu.barrier breaks OneShotBufferize analysis).
+// IMPORTANT: Must run AFTER bufferization — gpu.barrier has "unknown side
+// effects" that break OneShotBufferize analysis.
 std::unique_ptr<Pass> createNovaGPUInsertWorkgroupBarriersPass();
 void registerNovaGPUInsertWorkgroupBarriersPass();
 
 // Normalizes scf.forall loop bounds to lb=0, step=1.
 // Inserts affine.apply ops to compute denormalized induction variable values.
-// Must run before GPU distribution (map_forall_to_blocks requires normalized foralls).
-// Mirrors IREE's NormalizeLoopBoundsPass.
+// Must run before GPU distribution (map_forall_to_blocks requires normalized
+// foralls). Mirrors IREE's NormalizeLoopBoundsPass.
 std::unique_ptr<Pass> createNovaNormalizeLoopBoundsPass();
 void registerNovaNormalizeLoopBoundsPass();
 
 // Converts workgroup memref.alloc → memref.global + memref.get_global and
-// erases workgroup memref.dealloc. GPU shared memory must be statically
-// declared at module level (not dynamically allocated via malloc).
+// erases workgroup memref.dealloc.
+// GPU shared memory must be statically declared at module level (not
+// dynamically allocated via malloc).
 // Ported from IREE's ConvertSharedMemAllocOp + DropSharedMemoryDeallocOp.
 std::unique_ptr<Pass> createNovaConvertSharedMemAllocsPass();
 void registerNovaConvertSharedMemAllocsPass();
@@ -132,9 +151,11 @@ void registerNovaConvertSharedMemAllocsPass();
 std::unique_ptr<Pass> createNovaGPUMapForallToGPUPass();
 void registerNovaGPUMapForallToGPUPass();
 
-// Converts #gpu.address_space attributes on memref types to NVVM integer
-// address spaces (private=5, workgroup=3, global=1). Must run inside
-// gpu.module BEFORE finalizeMemRefToLLVMConversionPass.
+// Converts #gpu.address_space attributes on memref types to integer address
+// spaces appropriate for NVVM/LLVM lowering.
+// private → generic address space 0 (avoids LLVM LSR ScalarEvolution issues
+// with non-default address spaces on NVPTX).
+// Must run inside gpu.module BEFORE finalizeMemRefToLLVMConversionPass.
 std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass();
 void registerNovaGPULowerMemorySpacePass();
 

@@ -1,6 +1,6 @@
-// Nova GPU Erase Fusion Barriers Pass
+//===- NovaGPUEraseFusionBarriers.cpp - Erase fusion barriers pre-bufferize ===//
 //
-// Erases all nova.fusion_barrier ops by replacing them with their source
+// Erases all nova.fusion_barrier ops by replacing each one with its source
 // operand. This is the Nova equivalent of what IREE does at the start of
 // IREEComprehensiveBufferizePass::runOnOperation():
 //
@@ -8,13 +8,20 @@
 //     rewriter.replaceOp(barrier, barrier.getSource());
 //   });
 //
-// nova.fusion_barrier is inserted by NovaGPUPromoteMatmulOperandsPass to
-// prevent the global→shared linalg.copy (Stage 1) from being fused into the
-// per-thread linalg.copy (Stage 2) during tiling. Once tiling and all fusion
-// decisions have been made, the barrier is no longer needed and must be removed
-// before bufferization (it has no bufferized form).
+// Why nova.fusion_barrier exists:
+//   NovaGPUPromoteMatmulOperandsPass inserts a nova.fusion_barrier between
+//   Stage 1 (global→shared linalg.copy) and Stage 2 (per-thread linalg.copy).
+//   The barrier is an opaque identity — the fusion analysis cannot see through
+//   it, so Stage 1 and Stage 2 always end up in separate loops. This prevents
+//   the global→shared cooperative copy from being incorrectly fused into the
+//   per-thread loop that runs only for each thread's tile.
 //
-// This pass must run as the first step of addNovaGPUBufferizePasses.
+// IMPORTANT: This pass must run as the first step of addNovaGPUBufferizePasses.
+//   nova.fusion_barrier has no bufferized form (it is a tensor-level fence).
+//   If it is not erased before OneShotBufferize, the bufferizer will error on
+//   the unknown op.
+//
+//===----------------------------------------------------------------------===//
 
 #include "Passes.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
@@ -43,10 +50,12 @@ struct NovaGPUEraseFusionBarriersPass
     func::FuncOp funcOp = getOperation();
     IRRewriter rewriter(funcOp.getContext());
 
-    // Collect barriers first to avoid iterator invalidation.
+    // IMPORTANT: Collect all barriers into a snapshot list before erasing.
+    // Walking and erasing at the same time invalidates the walk iterator.
     SmallVector<FusionBarrierOp> barriers;
     funcOp.walk([&](FusionBarrierOp barrier) { barriers.push_back(barrier); });
 
+    // Replace each barrier with its source operand — a pure identity erasure.
     for (FusionBarrierOp barrier : barriers)
       rewriter.replaceOp(barrier, barrier.getSource());
   }

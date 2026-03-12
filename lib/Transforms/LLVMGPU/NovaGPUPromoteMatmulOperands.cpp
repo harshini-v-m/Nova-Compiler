@@ -1,31 +1,40 @@
-// Nova GPU Promote Matmul Operands Pass
+//===- NovaGPUPromoteMatmulOperands.cpp - Promote matmul ops to shared mem ===//
 //
 // Promotes A and B operands of linalg.matmul / linalg.batch_matmul inside
 // scf.forall (workgroup tiling) to shared memory using a two-stage copy pattern
-// that matches IREE's GPUPromoteMatmulOperands.cpp:
+// that matches IREE's GPUPromoteMatmulOperands.cpp.
 //
-//  Stage 1 — fill shared memory:
-//    %alloc  = bufferization.alloc_tensor {memory_space = #gpu.address_space<workgroup>}
-//    %shared = linalg.copy(%operand -> %alloc)
+// ALGORITHM STEP — Two-stage promotion for a single input operand:
 //
-//  Fence — prevent Stage 1 from fusing into Stage 2's loop:
-//    %fence  = nova.fusion_barrier %shared
+//   Stage 1 — Cooperative global→shared copy:
+//     %alloc  = bufferization.alloc_tensor {memory_space = #gpu.address_space<workgroup>}
+//     %shared = linalg.copy(%operand -> %alloc)
 //
-//  Stage 2 — per-thread promoted local copy (tiling/scheduling copy):
-//    %empty  = tensor.empty(sizes)
-//    %local  = linalg.copy(%fence -> %empty)
+//   Fence — prevent Stage 1 from fusing into Stage 2's loop:
+//     %fence  = nova.fusion_barrier %shared
 //
-//  The original operand use is then replaced with %local.
+//   Stage 2 — Per-thread promoted local copy:
+//     %empty  = tensor.empty(sizes)
+//     %local  = linalg.copy(%fence -> %empty)
 //
-// The nova.fusion_barrier op is a pure identity on the tensor that acts as an
-// opaque fence: the fusion analysis cannot see through it, so Stage 1 and
-// Stage 2 always end up in separate loops (the K-loop iteration only reloads
-// from shared memory, not from global memory again).
+//   The original operand use is replaced with %local.
 //
-// The nova.fusion_barrier is erased at the start of bufferization once all
-// tiling and fusion decisions have been made.
+// IMPORTANT — Why nova.fusion_barrier is needed:
+//   The fusion analysis cannot see through a fusion_barrier, so Stage 1
+//   (the cooperative global→shared copy, executed by all threads together)
+//   and Stage 2 (the per-thread copy from shared into registers) always
+//   end up in separate loops. Without the barrier, elementwise-op fusion
+//   would merge both copies into a single per-thread loop, defeating the
+//   cooperative loading pattern (each thread would copy only its own tile
+//   from global instead of collaborating on a full workgroup tile).
 //
-// Directly mirrors IREE: GPUPromoteMatmulOperands.cpp (promoteOperand / promoteResult)
+//   The nova.fusion_barrier is erased at the start of bufferization once all
+//   tiling and fusion decisions have been made.
+//
+// Directly mirrors IREE: GPUPromoteMatmulOperands.cpp
+//   (promoteOperand / promoteResult)
+//
+//===----------------------------------------------------------------------===//
 
 #include "Passes.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
@@ -77,16 +86,16 @@ static Value buildPerThreadCopy(OpBuilder &builder, Location loc, Value v) {
   return copy.getResult(0);
 }
 
-// Performs the full two-stage promotion for a single input operand at `index`
-// of `linalgOp`:
+// CORE LOGIC — Full two-stage promotion for a single input operand at `inputIdx`
+// of `linalgOp`.
 //
-//  1. Allocate in workgroup shared memory.
-//  2. Copy global → shared  (linalg.copy).
-//  3. Insert nova.fusion_barrier to block Stage-1 from fusing into Stage-2.
-//  4. Make a per-thread copy of the fenced value (linalg.copy).
-//  5. Replace the original operand use with the per-thread copy.
+//  Stage 1: Allocate in workgroup shared memory, cooperative copy global→shared.
+//  Fence:   Insert nova.fusion_barrier to prevent Stage 1 from fusing into Stage 2.
+//  Stage 2: Per-thread copy from shared into private (register) tensor.
+//           Replace the original operand use with the per-thread copy.
 //
-// Mirrors IREE's promoteOperand() + inline promoteResult() logic.
+// The net effect is that each thread operates on its own register tile sliced
+// from the shared-memory cooperative load, not directly from global memory.
 static void promoteOperandToShared(OpBuilder &builder,
                                    linalg::LinalgOp linalgOp,
                                    unsigned inputIdx) {
@@ -99,10 +108,9 @@ static void promoteOperandToShared(OpBuilder &builder,
   if (!tensorType)
     return;
 
-  // -----------------------------------------------------------------------
-  // Stage 1: allocate a tensor in workgroup shared memory and copy into it.
-  // -----------------------------------------------------------------------
-  // Build dynamic sizes list.
+  // ALGORITHM STEP 1: allocate a tensor in workgroup shared memory.
+  // Build dynamic sizes list for tensor dimensions that are not statically
+  // known at compile time.
   SmallVector<OpFoldResult> mixedSizes =
       tensor::getMixedSizes(builder, loc, operand);
   SmallVector<Value> dynSizes;
@@ -110,30 +118,24 @@ static void promoteOperandToShared(OpBuilder &builder,
     if (auto val = dyn_cast<Value>(ofr))
       dynSizes.push_back(val);
 
-  // bufferization.alloc_tensor with workgroup address space.
   Attribute workgroupSpace = gpu::AddressSpaceAttr::get(
       builder.getContext(), gpu::GPUDialect::getWorkgroupAddressSpace());
   auto allocOp =
       bufferization::AllocTensorOp::create(builder, loc, tensorType, dynSizes);
   allocOp.setMemorySpaceAttr(workgroupSpace);
 
-  // Stage-1 copy: global operand → workgroup alloc.
+  // Cooperative global→shared copy.
   auto stage1Copy =
       linalg::CopyOp::create(builder, loc, operand, allocOp.getResult());
   Value stage1Result = stage1Copy.getResult(0);
 
-  // -----------------------------------------------------------------------
-  // Fence: insert nova.fusion_barrier to prevent Stage 1 (global→shared
-  // cooperative copy) from fusing into Stage 2's per-thread loop.
-  // Without this barrier, elementwise fusion merges both copies into a
-  // single per-thread loop, defeating shared memory cooperative loading.
-  // The barrier is erased at the start of bufferization.
-  // -----------------------------------------------------------------------
+  // ALGORITHM STEP 2: Insert nova.fusion_barrier to prevent Stage 1
+  // (the cooperative global→shared copy) from being fused into Stage 2's
+  // per-thread loop. Without this barrier, elementwise fusion would merge
+  // both copies, defeating the cooperative loading pattern.
   Value fenced = FusionBarrierOp::create(builder, loc, stage1Result).getResult();
 
-  // -----------------------------------------------------------------------
-  // Stage 2: per-thread copy from shared memory.
-  // -----------------------------------------------------------------------
+  // ALGORITHM STEP 3: Per-thread copy from shared memory into private registers.
   Value promoted = buildPerThreadCopy(builder, loc, fenced);
 
   // Replace this operand of the linalg op with the promoted per-thread copy.

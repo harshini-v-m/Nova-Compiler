@@ -49,7 +49,8 @@ struct NovaGPUSelectLoweringStrategyPass
       funcOp.emitWarning()
           << "[nova-gpu-select-lowering-strategy] Unrecognized CUDA arch '"
           << cudaArch
-          << "'; falling back to sm_80 defaults.";
+          << "'; defaulting to sm_80 (Ampere A100). Check your --cuda-arch "
+             "flag or add the arch to NVIDIATargetUtils.cpp.";
       target = getNVIDIATargetInfo("sm_80");
     }
 
@@ -59,6 +60,11 @@ struct NovaGPUSelectLoweringStrategyPass
                << " maxShmem=" << target.maxWorkgroupMemBytes
                << " MMA intrinsics=" << target.mmaIntrinsics.size() << ")\n");
 
+    // CORE LOGIC: Stamp #nova.lowering_config on every linalg contraction
+    // and reduction op in this function.  All subsequent tiling passes
+    // (Reduction, Thread, Subgroup) read from this attribute to determine
+    // tile sizes and MMA intrinsic selection.  Without this, all tiling
+    // falls back to hardcoded heuristic values.
     initNovaGPULaunchConfig(funcOp, target);
   }
 

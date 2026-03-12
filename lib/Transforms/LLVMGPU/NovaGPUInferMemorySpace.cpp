@@ -1,20 +1,25 @@
-// Nova GPU Infer Memory Space Pass
+//===- NovaGPUInferMemorySpace.cpp - Infer GPU memory spaces pre-bufferize ===//
 //
-// This pass assigns gpu memory-space attributes to unattributed
+// Assigns gpu memory-space attributes to unattributed
 // `bufferization.alloc_tensor` ops just before bufferization.
 //
+// IMPORTANT: This pass must run immediately before OneShotBufferize so that
+// the GPU-aware allocation function (gpuRequireMemSpaceAllocationFn) receives
+// the correct MemRefType and can emit memref.alloc (workgroup/shared SRAM)
+// vs memref.alloca (private/register) correctly.
+//
 // IREE equivalent: GPUInferMemorySpacePass
-// (iree/compiler/src/iree/compiler/Codegen/Common/GPU/GPUInferMemorySpace.cpp)
+//   (iree/compiler/src/iree/compiler/Codegen/Common/GPU/GPUInferMemorySpace.cpp)
 //
 // Decision rules (same as IREE):
 //   1. If the alloc already has memory_space = private or workgroup → keep it.
-//   2. If all I/O-like users of the alloc are thread-mapped scf.forall ops
-//      (i.e., the alloc is a shared_outs init) → workgroup (shared) memory.
-//   3. Otherwise → private (register) memory.
+//   2. If all users of the alloc are thread-mapped scf.forall ops (i.e., the
+//      alloc is a shared_outs init) → workgroup (shared) memory.
+//   3. If the alloc is defined at function body level AND a user is a
+//      workgroup-level scf.forall → leave without space (global memory).
+//   4. Otherwise → private (register) memory.
 //
-// Run this pass immediately before OneShotBufferize so that the allocation
-// function receives the right MemRefType and can emit memref.alloc (workgroup)
-// vs memref.alloca (private) correctly.
+//===----------------------------------------------------------------------===//
 
 #include "Passes.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -47,10 +52,13 @@ static bool isWorkgroupForall(scf::ForallOp forall) {
   });
 }
 
-/// Returns true when `alloc` is *definitely* shared memory.
-/// This mirrors IREE's isDefinitelyShared():
-///   - The alloc is used as the initial value for the shared_outs of ≥1
-///     thread-mapped scf.forall ops AND no other non-forall users exist.
+// CORE LOGIC — Returns true when `alloc` is definitely shared memory.
+//
+// An alloc is shared if ALL of its users are thread-mapped scf.forall ops.
+// This mirrors IREE's isDefinitelyShared() heuristic — the alloc becomes a
+// shared workgroup buffer when it is passed as shared_outs to a thread forall.
+// Any non-forall user (e.g. an extract_slice going into a scalar op) means we
+// cannot guarantee the buffer is only accessed from thread-collective code.
 static bool isDefinitelyShared(bufferization::AllocTensorOp alloc) {
   for (auto *user : alloc->getUsers()) {
     // Thread-mapped forall → this alloc becomes a shared output.
@@ -64,12 +72,14 @@ static bool isDefinitelyShared(bufferization::AllocTensorOp alloc) {
   return true;
 }
 
-/// Returns true when `alloc` is used across workgroup boundaries.
-/// Such buffers must live in global memory (no address space tag).
-/// A buffer is cross-workgroup if:
-///   - It is defined at the function body level (not inside any forall), AND
-///   - At least one user is a workgroup-level scf.forall (it feeds as
-///     shared_outs init for workgroup distribution).
+// CORE LOGIC — Returns true when `alloc` is used across workgroup boundaries.
+//
+// Such buffers must live in global memory (no address space tag), so that the
+// GPU runtime can pass them between host allocations and kernels.
+// A buffer is cross-workgroup if:
+//   - It is defined at the function body level (not inside any forall/launch).
+//   - At least one user is a workgroup-level scf.forall (it is passed as
+//     shared_outs init for workgroup distribution).
 static bool isCrossWorkgroupUsed(bufferization::AllocTensorOp alloc) {
   // If defined inside a forall, it's local to that scope.
   auto parentForall = alloc->getParentOfType<scf::ForallOp>();

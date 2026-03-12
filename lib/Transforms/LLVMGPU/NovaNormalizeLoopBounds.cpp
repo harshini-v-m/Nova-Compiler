@@ -46,9 +46,10 @@ static LogicalResult eliminateDegenerateForall(IRRewriter &rewriter,
   if (forallOp.getNumResults() != 0)
     return failure();
 
-  // Only eliminate degenerate foralls that are nested inside another forall.
-  // Top-level block-mapped foralls must be preserved as GPU launch boundaries,
-  // even when they have a single iteration (e.g. small tensors with 1 block).
+  // IMPORTANT: Only eliminate nested (inner) degenerate foralls, not
+  // top-level block-mapped foralls. A top-level forall with a single
+  // iteration (e.g. a small tensor with only 1 workgroup) still defines
+  // the gpu.launch boundary and must be preserved for MapForallToGPU.
   if (!forallOp->getParentOfType<scf::ForallOp>())
     return failure();
 
@@ -216,13 +217,17 @@ struct NovaNormalizeLoopBoundsPass
     func::FuncOp funcOp = getOperation();
     IRRewriter rewriter(funcOp);
 
-    // First pass: eliminate degenerate single-iteration foralls (inner→outer).
+    // ALGORITHM STEP 1: Eliminate degenerate single-iteration foralls.
+    // Process inner→outer (reverse walk order) so that when an inner forall
+    // is eliminated its former parent is still present for the outer check.
     SmallVector<scf::ForallOp> forallOps;
     funcOp.walk([&](scf::ForallOp op) { forallOps.push_back(op); });
     for (auto forallOp : llvm::reverse(forallOps))
       (void)eliminateDegenerateForall(rewriter, forallOp);
 
-    // Second pass: normalize remaining forall loop bounds.
+    // ALGORITHM STEP 2: Normalize remaining forall loop bounds to lb=0, step=1.
+    // Must run after Step 1 so that we don't waste time normalizing foralls
+    // that are about to be eliminated.
     funcOp.walk([&](scf::ForallOp forallOp) {
       (void)normalizeLoopBounds(rewriter, forallOp);
     });
