@@ -21,6 +21,9 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "nova-gpu-map-forall"
 
 using namespace mlir;
 
@@ -106,6 +109,16 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     }
   }
 
+  // Validate grid dims: all must be > 0.
+  for (int i = 0; i < 3; ++i) {
+    if (gridDims[i] <= 0) {
+      LLVM_DEBUG(llvm::dbgs() << "[nova-gpu-map-forall] grid dim " << i
+                               << " is " << gridDims[i]
+                               << ", clamping to 1\n");
+      gridDims[i] = 1;
+    }
+  }
+
   // ----- Step 2: Find thread foralls and compute block dims -----
   int64_t blockDims[3] = {1, 1, 1};
   SmallVector<scf::ForallOp> threadForalls;
@@ -141,6 +154,23 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     }
     return WalkResult::advance();
   });
+
+  // Validate block dims: total threads must not exceed 1024.
+  {
+    int64_t totalThreads = blockDims[0] * blockDims[1] * blockDims[2];
+    if (totalThreads > 1024) {
+      return blockForall.emitError("total thread count ")
+             << totalThreads << " (blockDims=" << blockDims[0] << "x"
+             << blockDims[1] << "x" << blockDims[2]
+             << ") exceeds hardware max of 1024 threads/block; "
+             << "check thread tile sizes in lowering config";
+    }
+    // Clamp any 0-dim block dims to 1.
+    for (int i = 0; i < 3; ++i) {
+      if (blockDims[i] <= 0)
+        blockDims[i] = 1;
+    }
+  }
 
   // ----- Step 3: Create gpu.launch -----
   rewriter.setInsertionPoint(blockForall);

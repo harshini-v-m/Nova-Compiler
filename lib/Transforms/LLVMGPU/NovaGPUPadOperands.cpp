@@ -87,47 +87,25 @@ getPaddingSizes(linalg::LinalgOp linalgOp) {
   SmallVector<int64_t> padding(numLoops, 1);
   auto iterTypes = linalgOp.getIteratorTypesArray();
 
-  // Walk loops in reverse so we visit N before M (innermost first).
-  int parallelIdx  = 0; // 0=N, 1=M, ... (outermost last)
-  int reductionIdx = 0; // 0=K (usually only one)
-
-  // For contraction ops, wgTiles maps M/N dims in reverse (innermost first).
-  // For non-contraction ops, wgTiles aligns 1:1 with loop dims, so use direct
-  // indexing.
-  bool isContraction = linalg::isaContractionOpInterface(linalgOp);
-
-  for (int i = numLoops - 1; i >= 0; --i) {
+  // NovaKernelConfig stores tile sizes indexed by loop index (direct mapping).
+  // Use direct indexing for ALL ops (both contractions and non-contractions).
+  // The old reverse-index logic was designed for IREE's format but our config
+  // stores tiles[i] = tile for loop dim i.
+  for (int i = 0; i < numLoops; ++i) {
     if (linalg::isParallelIterator(iterTypes[i])) {
       int64_t tile = 0;
-      if (isContraction) {
-        // Contractions: reverse parallel index maps to workgroup tile.
-        int wgIdx = (int)wgTiles.size() - 1 - parallelIdx;
-        if (!wgTiles.empty() && wgIdx >= 0)
-          tile = wgTiles[wgIdx];
-      } else {
-        // Non-contraction: direct 1:1 mapping.
-        if (i < (int)wgTiles.size())
-          tile = wgTiles[i];
-      }
+      if (i < (int)wgTiles.size())
+        tile = wgTiles[i];
+      // wgTile==0 means "not tiled at this dim" — leave padding at 1.
       if (tile > 0)
         padding[i] = tile;
-      // else leave at 1 (no padding for untiled dims).
-      ++parallelIdx;
     } else {
       // Reduction dim: pad to the reduction tile step.
       int64_t tile = 0;
-      if (isContraction) {
-        int redIdx = (int)redTiles.size() - 1 - reductionIdx;
-        if (!redTiles.empty() && redIdx >= 0)
-          tile = redTiles[redIdx];
-      } else {
-        if (i < (int)redTiles.size())
-          tile = redTiles[i];
-      }
+      if (i < (int)redTiles.size())
+        tile = redTiles[i];
       if (tile > 0)
         padding[i] = tile;
-      // else leave at 1 (no-op pad for unrecognized reduction dims).
-      ++reductionIdx;
     }
   }
   return padding;

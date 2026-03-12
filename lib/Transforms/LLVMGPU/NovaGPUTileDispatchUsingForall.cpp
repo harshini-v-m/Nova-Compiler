@@ -438,6 +438,60 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       }
     }
 
+    // --- Helper: check if an op is part of a full-reduction chain -----------
+    // Full reductions (all reduction iterators, no parallel dims) are wrapped
+    // by Pass 3 together with their producer and consumer chains. If an op
+    // transitively feeds OR consumes a full-reduction op, skip it in Pass 2
+    // so the entire chain stays untiled for Pass 3 to wrap into one GPU kernel.
+    auto isFullReductionOp = [](Operation *op) -> bool {
+      if (auto lg = dyn_cast<linalg::LinalgOp>(op)) {
+        auto iters = lg.getIteratorTypesArray();
+        return !iters.empty() &&
+               !llvm::any_of(iters, linalg::isParallelIterator) &&
+               llvm::any_of(iters, linalg::isReductionIterator);
+      }
+      return false;
+    };
+    auto isInFullReductionChain = [&](Operation *op) -> bool {
+      // Check transitive consumers for a full-reduction op.
+      {
+        SmallVector<Operation *> worklist;
+        llvm::SmallPtrSet<Operation *, 16> visited;
+        for (auto user : op->getUsers())
+          worklist.push_back(user);
+        while (!worklist.empty()) {
+          Operation *curr = worklist.pop_back_val();
+          if (!visited.insert(curr).second)
+            continue;
+          if (isFullReductionOp(curr))
+            return true;
+          for (auto user : curr->getUsers())
+            worklist.push_back(user);
+        }
+      }
+      // Check transitive producers for a full-reduction op.
+      {
+        SmallVector<Operation *> worklist;
+        llvm::SmallPtrSet<Operation *, 16> visited;
+        for (Value operand : op->getOperands()) {
+          if (auto defOp = operand.getDefiningOp())
+            worklist.push_back(defOp);
+        }
+        while (!worklist.empty()) {
+          Operation *curr = worklist.pop_back_val();
+          if (!visited.insert(curr).second)
+            continue;
+          if (isFullReductionOp(curr))
+            return true;
+          for (Value operand : curr->getOperands()) {
+            if (auto defOp = operand.getDefiningOp())
+              worklist.push_back(defOp);
+          }
+        }
+      }
+      return false;
+    };
+
     // --- Pass 2: Tile remaining unfused elementwise ops (REVERSE order) ------
     // Mirrors IREE's tileConsumerAndFuseProducersUsingSCF contract:
     //   - Tile the LAST (sink) op in a chain as the "consumer/root".
@@ -451,6 +505,10 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       // Process in REVERSE so the last (sink) op is tiled first.
       for (Operation *rootOp : llvm::reverse(remainingOps)) {
         if (isInsideWorkgroupForall(rootOp))
+          continue;
+        // Skip ops that are part of a full-reduction chain (feed OR consume).
+        // These will be wrapped together with the reduction in Pass 3.
+        if (isInFullReductionChain(rootOp))
           continue;
         // Only tile each "sink": skip if this op's result feeds another
         // untiled compute op (it will be fused as a producer of that op).

@@ -396,6 +396,53 @@ LogicalResult setReductionLoweringConfig(linalg::LinalgOp op,
     reductionTiles[dim] = getReductionTilingFactor(loopBounds[dim]);
   }
 
+  // Clamp total thread count to <= 1024 (hardware max threads per block).
+  // If the product of (wgTile / threadTile) across parallel dims exceeds 1024,
+  // iteratively double the smallest thread tile to halve threads from that dim.
+  {
+    auto computeTotalThreads = [&]() -> int64_t {
+      int64_t total = 1;
+      for (unsigned dim : parallelDims) {
+        if (workgroupTiles[dim] > 0 && threadTiles[dim] > 0)
+          total *= (workgroupTiles[dim] / threadTiles[dim]);
+      }
+      return total;
+    };
+    while (computeTotalThreads() > 1024) {
+      // Find parallel dim with most threads and double its thread tile.
+      int bestDim = -1;
+      int64_t bestThreads = 0;
+      for (unsigned dim : parallelDims) {
+        if (workgroupTiles[dim] <= 0 || threadTiles[dim] <= 0)
+          continue;
+        int64_t threads = workgroupTiles[dim] / threadTiles[dim];
+        int64_t newTile = threadTiles[dim] * 2;
+        if (threads > 1 && newTile <= workgroupTiles[dim] &&
+            workgroupTiles[dim] % newTile == 0 && threads > bestThreads) {
+          bestThreads = threads;
+          bestDim = dim;
+        }
+      }
+      if (bestDim < 0) {
+        // Can't find a clean doubling; force the dim with most threads.
+        for (unsigned dim : parallelDims) {
+          if (workgroupTiles[dim] > 0 && threadTiles[dim] > 0) {
+            int64_t threads = workgroupTiles[dim] / threadTiles[dim];
+            if (threads > bestThreads) {
+              bestThreads = threads;
+              bestDim = dim;
+            }
+          }
+        }
+        if (bestDim < 0) break;
+        // Force: set threadTile = wgTile (1 thread from this dim).
+        threadTiles[bestDim] = workgroupTiles[bestDim];
+      } else {
+        threadTiles[bestDim] *= 2;
+      }
+    }
+  }
+
   LLVM_DEBUG({
     llvm::dbgs() << "[nova-kernel-config] Reduction config for "
                  << op->getName() << ": workgroup=[";
@@ -461,6 +508,48 @@ LogicalResult setElementwiseLoweringConfig(linalg::LinalgOp op,
       threadTiles[i] = 1;
     }
     ++parallelCount;
+  }
+
+  // Clamp total thread count to <= 1024 (hardware max threads per block).
+  {
+    auto computeTotalThreads = [&]() -> int64_t {
+      int64_t total = 1;
+      for (int i = 0; i < numLoops; ++i) {
+        if (workgroupTiles[i] > 0 && threadTiles[i] > 0)
+          total *= (workgroupTiles[i] / threadTiles[i]);
+      }
+      return total;
+    };
+    while (computeTotalThreads() > 1024) {
+      int bestDim = -1;
+      int64_t bestThreads = 0;
+      for (int i = 0; i < numLoops; ++i) {
+        if (workgroupTiles[i] <= 0 || threadTiles[i] <= 0)
+          continue;
+        int64_t threads = workgroupTiles[i] / threadTiles[i];
+        int64_t newTile = threadTiles[i] * 2;
+        if (threads > 1 && newTile <= workgroupTiles[i] &&
+            workgroupTiles[i] % newTile == 0 && threads > bestThreads) {
+          bestThreads = threads;
+          bestDim = i;
+        }
+      }
+      if (bestDim < 0) {
+        for (int i = 0; i < numLoops; ++i) {
+          if (workgroupTiles[i] > 0 && threadTiles[i] > 0) {
+            int64_t threads = workgroupTiles[i] / threadTiles[i];
+            if (threads > bestThreads) {
+              bestThreads = threads;
+              bestDim = i;
+            }
+          }
+        }
+        if (bestDim < 0) break;
+        threadTiles[bestDim] = workgroupTiles[bestDim];
+      } else {
+        threadTiles[bestDim] *= 2;
+      }
+    }
   }
 
   LLVM_DEBUG({
