@@ -101,6 +101,42 @@ struct AddGpuMemoryCopiesPass
     return false;
   }
 
+  // Find the last operation in `block` that uses `val` or any of its aliases
+  // (through view-like ops). Returns nullptr if no users found in the block.
+  Operation *findLastUseInBlock(Value val, Block *block) {
+    Operation *lastUser = nullptr;
+    DenseSet<Value> visited;
+
+    std::function<void(Value)> chase = [&](Value v) {
+      if (!visited.insert(v).second)
+        return;
+      for (Operation *user : v.getUsers()) {
+        // Chase through alias-producing ops
+        if (isa<memref::CollapseShapeOp, memref::ExpandShapeOp,
+                memref::SubViewOp, memref::CastOp, memref::ReshapeOp,
+                memref::TransposeOp, memref::ReinterpretCastOp>(user)) {
+          for (Value result : user->getResults()) {
+            if (llvm::isa<MemRefType>(result.getType()))
+              chase(result);
+          }
+        }
+
+        // Find ancestor of this user that lives in `block`
+        Operation *ancestor = user;
+        while (ancestor && ancestor->getBlock() != block)
+          ancestor = ancestor->getParentOp();
+
+        if (!ancestor)
+          continue;
+
+        if (!lastUser || lastUser->isBeforeInBlock(ancestor))
+          lastUser = ancestor;
+      }
+    };
+
+    chase(val);
+    return lastUser;
+  }
 
   void runOnOperation() override {
     func::FuncOp func = getOperation();
@@ -156,13 +192,17 @@ struct AddGpuMemoryCopiesPass
         }
     }
 
-    // Insert CopyBack (Device -> Host) before all returns
+    // Insert CopyBack (Device -> Host) and Dealloc before all returns
     func.walk([&](func::ReturnOp returnOp) {
         OpBuilder returnBuilder(returnOp);
         for (auto &pair : argsToCopyBack) {
             // Copy Device -> Host
             // pair.first is Host (dst), pair.second is Device (src)
             returnBuilder.create<memref::CopyOp>(returnOp.getLoc(), pair.second, pair.first);
+        }
+        // Dealloc all argument device allocs after copy-back, before return
+        for (auto &pair : argsToCopyBack) {
+            returnBuilder.create<memref::DeallocOp>(returnOp.getLoc(), pair.second);
         }
     });
 
@@ -365,6 +405,20 @@ struct AddGpuMemoryCopiesPass
     // avoid iterator invalidation in the walk).
     for (auto *op : deferredErase)
       op->erase();
+
+    // Phase 4: Insert DeallocOps for global device copies after their last use.
+    // These allocs were created in Phase 2 (Cases B/C) but the buffer
+    // deallocation pipeline ran before this pass, so it never saw them.
+    Block *entryBlock = &func.getBody().front();
+    for (auto &[symbol, deviceAlloc] : symbolToDeviceAlloc) {
+      Operation *lastUse = findLastUseInBlock(deviceAlloc, entryBlock);
+      if (lastUse) {
+        OpBuilder deallocBuilder(lastUse->getBlock(),
+                                 std::next(lastUse->getIterator()));
+        deallocBuilder.create<memref::DeallocOp>(deviceAlloc.getLoc(),
+                                                  deviceAlloc);
+      }
+    }
 
     // Debug: Dump the module to see changes
     // llvm::errs() << "[[[ IR after AddGpuMemoryCopies ]]]\n";
