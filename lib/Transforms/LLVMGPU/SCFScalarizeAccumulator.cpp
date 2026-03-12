@@ -7,6 +7,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
@@ -20,18 +21,87 @@ struct SCFScalarizeAccumulatorPass
 
   void runOnOperation() override {
     auto func = getOperation();
-    
-    // Collect loops to transform (to avoid iterator invalidation)
+
+    // Phase 1: Collect loops to transform (to avoid iterator invalidation)
     SmallVector<scf::ForOp> loopsToTransform;
-    
+
     func.walk([&](scf::ForOp forOp) {
       if (shouldScalarize(forOp))
         loopsToTransform.push_back(forOp);
     });
-    
-    // Transform collected loops
+
     for (auto forOp : loopsToTransform) {
       scalarizeLoop(forOp);
+    }
+
+    // Phase 2: atomicize cross-block stores inside gpu.launch that are NOT
+    // inside any scf.for and target memrefs defined outside the launch.
+    // These are distributed reduction outputs (e.g. mean) where each block
+    // computes a partial result and must atomically add it to the shared output.
+    SmallVector<gpu::LaunchOp> launches;
+    func.walk([&](gpu::LaunchOp launch) {
+      launches.push_back(launch);
+    });
+    for (auto launch : launches) {
+      atomicizeCrossBlockStores(launch);
+    }
+  }
+
+  // Returns true if `mem` is defined outside `launchOp`.
+  bool isExternalMemRef(Value mem, gpu::LaunchOp launchOp) {
+    Operation *defOp = mem.getDefiningOp();
+    if (!defOp) {
+      if (auto arg = dyn_cast<BlockArgument>(mem))
+        defOp = arg.getOwner()->getParentOp();
+    }
+    return defOp && !launchOp->isAncestor(defOp);
+  }
+
+  // For each memref.store inside `launchOp` that:
+  //   1. Is NOT inside any scf.for (post-loop result write), and
+  //   2. Targets a memref defined outside the launch (cross-block shared output),
+  // replace it with memref.atomic_rmw addf and insert a gpu.memset 0.0 before
+  // the launch so the accumulation starts from a clean zero.
+  void atomicizeCrossBlockStores(gpu::LaunchOp launchOp) {
+    SmallVector<memref::StoreOp> toAtomicize;
+
+    launchOp.walk([&](memref::StoreOp storeOp) {
+      // Skip stores already inside a scf.for — handled by Phase 1
+      if (storeOp->getParentOfType<scf::ForOp>())
+        return;
+      // Only float types can use addf atomic
+      auto memTy = dyn_cast<MemRefType>(storeOp.getMemRef().getType());
+      if (!memTy || !isa<FloatType>(memTy.getElementType()))
+        return;
+      if (isExternalMemRef(storeOp.getMemRef(), launchOp))
+        toAtomicize.push_back(storeOp);
+    });
+
+    if (toAtomicize.empty())
+      return;
+
+    // Track memrefs already given a zero-init to avoid duplicate gpu.memsets
+    llvm::DenseSet<Value> zeroed;
+
+    for (auto storeOp : toAtomicize) {
+      Value mem    = storeOp.getMemRef();
+      Value val    = storeOp.getValueToStore();
+      auto  elemTy = cast<MemRefType>(mem.getType()).getElementType();
+      Location loc = storeOp.getLoc();
+
+      // Replace direct store with atomic add so all blocks accumulate correctly
+      OpBuilder builder(storeOp);
+      builder.create<memref::AtomicRMWOp>(
+          loc, arith::AtomicRMWKind::addf, val, mem, storeOp.getIndices());
+      storeOp.erase();
+
+      // Insert gpu.memset %zero before the launch (once per unique memref)
+      if (zeroed.insert(mem).second) {
+        OpBuilder pre(launchOp);
+        Value zero = pre.create<arith::ConstantOp>(
+            loc, pre.getFloatAttr(elemTy, 0.0));
+        pre.create<gpu::MemsetOp>(loc, TypeRange{}, ValueRange{}, mem, zero);
+      }
     }
   }
 

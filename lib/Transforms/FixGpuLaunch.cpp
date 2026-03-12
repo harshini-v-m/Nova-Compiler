@@ -716,29 +716,20 @@ public:
 // device memory, but whose address space was erased during gpu-to-llvm
 // lowering.
 static bool isGpuAllocPtr(Value val) {
-  llvm::errs() << "[isGpuAllocPtr] Checking value: " << val << "\n";
-  if (val.getDefiningOp()) {
-      llvm::errs() << "[isGpuAllocPtr] Defining op: " << val.getDefiningOp()->getName() << "\n";
-  } else {
-      llvm::errs() << "[isGpuAllocPtr] No defining op (Block argument)\n";
-  }
-
   // Strip casts that might obscure the source
   while (auto castOp = val.getDefiningOp()) {
     if (isa<LLVM::AddrSpaceCastOp>(castOp) || isa<LLVM::BitcastOp>(castOp)) {
       val = castOp->getOperand(0);
-      llvm::errs() << "[isGpuAllocPtr] Stripped cast, new val: " << val << "\n";
     } else {
       break;
     }
   }
 
-  // Case 1: Direct CallOp return (fallback/rare in the current MLIR pattern)
+  // Case 1: Direct CallOp return
   if (auto callOp = val.getDefiningOp<LLVM::CallOp>()) {
     auto callee = callOp.getCallee();
     if (callee) {
       StringRef name = *callee;
-      llvm::errs() << "[isGpuAllocPtr] Case 1, Callee: " << name << "\n";
       return name == "mgpuMemAlloc" || name == "cudaMallocAsync";
     }
   }
@@ -746,16 +737,13 @@ static bool isGpuAllocPtr(Value val) {
   // Case 2: Standard conversion pattern Alloca -> Call -> Load
   if (auto loadOp = val.getDefiningOp<LLVM::LoadOp>()) {
     auto alloca = loadOp.getAddr();
-    llvm::errs() << "[isGpuAllocPtr] Case 2, LoadOp found. Alloca: " << alloca << "\n";
     // Verify that this exact alloca was passed as the first argument to cudaMallocAsync
     for (Operation *user : alloca.getUsers()) {
-      llvm::errs() << "  [isGpuAllocPtr] Alloca user: " << user->getName() << "\n";
       if (auto callOp = dyn_cast<LLVM::CallOp>(user)) {
         if (callOp.getNumOperands() > 0 && callOp.getOperand(0) == alloca) {
           auto callee = callOp.getCallee();
           if (callee) {
             StringRef name = *callee;
-            llvm::errs() << "  [isGpuAllocPtr] Alloca used in call: " << name << "\n";
             if (name == "mgpuMemAlloc" || name == "cudaMallocAsync") {
               return true;
             }
@@ -765,7 +753,6 @@ static bool isGpuAllocPtr(Value val) {
     }
   }
 
-  llvm::errs() << "[isGpuAllocPtr] Return false.\n";
   return false;
 }
 

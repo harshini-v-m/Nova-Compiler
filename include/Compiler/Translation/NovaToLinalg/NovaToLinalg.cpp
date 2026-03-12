@@ -1744,12 +1744,11 @@ struct NovaToLinalgPass
     target.addLegalDialect<mlir::bufferization::BufferizationDialect>();
 
     // Only the structural ops this file has patterns for are illegal.
-    // Elementwise ops and nova.reduce remain legal here (handled elsewhere).
-    target
-        .addIllegalOp<nova::MatmulOp, nova::BroadcastInDimOp, nova::TransposeOp,
+    target.addIllegalOp<nova::MatmulOp, nova::BroadcastInDimOp, nova::TransposeOp,
                       nova::ToDeviceOp, nova::ScatterAddOp, nova::GatherOp,
                       nova::Rndm2DOp, nova::ReshapeOp, nova::ArgMinOp,
-                      nova::ArgmaxOp, nova::ReduceOp, nova::AdamOp>();
+                      nova::ArgmaxOp, nova::ReduceOp, nova::AdamOp,
+                      nova::LinearOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 
     RewritePatternSet patterns(context);

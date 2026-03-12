@@ -25,7 +25,6 @@ namespace mlir::nova {
 static bool isComputeOp(Operation *op) {
   return isa<TilingInterface>(op);
 }
-
 /// Returns true if the op is a contraction-like op (e.g. matmul).
 static bool isContractionOp(Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
@@ -140,16 +139,6 @@ static SmallVector<Attribute> getMapping(MLIRContext *context, ArrayRef<OpFoldRe
 }
 
 /// Checks whether we have static dimension for all the loop bounds and steps.
-static bool areAllStaticLoopBounds(scf::ForallOp forallOp) {
-  for (auto [lb, ub, step] : llvm::zip_equal(forallOp.getMixedLowerBound(),
-                                             forallOp.getMixedUpperBound(),
-                                             forallOp.getMixedStep())) {
-    if (!getConstantIntValue(lb) || !getConstantIntValue(ub) || !getConstantIntValue(step)) {
-      return false;
-    }
-  }
-  return true;
-}
 
 struct TilingInfo {
   Operation *tilableOp;
@@ -307,22 +296,6 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       // 4. Fusion Options
       scf::SCFTileAndFuseOptions tileAndFuseOptions;
       tileAndFuseOptions.setTilingOptions(tilingOptions);
-
-      tileAndFuseOptions.setFusionControlFn(
-          [&](tensor::ExtractSliceOp sliceOp, OpResult producer,
-              bool isDest)
-              -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
-            Operation *producerOp = producer.getOwner();
-            if (isa<tensor::PadOp>(producerOp))
-              return std::nullopt;
-            // Block contraction fusion — GEMMs stay as independent roots.
-            if (isContractionOp(producerOp))
-              return std::nullopt;
-            bool yieldProducerReplacement =
-                yieldReplacementsFor.contains(producerOp);
-            return scf::SCFTileAndFuseOptions::ControlFnResult{
-                yieldProducerReplacement};
-          });
 
       // 5. Cleanup Patterns
       RewritePatternSet cleanupPatterns(&getContext());
