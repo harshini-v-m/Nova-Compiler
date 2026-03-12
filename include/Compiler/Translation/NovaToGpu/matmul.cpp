@@ -813,8 +813,9 @@ struct NovaToGpuMatmulPattern : public OpRewritePattern<nova::MatmulOp> {
 
     Value lhsMemRef = rewriter.create<bufferization::ToBufferOp>(loc, lhsMemRefType, lhs).getResult();
     Value rhsMemRef = rewriter.create<bufferization::ToBufferOp>(loc, rhsMemRefType, rhs).getResult();
-    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultShape, resultType.getElementType());
-    Value resultMemRef = rewriter.create<bufferization::ToBufferOp>(loc, resultMemRefType, emptyTensor).getResult();
+    // Allocate device output directly — avoids tensor.empty → to_buffer(space 1)
+    // chain that bufferization resolves as host alloc + device alloc + memcpy.
+    Value resultMemRef = rewriter.create<memref::AllocOp>(loc, resultMemRefType).getResult();
 
     Value lhsFlat = rewriter.create<memref::ReinterpretCastOp>(
         loc, lhsFlatType, lhsMemRef, (int64_t)0,
