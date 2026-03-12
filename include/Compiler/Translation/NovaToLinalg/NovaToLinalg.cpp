@@ -1130,11 +1130,11 @@ static Value createReduceCombiner(OpBuilder &b, Location loc,
                : b.create<arith::MulIOp>(loc, lhs, rhs).getResult();
   case nova::ReductionKind::MAX:
     return isa<FloatType>(elemType)
-               ? b.create<arith::MaxNumFOp>(loc, lhs, rhs).getResult()
+               ? b.create<arith::MaximumFOp>(loc, lhs, rhs).getResult()
                : b.create<arith::MaxSIOp>(loc, lhs, rhs).getResult();
   case nova::ReductionKind::MIN:
     return isa<FloatType>(elemType)
-               ? b.create<arith::MinNumFOp>(loc, lhs, rhs).getResult()
+               ? b.create<arith::MinimumFOp>(loc, lhs, rhs).getResult()
                : b.create<arith::MinSIOp>(loc, lhs, rhs).getResult();
   case nova::ReductionKind::ALL:
     return b.create<arith::AndIOp>(loc, lhs, rhs).getResult();
@@ -1176,7 +1176,7 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
     return rewriter.notifyMatchFailure(op, "unsupported reduction kind");
   Value identity = rewriter.create<arith::ConstantOp>(loc, identityAttr);
 
-  // FIX 1: Compute SQUEEZED shape (completely remove reduced dims)
+  // Compute SQUEEZED shape (completely remove reduced dims)
   // This allows the indexing map to be a valid permuted projection.
   SmallVector<int64_t> squeezedShape;
   for (int64_t i = 0; i < rank; ++i) {
@@ -1209,7 +1209,7 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
     inputExprs.push_back(rewriter.getAffineDimExpr(logicalToLoop[i]));
   }
 
-  // FIX 2: Only add DimExprs for parallel dims (results in rank N-K)
+  //  Only add DimExprs for parallel dims (results in rank N-K)
   SmallVector<AffineExpr> outputExprs;
   for (int64_t i = 0; i < rank; ++i) {
     if (!axisSet.contains(i)) {
@@ -1236,28 +1236,32 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
 
   Value reduced = genericOp.getResult(0);
 
-  // Handle MEAN: Apply division on the squeezed shape
+  //  divide by total reduced elements
   if (kind == nova::ReductionKind::MEAN && isa<FloatType>(reductionElemType)) {
     double divisor = static_cast<double>(totalReducedElements);
-    Value divisorVal = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(reductionElemType, divisor));
-    Value divisorTensor = rewriter.create<tensor::EmptyOp>(loc, squeezedShape, reductionElemType, ValueRange{});
-    Value filledDivisor = rewriter.create<linalg::FillOp>(loc, divisorVal, divisorTensor).result();
+    // Scalar constant captured by the region – no extra tensor needed.
+    Value divisorVal = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(reductionElemType, divisor));
 
-    int64_t squeezedRank = squeezedShape.size();
-    SmallVector<AffineMap> maps(3, rewriter.getMultiDimIdentityMap(squeezedRank));
-    Value outputTensor = rewriter.create<tensor::EmptyOp>(loc, squeezedShape, reductionElemType, ValueRange{});
+    int64_t squeezedRank = static_cast<int64_t>(squeezedShape.size());
+    // Single identity map: every loop index maps to the same output element.
+    AffineMap identityMap = rewriter.getMultiDimIdentityMap(squeezedRank);
 
     auto divOp = rewriter.create<linalg::GenericOp>(
-        loc, squeezedType, ValueRange{reduced, filledDivisor}, outputTensor,
-        maps, getNParallelLoopsAttrs(squeezedRank),
+        loc, squeezedType,
+        /*inputs=*/ValueRange{},
+        /*outputs=*/ValueRange{reduced},
+        /*indexingMaps=*/SmallVector<AffineMap>{identityMap},
+        /*iteratorTypes=*/getNParallelLoopsAttrs(squeezedRank),
         [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
-          Value res = b.create<arith::DivFOp>(nestedLoc, args[0], args[1]);
+          // args[0] is the accumulated sum element (from outs buffer).
+          Value res = b.create<arith::DivFOp>(nestedLoc, args[0], divisorVal);
           b.create<linalg::YieldOp>(nestedLoc, res);
         });
     reduced = divOp.getResult(0);
   }
 
-  // FIX 3: Reshape back to the resultType (handles keepdims=true or false)
+  //  Reshape back to the resultType (handles keepdims=true or false)
   if (cast<RankedTensorType>(reduced.getType()) != resultType) {
       auto shapeType = RankedTensorType::get({resultType.getRank()}, rewriter.getIndexType());
       auto shapeAttr = DenseIntElementsAttr::get(shapeType, resultType.getShape());
@@ -1270,6 +1274,160 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
   return success();
 }
 
+static LogicalResult
+lowerFullReduceMeanToSCF(nova::ReduceOp op, PatternRewriter &rewriter,
+                         Location loc, Value input, RankedTensorType inputType,
+                         RankedTensorType resultType, Type elemType,
+                         int64_t rank, SmallVector<int64_t> &axes) {
+
+  assert(static_cast<int64_t>(axes.size()) == rank &&
+         "lowerFullReduceMeanToSCF expects a full reduction over all axes");
+  assert(isa<FloatType>(elemType) &&
+         "full-reduction MEAN SCF path only supports float types");
+
+  llvm::sort(axes);
+
+  int64_t totalElems = 1;
+  for (int64_t d : axes)
+    totalElems *= inputType.getDimSize(d);
+
+  Value fZero = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getFloatAttr(elemType, 0.0));
+
+  auto scalarTensorType = RankedTensorType::get({}, elemType);
+
+  auto inputMemType = MemRefType::get(inputType.getShape(), elemType);
+  Value inputMem = rewriter.create<ToBufferOp>(
+      loc, inputMemType, input, /*restrict=*/true).getResult();
+
+  Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+  
+  // We distribute across a fixed number of blocks (e.g., 64)
+  int64_t numBlocks = 64;
+  int64_t elemsPerBlock = (totalElems + numBlocks - 1) / numBlocks;
+
+  Value cNumBlocks = rewriter.create<arith::ConstantIndexOp>(loc, numBlocks);
+
+  // Allocate an intermediate memref for the 64 partial sums
+  auto partialMemType = MemRefType::get({numBlocks}, elemType);
+  Value partialMem = rewriter.create<memref::AllocOp>(loc, partialMemType);
+
+  SmallVector<Attribute> mapping;
+  mapping.push_back(gpu::GPUBlockMappingAttr::get(rewriter.getContext(), gpu::MappingId::DimX));
+  ArrayAttr mappingAttr = rewriter.getArrayAttr(mapping);
+
+  // --- PASS 1: Partial Reduction (Distributed across blocks) ---
+  auto forallOp1 = rewriter.create<scf::ForallOp>(
+      loc,
+      /*lbs=*/SmallVector<OpFoldResult>{getAsOpFoldResult(c0)},
+      /*ubs=*/SmallVector<OpFoldResult>{getAsOpFoldResult(cNumBlocks)},
+      /*steps=*/SmallVector<OpFoldResult>{getAsOpFoldResult(c1)},
+      /*outputs=*/ValueRange{},  
+      /*mapping=*/mappingAttr);
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(forallOp1.getBody());
+
+    Value blockId = forallOp1.getInductionVar(0);
+
+    // Compute start and end linear indices for this block
+    Value cElemsPerBlock = rewriter.create<arith::ConstantIndexOp>(loc, elemsPerBlock);
+    Value startIdx = rewriter.create<arith::MulIOp>(loc, blockId, cElemsPerBlock);
+    Value endIdxUnclamped = rewriter.create<arith::AddIOp>(loc, startIdx, cElemsPerBlock);
+    Value cTotalElems = rewriter.create<arith::ConstantIndexOp>(loc, totalElems);
+    
+    // clamp endIdx to totalElems
+    Value isExceeding = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, endIdxUnclamped, cTotalElems);
+    Value endIdx = rewriter.create<arith::SelectOp>(loc, isExceeding, cTotalElems, endIdxUnclamped);
+
+    // Sequential loop within the block over its designated chunk
+    auto forOp = rewriter.create<scf::ForOp>(
+        loc, startIdx, endIdx, c1, ValueRange{fZero});
+    {
+      OpBuilder::InsertionGuard gLevel(rewriter);
+      rewriter.setInsertionPointToStart(forOp.getBody());
+      Value linearIdx = forOp.getInductionVar();
+      Value currentSum = forOp.getRegionIterArgs()[0];
+
+      // Delinearize 'linearIdx' into multi-dimensional indices 'ivs'
+      SmallVector<Value> ivs(rank);
+      Value rem = linearIdx;
+      for (int64_t d = rank - 1; d >= 0; --d) {
+        int64_t dimSize = inputType.getDimSize(d);
+        Value cDimSize = rewriter.create<arith::ConstantIndexOp>(loc, dimSize);
+        if (d == 0) {
+          ivs[d] = rem;
+        } else {
+          ivs[d] = rewriter.create<arith::RemSIOp>(loc, rem, cDimSize);
+          rem = rewriter.create<arith::DivSIOp>(loc, rem, cDimSize);
+        }
+      }
+
+      Value elem = rewriter.create<memref::LoadOp>(loc, inputMem, ivs);
+      Value nextSum = rewriter.create<arith::AddFOp>(loc, currentSum, elem);
+      rewriter.create<scf::YieldOp>(loc, nextSum);
+    }
+    Value partialSum = forOp.getResult(0);
+
+    // Store partial sum in the intermediate buffer
+    rewriter.create<memref::StoreOp>(loc, partialSum, partialMem, ValueRange{blockId});
+  }
+
+  // --- PASS 2: Final Reduction (Single Block) ---
+  auto scalarMemType = MemRefType::get({}, elemType);
+  Value finalMem = rewriter.create<memref::AllocOp>(loc, scalarMemType);
+
+  auto forallOp2 = rewriter.create<scf::ForallOp>(
+      loc,
+      /*lbs=*/SmallVector<OpFoldResult>{getAsOpFoldResult(c0)},
+      /*ubs=*/SmallVector<OpFoldResult>{getAsOpFoldResult(c1)},
+      /*steps=*/SmallVector<OpFoldResult>{getAsOpFoldResult(c1)},
+      /*outputs=*/ValueRange{},  
+      /*mapping=*/mappingAttr);
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(forallOp2.getBody());
+
+    auto forOp = rewriter.create<scf::ForOp>(
+        loc, c0, cNumBlocks, c1, ValueRange{fZero});
+    {
+      OpBuilder::InsertionGuard gLevel(rewriter);
+      rewriter.setInsertionPointToStart(forOp.getBody());
+      Value idx = forOp.getInductionVar();
+      Value currentSum = forOp.getRegionIterArgs()[0];
+      Value partialElem = rewriter.create<memref::LoadOp>(loc, partialMem, ValueRange{idx});
+      Value nextSum = rewriter.create<arith::AddFOp>(loc, currentSum, partialElem);
+      rewriter.create<scf::YieldOp>(loc, nextSum);
+    }
+    Value totalSum = forOp.getResult(0);
+
+    Value divisorVal = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(elemType, static_cast<double>(totalElems)));
+    Value mean = rewriter.create<arith::DivFOp>(loc, totalSum, divisorVal);
+    rewriter.create<memref::StoreOp>(loc, mean, finalMem, ValueRange{});
+  }
+
+  // Convert final scalar memref back to tensor
+  Value resultTensor = rewriter.create<bufferization::ToTensorOp>(
+      loc, scalarTensorType, finalMem, /*restrict=*/true).getResult();
+
+  // Reshape to final result shape if needed
+  Value result = resultTensor;
+  if (cast<RankedTensorType>(result.getType()) != resultType) {
+    auto shapeType = RankedTensorType::get({resultType.getRank()}, rewriter.getIndexType());
+    auto shapeAttr = DenseIntElementsAttr::get(shapeType, resultType.getShape());
+    auto shapeConst = rewriter.create<tosa::ConstShapeOp>(
+        loc, mlir::tosa::shapeType::get(rewriter.getContext(), resultType.getRank()), shapeAttr);
+    result = rewriter.create<tosa::ReshapeOp>(loc, resultType, result, shapeConst);
+  }
+
+  // Deallocate intermediate buffer (memref memory management)
+  // rewriter.create<memref::DeallocOp>(loc, partialMem); // Optional standard cleanup, often omitted in MLIR tensor passes till bufferization finalization, but good practice.
+
+  rewriter.replaceOp(op, result);
+  return success();
+}
 class ReduceOpConverter : public OpRewritePattern<nova::ReduceOp> {
 public:
   using OpRewritePattern<nova::ReduceOp>::OpRewritePattern;
@@ -1300,7 +1458,17 @@ public:
         axes.push_back(i);
     }
 
-    // Use linalg.generic path
+    // Full-reduction MEAN → scf.forall (GPU block) + nested scf.for loops.
+    // All other kinds and all partial reductions go through linalg.generic.
+    bool isFullReduction = (static_cast<int64_t>(axes.size()) == rank);
+    if (kind == nova::ReductionKind::MEAN && isFullReduction &&
+        isa<FloatType>(elemType)) {
+      return lowerFullReduceMeanToSCF(op, rewriter, loc, input, inputType,
+                                      resultType, elemType, rank, axes);
+    }
+
+    // Use linalg.generic path for everything else (partial reductions,
+    // other reduction kinds, non-float MEAN, …).
     return lowerWithLinalgGeneric(op, rewriter, loc, input, inputType,
                                   resultType, elemType, rank, kind, axes);
 

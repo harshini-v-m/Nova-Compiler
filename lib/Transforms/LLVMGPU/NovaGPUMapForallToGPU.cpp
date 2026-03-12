@@ -21,6 +21,9 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "nova-gpu-map-forall"
 
 using namespace mlir;
 
@@ -103,6 +106,16 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
       int64_t mid = blockAttr.getMappingId();
       if (mid < 3)
         gridDims[mid] = *dimCst;
+    }
+  }
+
+  // Validate grid dims: all must be > 0.
+  for (int i = 0; i < 3; ++i) {
+    if (gridDims[i] <= 0) {
+      LLVM_DEBUG(llvm::dbgs() << "[nova-gpu-map-forall] grid dim " << i
+                               << " is " << gridDims[i]
+                               << ", clamping to 1\n");
+      gridDims[i] = 1;
     }
   }
 

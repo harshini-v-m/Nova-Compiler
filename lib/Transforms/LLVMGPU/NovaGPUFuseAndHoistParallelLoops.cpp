@@ -521,7 +521,10 @@ struct FuseTilableForallConsumers final
       Block *block = forallProducer->getBlock();
       Block::iterator insertPt =
           std::next(forallProducer->getIterator());
-      for (Operation *op : llvm::reverse(slice)) {
+      // Move in topological order (sources first) so each op is placed
+      // after its dependencies. llvm::reverse was wrong here — it put
+      // sinks before sources, causing dominance violations.
+      for (Operation *op : slice) {
         op->moveBefore(block, insertPt);
       }
     }
@@ -532,6 +535,29 @@ struct FuseTilableForallConsumers final
         rewriter, insertSlices, loops);
     if (failed(fusionResult))
       return failure();
+
+    // Post-fixup: tileAndFuseConsumerOfSlices may create tensor.empty (or
+    // other ops) for fused consumer's shared_outs but place them AFTER
+    // the forall that uses them, violating dominance. Find the block
+    // from the tiled ops (forallProducer may be invalid after fusion).
+    for (Operation *tiledOp : fusionResult->tiledOps) {
+      // Walk up to the block that contains sibling foralls.
+      Operation *ancestor = tiledOp;
+      while (ancestor->getParentOp() &&
+             !isa<func::FuncOp>(ancestor->getParentOp()))
+        ancestor = ancestor->getParentOp();
+      // Now walk all blocks under this ancestor to fix dominance.
+      ancestor->walk([](scf::ForallOp forallOp) {
+        for (Value operand : forallOp->getOperands()) {
+          Operation *defOp = operand.getDefiningOp();
+          if (defOp && defOp->getBlock() == forallOp->getBlock() &&
+              !defOp->isBeforeInBlock(forallOp)) {
+            defOp->moveBefore(forallOp);
+          }
+        }
+      });
+      break; // Only need to do this once.
+    }
 
     return success();
   }

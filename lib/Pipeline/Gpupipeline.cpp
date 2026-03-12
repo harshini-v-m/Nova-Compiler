@@ -99,7 +99,7 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
 
 
             // 4. LINALG OPT to linalg generalize pass
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgGeneralizeNamedOpsPass());
+            // pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgGeneralizeNamedOpsPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createFuseMatmulBiasPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgFoldUnitExtentDimsPass());

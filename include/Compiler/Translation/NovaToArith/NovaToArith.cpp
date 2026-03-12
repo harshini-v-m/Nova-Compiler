@@ -39,6 +39,40 @@ struct NovaToArithOp{
   return nullptr;
   }
   static Value mappingArith(nova::ConstantOp op,Type resultType,ValueRange input,OpBuilder* builder){
+    auto elementsAttr = dyn_cast<DenseElementsAttr>(op.getValue());
+    if (elementsAttr && elementsAttr.isSplat()) {
+      auto splatVal = elementsAttr.getSplatValue<Attribute>();
+      bool isZero = false;
+      if (auto floatAttr = dyn_cast<FloatAttr>(splatVal)) {
+        if (floatAttr.getValueAsDouble() == 0.0)
+          isZero = true;
+      } else if (auto intAttr = dyn_cast<IntegerAttr>(splatVal)) {
+        if (intAttr.getInt() == 0)
+          isZero = true;
+      }
+
+      if (isZero) {
+        auto tensorType = cast<RankedTensorType>(resultType);
+        Location loc = op.getLoc();
+        // 1. Create tensor.empty to represent a destination buffer.
+        // Bufferization will later map this to a GPU allocation (addrspace 1).
+        Value empty = builder->create<tensor::EmptyOp>(
+            loc, tensorType.getShape(), tensorType.getElementType());
+
+        // 2. Create the scalar zero to fill the tensor with.
+        Value zero;
+        if (auto floatType = dyn_cast<FloatType>(tensorType.getElementType())) {
+          zero = builder->create<arith::ConstantOp>(
+              loc, builder->getFloatAttr(floatType, 0.0));
+        } else {
+          zero = builder->create<arith::ConstantOp>(
+              loc, builder->getIntegerAttr(tensorType.getElementType(), 0));
+        }
+
+        // 3. Use linalg.fill to zero-initialize the tensor on the device.
+        return builder->create<linalg::FillOp>(loc, zero, empty).result();
+      }
+    }
     return builder ->create<arith::ConstantOp>(op.getLoc(),resultType,op.getValue());
   }
    // SCE lOWERING  pattern
@@ -224,6 +258,8 @@ struct NovaToArithLoweringPass
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect>();
     registry.insert<func::FuncDialect>();
+    registry.insert<linalg::LinalgDialect>();
+    registry.insert<tensor::TensorDialect>();
   }
 
   StringRef getArgument() const final { return "convert-nova-to-arith"; }
@@ -239,6 +275,8 @@ struct NovaToArithLoweringPass
     
     target.addLegalDialect<arith::ArithDialect>();
     target.addLegalDialect<tosa::TosaDialect>();
+    target.addLegalDialect<linalg::LinalgDialect>();
+    target.addLegalDialect<tensor::TensorDialect>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     target.addIllegalOp<nova::ConstantOp>();
     target.addIllegalOp<nova::SceOp>();

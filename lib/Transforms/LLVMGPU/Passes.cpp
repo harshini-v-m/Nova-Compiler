@@ -1,6 +1,7 @@
 #include "Passes.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
 #include "Compiler/Transforms/Passes.h"
+#include "Compiler/Transforms/GenerateDynamicWrapper.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
@@ -75,7 +76,6 @@ namespace mlir::nova
     StringRef arch = cudaArch.empty() ? "sm_86" : cudaArch;
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(mlir::nova::createNovaToArithLoweringPass());
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
     pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaElementwiseToLinalgPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgPass());
@@ -155,9 +155,9 @@ namespace mlir::nova
     // -------------------------------------------------------------------------
     // Step 5: Tile thread-level M/N dimensions
     // -------------------------------------------------------------------------
-    // pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelThreadPass());
-    // pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-    // pm.addPass(createCSEPass());
+    pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelThreadPass());
+    pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
+    pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
     // Step 6: Tile subgroup (warp) M/N dimensions
@@ -169,8 +169,8 @@ namespace mlir::nova
     // -------------------------------------------------------------------------
     // Step 7: Fuse and hoist parallel loops
     // -------------------------------------------------------------------------
-    // pm.addNestedPass<func::FuncOp>(
-    //     createNovaGPUFuseAndHoistParallelLoopsPass());
+    pm.addNestedPass<func::FuncOp>(
+        createNovaGPUFuseAndHoistParallelLoopsPass());
 
     // -------------------------------------------------------------------------
     // Step 7.5: Normalize forall loop bounds
@@ -233,8 +233,8 @@ namespace mlir::nova
     // Step 10: Lower remaining linalg → scf loops, affine → arith
     // -------------------------------------------------------------------------
     pm.addPass(createConvertLinalgToLoopsPass());
-    pm.addNestedPass<func::FuncOp>(mlir::nova::createSCFScalarizeAccumulatorPass());
-    pm.addPass(createLowerAffinePass());
+    //pm.addNestedPass<func::FuncOp>(mlir::nova::createSCFScalarizeAccumulatorPass());
+   // pm.addPass(createLowerAffinePass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
@@ -340,10 +340,14 @@ namespace mlir::nova
     binaryOptions.toolkitPath = "/usr/local/cuda-13.0";
     binaryOptions.compilationTarget = "isa";
     pm.addPass(createGpuModuleToBinaryPass(binaryOptions));
-    pm.addPass(nova::createGpuRuntimeLoweringPass());
+    // 13.4 — Convert any remaining #gpu.address_space<private> on host-side
+    //         memrefs to generic address space 0 BEFORE gpu-to-llvm, so that
+    //         gpu.launch_func args don't carry symbolic address spaces that
+    //         the LLVM lowering cannot convert.
+    pm.addPass(createNovaGPULowerMemorySpacePass());
 
-    // 13.4 — Lower gpu.* host ops (gpu.alloc, gpu.launch_func, etc.) to LLVM
-    //         runtime calls (mgpuMemAlloc, mgpuLaunchKernel, etc.).
+    // 13.4b — Lower gpu.* host ops (gpu.alloc, gpu.launch_func, etc.) to LLVM
+    //          runtime calls (mgpuMemAlloc, mgpuLaunchKernel, etc.).
     GpuToLLVMConversionPassOptions hostOpts;
     pm.addPass(createGpuToLLVMConversionPass(hostOpts));
     pm.addPass(createReconcileUnrealizedCastsPass());
@@ -355,13 +359,9 @@ namespace mlir::nova
     pm.addPass(createConvertControlFlowToLLVMPass());
     pm.addPass(createArithToLLVMConversionPass());
     pm.addPass(memref::createExpandStridedMetadataPass());
-    // Safety net: convert any remaining #gpu.address_space<private> on host-side
-    // memrefs to generic address space 0. This handles edge cases where ops
-    // didn't get distributed to GPU kernels.
-    pm.addPass(createNovaGPULowerMemorySpacePass());
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
     pm.addPass(createConvertFuncToLLVMPass());
-    pm.addPass(nova::createGenerateDynamicWrapperPass());
+    pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
     pm.addPass(createReconcileUnrealizedCastsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
@@ -428,7 +428,6 @@ namespace mlir::nova
         memref::createResolveShapedTypeResultDimsPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
-    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
 
     // Hoist memref.alloc ops out of loops where possible. This moves shared
     // memory allocations out of the K-reduction loop so they are reused
