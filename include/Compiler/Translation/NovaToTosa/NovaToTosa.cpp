@@ -403,10 +403,9 @@ struct NovaGeluOpLowering : public OpConversionPattern<mlir::nova::GeluOp> {
       input = rewriter.create<mlir::tosa::CastOp>(loc, newInputType, input);
       inputType = newInputType;
     }
-    // op0 = pow(x, 3)
-    Value cst_3 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {3.0f}));
-    auto op0 = rewriter.create<mlir::nova::PowOp>(loc, inputType, input, cst_3);
+    // op0 = xxx
+    Value xsquare=rewriter.create<mlir::nova::MulOp>(loc,inputType,input,input);
+    Value op0=rewriter.create<mlir::nova::MulOp>(loc,inputType,xsquare,input);
     // op1 = mul(op0, 0.044715)
     Value cst_004 = rewriter.create<mlir::nova::ConstantOp>(
         loc, inputType, DenseElementsAttr::get(inputType, {4.471500e-02f}));
@@ -415,7 +414,7 @@ struct NovaGeluOpLowering : public OpConversionPattern<mlir::nova::GeluOp> {
     auto op2 = rewriter.create<mlir::nova::AddOp>(loc, inputType, input, op1);
     // op3 = mul(op2, sqrt(2/pi))
     Value cst_sqrt2pi = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {0.797884583f}));
+        loc, inputType, DenseElementsAttr::get(inputType, {0.7978845608028654f}));
     auto op3 =
         rewriter.create<mlir::nova::MulOp>(loc, inputType, op2, cst_sqrt2pi);
     // op4 = tanh(op3)
@@ -457,54 +456,47 @@ struct NovaGeluBackwardPattern
           rewriter.create<mlir::tosa::CastOp>(loc, newInputType, grad_out);
       inputType = newInputType;
     }
-
-    Value cst_3 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {3.0f}));
-    auto op0 = rewriter.create<mlir::nova::PowOp>(loc, inputType, input, cst_3);
-    Value cst_004 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {4.471500e-02f}));
-    auto op1 = rewriter.create<mlir::nova::MulOp>(loc, inputType, op0, cst_004);
-    auto op2 = rewriter.create<mlir::nova::AddOp>(loc, inputType, input, op1);
     Value cst_sqrt2pi = rewriter.create<mlir::nova::ConstantOp>(
         loc, inputType, DenseElementsAttr::get(inputType, {0.797884583f}));
-    auto op3 =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, op2, cst_sqrt2pi);
-    auto op4 = rewriter.create<mlir::nova::TanhOp>(loc, inputType, op3);
-    Value cst_1 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {1.0f}));
-    auto op5 = rewriter.create<mlir::nova::AddOp>(loc, inputType, op4, cst_1);
+    Value cst_004 = rewriter.create<mlir::nova::ConstantOp>(
+        loc, inputType, DenseElementsAttr::get(inputType, {4.471500e-02f}));
     Value cst_05 = rewriter.create<mlir::nova::ConstantOp>(
         loc, inputType, DenseElementsAttr::get(inputType, {0.5f}));
-    auto op6 =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, input, cst_05);
-
-    auto op4_sq = rewriter.create<mlir::nova::MulOp>(loc, inputType, op4, op4);
-    auto one_minus_tanh_sq =
-        rewriter.create<mlir::nova::SubOp>(loc, inputType, cst_1, op4_sq);
-
-    Value cst_2 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {2.0f}));
-    auto x_sq =
-        rewriter.create<mlir::nova::PowOp>(loc, inputType, input, cst_2);
+    Value cst_1 = rewriter.create<mlir::nova::ConstantOp>(
+        loc, inputType, DenseElementsAttr::get(inputType, {1.0f}));
     Value cst_013 = rewriter.create<mlir::nova::ConstantOp>(
         loc, inputType, DenseElementsAttr::get(inputType, {0.134145f}));
-    auto op_xsq_coeff =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, x_sq, cst_013);
-    auto poly_grad =
-        rewriter.create<mlir::nova::AddOp>(loc, inputType, cst_1, op_xsq_coeff);
 
-    auto t2_a = rewriter.create<mlir::nova::MulOp>(loc, inputType, op6,
-                                                   one_minus_tanh_sq);
-    auto t2_b =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, t2_a, cst_sqrt2pi);
-    auto term2 =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, t2_b, poly_grad);
+   //Finding g(x) = 0.7978845(x+0.044715xx*x)
+    //finding g'(x)=0.7978845(1+0.134145xx)
 
-    auto term1 =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, op5, cst_05);
-    auto d_gelu =
-        rewriter.create<mlir::nova::AddOp>(loc, inputType, term1, term2);
+    Value input_square=rewriter.create<mlir::nova::MulOp>(loc, inputType, input, input);
+    auto op_xsq_coeff =rewriter.create<mlir::nova::MulOp>(loc, inputType, input_square, cst_013);
+    auto op0 = rewriter.create<mlir::nova::MulOp>(loc, inputType, input, input_square);
+    auto op1 = rewriter.create<mlir::nova::MulOp>(loc, inputType, op0, cst_004);
+    auto op2 = rewriter.create<mlir::nova::AddOp>(loc, inputType, input, op1);
+    auto op3 =rewriter.create<mlir::nova::MulOp>(loc, inputType, op2, cst_sqrt2pi);
+    auto poly_grad =rewriter.create<mlir::nova::AddOp>(loc, inputType, cst_1, op_xsq_coeff);    
+    auto dg =rewriter.create<mlir::nova::MulOp>(loc, inputType, poly_grad, cst_sqrt2pi);
+   //fiding first term of grad_input
+   // =>0.5*(1+tanh(g(x)))
+    //finding second term of grad_input
+    // => 0.5 x(1-tanh^2(g(x)) ) *g'(x)
+    //finding  1- tanh^2
+    auto op4 = rewriter.create<mlir::nova::TanhOp>(loc, inputType, op3);
+    auto op4_sq = rewriter.create<mlir::nova::MulOp>(loc, inputType, op4, op4);
+    auto one_minus_tanh_sq =rewriter .create<mlir::nova::SubOp>(loc, inputType, cst_1, op4_sq);
+    auto t2_a = rewriter.create<mlir::nova::MulOp>(loc, inputType, dg,one_minus_tanh_sq);
+    auto term2 =rewriter.create<mlir::nova::MulOp>(loc, inputType, input, t2_a);
+    auto secondterm =rewriter.create<mlir::nova::MulOp>(loc, inputType, term2, cst_05);
+    auto op5 = rewriter.create<mlir::nova::AddOp>(loc, inputType, op4, cst_1);
+    auto term1 =rewriter.create<mlir::nova::MulOp>(loc, inputType, op5, cst_05);
 
+    auto op6 =rewriter.create<mlir::nova::MulOp>(loc, inputType, input, cst_05);
+    //adding two terms
+    auto d_gelu =rewriter.create<mlir::nova::AddOp>(loc, inputType, term1, secondterm);
+
+ //final cahin result multiply
     auto grad_input =
         rewriter.create<mlir::nova::MulOp>(loc, inputType, grad_out, d_gelu);
     rewriter.replaceOp(op, {grad_input.getResult()});
@@ -685,6 +677,7 @@ struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
 
 
 // layer norm lowering with nova operations
+
 struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
   using OpConversionPattern<nova::LayerNormOp>::OpConversionPattern;
 
@@ -703,29 +696,39 @@ struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
     auto elemType = xType.getElementType();
     // setting up
     float eps = 1e-5f;
+    int last_dim = xType.getRank()-1;
     // 1.finding row mean
     std::vector<int64_t> meanShape(xType.getShape().begin(),
                                    xType.getShape().end());
+    float last_dim_n = meanShape[last_dim];
     meanShape.back() = 1;
     auto meanType = mlir::RankedTensorType::get(meanShape, elemType);
-    auto mean = rewriter
+    auto mean_sum = rewriter
                     .create<mlir::nova::ReduceOp>(
-                        loc, mlir::nova::ReductionKind::MEAN, x, meanType, true,
+                        loc, mlir::nova::ReductionKind::SUM, x, meanType, true,
                         llvm::ArrayRef<int64_t>{-1}, false)
                     .getResult();
-    auto x_minus_mean =
-        rewriter.create<mlir::nova::SubOp>(loc, xres, x, mean).getResult();
+    auto scalarType = mlir::RankedTensorType::get({}, xType.getElementType());
+    auto n = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)(1/last_dim_n))));
+   // auto reciprocal = rewriter.create<nova::ReciprocalOp>(loc, n);
+    auto mean = rewriter.create<mlir::nova::MulOp>(loc, n, mean_sum).getResult();
+
+    auto x_minus_mean = rewriter.create<mlir::nova::SubOp>(loc, xres, x, mean).getResult();
+
+
     // 3. (x - mean)^2
     auto sq_diff =
         rewriter
             .create<mlir::nova::MulOp>(loc, xres, x_minus_mean, x_minus_mean)
             .getResult();
     // 4. Var(x) = Mean((x-mean)^2)
-    auto var = rewriter
+    auto var_sum = rewriter
                    .create<mlir::nova::ReduceOp>(
-                       loc, mlir::nova::ReductionKind::MEAN, sq_diff, meanType,
+                       loc, mlir::nova::ReductionKind::SUM, sq_diff, meanType,
                        true, llvm::ArrayRef<int64_t>{-1}, false)
                    .getResult();
+    auto var = rewriter.create<mlir::nova::MulOp>(loc, n, var_sum).getResult();
+
     // 5. sqrt(var + eps)
     auto epsAttr = mlir::DenseElementsAttr::get(
         mlir::cast<mlir::RankedTensorType>(var.getType()), eps);
@@ -753,6 +756,9 @@ struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
     return success();
   }
 };
+
+
+
 struct NovaLayerNormBackwardPattern
    : public OpConversionPattern<nova::LayerNormBackwardOp> {
  using OpConversionPattern<nova::LayerNormBackwardOp>::OpConversionPattern;
@@ -777,20 +783,23 @@ struct NovaLayerNormBackwardPattern
    int64_t last_dim = xType.getRank() - 1;
    llvm::SmallVector<int64_t, 1> dims = {last_dim};
    llvm::SmallVector<int64_t, 4> red_shape(xType.getShape().begin(), xType.getShape().end());
+   //create constant of 1/total number of elements 
+    
+   float ndim=red_shape[last_dim];
    red_shape[last_dim] = 1;
    auto red_type = mlir::RankedTensorType::get(red_shape, xType.getElementType());
    auto scalarType = mlir::RankedTensorType::get({}, xType.getElementType());
-   auto dim_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)xType.getShape().back())));
-   auto sum_x = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, x, red_type, true, dims, false);
-   auto mean = rewriter.create<mlir::nova::DivOp>(loc, sum_x.getResult(), dim_const.getResult());
+   auto dim_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (float)(1/ndim))));
+   auto sum_x = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, x, red_type, true,  llvm::ArrayRef<int64_t>{-1}, false);
+   auto mean = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_x);
    auto meanType = cast<RankedTensorType>(mean.getType());
 
 
    // calculate standard deviation
    auto diff = rewriter.create<mlir::nova::SubOp>(loc, x, mean.getResult());
    auto diff2 = rewriter.create<mlir::nova::MulOp>(loc, diff.getResult(), diff.getResult());
-   auto sum_sq = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, diff2.getResult(), red_type, true, dims, false);
-   auto var = rewriter.create<mlir::nova::DivOp>(loc, sum_sq.getResult(), dim_const.getResult());
+   auto sum_sq = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, diff2.getResult(), red_type, true,  llvm::ArrayRef<int64_t>{-1}, false);
+   auto var = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_sq);
    auto eps_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)eps)));
    auto var_eps = rewriter.create<mlir::nova::AddOp>(loc, var.getResult(), eps_const.getResult());
    auto rstd = rewriter.create<mlir::nova::RsqrtOp>(loc, var_eps.getResult());
@@ -831,24 +840,27 @@ struct NovaLayerNormBackwardPattern
    Value gy_gamma =
        rewriter.create<mlir::nova::MulOp>(loc, xType, gy, gamma).getResult();
 
-
-   Value mean_gy_gamma =
+ //Using reduce sum
+   Value sum_gy_gamma =
        rewriter
-           .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::MEAN,
+           .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
                                          gy_gamma, meanType, true,
                                          llvm::ArrayRef<int64_t>{-1})
            .getResult();
-
-
-   Value term2 =
+  //CReating constant of reciprocal 
+  
+  Value mean_gy_gamma = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_gy_gamma);
+   Value gy_gamma_xhat =
        rewriter.create<mlir::nova::MulOp>(loc, xType, gy_gamma, x_hat)
            .getResult();
+           
    Value mean_gy_gamma_xhat =
        rewriter
            .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::MEAN,
-                                         term2, meanType, true,
+                                         gy_gamma_xhat, meanType, true,
                                          llvm::ArrayRef<int64_t>{-1})
            .getResult();
+  // Value mean_gy_gamma_xhat = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_gy_gamma_xhat).getResult();
 
 
    Value t3 =
