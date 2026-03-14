@@ -423,35 +423,48 @@ struct EliminateSubSelf : public OpRewritePattern<SubOp> {
 //===----------------------------------------------------------------------===//
 
 /// Eliminate A * 1 -> A
+/// Handles: nova.constant, arith.constant, and broadcast_in_dim(constant)
 struct EliminateMulOne : public OpRewritePattern<MulOp> {
   using OpRewritePattern<MulOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(MulOp op,
                                 PatternRewriter &rewriter) const override {
     // Check RHS for constant 1
-    if (auto rhsDefOp = op.getRhs().getDefiningOp<arith::ConstantOp>()) {
-      if (auto denseAttr = dyn_cast<DenseElementsAttr>(rhsDefOp.getValue())) {
-        if (denseAttr.isSplat() && isSplatOne(denseAttr)) {
-          rewriter.replaceOp(op, op.getLhs());
-          return success();
-        }
-      }
+    if (isConstantOne(op.getRhs())) {
+      rewriter.replaceOp(op, op.getLhs());
+      return success();
     }
 
     // Check LHS for constant 1
-    if (auto lhsDefOp = op.getLhs().getDefiningOp<arith::ConstantOp>()) {
-      if (auto denseAttr = dyn_cast<DenseElementsAttr>(lhsDefOp.getValue())) {
-        if (denseAttr.isSplat() && isSplatOne(denseAttr)) {
-          rewriter.replaceOp(op, op.getRhs());
-          return success();
-        }
-      }
+    if (isConstantOne(op.getLhs())) {
+      rewriter.replaceOp(op, op.getRhs());
+      return success();
     }
 
     return failure();
   }
 
 private:
+  bool isConstantOne(Value val) const {
+    // Look through broadcast_in_dim
+    if (auto broadcast = val.getDefiningOp<BroadcastInDimOp>())
+      val = broadcast.getOperand();
+
+    // Check nova::ConstantOp
+    if (auto novaConst = val.getDefiningOp<nova::ConstantOp>()) {
+      if (auto denseAttr = dyn_cast<DenseElementsAttr>(novaConst.getValue()))
+        return denseAttr.isSplat() && isSplatOne(denseAttr);
+    }
+
+    // Check arith::ConstantOp
+    if (auto arithConst = val.getDefiningOp<arith::ConstantOp>()) {
+      if (auto denseAttr = dyn_cast<DenseElementsAttr>(arithConst.getValue()))
+        return denseAttr.isSplat() && isSplatOne(denseAttr);
+    }
+
+    return false;
+  }
+
   bool isSplatOne(DenseElementsAttr attr) const {
     auto elementType = attr.getElementType();
 
@@ -472,30 +485,15 @@ struct EliminateMulZero : public OpRewritePattern<MulOp> {
 
   LogicalResult matchAndRewrite(MulOp op,
                                 PatternRewriter &rewriter) const override {
-    Value zeroOperand = nullptr;
-
     // Check RHS for zero constant
-    if (auto rhsDefOp = op.getRhs().getDefiningOp<arith::ConstantOp>()) {
-      if (auto denseAttr = dyn_cast<DenseElementsAttr>(rhsDefOp.getValue())) {
-        if (denseAttr.isSplat() && isSplatZero(denseAttr)) {
-          zeroOperand = op.getRhs();
-        }
-      }
+    if (isConstantZero(op.getRhs())) {
+      rewriter.replaceOp(op, op.getRhs());
+      return success();
     }
 
     // Check LHS for zero constant
-    if (!zeroOperand) {
-      if (auto lhsDefOp = op.getLhs().getDefiningOp<arith::ConstantOp>()) {
-        if (auto denseAttr = dyn_cast<DenseElementsAttr>(lhsDefOp.getValue())) {
-          if (denseAttr.isSplat() && isSplatZero(denseAttr)) {
-            zeroOperand = op.getLhs();
-          }
-        }
-      }
-    }
-
-    if (zeroOperand) {
-      rewriter.replaceOp(op, zeroOperand);
+    if (isConstantZero(op.getLhs())) {
+      rewriter.replaceOp(op, op.getLhs());
       return success();
     }
 
@@ -503,6 +501,26 @@ struct EliminateMulZero : public OpRewritePattern<MulOp> {
   }
 
 private:
+  bool isConstantZero(Value val) const {
+    // Look through broadcast_in_dim
+    if (auto broadcast = val.getDefiningOp<BroadcastInDimOp>())
+      val = broadcast.getOperand();
+
+    // Check nova::ConstantOp
+    if (auto novaConst = val.getDefiningOp<nova::ConstantOp>()) {
+      if (auto denseAttr = dyn_cast<DenseElementsAttr>(novaConst.getValue()))
+        return denseAttr.isSplat() && isSplatZero(denseAttr);
+    }
+
+    // Check arith::ConstantOp
+    if (auto arithConst = val.getDefiningOp<arith::ConstantOp>()) {
+      if (auto denseAttr = dyn_cast<DenseElementsAttr>(arithConst.getValue()))
+        return denseAttr.isSplat() && isSplatZero(denseAttr);
+    }
+
+    return false;
+  }
+
   bool isSplatZero(DenseElementsAttr attr) const {
     auto elementType = attr.getElementType();
 

@@ -1020,4 +1020,33 @@ def Nova_SceBackwardOp : Op<Nova_Dialect, "sce_backward",
   }];
 }
 
+def Nova_SceFwdBwdOp : Op<Nova_Dialect, "sce_fwd_bwd",
+    [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Fused Sparse Cross Entropy forward + backward";
+  let description = [{
+    Computes both the sparse cross-entropy loss AND its gradient w.r.t. logits
+    in a single fused operation, sharing the softmax computation.
+
+    This is semantically equivalent to:
+      %loss = nova.sce %logits, %targets
+      %grad = nova.sce_backward %logits, %targets {dim = ...}
+    but avoids redundant softmax computation.
+
+    Example:
+      %loss, %grad = nova.sce_fwd_bwd %logits, %targets {dim = -1}
+        : tensor<4x10xf32>, tensor<4xi32>
+  }];
+
+  let arguments = (ins Nova_Tensor:$logits, Nova_Tensor:$targets,
+                       DefaultValuedAttr<I64Attr, "-1">:$dim);
+  let results = (outs Nova_Tensor:$loss, Nova_Tensor:$grad_logits);
+
+  let hasVerifier = 1;
+  let hasFolder = 1;
+
+  let assemblyFormat = [{
+    $logits `,` $targets attr-dict `:` type($logits) `,` type($targets)
+  }];
+}
+
 #endif // NOVA_OPS

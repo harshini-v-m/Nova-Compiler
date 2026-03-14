@@ -2,6 +2,7 @@ add_mlir_library(CompilerTransforms
   AddGpuMemoryCopies.cpp
   AffineScalarizeAccumulator.cpp
   FuseMatmulBias.cpp
+  NovaFusionPass.cpp
   ConvertMemRefToGpu.cpp
   FixGpuLaunch.cpp
   GenerateDynamicWrapper.cpp

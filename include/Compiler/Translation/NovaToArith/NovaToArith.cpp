@@ -7,6 +7,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
@@ -22,7 +24,6 @@
 
 namespace mlir {
 namespace nova {
-
 //--------------------------------------constant-----------------------------
 
 struct NovaToArithOp{
@@ -40,6 +41,7 @@ struct NovaToArithOp{
     return builder ->create<arith::ConstantOp>(op.getLoc(),resultType,op.getValue());
   }
    // SCE lOWERING  pattern
+  // tensor.extract cross-forall dominance issues in the tiling pass.
   static Value mappingArith(nova::SceOp op, Type resultType, ValueRange input,
                            OpBuilder *builder) {
     // Input[0] = logits (e.g., tensor<4x10xf32>)
@@ -71,71 +73,74 @@ struct NovaToArithOp{
       logitsType = newLogitsType;
     }
 
-    // Step 1: max_val = reduce_max(logits, dim=-1, keepdims=true)
+    // Step 1: max_val = reduce_max(logits, dim=-1, keepdims=false)
     int64_t rank = logitsType.getRank();
-    int64_t lastDim = rank - 1;
-    auto axisAttr = builder->getI32IntegerAttr(lastDim);
+    int64_t lastDim = rank - 1;\
 
-    auto maxShape = logitsType.getShape().vec();
-    maxShape[lastDim] = 1;
-    auto maxValType = mlir::RankedTensorType::get(maxShape, targetElemType);
+    // keepdims=true shape for broadcast in sub/exp
+    auto keepShape = logitsType.getShape().vec();
+    keepShape[lastDim] = 1;
+    auto keepType = mlir::RankedTensorType::get(keepShape, targetElemType);
+ //h : create nova reduce max
+  nova::ReductionKind rk = nova::ReductionKind::MAX;
+    Value maxValKeep = builder->create<nova::ReduceOp>(op.getLoc(),rk,
+                                                          logits,keepType, true,llvm::ArrayRef<int64_t>{-1},false);
 
-    Value maxVal = builder->create<tosa::ReduceMaxOp>(op.getLoc(), maxValType,
-                                                      logits, axisAttr);
+    // Step 2: z_shifted = logits - max_val (broadcast sub)
+    Value zShifted =
+        builder->create<nova::SubOp>(op.getLoc(), logits, maxValKeep);
 
-    // Step 2: z_shifted = logits - max_val
-    Value zShifted = builder->create<nova::SubOp>(op.getLoc(), logits, maxVal);
-
-    // Step 3: exp_z_shifted = exp(z_shifted)
+    // Step 3: exp(z_shifted)
     Value expZShifted = builder->create<nova::ExpOp>(op.getLoc(), zShifted);
 
-    // Step 4: sum_exp = reduce_sum(exp_z_shifted, dim=-1, keepdims=true)
-    Value sumExp = builder->create<tosa::ReduceSumOp>(op.getLoc(), maxValType,
-                                                      expZShifted, axisAttr);
+    // Step 4: sum_exp = reduce_sum(exp_z_shifted, dim=-1, keepdims=false)
+    // Use keepdims=false for the flat per-sample values
+    auto batchShape = logitsType.getShape().vec();
+    batchShape.pop_back(); // remove last dim → e.g. [4]
+    auto batchType =
+        mlir::RankedTensorType::get(batchShape, targetElemType);
 
-    // Step 5: log_sum_exp = log(sum_exp)
-    Value logSumExp = builder->create<nova::LogOp>(op.getLoc(), sumExp);
+    auto rk_sum = nova::ReductionKind::SUM;
+    llvm::SmallVector<int64_t, 1> reduceDims = {lastDim};
+    Value sumExp = builder->create<nova::ReduceOp>(
+        op.getLoc(), rk_sum, expZShifted, batchType, false, reduceDims);
 
-    // Step 6: log_sm_Z = z_shifted - log_sum_exp (log-softmax)
-    Value logSmZ =
-        builder->create<nova::SubOp>(op.getLoc(), zShifted, logSumExp);
 
-    // Step 7: Gather using linalg.generic since TOSA gather has shape
-    // constraints selected_log_probs[i] = log_sm_Z[i, targets[i]]
-    // Use lastDim as gather axis (e.g., C)
-    Value selectedLogProbs =
-        builder->create<nova::GatherOp>(op.getLoc(), logSmZ, targets, lastDim)
+
+    // Step 6: max_val flat (keepdims=false) → tensor<4xf32>
+    auto rk_max = nova::ReductionKind::MAX;
+    Value maxValFlat = builder->create<nova::ReduceOp>(
+        op.getLoc(), rk_max, logits, batchType, false, reduceDims);
+
+    // Step 7: Gather from ORIGINAL logits: gathered[i] = logits[i, targets[i]]
+    // This is safe because logits is a function argument (always dominates).
+    Value gatheredLogits =
+        builder->create<nova::GatherOp>(op.getLoc(), maxValFlat, targets, lastDim-1)
             .getResult();
 
-    // Step 8: loss = reduce_mean(selected_log_probs * -1.0)
-    // Create -1.0 constant
-    auto constType = mlir::RankedTensorType::get({}, targetElemType);
-    auto minus1Attr = DenseElementsAttr::get(
-        constType, builder->getFloatAttr(targetElemType, -1.0));
-    Value minus1 =
-        builder->create<nova::ConstantOp>(op.getLoc(), constType, minus1Attr);
+    // Step 5: log_sum_exp = log(sum_exp) → tensor<4xf32>
+    Value logSumExp = builder->create<nova::LogOp>(op.getLoc(), sumExp);
+    // Step 8: per_sample_loss = log_sum_exp + max_val - gathered_logits
+    Value lseMaxSum =
+        builder->create<nova::AddOp>(op.getLoc(), logSumExp, maxValFlat);
+    Value perSampleLoss =
+        builder->create<nova::SubOp>(op.getLoc(), lseMaxSum, gatheredLogits);
 
-    // Multiply selected_log_probs by -1
-    Value negLogProbs =
-        builder->create<nova::MulOp>(op.getLoc(), selectedLogProbs, minus1);
+    // Step 9: loss = reduce_mean(per_sample_loss)
+    auto rk_mean = nova::ReductionKind::MEAN;
+    llvm::SmallVector<int64_t, 1> allDims;
+    auto pslType = llvm::cast<RankedTensorType>(perSampleLoss.getType());
+    for (int64_t i = 0; i < pslType.getRank(); ++i)
+      allDims.push_back(i);
 
-    // Reduce mean over all dimensions
-    auto rk = nova::ReductionKind::MEAN;
-    llvm::SmallVector<int64_t, 2> dimensions;
-    auto probsType = llvm::cast<RankedTensorType>(negLogProbs.getType());
-    for (int64_t i = 0; i < probsType.getRank(); ++i)
-      dimensions.push_back(i);
-
-    // Determine the scalar type based on the result type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
     auto scalarType =
         RankedTensorType::get({1}, finalResultType.getElementType());
 
-    // Perform reduction to scalar
     Value reducedLoss = builder->create<nova::ReduceOp>(
-        op.getLoc(), rk, negLogProbs, scalarType, false, dimensions);
+        op.getLoc(), rk_mean, perSampleLoss, scalarType, false, allDims);
 
-    // Reshape scalar to 1D tensor (as expected by the new return type)
+    // Reshape to match expected return type
     llvm::SmallVector<int64_t> newShape = {1};
     auto shapeAttrType = RankedTensorType::get({1}, builder->getIndexType());
     auto shapeAttr = DenseIntElementsAttr::get(shapeAttrType, newShape);
@@ -149,6 +154,7 @@ struct NovaToArithOp{
 
     return finalLoss;
 };
+
 
 };
 template <typename NovaArithOp>
@@ -177,26 +183,29 @@ class NovaArithConversionPattern : public OpConversionPattern<NovaArithOp>{
 
 namespace {
 struct NovaToArithLoweringPass
-    : public PassWrapper<NovaToArithLoweringPass, OperationPass<ModuleOp>> {
-  
+    : public PassWrapper<NovaToArithLoweringPass, OperationPass<func::FuncOp>> {
+
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaToArithLoweringPass)
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect>();
+    registry.insert<tosa::TosaDialect>();
+    registry.insert<tensor::TensorDialect>();
+    registry.insert<linalg::LinalgDialect>();
     registry.insert<func::FuncDialect>();
   }
 
   StringRef getArgument() const final { return "convert-nova-to-arith"; }
-  
+
   StringRef getDescription() const final {
     return "Lower Nova dialect operations to Arith dialect";
   }
-  
+
   void runOnOperation() override {
-    ModuleOp module = getOperation();
-    
+    func::FuncOp funcOp = getOperation();
+
     ConversionTarget target(getContext());
-    
+
     target.addLegalDialect<arith::ArithDialect>();
     target.addLegalDialect<tosa::TosaDialect>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
@@ -205,9 +214,9 @@ struct NovaToArithLoweringPass
 
     RewritePatternSet patterns(&getContext());
 
-    
+
     populateNovaToArithConversionPatterns(patterns);
-    if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
+    if (failed(applyPartialConversion(funcOp, target, std::move(patterns)))) {
       signalPassFailure();
       return;
     }

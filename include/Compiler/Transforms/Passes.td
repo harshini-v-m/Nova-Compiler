@@ -104,4 +104,18 @@ def GpuRuntimeLowering : Pass<"gpu-runtime-lowering", "ModuleOp"> {
     let constructor = "::mlir::nova::createGpuRuntimeLoweringPass()";
 }
 
+def NovaFusion : Pass<"nova-fusion", "func::FuncOp"> {
+    let summary = "Fuse Nova dialect operation pairs that share computation";
+    let description = [{
+        Detects patterns of Nova operations that can be fused to share
+        intermediate computation. Initially handles SCE forward+backward
+        fusion where both ops share the same logits/targets operands,
+        eliminating redundant softmax computation.
+    }];
+    let dependentDialects = [
+        "mlir::nova::NovaDialect"
+    ];
+    let constructor = "::mlir::nova::createNovaFusionPass()";
+}
+
 #endif // NOVA_TRANSFORMS_PASSES

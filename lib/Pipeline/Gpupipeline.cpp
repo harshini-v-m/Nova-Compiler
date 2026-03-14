@@ -44,6 +44,7 @@
 // optimization passes includes
 #include "Compiler/Transforms/FixGpuLaunch.h"
 #include "Compiler/Transforms/FuseMatmulBias.h"
+#include "Compiler/Transforms/NovaFusionPass.h"
 #include "Compiler/Transforms/RenameGpuKernels.h"
 
 // gpu
@@ -79,7 +80,9 @@ namespace {
 void createNovaGPUPipelines(mlir::OpPassManager &pm) {
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaFusionPass());
   pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
+//   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToArithLoweringPass());
   pm.addNestedPass<mlir::func::FuncOp>(
       mlir::nova::createNovaElementwiseToLinalgPass());
   pm.addNestedPass<mlir::func::FuncOp>(
@@ -87,13 +90,11 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToGpuPass());
   pm.addPass(mlir::createLoopInvariantCodeMotionPass());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::createCanonicalizerPass());
 
             // 2. TOSA TO LINALG (Named and regular)
             pm.addNestedPass<mlir::func::FuncOp>(mlir::tosa::createTosaToLinalgNamed());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::tosa::createTosaToLinalg());
-            // This enables the 2:4 structured sparsity hardware path on your RTX 3060.
-            // pm.addPass(mlir::createSparsificationPass());
-            // pm.addPass(mlir::createSparseTensorConversionPass());
 
             // 3. TOSA TO ARITH/TENSOR/SCF
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createTosaToArithPass());
@@ -181,8 +182,22 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
 
-            // Use the modern SCF-based mapping which is much more robust than 
+            // Thread-level tiling: split the last parallel-loop dimension into
+            // an outer (block) and inner (thread) parallel loop of up to 32
+            // iterations, giving every elementwise kernel a full warp of threads.
+            // Dims 0,1 get tile-size 1 (stay as pure block dims);
+            // dim 2 gets tile-size 32 → inner scf.parallel of 32 → thread_id.
+            pm.addNestedPass<mlir::func::FuncOp>(
+                mlir::createParallelLoopTilingPass(
+                    /*tileSize=*/{1, 1, 32}, /*noMinMaxBounds=*/false));
+            pm.addPass(mlir::createCanonicalizerPass());
+            pm.addPass(mlir::createCSEPass());
+
+            // Use the modern SCF-based mapping which is much more robust than
             // ConvertAffineForToGPU for tiled and non-perfectly nested loops.
+            // With nested scf.parallel from the tiling above, this maps:
+            //   outer parallel dims → block_id_{x,y,z}
+            //   inner parallel dims → thread_id_{x,y,z}
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createGpuMapParallelLoopsPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertParallelLoopToGpuPass());
             pm.addPass(mlir::createCanonicalizerPass());

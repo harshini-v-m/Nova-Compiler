@@ -2173,3 +2173,90 @@ LogicalResult SceBackwardOp::verify() {
 }
 
 OpFoldResult SceBackwardOp::fold(FoldAdaptor adaptor) { return nullptr; }
+
+// SceFwdBwdOp
+LogicalResult
+SceFwdBwdOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
+                              ValueRange operands, DictionaryAttr attributes,
+                              OpaqueProperties properties, RegionRange regions,
+    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto logitsType = dyn_cast<RankedTensorType>(operands[0].getType());
+  auto targetsType = dyn_cast<RankedTensorType>(operands[1].getType());
+  if (!logitsType || !targetsType)
+    return failure();
+
+  // Result 0: loss (scalar tensor) - same logic as SceOp
+  Type outElemTy = getHigherHierarchyType(
+      logitsType.getElementType(), targetsType.getElementType(), context);
+
+  if (auto itype = dyn_cast<IntegerType>(outElemTy)) {
+    if (itype.getWidth() == 64)
+      outElemTy = Float64Type::get(context);
+    else if (logitsType.getElementType().isBF16())
+      outElemTy = BFloat16Type::get(context);
+    else
+      outElemTy = Float32Type::get(context);
+  }
+
+  inferredReturnTypes.push_back(RankedTensorType::get({1}, outElemTy));
+
+  // Result 1: grad_logits (same shape/type as logits) - same logic as SceBackwardOp
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(logitsType.getShape(), logitsType.getElementType()));
+  return success();
+}
+
+LogicalResult SceFwdBwdOp::verify() {
+  auto logitsType = dyn_cast<RankedTensorType>(getLogits().getType());
+  auto targetsType = dyn_cast<RankedTensorType>(getTargets().getType());
+
+  if (!logitsType || !targetsType)
+    return emitOpError("operands must be ranked tensors");
+
+  if (!isa<FloatType>(logitsType.getElementType()))
+    return emitOpError("logits must have float element type, got ")
+           << logitsType.getElementType();
+
+  auto targetElemType = targetsType.getElementType();
+  if (!targetElemType.isIntOrIndex() && !llvm::isa<mlir::IntegerType>(targetElemType))
+    return emitOpError("targets must have integer element type, got ")
+           << targetElemType;
+
+  int64_t logitsRank = logitsType.getRank();
+  if (logitsRank < 2)
+    return emitOpError("logits must have rank >= 2, got ") << logitsRank;
+
+  int64_t dim = getDim();
+  if (dim < 0)
+    dim += logitsRank;
+  if (dim < 0 || dim >= logitsRank)
+    return emitOpError("dim ") << getDim()
+           << " is out of bounds for logits rank " << logitsRank;
+
+  int64_t targetsRank = targetsType.getRank();
+  if (targetsRank != logitsRank - 1)
+    return emitOpError("targets rank must be logits_rank - 1, expected ")
+           << (logitsRank - 1) << " got " << targetsRank;
+
+  int64_t ti = 0;
+  for (int64_t i = 0; i < logitsRank; ++i) {
+    if (i == dim) continue;
+    int64_t logitsDim = logitsType.getDimSize(i);
+    int64_t targetsDim = targetsType.getDimSize(ti);
+    if (logitsDim != ShapedType::kDynamic &&
+        targetsDim != ShapedType::kDynamic &&
+        logitsDim != targetsDim) {
+      return emitOpError("shape mismatch at logits dim ")
+             << i << " (targets dim " << ti << "): logits has "
+             << logitsDim << ", targets has " << targetsDim;
+    }
+    ++ti;
+  }
+
+  return success();
+}
+
+LogicalResult SceFwdBwdOp::fold(FoldAdaptor adaptor,
+                                SmallVectorImpl<OpFoldResult> &results) {
+  return failure();
+}
