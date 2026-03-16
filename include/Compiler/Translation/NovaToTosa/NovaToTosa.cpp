@@ -1,5 +1,3 @@
-
-
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -24,333 +22,345 @@
 namespace mlir {
 namespace nova {
 
+static Value reduce_to_shape_nova(OpBuilder &builder, Location loc, Value grad, Value target) {
+  auto grad_type = llvm::dyn_cast<mlir::RankedTensorType>(grad.getType());
+  auto target_type = llvm::dyn_cast<mlir::RankedTensorType>(target.getType());
+  if (!grad_type || !target_type)
+    return grad;
+
+  auto grad_shape = grad_type.getShape();
+  auto target_shape = target_type.getShape();
+
+  if (grad_shape == target_shape)
+    return grad;
+
+  int64_t grad_rank = grad_type.getRank();
+  int64_t target_rank = target_type.getRank();
+
+  llvm::SmallVector<int64_t, 4> reduce_dims;
+  for (int64_t i = 0; i < grad_rank; ++i) {
+    int64_t grad_dim = grad_shape[grad_rank - 1 - i];
+    int64_t target_dim = (i < target_rank) ? target_shape[target_rank - 1 - i] : 1;
+    if (grad_dim != target_dim)
+        reduce_dims.push_back(grad_rank - 1 - i);
+  }
+
+  if (reduce_dims.empty() && grad_rank == target_rank)
+    return grad;
+  std::sort(reduce_dims.begin(), reduce_dims.end());
+
+  llvm::SmallVector<int64_t, 4> intermediate_shape;
+  for (int64_t i = 0; i < grad_rank; ++i) {
+    bool is_reduced = false;
+    for (auto d : reduce_dims)
+    if (d == i)
+        is_reduced = true;
+    if (!is_reduced)
+        intermediate_shape.push_back(grad_shape[i]);
+  }
+  if (intermediate_shape.empty()) {
+    intermediate_shape.push_back(1);
+  }
+  auto intermediate_type = mlir::RankedTensorType::get(intermediate_shape, grad_type.getElementType());
+  auto reduced = builder.create<mlir::nova::ReduceOp> (
+                  loc, mlir::nova::ReductionKind::SUM, grad, 
+                  intermediate_type, false,
+                  reduce_dims, false);
+
+  return builder.create<mlir::nova::ReshapeOp>(loc, target_type, reduced.getResult()).getResult();
+}
+
 // functions which will be called inside template
 struct NovaOpTosaOp {
   // helper function
-  static SmallVector<int64_t>
-  shapeFind(Type currType, int64_t axis) // if 2x3,axis=1 is given returns
+  static SmallVector<int64_t> shapeFind(Type currType, int64_t axis) // if 2x3,axis=1 is given returns
   {
-    SmallVector<int64_t>
-        newshape; // paramters=>inputshape(auto) and axis(int32)
+    SmallVector<int64_t> newshape; // paramters=>inputshape(auto) and axis(int32)
     auto rankedType = cast<RankedTensorType>(currType);
     for (int64_t i = 0; i < rankedType.getRank(); ++i) {
       if (i == axis) {
-        newshape.push_back(1); // TOSA keeps reduced dimension as size 1
+          newshape.push_back(1); // TOSA keeps reduced dimension as size 1
       } else {
-        newshape.push_back(rankedType.getDimSize(i));
+          newshape.push_back(rankedType.getDimSize(i));
       }
     }
     return newshape;
   }
-  // sigmoid
-  static Value mappingtosa(nova::SigmoidOp op, Type resultType,
-                           ValueRange input, OpBuilder *builder) {
+
+  // sigmoid activation
+  static Value mappingtosa(nova::SigmoidOp op, Type resultType, ValueRange input, OpBuilder *builder) {
+    // sigmoid = 1 / (1 + e^-x)
     auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
+
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType =
-        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
+    auto newVType = mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
+    
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
     return builder->create<tosa::SigmoidOp>(op.getLoc(), resultType, v);
   }
 
   // MAE lowering pattern
-  static Value mappingtosa(nova::MaeOp op, Type resultType, ValueRange input,
-                           OpBuilder *builder) {
+  static Value mappingtosa(nova::MaeOp op, Type resultType, ValueRange input, OpBuilder *builder) {
+    // loss = reduce_mean(abs(arg0 - arg1))
     auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
+
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType =
-        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
+    auto newVType = mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
+    
     auto w_type = cast<mlir::RankedTensorType>(input[1].getType());
-    auto newWType =
-        mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
+    auto newWType = mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
     auto w = builder->create<tosa::CastOp>(op.getLoc(), newWType, input[1]);
-    // loss= reduce_mean(abs(arg0-arg1))
+    
+    // 1. (arg0 - arg1)
     auto sub = builder->create<nova::SubOp>(op.getLoc(), newVType, v, w);
+
+    // 2. abs(arg0 - arg1)
     auto abs = builder->create<nova::AbsOp>(op.getLoc(), newVType, sub);
-    nova::ReductionKind rk = nova::ReductionKind::MEAN;
-    // only 2d for now.
-    int64_t rank = cast<mlir::ShapedType>(abs.getType()).getRank();
+
+    // 3. mean calculation
+    auto absType = cast<RankedTensorType>(abs.getType());
+    int64_t absRank = absType.getRank();
+    
+    int64_t num_of_elements = 1;
+    std::vector<int64_t> meanShape = absType.getShape();
+
+    // full reduction: dimensions = [0,1], num_of_elements = rxc
     llvm::SmallVector<int64_t, 1> dimensions;
-    if (rank > 0) {
-      for (int64_t i = 0; i < rank; ++i) {
+    if (absRank > 0) {
+      for (int64_t i = 0; i < absRank; ++i) {
         dimensions.push_back(i);
-      }
+        num_of_elements *= meanShape[i];
+      }      
     }
-    // Determine scalar type
-    auto finalResultType = llvm::cast<RankedTensorType>(resultType);
-    auto scalarType =
-        RankedTensorType::get({1}, finalResultType.getElementType());
 
-    // Reduce to scalar
-    Value reducedLoss = builder->create<nova::ReduceOp>(
-        op.getLoc(), rk, abs, scalarType, false, dimensions);
-
-    // Reshape to {1}
-    llvm::SmallVector<int64_t> newShape = {1};
-    auto shapeAttrType = RankedTensorType::get({1}, builder->getIndexType());
-    auto shapeAttr = DenseIntElementsAttr::get(shapeAttrType, newShape);
-
-    Value shapeConst = builder->create<tosa::ConstShapeOp>(
-        op.getLoc(), mlir::tosa::shapeType::get(builder->getContext(), 1),
-        shapeAttr);
-
-    return builder->create<tosa::ReshapeOp>(op.getLoc(), resultType,
-                                            reducedLoss, shapeConst);
+    // mean = reduce sum * (1/n)
+    auto scalarType = mlir::RankedTensorType::get({1}, absType.getElementType());
+    auto mean_sum = builder->create<mlir::nova::ReduceOp>(
+                        op.getLoc(), mlir::nova::ReductionKind::SUM, abs, 
+                        scalarType, false, dimensions
+                    ).getResult();     
+    auto n = builder->create<mlir::nova::ConstantOp>(op.getLoc(), scalarType, mlir::DenseElementsAttr::get(scalarType, builder->getFloatAttr(absType.getElementType(), (double)(1.0f/num_of_elements))));            
+    
+    return builder->create<mlir::nova::MulOp>(op.getLoc(), n, mean_sum).getResult();
   }
+
   // MSE lowering pattern
-  static Value mappingtosa(nova::MseOp op, Type resultType, ValueRange input,
-                           OpBuilder *builder) {
-    // loss= reduce_mean(square(arg0-arg1))
+  static Value mappingtosa(nova::MseOp op, Type resultType, ValueRange input, OpBuilder *builder) {
+    // loss = reduce_mean(square(arg0 - arg1))
     auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
+    
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType =
-        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
+    auto newVType = mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
+    
     auto w_type = cast<mlir::RankedTensorType>(input[1].getType());
-    auto newWType =
-        mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
+    auto newWType = mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
     auto w = builder->create<tosa::CastOp>(op.getLoc(), newWType, input[1]);
 
+    // 1. (arg0 - arg1)
     auto sub = builder->create<nova::SubOp>(op.getLoc(), newVType, v, w);
-    mlir::RankedTensorType constType =
-        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
-    mlir::DenseElementsAttr constAttr = mlir::DenseElementsAttr::get(
-        constType, builder->getFloatAttr(targetElemType, 2.0));
-    auto constTwo =
-        builder->create<nova::ConstantOp>(op.getLoc(), constType, constAttr);
-    auto abs =
-        builder->create<nova::PowOp>(op.getLoc(), newVType, sub, constTwo);
+    
+    // 2. (arg0 - arg1)^2
+    auto pow = builder->create<nova::MulOp>(op.getLoc(), sub, sub);
 
-    nova::ReductionKind rk = nova::ReductionKind::MEAN;
-    int64_t rank = cast<mlir::ShapedType>(abs.getType()).getRank();
+    // 3. mean calculation
+    auto powType = cast<RankedTensorType>(pow.getType());
+    int64_t powRank = powType.getRank();
+    
+    int64_t num_of_elements = 1;
+    std::vector<int64_t> meanShape = powType.getShape();
 
+    // full reduction: dimensions = [0,1], num_of_elements = rxc
     llvm::SmallVector<int64_t, 1> dimensions;
-    if (rank > 0) {
-      for (int64_t i = 0; i < rank; ++i) {
+    if (powRank > 0) {
+      for (int64_t i = 0; i < powRank; ++i) {
         dimensions.push_back(i);
-      }
+        num_of_elements *= meanShape[i];
+      }      
     }
-    // Determine scalar type
-    auto finalResultType = llvm::cast<RankedTensorType>(resultType);
-    auto scalarType =
-        RankedTensorType::get({1}, finalResultType.getElementType());
 
-    // Reduce to scalar
-    Value reducedLoss = builder->create<nova::ReduceOp>(
-        op.getLoc(), rk, abs, scalarType, false, dimensions);
-
-    // Reshape to {1}
-    llvm::SmallVector<int64_t> newShape = {1};
-    auto shapeAttrType = RankedTensorType::get({1}, builder->getIndexType());
-    auto shapeAttr = DenseIntElementsAttr::get(shapeAttrType, newShape);
-
-    Value shapeConst = builder->create<tosa::ConstShapeOp>(
-        op.getLoc(), mlir::tosa::shapeType::get(builder->getContext(), 1),
-        shapeAttr);
-
-    return builder->create<tosa::ReshapeOp>(op.getLoc(), resultType,
-                                            reducedLoss, shapeConst);
+    // mean = reduce sum * (1/n)
+    auto scalarType = mlir::RankedTensorType::get({1}, powType.getElementType());
+    auto mean_sum = builder->create<mlir::nova::ReduceOp> (
+                        op.getLoc(), mlir::nova::ReductionKind::SUM, pow, 
+                        scalarType, false, dimensions
+                    ).getResult();     
+    auto n = builder->create<mlir::nova::ConstantOp>(op.getLoc(), scalarType, mlir::DenseElementsAttr::get(scalarType, builder->getFloatAttr(powType.getElementType(), (double)(1.0f/num_of_elements))));            
+    
+    return builder->create<mlir::nova::MulOp>(op.getLoc(), n, mean_sum).getResult();
   }
+
   // CCE lowering pattern
-  static Value mappingtosa(nova::CceOp op, Type resultType, ValueRange input,
-                           OpBuilder *builder) {
-    // basic casting logic
+  static Value mappingtosa(nova::CceOp op, Type resultType, ValueRange input, OpBuilder *builder) {
+    // loss = -1 * yA * log(yP)
     auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
+    
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType =
-        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
+    auto newVType = mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
+    
     auto w_type = cast<mlir::RankedTensorType>(input[1].getType());
-    auto newWType =
-        mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
+    auto newWType = mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
     auto w = builder->create<tosa::CastOp>(op.getLoc(), newWType, input[1]);
-    // step1:creating 1x10^-7  tensor constant
-    auto hostVType =
-        mlir::RankedTensorType::get(newVType.getShape(), targetElemType);
 
-    auto epiAttr = DenseElementsAttr::get(
-        hostVType, builder->getFloatAttr(targetElemType, 1e-7));
-    Value epi =
-        builder->create<nova::ConstantOp>(op.getLoc(), hostVType, epiAttr);
+    // 1. creating 1x10^-7  tensor constant
+    auto hostVType = mlir::RankedTensorType::get(newVType.getShape(), targetElemType);
+    auto epiAttr = DenseElementsAttr::get(hostVType, builder->getFloatAttr(targetElemType, 1e-7));
+    Value epi = builder->create<nova::ConstantOp>(op.getLoc(), hostVType, epiAttr);
 
-    // step2: creating one minus epsilon constant
-    auto oneminusepiAttr = DenseElementsAttr::get(
-        hostVType, builder->getFloatAttr(targetElemType, 1.0));
-    Value ones = builder->create<nova::ConstantOp>(op.getLoc(), hostVType,
-                                                   oneminusepiAttr);
+    // 2. creating one minus epsilon constant
+    auto oneminusepiAttr = DenseElementsAttr::get(hostVType, builder->getFloatAttr(targetElemType, 1.0));
+    Value ones = builder->create<nova::ConstantOp>(op.getLoc(), hostVType, oneminusepiAttr);
     Value oneminusepi = builder->create<nova::SubOp>(op.getLoc(), ones, epi);
-    // step3:creating compare op
+
+    // 3. creating compare op => exactly 0/1 causes instability, therefore, clip with epsilon and (1 - epsilon)
     auto inputShape = cast<mlir::RankedTensorType>(v.getType()).getShape();
+    
     // Get the boolean element type (i1)
     auto boolType = builder->getI1Type();
     auto compareResultType = mlir::RankedTensorType::get(inputShape, boolType);
+
+    // term 1 compare (< epsilon)
     auto ck = nova::ComparisonType::LT;
-    auto compare = builder->create<nova::CompareOp>(
-        op.getLoc(), compareResultType, v, epi, ck);
-    auto cp =
-        builder->create<tosa::SelectOp>(op.getLoc(), newVType, compare, epi, v);
-    // step4:second compare
+    auto compare = builder->create<nova::CompareOp>(op.getLoc(), compareResultType, v, epi, ck);
+    auto cp = builder->create<tosa::SelectOp>(op.getLoc(), newVType, compare, epi, v);
+    
+    // term 2 compare (> epsilon) => clipped predicts
     auto ck1 = nova::ComparisonType::GT;
-    auto compare1 = builder->create<nova::CompareOp>(
-        op.getLoc(), compareResultType, cp, oneminusepi, ck1);
-    auto cp1 = builder->create<tosa::SelectOp>(op.getLoc(), newVType, compare1,
-                                               oneminusepi, cp);
-    // step5 : target *log(cp)
+    auto compare1 = builder->create<nova::CompareOp>(op.getLoc(), compareResultType, cp, oneminusepi, ck1);
+    auto cp1 = builder->create<tosa::SelectOp>(op.getLoc(), newVType, compare1, oneminusepi, cp);
+    
+    // 4. term = true * log(cp)
     auto log = builder->create<nova::LogOp>(op.getLoc(), cp1);
-    auto mul = builder->create<nova::MulOp>(op.getLoc(), log, w);
-    // step6:create -1 constant tensor (scalar)
-    auto constType = mlir::RankedTensorType::get({}, targetElemType);
-    auto minus1Attr = DenseElementsAttr::get(
-        constType, builder->getFloatAttr(targetElemType, -1.0));
-    Value minus1 =
-        builder->create<nova::ConstantOp>(op.getLoc(), constType, minus1Attr);
-    // step 7 :reducesum(log result) along expect 0
-    auto inputTensorType = cast<mlir::RankedTensorType>(mul.getType());
-    int64_t inputRank = inputTensorType.getRank();
-    llvm::SmallVector<int64_t, 4> newShape;
-    newShape.push_back(inputTensorType.getDimSize(0));
-    // reducing along all axis expect zero
-    llvm::SmallVector<int64_t, 4> dimensions;
-    for (int64_t i = 1; i < inputRank; ++i) {
-      dimensions.push_back(i);
-      // newShape.push_back(1);
+    auto term = builder->create<nova::MulOp>(op.getLoc(), log, w);
+
+    // 5. mean calculation
+    auto inputType = cast<mlir::RankedTensorType>(term.getType());
+    int64_t inputRank = inputType.getRank();
+
+    int64_t num_of_elements = 1;
+    std::vector<int64_t> meanShape = inputType.getShape();
+
+    // full reduction: dimensions = [0,1], num_of_elements = rxc
+    llvm::SmallVector<int64_t, 1> dimensions;
+    if (inputRank > 0) {
+      for (int64_t i = 0; i < inputRank; ++i) {
+          dimensions.push_back(i);
+          num_of_elements *= meanShape[i];
+      }      
     }
-    auto reducedResultType =
-        mlir::RankedTensorType::get(newShape, targetElemType);
 
-    nova::ReductionKind rk = nova::ReductionKind::SUM;
-    auto reduceres = builder->create<nova::ReduceOp>(
-        op.getLoc(), rk, mul, reducedResultType, false, dimensions);
-    // Determine scalar type
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
-    auto scalarType =
-        RankedTensorType::get({1}, finalResultType.getElementType());
+    auto scalarType = mlir::RankedTensorType::get({1}, finalResultType.getElementType());
+    auto mean_sum = builder->create<mlir::nova::ReduceOp> (
+                        op.getLoc(), mlir::nova::ReductionKind::SUM, term, 
+                        scalarType, false, dimensions
+                    ).getResult();     
+    auto n = builder->create<mlir::nova::ConstantOp>(op.getLoc(), scalarType, mlir::DenseElementsAttr::get(scalarType, builder->getFloatAttr(inputType.getElementType(), (double)(1.0f/num_of_elements))));  
+    auto mean = builder->create<mlir::nova::MulOp>(op.getLoc(), n, mean_sum).getResult();
 
-    auto reducemeanres =
-        builder->create<nova::ReduceOp>(op.getLoc(), rk, reduceres, scalarType);
-    // step 9: mul reduce result and -1
-    Value multiplied =
-        builder->create<nova::MulOp>(op.getLoc(), reducemeanres, minus1);
-
-    // Reshape to {1}
-    llvm::SmallVector<int64_t> newShape1 = {1};
-    auto shapeAttrType = RankedTensorType::get({1}, builder->getIndexType());
-    auto shapeAttr = DenseIntElementsAttr::get(shapeAttrType, newShape1);
-
-    Value shapeConst = builder->create<tosa::ConstShapeOp>(
-        op.getLoc(), mlir::tosa::shapeType::get(builder->getContext(), 1),
-        shapeAttr);
-
-    return builder->create<tosa::ReshapeOp>(op.getLoc(), resultType, multiplied,
-                                            shapeConst);
+    // 6. (-1) * mean
+    auto constType = mlir::RankedTensorType::get({}, targetElemType);
+    auto minus1Attr = DenseElementsAttr::get(constType, builder->getFloatAttr(targetElemType, -1.0));
+    Value minus1 = builder->create<nova::ConstantOp>(op.getLoc(), constType, minus1Attr);
+  
+    return builder->create<nova::MulOp>(op.getLoc(), mean, minus1);
   }
 
   // BCE lowering pattern
-  static Value mappingtosa(nova::BceOp op, Type resultType, ValueRange input,
-                           OpBuilder *builder) {
-    // basic casting logic
+  static Value mappingtosa(nova::BceOp op, Type resultType, ValueRange input, OpBuilder *builder) {
+    // loss = -1 * reduce_mean[yA * log(yP) + (1 - yA) * log(1 - yP)]
     auto restensor = cast<mlir::RankedTensorType>(resultType);
     auto targetElemType = restensor.getElementType();
+    
     auto v_type = cast<mlir::RankedTensorType>(input[0].getType());
-    auto newVType =
-        mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
+    auto newVType = mlir::RankedTensorType::get(v_type.getShape(), targetElemType);
     auto v = builder->create<tosa::CastOp>(op.getLoc(), newVType, input[0]);
+    
     auto w_type = cast<mlir::RankedTensorType>(input[1].getType());
-    auto newWType =
-        mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
+    auto newWType = mlir::RankedTensorType::get(w_type.getShape(), targetElemType);
     auto w = builder->create<tosa::CastOp>(op.getLoc(), newWType, input[1]);
 
-    // step1:creating 1x10^-7  tensor constant
-    auto hostVType =
-        mlir::RankedTensorType::get(newVType.getShape(), targetElemType);
+    // 1. creating 1x10^-7  tensor constant
+    auto hostVType = mlir::RankedTensorType::get(newVType.getShape(), targetElemType);
+    auto epiAttr = DenseElementsAttr::get(hostVType, builder->getFloatAttr(targetElemType, 1e-7));
+    Value epi = builder->create<nova::ConstantOp>(op.getLoc(), hostVType, epiAttr);
 
-    auto epiAttr = DenseElementsAttr::get(
-        hostVType, builder->getFloatAttr(targetElemType, 1e-7));
-    Value epi =
-        builder->create<nova::ConstantOp>(op.getLoc(), hostVType, epiAttr);
-
-    // step2: creating one minus epsilon constant
-    auto oneminusepiAttr = DenseElementsAttr::get(
-        hostVType, builder->getFloatAttr(targetElemType, 1.0));
-    Value ones = builder->create<nova::ConstantOp>(op.getLoc(), hostVType,
-                                                   oneminusepiAttr);
+    // 2. creating one minus epsilon constant
+    auto oneminusepiAttr = DenseElementsAttr::get(hostVType, builder->getFloatAttr(targetElemType, 1.0));
+    Value ones = builder->create<nova::ConstantOp>(op.getLoc(), hostVType, oneminusepiAttr);
     Value oneminusepi = builder->create<nova::SubOp>(op.getLoc(), ones, epi);
-    // step3:creating compare op
+
+    // 3. creating compare op => exactly 0/1 causes instability, therefore, clip with epsilon and (1 - epsilon)
     auto inputShape = cast<mlir::RankedTensorType>(v.getType()).getShape();
+    
     // Get the boolean element type (i1)
     auto boolType = builder->getI1Type();
     auto compareResultType = mlir::RankedTensorType::get(inputShape, boolType);
+
+    // term 1 compare (< epsilon)
     auto ck = nova::ComparisonType::LT;
-    auto compare = builder->create<nova::CompareOp>(
-        op.getLoc(), compareResultType, v, epi, ck);
-    auto cp =
-        builder->create<tosa::SelectOp>(op.getLoc(), newVType, compare, epi, v);
-    // step4:second compare
+    auto compare = builder->create<nova::CompareOp>(op.getLoc(), compareResultType, v, epi, ck);
+    auto cp = builder->create<tosa::SelectOp>(op.getLoc(), newVType, compare, epi, v);
+    
+    // term 2 compare (> epsilon) => clipped predicts
     auto ck1 = nova::ComparisonType::GT;
-    auto compare1 = builder->create<nova::CompareOp>(
-        op.getLoc(), compareResultType, cp, oneminusepi, ck1);
-    auto cp1 = builder->create<tosa::SelectOp>(op.getLoc(), newVType, compare1,
-                                               oneminusepi, cp);
-    // step5 : temr1=target *log(cp)
+    auto compare1 = builder->create<nova::CompareOp>(op.getLoc(), compareResultType, cp, oneminusepi, ck1);
+    auto cp1 = builder->create<tosa::SelectOp>(op.getLoc(), newVType, compare1, oneminusepi, cp);
+    
+    // 4. term1 = true * log(cp)
     auto log = builder->create<nova::LogOp>(op.getLoc(), cp1);
     auto term1 = builder->create<nova::MulOp>(op.getLoc(), log, w);
 
-    // step6:find term2=(ones-arg1)*log(ones-clipped predicts)
-    // ones-arg1
+    // 5. term2 = (1 - true) * log(1 - cp1)
     auto termonelhs = builder->create<nova::SubOp>(op.getLoc(), ones, w);
     auto termtworhs = builder->create<nova::SubOp>(op.getLoc(), ones, cp1);
     auto termtwologrhs = builder->create<nova::LogOp>(op.getLoc(), termtworhs);
-    auto term2 =
-        builder->create<nova::MulOp>(op.getLoc(), termonelhs, termtwologrhs);
-    // step7 :find sum terms +term1+term2
+    auto term2 = builder->create<nova::MulOp>(op.getLoc(), termonelhs, termtwologrhs);
+    
+    // 6. sum = term1 + term2
     auto sumterms = builder->create<nova::AddOp>(op.getLoc(), term1, term2);
-    // step 8 :reducemean(sum result) full reduction
-    auto inputTensorType = cast<mlir::RankedTensorType>(term1.getType());
-    int64_t inputRank = inputTensorType.getRank();
-    llvm::SmallVector<int64_t, 4> dimensions;
-    for (int64_t i = 0; i < inputRank; ++i) {
-      dimensions.push_back(i);
+    
+    // 7. mean calculation
+    auto inputType = cast<RankedTensorType>(term1.getType());
+    int64_t inputRank = inputType.getRank();
+    
+    int64_t num_of_elements = 1;
+    std::vector<int64_t> meanShape = inputType.getShape();
+
+    // full reduction: dimensions = [0,1], num_of_elements = rxc
+    llvm::SmallVector<int64_t, 1> dimensions;
+    if (inputRank > 0) {
+      for (int64_t i = 0; i < inputRank; ++i) {
+        dimensions.push_back(i);
+        num_of_elements *= meanShape[i];
+      }      
     }
-    // Determine scalar type
+
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
-    auto scalarType =
-        RankedTensorType::get({1}, finalResultType.getElementType());
+    auto scalarType = mlir::RankedTensorType::get({1}, finalResultType.getElementType());
+    auto mean_sum = builder->create<mlir::nova::ReduceOp> (
+                        op.getLoc(), mlir::nova::ReductionKind::SUM, sumterms, 
+                        scalarType, false, dimensions
+                    ).getResult();     
+    auto n = builder->create<mlir::nova::ConstantOp>(op.getLoc(), scalarType, mlir::DenseElementsAttr::get(scalarType, builder->getFloatAttr(inputType.getElementType(), (double)(1.0f/num_of_elements))));  
+    auto mean = builder->create<mlir::nova::MulOp>(op.getLoc(), n, mean_sum).getResult();
 
-    // reducing along all axis
-    auto rk = nova::ReductionKind::MEAN;
-    auto reducemeanres = builder->create<nova::ReduceOp>(
-        op.getLoc(), rk, sumterms, scalarType, false, dimensions);
-
-    // restore -1 constant for BCE/CCE
+    // 8. (-1) * mean
     auto constType = mlir::RankedTensorType::get({}, targetElemType);
-    auto minus1Attr = DenseElementsAttr::get(
-        constType, builder->getFloatAttr(targetElemType, -1.0));
-    Value minus1 =
-        builder->create<nova::ConstantOp>(op.getLoc(), constType, minus1Attr);
-    // multiply by -1
-    Value multiplied =
-        builder->create<nova::MulOp>(op.getLoc(), reducemeanres, minus1);
+    auto minus1Attr = DenseElementsAttr::get(constType, builder->getFloatAttr(targetElemType, -1.0));
+    Value minus1 = builder->create<nova::ConstantOp>(op.getLoc(), constType, minus1Attr);
 
-    // Reshape to {1}
-    llvm::SmallVector<int64_t> newShape1 = {1};
-    auto shapeAttrType = RankedTensorType::get({1}, builder->getIndexType());
-    auto shapeAttr = DenseIntElementsAttr::get(shapeAttrType, newShape1);
-
-    Value shapeConst = builder->create<tosa::ConstShapeOp>(
-        op.getLoc(), mlir::tosa::shapeType::get(builder->getContext(), 1),
-        shapeAttr);
-
-    return builder->create<tosa::ReshapeOp>(op.getLoc(), resultType, multiplied,
-                                            shapeConst);
+    return builder->create<nova::MulOp>(op.getLoc(), mean, minus1);
   }
-  //   // Cast lowering pattern
-  static Value mappingtosa(nova::CastOp op, Type resultType, ValueRange input,
-                           OpBuilder *builder) {
+
+  // Cast lowering pattern
+  static Value mappingtosa(nova::CastOp op, Type resultType, ValueRange input, OpBuilder *builder) {
     auto inputType = cast<RankedTensorType>(input[0].getType());
     auto outputType = cast<RankedTensorType>(resultType);
     auto inputElemType = inputType.getElementType();
@@ -361,27 +371,23 @@ struct NovaOpTosaOp {
     // We do i1 -> i32 -> float
     if (inputElemType.isInteger(1) && isa<FloatType>(outputElemType)) {
       auto i32Type = builder->getI32Type();
-      auto intermediateType =
-          RankedTensorType::get(inputType.getShape(), i32Type);
-      auto intermediateCast = builder->create<tosa::CastOp>(
-          op.getLoc(), intermediateType, input[0]);
-      return builder->create<tosa::CastOp>(op.getLoc(), outputType,
-                                           intermediateCast);
+      auto intermediateType = RankedTensorType::get(inputType.getShape(), i32Type);
+      auto intermediateCast = builder->create<tosa::CastOp>(op.getLoc(), intermediateType, input[0]);
+      return builder->create<tosa::CastOp>(op.getLoc(), outputType, intermediateCast);
     }
 
     return builder->create<tosa::CastOp>(op.getLoc(), resultType, input[0]);
   }
 
   template <typename OpTy>
-  static Value maptop(OpTy op, Type resultType, ValueRange input,
-                      OpBuilder *builder) {
+  static Value maptop(OpTy op, Type resultType, ValueRange input, OpBuilder *builder) {
     return mappingtosa(op, resultType, input, builder);
   }
 
-private:
+  private:
   template <typename OpTy>
   static Value mappingtosa(OpTy op, Type resultType, ValueRange input,
-                           OpBuilder *builder) {
+                          OpBuilder *builder) {
     return nullptr;
   }
 };
@@ -390,11 +396,12 @@ private:
 /// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 struct NovaGeluOpLowering : public OpConversionPattern<mlir::nova::GeluOp> {
   using OpConversionPattern<mlir::nova::GeluOp>::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(mlir::nova::GeluOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(mlir::nova::GeluOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const override {
+
     Location loc = op.getLoc();
     Value input = adaptor.getLhs();
+    
     // if input is integer, cast to float and update type for following ops
     auto inputType = cast<RankedTensorType>(input.getType());
     if (isa<IntegerType>(inputType.getElementType())) {
@@ -403,33 +410,37 @@ struct NovaGeluOpLowering : public OpConversionPattern<mlir::nova::GeluOp> {
       input = rewriter.create<mlir::tosa::CastOp>(loc, newInputType, input);
       inputType = newInputType;
     }
-    // op0 = pow(x, 3)
-    Value cst_3 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {3.0f}));
-    auto op0 = rewriter.create<mlir::nova::PowOp>(loc, inputType, input, cst_3);
+    // op0 = xxx
+    Value xsquare=rewriter.create<mlir::nova::MulOp>(loc,inputType,input,input);
+    Value op0=rewriter.create<mlir::nova::MulOp>(loc,inputType,xsquare,input);
+
     // op1 = mul(op0, 0.044715)
     Value cst_004 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {4.471500e-02f}));
+    loc, inputType, DenseElementsAttr::get(inputType, {4.471500e-02f}));
     auto op1 = rewriter.create<mlir::nova::MulOp>(loc, inputType, op0, cst_004);
+
     // op2 = add(x, op1)
     auto op2 = rewriter.create<mlir::nova::AddOp>(loc, inputType, input, op1);
+    
     // op3 = mul(op2, sqrt(2/pi))
     Value cst_sqrt2pi = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {0.797884583f}));
+    loc, inputType, DenseElementsAttr::get(inputType, {0.7978845608028654f}));
     auto op3 =
         rewriter.create<mlir::nova::MulOp>(loc, inputType, op2, cst_sqrt2pi);
+
     // op4 = tanh(op3)
     auto op4 = rewriter.create<mlir::nova::TanhOp>(loc, inputType, op3);
+
     // op5 = add(op4 ,1)
     Value cst_1 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {1.0f}));
+    loc, inputType, DenseElementsAttr::get(inputType, {1.0f}));
     auto op5 = rewriter.create<mlir::nova::AddOp>(loc, inputType, op4, cst_1);
+
     // op6 = mul(x, 0.5)
     Value cst_05 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {0.5f}));
+    loc, inputType, DenseElementsAttr::get(inputType, {0.5f}));
     auto op6 =
         rewriter.create<mlir::nova::MulOp>(loc, inputType, input, cst_05);
-
     auto op7 = rewriter.create<mlir::nova::MulOp>(loc, inputType, op6, op5);
 
     rewriter.replaceOp(op, {op7.getResult()});
@@ -457,54 +468,56 @@ struct NovaGeluBackwardPattern
           rewriter.create<mlir::tosa::CastOp>(loc, newInputType, grad_out);
       inputType = newInputType;
     }
-
-    Value cst_3 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {3.0f}));
-    auto op0 = rewriter.create<mlir::nova::PowOp>(loc, inputType, input, cst_3);
-    Value cst_004 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {4.471500e-02f}));
-    auto op1 = rewriter.create<mlir::nova::MulOp>(loc, inputType, op0, cst_004);
-    auto op2 = rewriter.create<mlir::nova::AddOp>(loc, inputType, input, op1);
     Value cst_sqrt2pi = rewriter.create<mlir::nova::ConstantOp>(
         loc, inputType, DenseElementsAttr::get(inputType, {0.797884583f}));
-    auto op3 =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, op2, cst_sqrt2pi);
-    auto op4 = rewriter.create<mlir::nova::TanhOp>(loc, inputType, op3);
-    Value cst_1 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {1.0f}));
-    auto op5 = rewriter.create<mlir::nova::AddOp>(loc, inputType, op4, cst_1);
+    Value cst_004 = rewriter.create<mlir::nova::ConstantOp>(
+        loc, inputType, DenseElementsAttr::get(inputType, {4.471500e-02f}));
     Value cst_05 = rewriter.create<mlir::nova::ConstantOp>(
         loc, inputType, DenseElementsAttr::get(inputType, {0.5f}));
-    auto op6 =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, input, cst_05);
-
-    auto op4_sq = rewriter.create<mlir::nova::MulOp>(loc, inputType, op4, op4);
-    auto one_minus_tanh_sq =
-        rewriter.create<mlir::nova::SubOp>(loc, inputType, cst_1, op4_sq);
-
-    Value cst_2 = rewriter.create<mlir::nova::ConstantOp>(
-        loc, inputType, DenseElementsAttr::get(inputType, {2.0f}));
-    auto x_sq =
-        rewriter.create<mlir::nova::PowOp>(loc, inputType, input, cst_2);
+    Value cst_1 = rewriter.create<mlir::nova::ConstantOp>(
+        loc, inputType, DenseElementsAttr::get(inputType, {1.0f}));
     Value cst_013 = rewriter.create<mlir::nova::ConstantOp>(
         loc, inputType, DenseElementsAttr::get(inputType, {0.134145f}));
-    auto op_xsq_coeff =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, x_sq, cst_013);
-    auto poly_grad =
-        rewriter.create<mlir::nova::AddOp>(loc, inputType, cst_1, op_xsq_coeff);
 
-    auto t2_a = rewriter.create<mlir::nova::MulOp>(loc, inputType, op6,
-                                                   one_minus_tanh_sq);
-    auto t2_b =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, t2_a, cst_sqrt2pi);
-    auto term2 =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, t2_b, poly_grad);
+    //Finding g(x) = 0.7978845(x+0.044715*x*x*x)
+    //finding g'(x)=0.7978845(1+0.134145*x*x)
 
-    auto term1 =
-        rewriter.create<mlir::nova::MulOp>(loc, inputType, op5, cst_05);
-    auto d_gelu =
-        rewriter.create<mlir::nova::AddOp>(loc, inputType, term1, term2);
+    Value input_square=rewriter.create<mlir::nova::MulOp>(loc, inputType, input, input);
+    auto op_xsq_coeff =rewriter.create<mlir::nova::MulOp>(loc, inputType, input_square, cst_013);
+    auto op0 = rewriter.create<mlir::nova::MulOp>(loc, inputType, input, input_square);
+    auto op1 = rewriter.create<mlir::nova::MulOp>(loc, inputType, op0, cst_004);
+    auto op2 = rewriter.create<mlir::nova::AddOp>(loc, inputType, input, op1);
+    auto op3_raw =rewriter.create<mlir::nova::MulOp>(loc, inputType, op2, cst_sqrt2pi);
+    // Guard: clamp tanh input to [-10, 10] to prevent intermediate Inf/NaN.
+    // For |x| > ~4, g(x) grows cubically and can overflow float32, causing
+    // tanh(Inf) = 1.0 but Inf * (1 - 1.0) = Inf * 0 = NaN in the backward chain.
+    Value cst_pos10 = rewriter.create<mlir::nova::ConstantOp>(
+        loc, inputType, DenseElementsAttr::get(inputType, {10.0f}));
+    Value cst_neg10 = rewriter.create<mlir::nova::ConstantOp>(
+        loc, inputType, DenseElementsAttr::get(inputType, {-10.0f}));
+    Value op3_clamped = rewriter.create<mlir::nova::MinOp>(loc, inputType, op3_raw, cst_pos10);
+    Value op3 = rewriter.create<mlir::nova::MaxOp>(loc, inputType, op3_clamped, cst_neg10);
+    auto poly_grad =rewriter.create<mlir::nova::AddOp>(loc, inputType, cst_1, op_xsq_coeff);
+    auto dg =rewriter.create<mlir::nova::MulOp>(loc, inputType, poly_grad, cst_sqrt2pi);
+    //fiding first term of grad_input
+    // =>0.5*(1+tanh(g(x)))
+    //finding second term of grad_input
+    // => 0.5 *x*(1-tanh^2(g(x)) ) *g'(x)
+    //finding  1- tanh^2
+    auto op4 = rewriter.create<mlir::nova::TanhOp>(loc, inputType, op3);
+    auto op4_sq = rewriter.create<mlir::nova::MulOp>(loc, inputType, op4, op4);
+    auto one_minus_tanh_sq =rewriter .create<mlir::nova::SubOp>(loc, inputType, cst_1, op4_sq);
+    auto t2_a = rewriter.create<mlir::nova::MulOp>(loc, inputType, dg,one_minus_tanh_sq);
+    auto term2 =rewriter.create<mlir::nova::MulOp>(loc, inputType, input, t2_a);
+    auto secondterm =rewriter.create<mlir::nova::MulOp>(loc, inputType, term2, cst_05);
+    auto op5 = rewriter.create<mlir::nova::AddOp>(loc, inputType, op4, cst_1);
+    auto term1 =rewriter.create<mlir::nova::MulOp>(loc, inputType, op5, cst_05);
 
+    auto op6 =rewriter.create<mlir::nova::MulOp>(loc, inputType, input, cst_05);
+    //adding two terms
+    auto d_gelu =rewriter.create<mlir::nova::AddOp>(loc, inputType, term1, secondterm);
+
+    //final cahin result multiply
     auto grad_input =
         rewriter.create<mlir::nova::MulOp>(loc, inputType, grad_out, d_gelu);
     rewriter.replaceOp(op, {grad_input.getResult()});
@@ -513,18 +526,16 @@ struct NovaGeluBackwardPattern
 };
 
 // relu lowering
-struct NovaReluOpLowering : public OpConversionPattern<mlir::nova::ReluOp> {
+struct NovaReluOpLowering : public OpConversionPattern<mlir::nova::ReluOp> { 
   using OpConversionPattern<mlir::nova::ReluOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(mlir::nova::ReluOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(mlir::nova::ReluOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+    // relu = max(0, x)
     Location loc = op.getLoc();
     Value input = adaptor.getInput();
     auto inputType = cast<RankedTensorType>(input.getType());
     Type elementType = inputType.getElementType();
 
-    // Create zero constant tensor with the same shape as input
+    // Create zero constant tensor with the same type and shape as input
     Attribute zeroAttr;
 
     if (auto floatType = dyn_cast<FloatType>(elementType)) {
@@ -535,35 +546,31 @@ struct NovaReluOpLowering : public OpConversionPattern<mlir::nova::ReluOp> {
     } else {
       return failure();
     }
+
     DenseElementsAttr zeroTensor = DenseElementsAttr::get(inputType, zeroAttr);
-    Value zero =
-        rewriter.create<mlir::nova::ConstantOp>(loc, inputType, zeroTensor);
-    Value result =
-        rewriter.create<mlir::nova::MaxOp>(loc, inputType, input, zero);
+    Value zero = rewriter.create<mlir::nova::ConstantOp>(loc, inputType, zeroTensor);
+    Value result = rewriter.create<mlir::nova::MaxOp>(loc, inputType, input, zero);
 
     rewriter.replaceOp(op, result);
     return success();
   }
 };
-// creating a  lowering for softmax
-struct NovaSoftmaxLoweringPattern
-    : public OpConversionPattern<mlir::nova::SoftmaxOp> {
-  using OpConversionPattern<mlir::nova::SoftmaxOp>::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(mlir::nova::SoftmaxOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
 
+// creating a  lowering for softmax
+struct NovaSoftmaxLoweringPattern : public OpConversionPattern<mlir::nova::SoftmaxOp> { 
+  using OpConversionPattern<mlir::nova::SoftmaxOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::SoftmaxOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+    // e^(x - max) / reduce<sum>(e^x - max)
     Location loc = op.getLoc();
     Value input = adaptor.getInput();
+
     auto restype = cast<RankedTensorType>(op.getType());
     auto inputType = cast<RankedTensorType>(input.getType());
     auto size = inputType.getShape().size();
-    int32_t dimension =
-        op.getDimension().has_value() ? op.getDimension().value() : -1;
-    if (dimension < 0) {
-      //  auto size1=inputType.getShape().size() - 1;
+
+    int32_t dimension = op.getDimension().has_value() ? op.getDimension().value() : -1;
+    if (dimension < 0)
       dimension += size;
-    }
     SmallVector<int64_t> dim;
     dim.push_back(dimension);
 
@@ -574,29 +581,35 @@ struct NovaSoftmaxLoweringPattern
       input = rewriter.create<mlir::tosa::CastOp>(loc, restype, input);
     }
 
+    // 1. find maximum
     SmallVector<int64_t> axes = {dimension};
-    Value op1 = rewriter.create<mlir::nova::ReduceOp>(
-        loc, ReductionKind::MAX, input, tempresult, /*keepdims=*/true, axes);
+    Value op1 = rewriter.create<mlir::nova::ReduceOp>(loc, ReductionKind::MAX, input, tempresult, /*keepdims=*/true, axes);
 
-    // step2
-    // create a TOSA sub op with input and op1
+    // 2. xi - max
     Value op2 = rewriter.create<mlir::nova::SubOp>(loc, restype, input, op1);
-    // step3
-    // create  a TOSA exp op
+    
+    // 3. exp(xi - max)
     Value op3 = rewriter.create<mlir::nova::ExpOp>(loc, restype, op2);
-    // step4
-    // create a TOSA reduce sum
-    Value op4 = rewriter.create<mlir::nova::ReduceOp>(
-        loc, ReductionKind::SUM, op3, tempresult, /*keepdims=*/true, axes);
+    
+    // 4. sum(exp(xi - max))
+    Value op4 = rewriter.create<mlir::nova::ReduceOp>(loc, ReductionKind::SUM, op3, tempresult, /*keepdims=*/true, axes);
 
-    // step 5
+    // 5. 1 / sum
     // create TOSA div: reciprocal(op4) * op3
     // TOSA's native broadcasting will map the 8x1 op4 onto the 8x16 op3.
-    Value recip =
-        rewriter.create<mlir::nova::ReciprocalOp>(loc, op4.getType(), op4);
+    // Guard: clamp sum_exp to at least eps to prevent Inf from reciprocal(~0).
+    // Without this, when logits have extreme variance, exp() underflows for most
+    // entries, making sum_exp ≈ 0 → reciprocal → Inf → NaN in backward pass.
+    auto epsType = cast<RankedTensorType>(op4.getType());
+    auto epsAttr = DenseElementsAttr::get(epsType, rewriter.getFloatAttr(epsType.getElementType(), 1.0e-7));
+    Value epsConst = rewriter.create<mlir::nova::ConstantOp>(loc, epsType, epsAttr);
+    Value safeSumExp = rewriter.create<mlir::nova::MaxOp>(loc, epsType, op4, epsConst);
+    Value recip = rewriter.create<mlir::nova::ReciprocalOp>(loc, safeSumExp.getType(), safeSumExp);
+    
+    // 6. mul(reciprocal * each_value)
     Value op5 = rewriter.create<mlir::nova::MulOp>(loc, restype, op3, recip);
-    rewriter.replaceOp(op, op5);
 
+    rewriter.replaceOp(op, op5);
     return success();
   }
 };
@@ -685,86 +698,78 @@ struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
 
 
 // layer norm lowering with nova operations
-struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
-  using OpConversionPattern<nova::LayerNormOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(nova::LayerNormOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
+struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> { using OpConversionPattern<nova::LayerNormOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite ( 
+      nova::LayerNormOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter
+  ) const override {      
     //  y = (x - E[x]) / sqrt(Var[x] + eps) * gamma + beta
-    // getting operands
     Location loc = op.getLoc();
     Value x = adaptor.getInput();
     Value gamma = adaptor.getGamma();
     Value beta = adaptor.getBeta();
+
     auto xres = cast<RankedTensorType>(op.getType());
     auto xType = cast<RankedTensorType>(x.getType());
 
     auto elemType = xType.getElementType();
-    // setting up
+
+    // setting up epsilon
     float eps = 1e-5f;
     int last_dim = xType.getRank()-1;
-    // 1.finding row mean
-    std::vector<int64_t> meanShape(xType.getShape().begin(),
-                                   xType.getShape().end());
+    
+    // 1.calculating mean: 
+    // row mean = sum(row_elements)       
+    std::vector<int64_t> meanShape(xType.getShape().begin(), xType.getShape().end());
     float last_dim_n = meanShape[last_dim];
     meanShape.back() = 1;
     auto meanType = mlir::RankedTensorType::get(meanShape, elemType);
-    auto mean_sum = rewriter
-                    .create<mlir::nova::ReduceOp>(
-                        loc, mlir::nova::ReductionKind::SUM, x, meanType, true,
-                        llvm::ArrayRef<int64_t>{-1}, false)
-                    .getResult();
+    auto mean_sum = rewriter.create<mlir::nova::ReduceOp> (
+                        loc, mlir::nova::ReductionKind::SUM, x, meanType, 
+                        true, llvm::ArrayRef<int64_t>{-1}, false
+                    ).getResult();
     auto scalarType = mlir::RankedTensorType::get({}, xType.getElementType());
+    
+    // constant = 1/n (constfolding)
     auto n = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)(1/last_dim_n))));
-   // auto reciprocal = rewriter.create<nova::ReciprocalOp>(loc, n);
+    
+    // mean = constant * row_mean 
     auto mean = rewriter.create<mlir::nova::MulOp>(loc, n, mean_sum).getResult();
-
+    
+    // 2. x - mean
     auto x_minus_mean = rewriter.create<mlir::nova::SubOp>(loc, xres, x, mean).getResult();
 
-
     // 3. (x - mean)^2
-    auto sq_diff =
-        rewriter
-            .create<mlir::nova::MulOp>(loc, xres, x_minus_mean, x_minus_mean)
-            .getResult();
-    // 4. Var(x) = Mean((x-mean)^2)
-    auto var_sum = rewriter
-                   .create<mlir::nova::ReduceOp>(
-                       loc, mlir::nova::ReductionKind::SUM, sq_diff, meanType,
-                       true, llvm::ArrayRef<int64_t>{-1}, false)
-                   .getResult();
+    auto sq_diff = rewriter.create<mlir::nova::MulOp>(loc, xres, x_minus_mean, x_minus_mean).getResult();
+
+    // 4. var(x) = Mean((x-mean)^2)
+    auto var_sum = rewriter.create<mlir::nova::ReduceOp> (
+                        loc, mlir::nova::ReductionKind::SUM, sq_diff, meanType,
+                        true, llvm::ArrayRef<int64_t>{-1}, false
+                    ).getResult();
     auto var = rewriter.create<mlir::nova::MulOp>(loc, n, var_sum).getResult();
 
     // 5. sqrt(var + eps)
-    auto epsAttr = mlir::DenseElementsAttr::get(
-        mlir::cast<mlir::RankedTensorType>(var.getType()), eps);
-    auto epsConst =
-        rewriter.create<mlir::nova::ConstantOp>(loc, var.getType(), epsAttr)
-            .getResult();
-    auto var_plus_eps =
-        rewriter.create<mlir::nova::AddOp>(loc, var.getType(), var, epsConst)
-            .getResult();
-    auto std_inv =
-        rewriter.create<mlir::nova::RsqrtOp>(loc, var.getType(), var_plus_eps)
-            .getResult();
+    auto epsAttr = mlir::DenseElementsAttr::get(mlir::cast<mlir::RankedTensorType>(var.getType()), eps);
+    auto epsConst = rewriter.create<mlir::nova::ConstantOp>(loc, var.getType(), epsAttr).getResult();
+    // Guard: clamp variance to at least eps before adding eps to prevent
+    // rsqrt from producing excessively large values on near-zero variance.
+    auto safeVar = rewriter.create<mlir::nova::MaxOp>(loc, var.getType(), var, epsConst).getResult();
+    auto var_plus_eps = rewriter.create<mlir::nova::AddOp>(loc, var.getType(), safeVar, epsConst).getResult();
+    auto std_inv = rewriter.create<mlir::nova::RsqrtOp>(loc, var.getType(), var_plus_eps).getResult();
+
     // 6. Normalize
-    auto norm =
-        rewriter.create<mlir::nova::MulOp>(loc, xres, x_minus_mean, std_inv)
-            .getResult();
+    auto norm = rewriter.create<mlir::nova::MulOp>(loc, xres, x_minus_mean, std_inv).getResult();
+
     // 7. scale and shift
-    // multiply by gamma
-    auto res =
-        rewriter.create<mlir::nova::MulOp>(loc, xres, norm, gamma).getResult();
+    // multiply gamma
+    auto res = rewriter.create<mlir::nova::MulOp>(loc, xres, norm, gamma).getResult();
     // add beta
-    auto result =
-        rewriter.create<mlir::nova::AddOp>(loc, xres, res, beta).getResult();
+    auto result = rewriter.create<mlir::nova::AddOp>(loc, xres, res, beta).getResult();
+
     rewriter.replaceOp(op, result);
     return success();
   }
 };
-
-
 
 struct NovaLayerNormBackwardPattern
    : public OpConversionPattern<nova::LayerNormBackwardOp> {
@@ -801,18 +806,18 @@ struct NovaLayerNormBackwardPattern
    auto mean = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_x);
    auto meanType = cast<RankedTensorType>(mean.getType());
 
-
    // calculate standard deviation
    auto diff = rewriter.create<mlir::nova::SubOp>(loc, x, mean.getResult());
    auto diff2 = rewriter.create<mlir::nova::MulOp>(loc, diff.getResult(), diff.getResult());
    auto sum_sq = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, diff2.getResult(), red_type, true,  llvm::ArrayRef<int64_t>{-1}, false);
    auto var = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_sq);
    auto eps_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)eps)));
-   auto var_eps = rewriter.create<mlir::nova::AddOp>(loc, var.getResult(), eps_const.getResult());
+   // Guard: clamp variance to at least eps before adding eps, so var_eps >= 2*eps.
+   // This prevents rsqrt from producing excessively large values that overflow
+   // when multiplied through the backward chain (rstd is used twice in dx).
+   auto safeVar = rewriter.create<mlir::nova::MaxOp>(loc, var.getType(), var.getResult(), eps_const.getResult());
+   auto var_eps = rewriter.create<mlir::nova::AddOp>(loc, safeVar.getResult(), eps_const.getResult());
    auto rstd = rewriter.create<mlir::nova::RsqrtOp>(loc, var_eps.getResult());
-
-
-
 
    // 1. Compute x_hat = (x - mean) * rstd
    Value x_minus_mean =
@@ -820,7 +825,6 @@ struct NovaLayerNormBackwardPattern
    Value x_hat =
        rewriter.create<mlir::nova::MulOp>(loc, xType, x_minus_mean, rstd)
            .getResult();
-
 
    // 3. dgamma = sum(gy * x_hat, over batch dims)
    Value gy_xhat =
@@ -834,7 +838,6 @@ struct NovaLayerNormBackwardPattern
                                          gy_xhat, gammaType, false, batchDims)
            .getResult();
 
-
    // 4. dbeta = sum(gy, over batch dims)
    Value dbeta =
        rewriter
@@ -842,29 +845,31 @@ struct NovaLayerNormBackwardPattern
                                          gy, gammaType, false, batchDims)
            .getResult();
 
-
    // 5. dx
    Value gy_gamma =
        rewriter.create<mlir::nova::MulOp>(loc, xType, gy, gamma).getResult();
 
  //Using reduce sum
-   Value mean_gy_gamma =
+   Value sum_gy_gamma =
        rewriter
            .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
                                          gy_gamma, meanType, true,
                                          llvm::ArrayRef<int64_t>{-1})
            .getResult();
+  //CReating constant of reciprocal 
   
-
-   Value term2 =
+  Value mean_gy_gamma = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_gy_gamma);
+   Value gy_gamma_xhat =
        rewriter.create<mlir::nova::MulOp>(loc, xType, gy_gamma, x_hat)
            .getResult();
+           
    Value mean_gy_gamma_xhat =
        rewriter
            .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::MEAN,
-                                         term2, meanType, true,
+                                         gy_gamma_xhat, meanType, true,
                                          llvm::ArrayRef<int64_t>{-1})
            .getResult();
+  // Value mean_gy_gamma_xhat = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_gy_gamma_xhat).getResult();
 
 
    Value t3 =
@@ -884,8 +889,6 @@ struct NovaLayerNormBackwardPattern
    return success();
  }
 };
-
-
 
 struct NovaSceBackwardOpLowering
     : public OpConversionPattern<mlir::nova::SceBackwardOp> {
@@ -1070,6 +1073,237 @@ struct NovaLinearBackwardPattern
     return success();
   }
 };
+
+struct NovaAddBackwardPattern : public OpConversionPattern<mlir::nova::AddBackwardOp> {
+  using OpConversionPattern<mlir::nova::AddBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::AddBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value gx = reduce_to_shape_nova(rewriter, loc, g, adaptor.getX());
+    Value gy = reduce_to_shape_nova(rewriter, loc, g, adaptor.getY());
+    rewriter.replaceOp(op, {gx, gy});
+    return success();
+  }
+};
+
+struct NovaSubBackwardPattern : public OpConversionPattern<mlir::nova::SubBackwardOp> {
+  using OpConversionPattern<mlir::nova::SubBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::SubBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value neg_g = rewriter.create<mlir::nova::NegOp>(loc, g.getType(), g).getResult();
+    Value gx = reduce_to_shape_nova(rewriter, loc, g, adaptor.getX());
+    Value gy = reduce_to_shape_nova(rewriter, loc, neg_g, adaptor.getY());
+    rewriter.replaceOp(op, {gx, gy});
+    return success();
+  }
+};
+
+struct NovaMulBackwardPattern : public OpConversionPattern<mlir::nova::MulBackwardOp> {
+  using OpConversionPattern<mlir::nova::MulBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::MulBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value dx_p = rewriter.create<mlir::nova::MulOp>(loc, g.getType(), g, adaptor.getY()).getResult();
+    Value dy_p = rewriter.create<mlir::nova::MulOp>(loc, g.getType(), g, adaptor.getX()).getResult();
+    Value gx = reduce_to_shape_nova(rewriter, loc, dx_p, adaptor.getX());
+    Value gy = reduce_to_shape_nova(rewriter, loc, dy_p, adaptor.getY());
+    rewriter.replaceOp(op, {gx, gy});
+    return success();
+  }
+};
+
+struct NovaDivBackwardPattern : public OpConversionPattern<mlir::nova::DivBackwardOp> {
+  using OpConversionPattern<mlir::nova::DivBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::DivBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value x = adaptor.getX();
+    Value y = adaptor.getY();
+    Value inv_y = rewriter.create<mlir::nova::ReciprocalOp>(loc, y.getType(), y).getResult();
+    Value dx_p = rewriter.create<mlir::nova::MulOp>(loc, g.getType(), g, inv_y).getResult();
+    Value y2 = rewriter.create<mlir::nova::MulOp>(loc, y.getType(), y, y).getResult();
+    Value inv_y2 = rewriter.create<mlir::nova::ReciprocalOp>(loc, y.getType(), y2).getResult();
+    Value dy_pre = rewriter.create<mlir::nova::MulOp>(loc, x.getType(), x, inv_y2).getResult();
+    Value dy_mid = rewriter.create<mlir::nova::MulOp>(loc, g.getType(), g, dy_pre).getResult();
+    Value dy_p = rewriter.create<mlir::nova::NegOp>(loc, dy_mid.getType(), dy_mid).getResult();
+    Value gx = reduce_to_shape_nova(rewriter, loc, dx_p, x);
+    Value gy = reduce_to_shape_nova(rewriter, loc, dy_p, y);
+    rewriter.replaceOp(op, {gx, gy});
+    return success();
+  }
+};
+
+struct NovaMatmulBackwardPattern : public OpConversionPattern<mlir::nova::MatmulBackwardOp> {
+  using OpConversionPattern<mlir::nova::MatmulBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::MatmulBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value x = adaptor.getX();
+    Value y = adaptor.getY();
+    auto xType = llvm::cast<mlir::RankedTensorType>(x.getType());
+    auto yType = llvm::cast<mlir::RankedTensorType>(y.getType());
+
+    auto xShape = xType.getShape().vec();
+    if (xShape.size() >= 2) std::swap(xShape.back(), xShape[xShape.size()-2]);
+    auto xtType = mlir::RankedTensorType::get(xShape, xType.getElementType());
+    Value xt = rewriter.create<mlir::nova::TransposeOp>(loc, xtType, x, rewriter.getI32IntegerAttr(-1), rewriter.getI32IntegerAttr(-2)).getResult();
+
+    auto yShape = yType.getShape().vec();
+    if (yShape.size() >= 2) std::swap(yShape.back(), yShape[yShape.size()-2]);
+    auto ytType = mlir::RankedTensorType::get(yShape, yType.getElementType());
+    Value yt = rewriter.create<mlir::nova::TransposeOp>(loc, ytType, y, rewriter.getI32IntegerAttr(-1), rewriter.getI32IntegerAttr(-2)).getResult();
+
+    Value da = rewriter.create<mlir::nova::MatmulOp>(loc, xType, g, yt).getResult();
+    Value db = rewriter.create<mlir::nova::MatmulOp>(loc, yType, xt, g).getResult();
+    rewriter.replaceOp(op, {da, db});
+    return success();
+  }
+};
+
+struct NovaSoftmaxBackwardPattern : public OpConversionPattern<mlir::nova::SoftmaxBackwardOp> {
+  using OpConversionPattern<mlir::nova::SoftmaxBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::SoftmaxBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value s = adaptor.getOutput();
+    auto type = llvm::cast<mlir::RankedTensorType>(s.getType());
+    Value gs = rewriter.create<mlir::nova::MulOp>(loc, type, g, s).getResult();
+    int32_t dim = op.getDimension().has_value() ? op.getDimension().value() : -1;
+    if (dim < 0) dim += type.getRank();
+    llvm::SmallVector<int64_t, 1> dims = {static_cast<int64_t>(dim)};
+    auto outShape = type.getShape().vec();
+    outShape[dim] = 1;
+    auto outType = mlir::RankedTensorType::get(outShape, type.getElementType());
+    Value sum_gs = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, gs, outType, true, dims, false).getResult();
+    Value diff = rewriter.create<mlir::nova::SubOp>(loc, type, g, sum_gs).getResult();
+    Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, s, diff).getResult();
+    rewriter.replaceOp(op, dx);
+    return success();
+  }
+};
+
+struct NovaTanhBackwardPattern : public OpConversionPattern<mlir::nova::TanhBackwardOp> {
+  using OpConversionPattern<mlir::nova::TanhBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::TanhBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value y = adaptor.getOutput();
+    auto type = llvm::cast<mlir::RankedTensorType>(y.getType());
+    Value y2 = rewriter.create<mlir::nova::MulOp>(loc, type, y, y).getResult();
+    Value one = rewriter.create<mlir::nova::ConstantOp>(loc, type, DenseElementsAttr::get( type, rewriter.getFloatAttr(type.getElementType(), 1.0f))).getResult();
+    Value dy = rewriter.create<mlir::nova::SubOp>(loc, type, one, y2).getResult();
+    Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, g, dy).getResult();
+    rewriter.replaceOp(op, dx);
+    return success();
+  }
+};
+
+struct NovaReluBackwardPattern : public OpConversionPattern<mlir::nova::ReluBackwardOp> {
+  using OpConversionPattern<mlir::nova::ReluBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::ReluBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value x = adaptor.getInput();
+    auto type = llvm::cast<mlir::RankedTensorType>(x.getType());
+    Value zero = rewriter.create<mlir::nova::ConstantOp>(loc, type,  DenseElementsAttr::get( type,rewriter.getFloatAttr(type.getElementType(), 0.0f))).getResult();
+    auto i1Type = mlir::RankedTensorType::get(type.getShape(), rewriter.getI1Type());
+    Value mask = rewriter.create<mlir::nova::CompareOp>(loc, i1Type, x, zero, mlir::nova::ComparisonType::GT).getResult();
+    Value mask_f = rewriter.create<mlir::nova::CastOp>(loc, type, mask).getResult();
+    Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, g, mask_f).getResult();
+    rewriter.replaceOp(op, dx);
+    return success();
+  }
+};
+
+struct NovaSigmoidBackwardPattern : public OpConversionPattern<mlir::nova::SigmoidBackwardOp> {
+  using OpConversionPattern<mlir::nova::SigmoidBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::SigmoidBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value y = adaptor.getOutput();
+    auto type = llvm::cast<mlir::RankedTensorType>(y.getType());
+    Value one = rewriter.create<mlir::nova::ConstantOp>(loc, type, DenseElementsAttr::get( type, rewriter.getFloatAttr(type.getElementType(), 1.0f))).getResult();
+    Value one_minus_y = rewriter.create<mlir::nova::SubOp>(loc, type, one, y).getResult();
+    Value dy = rewriter.create<mlir::nova::MulOp>(loc, type, y, one_minus_y).getResult();
+    Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, g, dy).getResult();
+    rewriter.replaceOp(op, dx);
+    return success();
+  }
+};
+
+struct NovaMseBackwardPattern : public OpConversionPattern<mlir::nova::MseBackwardOp> {
+  using OpConversionPattern<mlir::nova::MseBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::MseBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value pred = adaptor.getPred();
+    Value target = adaptor.getTarget();
+    auto type = llvm::cast<mlir::RankedTensorType>(pred.getType());
+    Value diff = rewriter.create<mlir::nova::SubOp>(loc, type, pred, target).getResult();
+    int64_t numel = type.getNumElements();
+    Value scale = rewriter.create<mlir::nova::ConstantOp>(loc, type,  DenseElementsAttr::get( type,rewriter.getFloatAttr(type.getElementType(), 2.0f / numel))).getResult();
+    Value dx_pre = rewriter.create<mlir::nova::MulOp>(loc, type, diff, scale).getResult();
+    Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, dx_pre, g).getResult();
+    rewriter.replaceOp(op, dx);
+    return success();
+  }
+};
+
+struct NovaMaeBackwardPattern : public OpConversionPattern<mlir::nova::MaeBackwardOp> {
+  using OpConversionPattern<mlir::nova::MaeBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::MaeBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value pred = adaptor.getPred();
+    Value target = adaptor.getTarget();
+    auto type = llvm::cast<mlir::RankedTensorType>(pred.getType());
+    Value diff = rewriter.create<mlir::nova::SubOp>(loc, type, pred, target).getResult();
+    Value sign = rewriter.create<mlir::nova::SignOp>(loc, type, diff).getResult();
+    int64_t numel = type.getNumElements();
+    Value scale = rewriter.create<mlir::nova::ConstantOp>(loc, type,  DenseElementsAttr::get( type,rewriter.getFloatAttr(type.getElementType(), 1.0f / numel))).getResult();
+    Value dx_pre = rewriter.create<mlir::nova::MulOp>(loc, type, sign, scale).getResult();
+    Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, dx_pre, g).getResult();
+    rewriter.replaceOp(op, dx);
+    return success();
+  }
+};
+
+struct NovaBceBackwardPattern : public OpConversionPattern<nova::BceBackwardOp> {
+  using OpConversionPattern<nova::BceBackwardOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(nova::BceBackwardOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value g = adaptor.getGradOut();
+    Value pred = adaptor.getPred();
+    Value target = adaptor.getTarget();
+    auto type = cast<RankedTensorType>(pred.getType());
+    Value one = rewriter.create<nova::ConstantOp>(loc, type, DenseElementsAttr::get(type, {1.0f}));
+    Value one_minus_pred = rewriter.create<nova::SubOp>(loc, type, one, pred);
+    Value denom = rewriter.create<nova::MulOp>(loc, type, pred, one_minus_pred);
+    Value num = rewriter.create<nova::SubOp>(loc, type, pred, target);
+    Value inv_denom = rewriter.create<nova::ReciprocalOp>(loc, type, denom);
+    Value raw_grad = rewriter.create<nova::MulOp>(loc, type, num, inv_denom);
+    int64_t numel = type.getNumElements();
+    Value scale = rewriter.create<nova::ConstantOp>(loc, type, DenseElementsAttr::get(type, {1.0f / numel}));
+    Value dx_pre = rewriter.create<nova::MulOp>(loc, type, raw_grad, scale);
+    Value dx = rewriter.create<nova::MulOp>(loc, type, dx_pre, g);
+    rewriter.replaceOp(op, dx);
+    return success();
+  }
+};
+
 // pass definition
 namespace {
 struct NovaToTosaLoweringPass
@@ -1116,6 +1350,20 @@ struct NovaToTosaLoweringPass
     target.addIllegalOp<nova::MaeOp>();
     target.addIllegalOp<nova::CastOp>();
     target.addIllegalOp<nova::LinearOp>();
+
+    target.addIllegalOp<nova::AddBackwardOp>();
+    target.addIllegalOp<nova::SubBackwardOp>();
+    target.addIllegalOp<nova::MulBackwardOp>();
+    target.addIllegalOp<nova::DivBackwardOp>();
+    target.addIllegalOp<nova::MatmulBackwardOp>();
+    target.addIllegalOp<nova::SoftmaxBackwardOp>();
+    target.addIllegalOp<nova::TanhBackwardOp>();
+    target.addIllegalOp<nova::ReluBackwardOp>();
+    target.addIllegalOp<nova::SigmoidBackwardOp>();
+    target.addIllegalOp<nova::MseBackwardOp>();
+    target.addIllegalOp<nova::MaeBackwardOp>();
+    target.addIllegalOp<nova::BceBackwardOp>();
+
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     TypeConverter typeConverter;
     typeConverter.addConversion([](Type type) { return type; });
@@ -1133,16 +1381,22 @@ struct NovaToTosaLoweringPass
 void populateNovaToTosaConversionPatterns(RewritePatternSet &patterns) {
   patterns
       .add<NovaReluOpLowering, NovaGeluOpLowering, NovaGeluBackwardPattern, NovaLinearOpLowering,
-               NovaSoftmaxLoweringPattern, NovaConstantToArithConstPattern,
-               NovaSceBackwardOpLowering, NovaLayerNormPattern,
-               NovaLayerNormBackwardPattern, NovaLinearBackwardPattern,
-               NovaToTosaLoweringTemplate<nova::MaeOp>,
-               NovaToTosaLoweringTemplate<nova::MseOp>,
-               NovaToTosaLoweringTemplate<nova::CceOp>,
-               NovaToTosaLoweringTemplate<nova::BceOp>,
-
-               NovaToTosaLoweringTemplate<nova::SigmoidOp>,
-               NovaToTosaLoweringTemplate<nova::CastOp>>(patterns.getContext());
+              NovaSoftmaxLoweringPattern, NovaConstantToArithConstPattern,
+              NovaSceBackwardOpLowering, NovaLayerNormPattern,
+              NovaLayerNormBackwardPattern, NovaLinearBackwardPattern,
+              NovaToTosaLoweringTemplate<nova::MaeOp>,
+              NovaToTosaLoweringTemplate<nova::MseOp>,
+              NovaToTosaLoweringTemplate<nova::CceOp>,
+              NovaToTosaLoweringTemplate<nova::BceOp>,
+              NovaToTosaLoweringTemplate<nova::CceBackwardOp>,
+              NovaToTosaLoweringTemplate<nova::SigmoidOp>,
+              NovaToTosaLoweringTemplate<nova::CastOp>,
+              NovaAddBackwardPattern, NovaSubBackwardPattern,
+              NovaMulBackwardPattern, NovaDivBackwardPattern, 
+              NovaMatmulBackwardPattern, NovaSoftmaxBackwardPattern,
+              NovaTanhBackwardPattern, NovaReluBackwardPattern, 
+              NovaSigmoidBackwardPattern, NovaMseBackwardPattern, 
+              NovaMaeBackwardPattern, NovaBceBackwardPattern> (patterns.getContext());
 }
 
 // creating a pointer for this pass

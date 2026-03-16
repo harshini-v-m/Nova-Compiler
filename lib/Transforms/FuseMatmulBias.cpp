@@ -148,8 +148,10 @@ struct FuseMatmulBiasPattern : public OpRewritePattern<GenericOp> {
     Type targetElementType = addResultType.getElementType();
 
     ValueRange operands = addOp.getOperands();
+    if (operands.size() < 2) return failure();
     auto lhstensor = llvm::dyn_cast<TensorType>(operands[0].getType());
     auto rhstensor = llvm::dyn_cast<TensorType>(operands[1].getType());
+    if (!lhstensor || !rhstensor) return failure();
 
     Value output = transformedBias;
 
@@ -396,8 +398,11 @@ private:
   }
 
   bool isMatmul(GenericOp op) const {
+    if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1)
+      return false;
+
     auto iterators = op.getIteratorTypesArray();
-    // Matmul has 2 parallel + 1 reduction dimension
+    // Matmul has 2 parallel + 1 reduction dimension (or more for batch)
     if (iterators.size() < 3)
       return false;
 

@@ -2116,6 +2116,43 @@ SceBackwardOp::inferReturnTypes(MLIRContext *context, std::optional<Location> lo
   return success();
 }
 
+#define INFER_RETURN_TYPES_GRAD_X_Y(Op)                                        \
+  LogicalResult Op::inferReturnTypes(                                          \
+      MLIRContext *context, std::optional<Location> loc, ValueRange operands,  \
+      DictionaryAttr attributes, OpaqueProperties properties,                  \
+      RegionRange regions, llvm::SmallVectorImpl<Type> &inferredReturnTypes) { \
+    if (operands.size() < 3)                                                   \
+      return failure();                                                        \
+    inferredReturnTypes.push_back(operands[1].getType());                      \
+    inferredReturnTypes.push_back(operands[2].getType());                      \
+    return success();                                                          \
+  }
+
+#define INFER_RETURN_TYPES_GRAD_INPUT(Op)                                      \
+  LogicalResult Op::inferReturnTypes(                                          \
+      MLIRContext *context, std::optional<Location> loc, ValueRange operands,  \
+      DictionaryAttr attributes, OpaqueProperties properties,                  \
+      RegionRange regions, llvm::SmallVectorImpl<Type> &inferredReturnTypes) { \
+    if (operands.size() < 2)                                                   \
+      return failure();                                                        \
+    inferredReturnTypes.push_back(operands[1].getType());                      \
+    return success();                                                          \
+  }
+
+INFER_RETURN_TYPES_GRAD_X_Y(AddBackwardOp)
+INFER_RETURN_TYPES_GRAD_X_Y(SubBackwardOp)
+INFER_RETURN_TYPES_GRAD_X_Y(MulBackwardOp)
+INFER_RETURN_TYPES_GRAD_X_Y(DivBackwardOp)
+INFER_RETURN_TYPES_GRAD_X_Y(MatmulBackwardOp)
+
+INFER_RETURN_TYPES_GRAD_INPUT(SoftmaxBackwardOp)
+INFER_RETURN_TYPES_GRAD_INPUT(TanhBackwardOp)
+INFER_RETURN_TYPES_GRAD_INPUT(ReluBackwardOp)
+INFER_RETURN_TYPES_GRAD_INPUT(SigmoidBackwardOp)
+INFER_RETURN_TYPES_GRAD_INPUT(MseBackwardOp)
+INFER_RETURN_TYPES_GRAD_INPUT(MaeBackwardOp)
+INFER_RETURN_TYPES_GRAD_INPUT(BceBackwardOp)
+
 LogicalResult SceBackwardOp::verify() {
   auto logitsType = dyn_cast<RankedTensorType>(getLogits().getType());
   auto targetsType = dyn_cast<RankedTensorType>(getTargets().getType());
@@ -2171,3 +2208,17 @@ LogicalResult SceBackwardOp::verify() {
 }
 
 OpFoldResult SceBackwardOp::fold(FoldAdaptor adaptor) { return nullptr; }
+LogicalResult
+CceBackwardOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
+                                ValueRange operands, DictionaryAttr attributes,
+                                OpaqueProperties properties, RegionRange regions,
+    llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto logitsType = dyn_cast<RankedTensorType>(operands[1].getType());
+  if (!logitsType)
+    return failure();
+
+  // Output gradient has the same shape and element type as logits
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(logitsType.getShape(), logitsType.getElementType()));
+  return success();
+}

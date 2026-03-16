@@ -83,8 +83,8 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
   pm.addPass(mlir::createCSEPass());
   pm.addNestedPass<mlir::func::FuncOp>(
       mlir::nova::createNovaElementwiseToLinalgPass());
-//   pm.addNestedPass<mlir::func::FuncOp>(
-//       mlir::nova::createNovaFusionKernelEmitterPass());
+  pm.addNestedPass<mlir::func::FuncOp>(
+      mlir::nova::createNovaFusionKernelEmitterPass());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToGpuPass());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgPass());
 

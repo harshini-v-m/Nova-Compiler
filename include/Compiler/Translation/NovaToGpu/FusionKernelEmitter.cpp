@@ -712,7 +712,7 @@ struct NovaFusionKernelEmitterPass
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    // patterns.add<FullReduceLowering>(context);
+    patterns.add<FullReduceLowering>(context);
     // patterns.add<PartialReduceLowering>(context);
 
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
