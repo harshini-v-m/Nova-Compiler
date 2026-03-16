@@ -1048,5 +1048,100 @@ def Nova_SceFwdBwdOp : Op<Nova_Dialect, "sce_fwd_bwd",
     $logits `,` $targets attr-dict `:` type($logits) `,` type($targets)
   }];
 }
+//============================LOSS BACKWARD OPERATION====================
 
+def CceBackwardOp :Op<Nova_Dialect,"cce_backward",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary ="CCE backward operation calculating gradient for input";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$input, Nova_Tensor:$target);
+  let results=(outs Nova_Tensor:$grad_input);
+  //let hasVerifier=1;
+    let assemblyFormat = [{
+    $grad_out `,` $input `,` $target attr-dict `:` type($grad_out) `,` type($input) `,` type($target) 
+  }];
+}
+
+// Backward Operations
+def Nova_AddBackwardOp : Op<Nova_Dialect, "add_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for add";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$x, Nova_Tensor:$y);
+  let results = (outs Nova_Tensor:$grad_x, Nova_Tensor:$grad_y);
+  let assemblyFormat = "$grad_out `,` $x `,` $y attr-dict `:` type($grad_out) `,` type($x) `,` type($y) `->` type($grad_x) `,` type($grad_y)";
+}
+
+def Nova_SubBackwardOp : Op<Nova_Dialect, "sub_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for sub";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$x, Nova_Tensor:$y);
+  let results = (outs Nova_Tensor:$grad_x, Nova_Tensor:$grad_y);
+  let assemblyFormat = "$grad_out `,` $x `,` $y attr-dict `:` type($grad_out) `,` type($x) `,` type($y) `->` type($grad_x) `,` type($grad_y)";
+}
+
+def Nova_MulBackwardOp : Op<Nova_Dialect, "mul_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for mul";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$x, Nova_Tensor:$y);
+  let results = (outs Nova_Tensor:$grad_x, Nova_Tensor:$grad_y);
+  let assemblyFormat = "$grad_out `,` $x `,` $y attr-dict `:` type($grad_out) `,` type($x) `,` type($y) `->` type($grad_x) `,` type($grad_y)";
+}
+
+def Nova_DivBackwardOp : Op<Nova_Dialect, "div_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for div";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$x, Nova_Tensor:$y);
+  let results = (outs Nova_Tensor:$grad_x, Nova_Tensor:$grad_y);
+  let assemblyFormat = "$grad_out `,` $x `,` $y attr-dict `:` type($grad_out) `,` type($x) `,` type($y) `->` type($grad_x) `,` type($grad_y)";
+}
+
+def Nova_MatmulBackwardOp : Op<Nova_Dialect, "matmul_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for matmul";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$x, Nova_Tensor:$y);
+  let results = (outs Nova_Tensor:$grad_x, Nova_Tensor:$grad_y);
+  let assemblyFormat = "$grad_out `,` $x `,` $y attr-dict `:` type($grad_out) `,` type($x) `,` type($y) `->` type($grad_x) `,` type($grad_y)";
+}
+
+def Nova_SoftmaxBackwardOp : Op<Nova_Dialect, "softmax_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for softmax";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$output, OptionalAttr<I32Attr>:$dimension);
+  let results = (outs Nova_Tensor:$grad_input);
+  let assemblyFormat = "$grad_out `,` $output (`dimension` `=` $dimension^)? attr-dict `:` type($grad_out) `,` type($output) `->` type($grad_input)";
+}
+
+def Nova_TanhBackwardOp : Op<Nova_Dialect, "tanh_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for tanh";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$output);
+  let results = (outs Nova_Tensor:$grad_input);
+  let assemblyFormat = "$grad_out `,` $output attr-dict `:` type($grad_out) `,` type($output) `->` type($grad_input)";
+}
+
+def Nova_ReluBackwardOp : Op<Nova_Dialect, "relu_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for relu";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$input);
+  let results = (outs Nova_Tensor:$grad_input);
+  let assemblyFormat = "$grad_out `,` $input attr-dict `:` type($grad_out) `,` type($input) `->` type($grad_input)";
+}
+
+def Nova_SigmoidBackwardOp : Op<Nova_Dialect, "sigmoid_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for sigmoid";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$output);
+  let results = (outs Nova_Tensor:$grad_input);
+  let assemblyFormat = "$grad_out `,` $output attr-dict `:` type($grad_out) `,` type($output) `->` type($grad_input)";
+}
+
+def Nova_MseBackwardOp : Op<Nova_Dialect, "mse_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for MSE loss";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$pred, Nova_Tensor:$target);
+  let results = (outs Nova_Tensor:$grad_input);
+  let assemblyFormat = "$grad_out `,` $pred `,` $target attr-dict `:` type($grad_out) `,` type($pred) `,` type($target) `->` type($grad_input)";
+}
+
+def Nova_MaeBackwardOp : Op<Nova_Dialect, "mae_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for MAE loss";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$pred, Nova_Tensor:$target);
+  let results = (outs Nova_Tensor:$grad_input);
+  let assemblyFormat = "$grad_out `,` $pred `,` $target attr-dict `:` type($grad_out) `,` type($pred) `,` type($target) `->` type($grad_input)";
+}
+
+def Nova_BceBackwardOp : Op<Nova_Dialect, "bce_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Backward operation for BCE loss";
+  let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$pred, Nova_Tensor:$target);
+  let results = (outs Nova_Tensor:$grad_input);
+  let assemblyFormat = "$grad_out `,` $pred `,` $target attr-dict `:` type($grad_out) `,` type($pred) `,` type($target) `->` type($grad_input)";
+}
 #endif // NOVA_OPS
