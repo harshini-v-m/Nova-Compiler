@@ -449,6 +449,165 @@ struct FuseUnitLoopDestination final : OpRewritePattern<scf::ForallOp> {
 // full workgroup tile (e.g., 128x128), avoiding oversized private allocas.
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// Pattern 4.5: FuseExtractSliceConsumers
+//
+// When a tensor.extract_slice directly consumes a scf.forall result,
+// fuse the slice into the forall by slicing the init operand instead.
+// This eliminates an extra materialization of the full tensor outside
+// the forall.
+//
+// Simplified version of IREE's fuseExtractSliceIntoProducerForall():
+// - Requires zero offsets on the extract_slice
+// - Requires single use of the forall result
+// - No rank reduction support (deferred — add when tests need it)
+// TODO: Support rank-reducing extract_slice (needs collapse_shape on result).
+// TODO: Support clamping parallel_insert_slice (IREE's clampParallelInsertSliceOp).
+//===----------------------------------------------------------------------===//
+
+struct FuseExtractSliceConsumers final
+    : OpRewritePattern<tensor::ExtractSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::ExtractSliceOp extractSliceOp,
+                                PatternRewriter &rewriter) const override {
+    // Source must be a scf.forall result.
+    auto forallOp = extractSliceOp.getSource().getDefiningOp<scf::ForallOp>();
+    if (!forallOp)
+      return failure();
+
+    auto forallResult = cast<OpResult>(extractSliceOp.getSource());
+    if (!forallResult.hasOneUse())
+      return rewriter.notifyMatchFailure(forallOp,
+                                         "forall result has multiple uses");
+
+    // Only zero-offset extract_slice ops are supported.
+    if (!llvm::all_of(extractSliceOp.getMixedOffsets(), [](OpFoldResult ofr) {
+          auto cst = getConstantIntValue(ofr);
+          return cst && *cst == 0;
+        }))
+      return rewriter.notifyMatchFailure(forallOp,
+                                         "extract_slice has non-zero offsets");
+
+    // Unit strides only.
+    if (!llvm::all_of(extractSliceOp.getMixedStrides(), [](OpFoldResult ofr) {
+          auto cst = getConstantIntValue(ofr);
+          return cst && *cst == 1;
+        }))
+      return rewriter.notifyMatchFailure(forallOp,
+                                         "extract_slice has non-unit strides");
+
+    // No rank reduction for now.
+    if (extractSliceOp.getSourceType().getRank() !=
+        extractSliceOp.getType().getRank())
+      return rewriter.notifyMatchFailure(forallOp,
+                                         "rank-reducing extract_slice");
+
+    // Find the corresponding parallel_insert_slice in the forall terminator.
+    int64_t resultIdx = forallResult.getResultNumber();
+    BlockArgument initBbarg = forallOp.getRegionIterArgs()[resultIdx];
+    SmallVector<Operation *> parallelInsertOps =
+        forallOp.getCombiningOps(initBbarg);
+    if (parallelInsertOps.size() != 1)
+      return rewriter.notifyMatchFailure(
+          forallOp, "expected a single parallel_insert_slice");
+    auto parallelInsertOp =
+        dyn_cast<tensor::ParallelInsertSliceOp>(parallelInsertOps.front());
+    if (!parallelInsertOp)
+      return failure();
+
+    // Extract_slice index operands must dominate the forall.
+    DominanceInfo domInfo;
+    int64_t indexStart =
+        extractSliceOp.getOffsetSizeAndStrideStartOperandIndex();
+    for (Value v : extractSliceOp->getOperands().drop_front(indexStart)) {
+      if (!domInfo.dominates(v, forallOp))
+        return rewriter.notifyMatchFailure(
+            extractSliceOp, "index operands do not dominate forall");
+    }
+
+    // Clamp parallel_insert_slice sizes to fit within extracted slice sizes.
+    // For each dimension: new_size = min(insert_size, extract_size).
+    SmallVector<OpFoldResult> extractSizes = extractSliceOp.getMixedSizes();
+    SmallVector<OpFoldResult> insertSizes = parallelInsertOp.getMixedSizes();
+    SmallVector<OpFoldResult> newInsertSizes;
+    bool needsClamp = false;
+    for (auto [eSz, iSz] : llvm::zip_equal(extractSizes, insertSizes)) {
+      auto eVal = getConstantIntValue(eSz);
+      auto iVal = getConstantIntValue(iSz);
+      if (eVal && iVal) {
+        int64_t minSz = std::min(*eVal, *iVal);
+        newInsertSizes.push_back(rewriter.getIndexAttr(minSz));
+        if (minSz != *iVal)
+          needsClamp = true;
+      } else {
+        // Dynamic — keep original (conservative, may need AffineMinOp later).
+        newInsertSizes.push_back(iSz);
+      }
+    }
+
+    // Replace uses of initBbarg (except in parallel_insert dest) with
+    // the output operand from outside the loop.
+    Value forallOutput = forallOp.getOutputs()[resultIdx];
+    rewriter.replaceUsesWithIf(initBbarg, forallOutput, [&](OpOperand &operand) {
+      return operand.getOwner() != parallelInsertOp.getOperation() ||
+             operand.getOperandNumber() !=
+                 parallelInsertOp.getDestMutable().getOperandNumber();
+    });
+
+    // Create extract_slice of the forall init with the same sizes.
+    rewriter.setInsertionPoint(forallOp);
+    auto extractedInit = tensor::ExtractSliceOp::create(
+        rewriter, forallOp->getLoc(), forallOp.getOutputs()[resultIdx],
+        extractSliceOp.getMixedOffsets(), extractSliceOp.getMixedSizes(),
+        extractSliceOp.getMixedStrides());
+
+    // Create new forall with sliced init.
+    SmallVector<Value> newOutputs(forallOp.getOutputs());
+    newOutputs[resultIdx] = extractedInit.getResult();
+
+    auto newForallOp = scf::ForallOp::create(
+        rewriter, forallOp->getLoc(), forallOp.getMixedLowerBound(),
+        forallOp.getMixedUpperBound(), forallOp.getMixedStep(), newOutputs,
+        forallOp.getMappingAttr());
+
+    // Merge old forall body into new forall.
+    SmallVector<Value> argReplacements(newForallOp.getInductionVars());
+    argReplacements.append(newForallOp.getRegionIterArgs().begin(),
+                           newForallOp.getRegionIterArgs().end());
+    newForallOp.getTerminator()->erase();
+    rewriter.mergeBlocks(forallOp.getBody(), newForallOp.getBody(),
+                         argReplacements);
+
+    // Update parallel_insert_slice sizes if clamping was needed.
+    if (needsClamp) {
+      // Find the (now moved) parallel_insert in the new forall.
+      for (Operation &op :
+           newForallOp.getTerminator().getYieldingOps()) {
+        if (auto ins = dyn_cast<tensor::ParallelInsertSliceOp>(&op)) {
+          rewriter.setInsertionPoint(ins);
+          auto newIns = tensor::ParallelInsertSliceOp::create(
+              rewriter, ins.getLoc(), ins.getSource(), ins.getDest(),
+              ins.getMixedOffsets(), newInsertSizes, ins.getMixedStrides());
+          rewriter.eraseOp(ins);
+          (void)newIns;
+          break;
+        }
+      }
+    }
+
+    // Replace original extract_slice and forall.
+    rewriter.replaceAllOpUsesWith(extractSliceOp,
+                                  newForallOp->getResult(resultIdx));
+    rewriter.replaceOp(forallOp, newForallOp->getResults());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pattern 5: FuseTilableForallConsumers
+//===----------------------------------------------------------------------===//
+
 struct FuseTilableForallConsumers final
     : OpInterfaceRewritePattern<TilingInterface> {
   using OpInterfaceRewritePattern::OpInterfaceRewritePattern;
@@ -474,20 +633,13 @@ struct FuseTilableForallConsumers final
       }
     }
 
-    // Find a scf.forall producer among the DPS inputs.
+    // Find the FIRST forall producer among DPS inputs (matches IREE).
     scf::ForallOp forallProducer;
     for (auto operand : dpsOp.getDpsInputs()) {
       auto forallOp = operand.getDefiningOp<scf::ForallOp>();
       if (!forallOp)
         continue;
-      // Must be in the same block (not nested).
       if (forallOp->getBlock() != tilableOp->getBlock())
-        continue;
-      // FIX: Only fuse into thread-mapped foralls, not block-mapped ones.
-      // Block-mapped foralls represent workgroup-level distribution and
-      // should not have consumers fused into them (that would duplicate
-      // computation across all threads).
-      if (!isThreadMappedForall(forallOp))
         continue;
       forallProducer = forallOp;
       break;
@@ -495,68 +647,64 @@ struct FuseTilableForallConsumers final
 
     if (!forallProducer)
       return rewriter.notifyMatchFailure(
-          tilableOp, "no thread-mapped scf.forall producer to fuse into");
+          tilableOp, "no scf.forall producer to fuse into");
 
-    // Collect the parallel_insert_slice ops from the forall's terminator.
-    scf::InParallelOp parallelTerminator = forallProducer.getTerminator();
-    SmallVector<Operation *> insertSlices;
-    for (Operation &yieldingOp : parallelTerminator.getYieldingOps()) {
-      insertSlices.push_back(&yieldingOp);
-    }
-    if (insertSlices.empty())
-      return failure();
-
-    // Move the tilable consumer right after the forall producer to ensure
-    // proper dominance (other users of the forall result may be in between).
-    DominanceInfo domInfo;
+    // Move the consumer (and its backward slice) right after the producer
+    // forall to ensure dominance for tileAndFuseConsumerOfSlices.
+    // Use op->moveBefore() directly (NOT rewriter.moveOpBefore()) to avoid
+    // re-triggering patterns on the worklist (matches IREE approach).
     llvm::SetVector<Operation *> slice;
     BackwardSliceOptions opts;
+    DominanceInfo domInfo;
     opts.filter = [&](Operation *op) {
       return domInfo.properlyDominates(forallProducer.getOperation(), op);
     };
     opts.inclusive = true;
     opts.omitUsesFromAbove = false;
     opts.omitBlockArguments = true;
+
+    // Record original {op, successor} pairs for rollback on failure.
+    SmallVector<std::pair<Operation *, Operation *>> originalPositions;
     if (succeeded(getBackwardSlice(tilableOp, &slice, opts))) {
-      Block *block = forallProducer->getBlock();
-      Block::iterator insertPt =
-          std::next(forallProducer->getIterator());
-      // Move in topological order (sources first) so each op is placed
-      // after its dependencies. llvm::reverse was wrong here — it put
-      // sinks before sources, causing dominance violations.
       for (Operation *op : slice) {
+        originalPositions.push_back({op, op->getNextNode()});
+      }
+      Block *block = forallProducer->getBlock();
+      for (Operation *op : llvm::reverse(slice)) {
+        // Recompute insert point each iteration (matches IREE).
+        // After each move, std::next(forallProducer) points to
+        // the most recently moved op, giving correct topological order.
+        Block::iterator insertPt = std::next(forallProducer->getIterator());
         op->moveBefore(block, insertPt);
       }
     }
 
+    // Collect parallel_insert_slice ops from the forall terminator.
+    scf::InParallelOp parallelTerminator = forallProducer.getTerminator();
+    SmallVector<Operation *> insertSlices;
+    for (Operation &yieldingOp : parallelTerminator.getYieldingOps())
+      insertSlices.push_back(&yieldingOp);
+    if (insertSlices.empty()) {
+      for (auto &[op, successor] : originalPositions) {
+        if (successor) op->moveBefore(successor);
+        else op->moveBefore(forallProducer->getBlock(),
+                            forallProducer->getBlock()->end());
+      }
+      return failure();
+    }
+
     SmallVector<LoopLikeOpInterface> loops = {
         cast<LoopLikeOpInterface>(forallProducer.getOperation())};
-    auto fusionResult = scf::tileAndFuseConsumerOfSlices(
-        rewriter, insertSlices, loops);
-    if (failed(fusionResult))
-      return failure();
 
-    // Post-fixup: tileAndFuseConsumerOfSlices may create tensor.empty (or
-    // other ops) for fused consumer's shared_outs but place them AFTER
-    // the forall that uses them, violating dominance. Find the block
-    // from the tiled ops (forallProducer may be invalid after fusion).
-    for (Operation *tiledOp : fusionResult->tiledOps) {
-      // Walk up to the block that contains sibling foralls.
-      Operation *ancestor = tiledOp;
-      while (ancestor->getParentOp() &&
-             !isa<func::FuncOp>(ancestor->getParentOp()))
-        ancestor = ancestor->getParentOp();
-      // Now walk all blocks under this ancestor to fix dominance.
-      ancestor->walk([](scf::ForallOp forallOp) {
-        for (Value operand : forallOp->getOperands()) {
-          Operation *defOp = operand.getDefiningOp();
-          if (defOp && defOp->getBlock() == forallOp->getBlock() &&
-              !defOp->isBeforeInBlock(forallOp)) {
-            defOp->moveBefore(forallOp);
-          }
-        }
-      });
-      break; // Only need to do this once.
+    FailureOr<scf::SCFFuseConsumerOfSliceResult> fusionResult =
+        scf::tileAndFuseConsumerOfSlices(rewriter, insertSlices, loops);
+    if (failed(fusionResult)) {
+      for (auto &[op, successor] : originalPositions) {
+        if (successor) op->moveBefore(successor);
+        else op->moveBefore(forallProducer->getBlock(),
+                            forallProducer->getBlock()->end());
+      }
+      return failure();
     }
 
     return success();
@@ -602,9 +750,15 @@ struct HoistForallFromFor final : OpRewritePattern<scf::ForOp> {
     for (Operation &op : loopBody->getOperations()) {
       if (&op == forallOp.getOperation() || &op == loopBody->getTerminator())
         continue;
-      if (op.getNumRegions() != 0 || isa<TilingInterface>(&op))
+      // Reject other scf.forall or loop-like ops (we need exactly one forall
+      // to hoist).  Allow TilingInterface ops with regions (e.g. linalg.copy
+      // from shared memory promotion) — they get moved into the forall body.
+      if (isa<scf::ForallOp>(&op))
         return rewriter.notifyMatchFailure(
-            loop, "for body contains region/tilable op besides the forall");
+            loop, "for body contains another scf.forall besides the target");
+      if (isa<LoopLikeOpInterface>(&op))
+        return rewriter.notifyMatchFailure(
+            loop, "for body contains a loop-like op");
       for (Value operand : op.getOperands())
         if (operand == forIterArg)
           return rewriter.notifyMatchFailure(
@@ -781,19 +935,26 @@ struct HoistForallFromFor final : OpRewritePattern<scf::ForOp> {
         rewriter.setInsertionPointToEnd(newFor.getBody());
         scf::YieldOp::create(rewriter, loop.getLoc(),
                               parallelInsert.getSource());
-        rewriter.eraseOp(parallelInsert.getOperation());
       }
 
       // STEP G: Create the new terminator for the outer forall.
+      // Save parallelInsert metadata AFTER mergeBlocks (so values are updated)
+      // but BEFORE erasing it.
+      Location insertLoc = parallelInsert.getLoc();
+      SmallVector<OpFoldResult> insertOffsets(parallelInsert.getMixedOffsets());
+      SmallVector<OpFoldResult> insertSizes(parallelInsert.getMixedSizes());
+      SmallVector<OpFoldResult> insertStrides(parallelInsert.getMixedStrides());
+      rewriter.eraseOp(parallelInsert.getOperation());
+
       BlockArgument newForallIterArg = newForallOp.getRegionIterArgs()[0];
       rewriter.setInsertionPointToEnd(newForallOp.getTerminator().getBody());
       tensor::ParallelInsertSliceOp::create(
-          rewriter, parallelInsert.getLoc(),
+          rewriter, insertLoc,
           newFor.getResult(0),
           newForallIterArg,
-          parallelInsert.getMixedOffsets(),
-          parallelInsert.getMixedSizes(),
-          parallelInsert.getMixedStrides());
+          insertOffsets,
+          insertSizes,
+          insertStrides);
       rewriter.eraseOp(parallelTerminator);
     }
 
@@ -836,10 +997,9 @@ struct NovaGPUFuseAndHoistParallelLoopsPass
     });
 
     // -------------------------------------------------------------------
-    // Round 1: Hoist + fuse foralls
+    // Round 1: Hoist + fuse foralls (matches IREE Phase 1)
     // -------------------------------------------------------------------
     {
-      // Round 1 entry
       RewritePatternSet patterns(ctx);
       if (maybeFlatWorkgroupSize) {
         patterns.add<FuseForalls>(ctx, *maybeFlatWorkgroupSize, /*benefit=*/2);
@@ -847,36 +1007,31 @@ struct NovaGPUFuseAndHoistParallelLoopsPass
       patterns.add<FuseTilableForallConsumers>(ctx);
       patterns.add<HoistForallFromFor>(ctx);
       tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
-      tensor::populateFoldTensorEmptyPatterns(patterns);
-      scf::ForallOp::getCanonicalizationPatterns(patterns, ctx);
       if (failed(applyPatternsGreedilyWithConfig(
               funcOp, std::move(patterns), "round 1 (hoist+fuse foralls)")))
         return signalPassFailure();
-      // Round 1 done
     }
 
     // -------------------------------------------------------------------
     // Round 2: Revealed consumers / destinations
     // -------------------------------------------------------------------
     {
-      // Round 2 entry
       RewritePatternSet patterns(ctx);
       patterns.add<FuseTilableDestinationProducers>(ctx);
       patterns.add<FuseUnitLoopDestination>(ctx);
       patterns.add<FuseTilableForallConsumers>(ctx);
-      // FIX: Removed FuseExtractSliceConsumers from Round 2.
-      // The original implementation used tileAndFuseConsumerOfSlices
-      // incorrectly — it passed the tiled op (inside the forall) to
-      // replaceOp instead of the forall's new results.  IREE uses a
-      // custom fuseExtractSliceIntoProducerForall() which is not
-      // available in upstream MLIR.  Without a correct implementation,
-      // this pattern causes crashes and incorrect replacements.
+      // TODO: Enable FuseExtractSliceConsumers — needs proper source clamping
+      // (extract_slice of the parallel_insert source to match new dest sizes).
+      // IREE's clampParallelInsertSliceOp handles this but is complex.
+      // patterns.add<FuseExtractSliceConsumers>(ctx);
+      // TODO: Add FuseCollapseShapeConsumers when tests need it.
+      // IREE uses fuseCollapseShapeIntoProducerForall() which requires
+      // AffineLinearizeIndexOp (not available in Nova).
       tensor::populateFoldTensorEmptyPatterns(patterns);
       scf::ForallOp::getCanonicalizationPatterns(patterns, ctx);
       if (failed(applyPatternsGreedilyWithConfig(
               funcOp, std::move(patterns), "round 2 (consumer fusion)")))
         return signalPassFailure();
-      // Round 2 done
     }
 
     // -------------------------------------------------------------------

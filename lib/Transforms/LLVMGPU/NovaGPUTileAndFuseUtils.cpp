@@ -80,6 +80,13 @@ void fuseProducersOfSlices(RewriterBase &rewriter,
 // (operand-defining TilingInterface) and consumer (result-using TilingInterface)
 // edges. Used to scope the fusion analysis to the compute cluster around
 // the root matmul/reduction op.
+//
+// IMPORTANT: When following consumer edges, stop at contraction ops
+// (matmul, batch_matmul). Without this, sibling contractions that share a
+// producer (e.g. grad_input and grad_weight matmuls sharing a grad_output
+// fill) would be merged into the same cluster, causing both to be fused
+// into one forall. The second matmul's full-size output then materializes
+// in every block's local memory (30MB+), crashing CUDA.
 void collectTiledAndFusedOps(Operation *rootOp,
                               llvm::SmallDenseSet<Operation *> &result) {
   SmallVector<Operation *> worklist;
@@ -87,7 +94,7 @@ void collectTiledAndFusedOps(Operation *rootOp,
   result.insert(rootOp);
   while (!worklist.empty()) {
     Operation *current = worklist.pop_back_val();
-    // Collect all tilable producers.
+    // Collect all tilable producers (traverse backward unconditionally).
     for (OpOperand &operand : current->getOpOperands()) {
       Operation *producer = operand.get().getDefiningOp();
       if (!producer || !isa<TilingInterface>(producer) ||
@@ -97,15 +104,20 @@ void collectTiledAndFusedOps(Operation *rootOp,
       worklist.push_back(producer);
       result.insert(producer);
     }
-    // Collect all tilable consumers.
+    // Collect tilable consumers, but stop at contraction boundaries.
+    // Contraction ops are independent roots that should get their own forall.
     for (auto user : current->getUsers()) {
-      if (result.count(user)) {
+      if (result.count(user))
         continue;
+      if (!isa<TilingInterface>(user))
+        continue;
+      // Don't traverse into contractions — they are independent roots.
+      if (auto linalgUser = dyn_cast<linalg::LinalgOp>(user)) {
+        if (linalg::isaContractionOpInterface(linalgUser))
+          continue;
       }
-      if (isa<TilingInterface>(user)) {
-        worklist.push_back(user);
-        result.insert(user);
-      }
+      worklist.push_back(user);
+      result.insert(user);
     }
   }
 }
@@ -164,7 +176,50 @@ FailureOr<std::queue<Operation *>> fuseConsumersIntoForall(
         continue;
       }
       mlir::computeTopologicalSorting(users);
+      unsigned forallDims = currLoop.getInductionVars().size();
+      // Get forall upper bounds for dimension-wise overlap check.
+      auto forallUBs = currLoop.getStaticUpperBound();
       for (Operation *fusableUser : users) {
+        // Skip consumers whose results can't be uniquely addressed by all
+        // forall induction variables. Two cases:
+        //   1. result rank < forall dims (e.g., 2D output in 3D forall)
+        //   2. result dim[i] < forall upper_bound[i] for some i
+        //      (e.g., 8x1024x384 result in (8,1024,1536) forall — the
+        //       N IV has no matching dim, so 12 N-iterations write to the
+        //       same positions → race condition)
+        {
+          bool wouldOverlap = false;
+          for (Value result : fusableUser->getResults()) {
+            auto tensorType = dyn_cast<RankedTensorType>(result.getType());
+            if (!tensorType)
+              continue;
+            unsigned rank = tensorType.getRank();
+            if (rank < forallDims) {
+              wouldOverlap = true;
+              break;
+            }
+            // Check dimension-wise: result shape must cover forall bounds.
+            auto shape = tensorType.getShape();
+            for (unsigned i = 0; i < forallDims && i < rank; ++i) {
+              if (!ShapedType::isDynamic(shape[i]) &&
+                  !ShapedType::isDynamic(forallUBs[i]) &&
+                  shape[i] < forallUBs[i]) {
+                wouldOverlap = true;
+                break;
+              }
+            }
+            if (wouldOverlap)
+              break;
+          }
+          if (wouldOverlap) {
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[nova-tile-fuse-utils] Skipping consumer fusion: "
+                       << "result shape doesn't cover forall bounds ("
+                       << forallDims << " dims), would create overlapping "
+                       << "writes\n");
+            continue;
+          }
+        }
         // Check all operands from the `scf.forall`
         SmallVector<OpResult> loopResults;
         for (OpOperand &opOperand : fusableUser->getOpOperands()) {

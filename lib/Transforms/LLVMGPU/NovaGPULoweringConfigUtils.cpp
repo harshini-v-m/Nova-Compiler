@@ -71,6 +71,25 @@ getPromotedOperandList(DictionaryAttr config) {
   return ops;
 }
 
+std::optional<SmallVector<int64_t>>
+getPaddingList(DictionaryAttr config) {
+  if (!config)
+    return std::nullopt;
+  auto attr = config.get(kPaddingKey);
+  if (!attr)
+    return std::nullopt;
+  auto arrayAttr = dyn_cast<ArrayAttr>(attr);
+  if (!arrayAttr)
+    return std::nullopt;
+  SmallVector<int64_t> sizes;
+  for (Attribute a : arrayAttr) {
+    auto intAttr = dyn_cast<IntegerAttr>(a);
+    if (!intAttr) return std::nullopt;
+    sizes.push_back(intAttr.getInt());
+  }
+  return sizes;
+}
+
 //===----------------------------------------------------------------------===//
 // Write helpers
 //===----------------------------------------------------------------------===//
@@ -90,6 +109,14 @@ void setMmaKindRaw(MLIRContext *ctx,
   Builder b(ctx);
   attrs.emplace_back(StringAttr::get(ctx, kMmaKindKey),
                      b.getI32IntegerAttr(intrinsicValue));
+}
+
+void appendPaddingList(MLIRContext *ctx,
+                       SmallVectorImpl<NamedAttribute> &attrs,
+                       ArrayRef<int64_t> padding) {
+  Builder b(ctx);
+  attrs.emplace_back(StringAttr::get(ctx, kPaddingKey),
+                     b.getI64ArrayAttr(padding));
 }
 
 void appendPromotedOperandsList(MLIRContext *ctx,
@@ -137,7 +164,8 @@ void setMatmulLoweringConfigAttrs(Operation *op,
                                   ArrayRef<int64_t> threadTiles,
                                   ArrayRef<int64_t> subgroupTiles,
                                   int32_t mmaKindValue,
-                                  ArrayRef<int64_t> promotedOperands) {
+                                  ArrayRef<int64_t> promotedOperands,
+                                  ArrayRef<int64_t> paddingSizes) {
   SmallVector<NamedAttribute> attrs;
   setLoweringConfigTileSizes(ctx, attrs, kWorkgroupKey, workgroupTiles);
   setLoweringConfigTileSizes(ctx, attrs, kReductionKey, reductionTiles);
@@ -145,6 +173,8 @@ void setMatmulLoweringConfigAttrs(Operation *op,
   setLoweringConfigTileSizes(ctx, attrs, kSubgroupKey, subgroupTiles);
   setMmaKindRaw(ctx, attrs, mmaKindValue);
   appendPromotedOperandsList(ctx, attrs, promotedOperands);
+  if (!paddingSizes.empty())
+    appendPaddingList(ctx, attrs, paddingSizes);
   auto configDict = DictionaryAttr::get(ctx, attrs);
   setLoweringConfig(op, configDict);
 }

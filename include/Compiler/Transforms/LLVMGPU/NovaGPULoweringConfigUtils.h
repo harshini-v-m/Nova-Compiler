@@ -36,6 +36,7 @@ constexpr llvm::StringLiteral kThreadKey        = "thread";
 constexpr llvm::StringLiteral kSubgroupKey      = "subgroup";
 constexpr llvm::StringLiteral kMmaKindKey       = "mma_kind";
 constexpr llvm::StringLiteral kPromotedOpsKey   = "promoted_operands";
+constexpr llvm::StringLiteral kPaddingKey       = "padding";
 
 // Attribute name attached to linalg ops for the config dict.
 constexpr llvm::StringLiteral kLoweringConfigAttrName = "lowering_config";
@@ -74,6 +75,16 @@ void appendPromotedOperandsList(MLIRContext *ctx,
 std::optional<SmallVector<int64_t>>
 getPromotedOperandList(DictionaryAttr config);
 
+/// Read padding sizes from a LoweringConfig dict.
+/// Returns std::nullopt if the key is absent.
+std::optional<SmallVector<int64_t>>
+getPaddingList(DictionaryAttr config);
+
+/// Append padding sizes to an in-progress attrs list.
+void appendPaddingList(MLIRContext *ctx,
+                       SmallVectorImpl<NamedAttribute> &attrs,
+                       ArrayRef<int64_t> padding);
+
 //===----------------------------------------------------------------------===//
 // Op-level helpers
 //===----------------------------------------------------------------------===//
@@ -94,7 +105,8 @@ void setMatmulLoweringConfigAttrs(Operation *op,
                                   ArrayRef<int64_t> threadTiles,
                                   ArrayRef<int64_t> subgroupTiles,
                                   int32_t mmaKindValue,
-                                  ArrayRef<int64_t> promotedOperands);
+                                  ArrayRef<int64_t> promotedOperands,
+                                  ArrayRef<int64_t> paddingSizes = {});
 
 } // namespace mlir::nova
 

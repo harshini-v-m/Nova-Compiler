@@ -11,13 +11,13 @@
 // IREE equivalent: GPUInferMemorySpacePass
 //   (iree/compiler/src/iree/compiler/Codegen/Common/GPU/GPUInferMemorySpace.cpp)
 //
-// Decision rules (same as IREE):
+// Decision rules (aligned with IREE's 2-way classification):
 //   1. If the alloc already has memory_space = private or workgroup → keep it.
 //   2. If all users of the alloc are thread-mapped scf.forall ops (i.e., the
 //      alloc is a shared_outs init) → workgroup (shared) memory.
-//   3. If the alloc is defined at function body level AND a user is a
-//      workgroup-level scf.forall → leave without space (global memory).
-//   4. Otherwise → private (register) memory.
+//   3. Otherwise → private (register) memory.
+//      Note: function-scope private allocs are demoted to global memref.alloc
+//      by the allocation function in NovaGPUBufferize.cpp (defence-in-depth).
 //
 //===----------------------------------------------------------------------===//
 
@@ -42,14 +42,14 @@ static bool hasThreadMapping(scf::ForallOp forall) {
   });
 }
 
-/// Returns true if the given scf.forall has a block-level mapping attribute
-/// (i.e., a workgroup-level distribution loop).
-static bool isWorkgroupForall(scf::ForallOp forall) {
-  if (!forall.getMapping().has_value())
-    return false;
-  return llvm::any_of(*forall.getMapping(), [](Attribute attr) {
-    return isa<gpu::GPUBlockMappingAttr>(attr);
-  });
+
+/// Returns true if the alloc_tensor is inside an scf.if region and its result
+/// (possibly through intermediate ops) flows to the scf.yield of that region.
+/// Such allocs are padding placeholders — their memory space must be left
+/// unset so that bufferization can infer a consistent space from context
+/// (avoiding "inconsistent memory space on then/else branches" errors).
+static bool isInsideScfIfBranch(bufferization::AllocTensorOp alloc) {
+  return alloc->getParentOfType<scf::IfOp>() != nullptr;
 }
 
 // CORE LOGIC — Returns true when `alloc` is definitely shared memory.
@@ -72,29 +72,6 @@ static bool isDefinitelyShared(bufferization::AllocTensorOp alloc) {
   return true;
 }
 
-// CORE LOGIC — Returns true when `alloc` is used across workgroup boundaries.
-//
-// Such buffers must live in global memory (no address space tag), so that the
-// GPU runtime can pass them between host allocations and kernels.
-// A buffer is cross-workgroup if:
-//   - It is defined at the function body level (not inside any forall/launch).
-//   - At least one user is a workgroup-level scf.forall (it is passed as
-//     shared_outs init for workgroup distribution).
-static bool isCrossWorkgroupUsed(bufferization::AllocTensorOp alloc) {
-  // If defined inside a forall, it's local to that scope.
-  auto parentForall = alloc->getParentOfType<scf::ForallOp>();
-  if (parentForall)
-    return false;
-
-  // Check if any user is a workgroup-level forall.
-  for (auto *user : alloc->getUsers()) {
-    if (auto forallOp = dyn_cast<scf::ForallOp>(user)) {
-      if (isWorkgroupForall(forallOp))
-        return true;
-    }
-  }
-  return false;
-}
 
 struct NovaGPUInferMemorySpacePass
     : public PassWrapper<NovaGPUInferMemorySpacePass,
@@ -131,12 +108,15 @@ struct NovaGPUInferMemorySpacePass
         return;
       }
 
-      // Infer based on usage pattern.
+      // Skip allocs inside scf.if branches — these are padding placeholders
+      // whose memory space must match the other branch. Leaving them unset
+      // lets bufferization infer a consistent space from context.
+      if (isInsideScfIfBranch(alloc))
+        return;
+
+      // Infer based on usage pattern (2-way: shared or private).
       if (isDefinitelyShared(alloc)) {
         alloc.setMemorySpaceAttr(workgroupSpace);
-      } else if (isCrossWorkgroupUsed(alloc)) {
-        // Cross-workgroup buffer: leave without memory space (global memory).
-        // The allocation function will emit a plain memref.alloc.
       } else {
         alloc.setMemorySpaceAttr(privateSpace);
       }

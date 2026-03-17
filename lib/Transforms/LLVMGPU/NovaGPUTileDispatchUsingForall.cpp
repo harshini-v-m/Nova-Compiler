@@ -14,14 +14,19 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "nova-tile-dispatch"
 
 using namespace mlir;
 
 namespace mlir::nova {
 
-// --- Utility Functions ---
+//===----------------------------------------------------------------------===//
+// Utility Functions
+//===----------------------------------------------------------------------===//
 
-/// Returns true if the operation is a compute operation (implements TilingInterface).
+/// Returns true if the operation implements TilingInterface.
 static bool isComputeOp(Operation *op) {
   return isa<TilingInterface>(op);
 }
@@ -32,7 +37,7 @@ static bool isContractionOp(Operation *op) {
   return linalgOp && linalg::isaContractionOpInterface(linalgOp);
 }
 
-/// Returns true if the op is already inside any scf.forall distribution loop.
+/// Returns true if the op is inside a scf.forall with GPU block mapping.
 static bool isInsideWorkgroupForall(Operation *op) {
   auto parent = op->getParentOfType<scf::ForallOp>();
   while (parent) {
@@ -51,49 +56,46 @@ static bool isInsideWorkgroupForall(Operation *op) {
 static SmallVector<Operation *> getComputeOps(func::FuncOp funcOp) {
   SmallVector<Operation *> computeOps;
   funcOp.walk([&](Operation *op) {
-    if (isComputeOp(op)) {
+    if (isComputeOp(op))
       computeOps.push_back(op);
-    }
   });
   return computeOps;
 }
 
-/// Returns true if it is allowed to leave the `op` outside distribution loops.
-/// E.g., linalg.pack op can only be fused as a consumer in perfect tiling scenario.
+/// Returns true if it is allowed to leave the op outside distribution loops.
 static bool isAllowedToFailOnConsumerFusion(Operation *op) {
   return isa<linalg::PackOp>(op);
 }
 
-/// Returns true if all the compute ops are within scf.forall distribution
-/// loops, except the ops that are allowed to stay outside.
+/// Returns true if all compute ops are within scf.forall distribution loops.
 static bool verifyComputeOpsAfterDistribution(func::FuncOp funcOp) {
   WalkResult res = funcOp.walk<WalkOrder::PreOrder>([&](Operation *op) {
-    if (isa<scf::ForallOp>(op) || !isComputeOp(op)) {
+    if (isa<scf::ForallOp>(op) || !isComputeOp(op))
       return WalkResult::skip();
-    }
-    if (!isAllowedToFailOnConsumerFusion(op)) {
+    if (!isAllowedToFailOnConsumerFusion(op))
       return WalkResult::interrupt();
-    }
     return WalkResult::advance();
   });
   return !res.wasInterrupted();
 }
 
 /// Returns true if any value produced by `producer` is used as an init value
-/// for the DPS `user`. Returns false if the user is not in DPS.
+/// for the DPS `user`.
 static bool isUsedAsInit(Operation *producer, Operation *user) {
   auto dpsIface = dyn_cast<DestinationStyleOpInterface>(user);
-  if (!dpsIface) {
+  if (!dpsIface)
     return false;
-  }
   ValueRange results = producer->getResults();
   return llvm::any_of(dpsIface.getDpsInits(), [&](Value operand) {
     return llvm::is_contained(results, operand);
   });
 }
 
-static SmallVector<Attribute> getMapping(MLIRContext *context, ArrayRef<OpFoldResult> tileSizes) {
-  // Count non-zero tile dimensions.
+/// Creates GPU block mapping attributes for non-zero tile dimensions.
+/// For ≤3 active dims: uses DimX/DimY/DimZ (innermost first).
+/// For >3 active dims: uses LinearDim0..N (innermost first, reversed).
+static SmallVector<Attribute> getMapping(MLIRContext *context,
+                                          ArrayRef<OpFoldResult> tileSizes) {
   int numActiveDims = 0;
   for (auto tileSize : tileSizes) {
     std::optional<int64_t> cst = getConstantIntValue(tileSize);
@@ -104,8 +106,6 @@ static SmallVector<Attribute> getMapping(MLIRContext *context, ArrayRef<OpFoldRe
   SmallVector<Attribute> mapping;
 
   if (numActiveDims > 3) {
-    // >3 active dimensions: use linear block mapping (linearizes all dims).
-    // IREE uses this approach for high-dimensional ops.
     unsigned idx = 0;
     for (auto tileSize : tileSizes) {
       std::optional<int64_t> cst = getConstantIntValue(tileSize);
@@ -116,145 +116,129 @@ static SmallVector<Attribute> getMapping(MLIRContext *context, ArrayRef<OpFoldRe
       mapping.push_back(gpu::GPUBlockMappingAttr::get(
           context, static_cast<gpu::MappingId>(mappingId)));
     }
-    // IREE reverses so innermost dim gets LinearDim0.
     return llvm::to_vector(llvm::reverse(mapping));
   }
 
   // ≤3 active dimensions: use 3D block mapping (x, y, z).
-  // Iterate in reverse: Inner loop -> Block X, Next -> Block Y, Next -> Block Z
   int dim = 0;
   for (auto tileSize : llvm::reverse(tileSizes)) {
-      std::optional<int64_t> cst = getConstantIntValue(tileSize);
-      if (cst && *cst == 0) continue; // Skip size 0 tiles
-
-      switch (dim) {
-          case 0: mapping.push_back(gpu::GPUBlockMappingAttr::get(context, gpu::MappingId::DimX)); break;
-          case 1: mapping.push_back(gpu::GPUBlockMappingAttr::get(context, gpu::MappingId::DimY)); break;
-          case 2: mapping.push_back(gpu::GPUBlockMappingAttr::get(context, gpu::MappingId::DimZ)); break;
-          default: break;
-      }
-      dim++;
+    std::optional<int64_t> cst = getConstantIntValue(tileSize);
+    if (cst && *cst == 0)
+      continue;
+    switch (dim) {
+    case 0:
+      mapping.push_back(gpu::GPUBlockMappingAttr::get(
+          context, gpu::MappingId::DimX));
+      break;
+    case 1:
+      mapping.push_back(gpu::GPUBlockMappingAttr::get(
+          context, gpu::MappingId::DimY));
+      break;
+    case 2:
+      mapping.push_back(gpu::GPUBlockMappingAttr::get(
+          context, gpu::MappingId::DimZ));
+      break;
+    default:
+      break;
+    }
+    dim++;
   }
-  // Reverse back to match loop order
   return llvm::to_vector(llvm::reverse(mapping));
 }
 
-/// Checks whether we have static dimension for all the loop bounds and steps.
-static bool areAllStaticLoopBounds(scf::ForallOp forallOp) {
-  for (auto [lb, ub, step] : llvm::zip_equal(forallOp.getMixedLowerBound(),
-                                             forallOp.getMixedUpperBound(),
-                                             forallOp.getMixedStep())) {
-    if (!getConstantIntValue(lb) || !getConstantIntValue(ub) || !getConstantIntValue(step)) {
-      return false;
-    }
-  }
-  return true;
-}
+//===----------------------------------------------------------------------===//
+// Tiling info extraction
+//===----------------------------------------------------------------------===//
 
 struct TilingInfo {
   Operation *tilableOp;
   SmallVector<OpFoldResult> tileSizes;
-  SmallVector<int64_t> interchange;  // TODO: Implement loop interchange support (see missing_functionality_analysis.md #7)
 };
 
-static FailureOr<TilingInfo> getTiledAndDistributionInfo(RewriterBase &rewriter,
-                                                          Operation *op) {
+/// Reads workgroup tile sizes from the lowering_config attribute.
+/// Zeros out reduction dims (workgroup tiling is parallel-only).
+/// Applies full-tile optimization (zero tile when loopSize == tileSize).
+static FailureOr<TilingInfo> getTiledAndDistributionInfo(
+    RewriterBase &rewriter, Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
-  if (!linalgOp) return failure();
+  if (!linalgOp)
+    return failure();
 
   int numLoops = linalgOp.getNumLoops();
   SmallVector<OpFoldResult> tileSizes(numLoops, rewriter.getIndexAttr(0));
 
-  // Try to read workgroup tile sizes from the lowering_config attribute
-  // stamped by NovaGPUSelectLoweringStrategy. This avoids hardcoded tile sizes.
-  bool usedConfig = false;
-  if (auto config = getLoweringConfig(op)) {
-    SmallVector<int64_t> wgTiles =
-        getLoweringConfigTileSizes(config, kWorkgroupKey);
-    if (wgTiles.size() == static_cast<size_t>(numLoops)) {
-      for (int i = 0; i < numLoops; ++i)
-        tileSizes[i] = rewriter.getIndexAttr(wgTiles[i]);
-      usedConfig = true;
-    }
-  }
+  // Read workgroup tile sizes from lowering_config.
+  auto config = getLoweringConfig(op);
+  if (!config)
+    return failure(); // No config → can't tile.
 
-  if (!usedConfig) {
-    // Heuristic fallback: tile parallel dims to 128, batch to 1, reduction to 0.
-    int parallelDimCount = 0;
-    for (int i = numLoops - 1; i >= 0; --i) {
-      if (!linalg::isParallelIterator(linalgOp.getIteratorTypesArray()[i]))
-        continue;
-      if (parallelDimCount < 2)
-        tileSizes[i] = rewriter.getIndexAttr(128);
-      else
-        tileSizes[i] = rewriter.getIndexAttr(1);   // Batch -> BlockZ
-      ++parallelDimCount;
-    }
-  }
+  SmallVector<int64_t> wgTiles =
+      getLoweringConfigTileSizes(config, kWorkgroupKey);
+  if (wgTiles.size() != static_cast<size_t>(numLoops))
+    return failure();
+
+  for (int i = 0; i < numLoops; ++i)
+    tileSizes[i] = rewriter.getIndexAttr(wgTiles[i]);
 
   // Zero out non-parallel (reduction) dims at workgroup level.
-  // Workgroup distribution is only for parallel dimensions.
   for (int i = 0; i < numLoops; ++i) {
     if (!linalg::isParallelIterator(linalgOp.getIteratorTypesArray()[i]))
       tileSizes[i] = rewriter.getIndexAttr(0);
   }
 
   // Full-tile optimization: zero tile size when staticLoopSize == tileSize.
-  // This prevents single-trip scf.forall loops, which can block cleanup patterns.
-  // Keep at least one non-zero tile size so the forall loop is still created.
-  //
-  // EXCEPTION: Skip for ops with reduction iterators. These ops MUST stay
-  // inside a block-mapped forall so they get lowered to GPU kernels. A
-  // single-trip forall is fine — the kernel launches 1 block for the parallel
-  // dim while the reduction runs inside the kernel body.
-  {
-    bool hasReductionIter = false;
-    if (auto lg = dyn_cast<linalg::LinalgOp>(op)) {
-      hasReductionIter = llvm::any_of(lg.getIteratorTypesArray(),
-                                       linalg::isReductionIterator);
+  // Prevents single-trip scf.forall loops that block cleanup patterns.
+  // Keep at least one non-zero tile so the forall loop is created.
+  // Exception: ops with reduction iterators must stay in a forall for GPU.
+  bool hasReductionIter = llvm::any_of(linalgOp.getIteratorTypesArray(),
+                                        linalg::isReductionIterator);
+  if (!hasReductionIter) {
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPoint(op);
+    auto tilingIface = cast<TilingInterface>(op);
+    SmallVector<Range> bounds = tilingIface.getIterationDomain(rewriter);
+
+    int numNonZero = 0;
+    for (auto &ts : tileSizes) {
+      if (auto cst = getConstantIntValue(ts))
+        if (*cst != 0)
+          ++numNonZero;
     }
 
-    if (!hasReductionIter) {
-      OpBuilder::InsertionGuard g(rewriter);
-      rewriter.setInsertionPoint(op);
-      auto tilingIface = cast<TilingInterface>(op);
-      SmallVector<Range> bounds = tilingIface.getIterationDomain(rewriter);
-
-      // Count current non-zero tile sizes.
-      int numNonZero = 0;
-      for (auto &ts : tileSizes) {
-        if (auto cst = getConstantIntValue(ts))
-          if (*cst != 0) ++numNonZero;
-      }
-
-      // Zero out full-tile dims from innermost outward, keeping at least 1.
-      for (int i = (int)tileSizes.size() - 1; i >= 0; --i) {
-        if (numNonZero <= 1) break;
-        auto tsCst = getConstantIntValue(tileSizes[i]);
-        if (!tsCst || *tsCst == 0) continue;
-        if (i >= (int)bounds.size()) continue;
-        auto boundCst = getConstantIntValue(bounds[i].size);
-        if (boundCst && *boundCst == *tsCst) {
-          tileSizes[i] = rewriter.getIndexAttr(0);
-          --numNonZero;
-        }
+    for (int i = (int)tileSizes.size() - 1; i >= 0; --i) {
+      if (numNonZero <= 1)
+        break;
+      auto tsCst = getConstantIntValue(tileSizes[i]);
+      if (!tsCst || *tsCst == 0)
+        continue;
+      if (i >= (int)bounds.size())
+        continue;
+      auto boundCst = getConstantIntValue(bounds[i].size);
+      if (boundCst && *boundCst == *tsCst) {
+        tileSizes[i] = rewriter.getIndexAttr(0);
+        --numNonZero;
       }
     }
   }
 
-  return TilingInfo{op, tileSizes, {}};
+  return TilingInfo{op, tileSizes, };
 }
 
-// --- Main Pass ---
+//===----------------------------------------------------------------------===//
+// Main Pass
+//===----------------------------------------------------------------------===//
 
-struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass, OperationPass<func::FuncOp>> {
+struct NovaTileAndDistributePass
+    : public PassWrapper<NovaTileAndDistributePass,
+                         OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaTileAndDistributePass)
 
   NovaTileAndDistributePass() = default;
-  NovaTileAndDistributePass(const NovaTileAndDistributePass &pass) : PassWrapper(pass) {}
+  NovaTileAndDistributePass(const NovaTileAndDistributePass &pass)
+      : PassWrapper(pass) {}
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<gpu::GPUDialect, scf::SCFDialect, linalg::LinalgDialect, 
+    registry.insert<gpu::GPUDialect, scf::SCFDialect, linalg::LinalgDialect,
                     tensor::TensorDialect, affine::AffineDialect>();
   }
 
@@ -262,40 +246,65 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
     func::FuncOp funcOp = getOperation();
     IRRewriter rewriter(&getContext());
 
-    // =========================================================================
-    // Two-pass tiling strategy (mirrors IREE's dispatch formation):
+    // =====================================================================
+    // Two-phase tiling strategy (simplified from previous 3-pass):
     //
-    // Pass 1: Tile contraction ops (matmuls) in FORWARD order. After tiling
-    //         each matmul, fuse downstream elementwise consumers (bias, relu)
-    //         as epilogues. This gives: matmul+bias+relu per kernel.
+    // Phase 1: Tile all ops that have a lowering_config attribute.
+    //          Process in reverse order (innermost compute first) so that
+    //          producer fusion pulls upstream ops into the tile loop.
+    //          Consumer fusion pulls downstream epilogues (bias, relu).
     //
-    // Pass 2: Tile any remaining unfused compute ops (standalone elementwise
-    //         ops that are not consumers of any matmul).
-    //
-    // Previously we iterated in REVERSE, which caused elementwise ops between
-    // two matmuls (relu1 between matmul1 and matmul2) to be fused as
-    // PRODUCERS of the later matmul — causing redundant recomputation.
-    // =========================================================================
+    // Phase 2: Wrap any remaining un-distributed compute ops in a
+    //          single-block scf.forall (for full-reduction chains that
+    //          have all-zero workgroup tiles).
+    // =====================================================================
 
     llvm::SmallPtrSet<Operation *, 16> handledOps;
 
-    // --- Helper lambda: tile a root op, fuse producers + consumers -----------
-    // Returns failure() on error. Sets didTile=true if tiling actually happened,
-    // false if the op was skipped (not a LinalgOp, etc.).
-    auto tileRoot = [&](Operation *rootOp, bool &didTile) -> LogicalResult {
+    // --- Helper: tile a root op with producer + optional consumer fusion ----
+    // When doConsumerFusion=false, only producer fusion happens. This is used
+    // for contractions: we tile ALL contractions first (without consumer
+    // fusion), then do consumer fusion in a separate pass. This prevents
+    // tileAndFuseConsumerOfSlices from dragging sibling contractions into
+    // the forall (the MLIR utility moves intervening ops between the forall
+    // and the consumer into the forall body).
+    auto tileRoot = [&](Operation *rootOp, bool &didTile,
+                        bool doConsumerFusion = true) -> LogicalResult {
       didTile = false;
       if (handledOps.count(rootOp))
         return success();
-      // 2. Info
+
       auto infoOr = getTiledAndDistributionInfo(rewriter, rootOp);
       if (failed(infoOr))
-        return success(); // skip non-tilable ops gracefully
+        return success(); // Skip non-tilable ops gracefully.
       TilingInfo info = *infoOr;
+
+      // Check if all tile sizes are zero (full reduction, no parallel dims).
+      // These are handled by Phase 2.
+      bool allZero = true;
+      for (auto &ts : info.tileSizes) {
+        if (auto cst = getConstantIntValue(ts)) {
+          if (*cst != 0) {
+            allZero = false;
+            break;
+          }
+        } else {
+          allZero = false;
+          break;
+        }
+      }
+      if (allZero)
+        return success(); // Defer to Phase 2.
+
       auto tilingInterface = cast<TilingInterface>(rootOp);
 
-      // 2b. Collect Fusion Cluster
+      // Collect fusion cluster.
       llvm::SmallDenseSet<Operation *> tiledAndFusedOps;
       collectTiledAndFusedOps(rootOp, tiledAndFusedOps);
+
+      LLVM_DEBUG(llvm::dbgs() << "[nova-tile-dispatch] Root: "
+                             << rootOp->getName()
+                             << " cluster=" << tiledAndFusedOps.size() << "\n");
 
       DominanceInfo dominanceInfo(rootOp);
       llvm::DenseSet<Operation *> yieldReplacementsFor;
@@ -310,14 +319,14 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
         }
       }
 
-      // 3. Configure Options
+      // Configure tiling options.
       scf::SCFTilingOptions tilingOptions;
       tilingOptions.setTileSizes(info.tileSizes);
       auto mapping = getMapping(&getContext(), info.tileSizes);
       tilingOptions.setMapping(mapping);
       tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
 
-      // 4. Fusion Options
+      // Fusion control: fuse producers except pad ops and contractions.
       scf::SCFTileAndFuseOptions tileAndFuseOptions;
       tileAndFuseOptions.setTilingOptions(tilingOptions);
 
@@ -326,9 +335,10 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
               bool isDest)
               -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
             Operation *producerOp = producer.getOwner();
+            // Don't fuse pad ops into the workgroup loop.
             if (isa<tensor::PadOp>(producerOp))
               return std::nullopt;
-            // Block contraction fusion — GEMMs stay as independent roots.
+            // Contractions stay as independent roots.
             if (isContractionOp(producerOp))
               return std::nullopt;
             bool yieldProducerReplacement =
@@ -337,7 +347,7 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
                 yieldProducerReplacement};
           });
 
-      // 5. Cleanup Patterns
+      // Cleanup patterns.
       RewritePatternSet cleanupPatterns(&getContext());
       tensor::ExtractSliceOp::getCanonicalizationPatterns(cleanupPatterns,
                                                          &getContext());
@@ -350,7 +360,7 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       tileAndFuseOptions.cleanupPatterns =
           FrozenRewritePatternSet(std::move(cleanupPatterns));
 
-      // 6. Execute Tile & Fuse (Producer Fusion)
+      // Execute tile & fuse.
       FailureOr<scf::SCFTileAndFuseResult> result;
       if (rootOp->getNumResults() > 0) {
         result = scf::tileConsumerAndFuseProducersUsingSCF(
@@ -367,14 +377,13 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       if (succeeded(result)) {
         didTile = true;
         handledOps.insert(rootOp);
-        for (auto op : result->tiledAndFusedOps) {
+        for (auto op : result->tiledAndFusedOps)
           handledOps.insert(op);
-        }
       } else {
         return failure();
       }
 
-      // Replace results (with dominance check)
+      // Replace results (with dominance check).
       for (auto [origValue, replacement] : result->replacements) {
         Value replacementCopy = replacement;
         rewriter.replaceUsesWithIf(
@@ -385,344 +394,238 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
             });
       }
 
-      // 7. Execute Consumer Fusion (epilogue: bias, relu, etc.)
-      SmallVector<LoopLikeOpInterface> loops = result->loops;
-      if (!result->tiledAndFusedOps.empty() && !loops.empty()) {
-        FailureOr<std::queue<Operation *>> newFusionOpportunities =
-            fuseConsumersIntoForall(
-                rewriter, result->tiledAndFusedOps.getArrayRef(), loops,
-                [&](Operation *op) {
-                  // Only fuse non-contraction consumers. Contraction ops
-                  // (matmuls) must remain independent roots — fusing them
-                  // as consumers would collapse all layers into one forall.
-                  if (isContractionOp(op))
-                    return false;
-                  // Do NOT fuse full-reduction consumers (all reduction
-                  // iterators, no parallel dims). They need the FULL
-                  // producer output, not one tile per block. Fusing them
-                  // causes all blocks to race on the same scalar accumulator.
-                  if (auto lg = dyn_cast<linalg::LinalgOp>(op)) {
-                    auto iters = lg.getIteratorTypesArray();
-                    if (!iters.empty() &&
-                        !llvm::any_of(iters, linalg::isParallelIterator) &&
-                        llvm::any_of(iters, linalg::isReductionIterator))
+      // Consumer fusion (epilogue: bias, relu, etc.).
+      // Skipped for contractions in Phase 1a — deferred to Phase 1a-2 after
+      // all contractions are tiled (prevents dragging sibling contractions).
+      if (doConsumerFusion) {
+        SmallVector<LoopLikeOpInterface> loops = result->loops;
+        if (!result->tiledAndFusedOps.empty() && !loops.empty()) {
+          FailureOr<std::queue<Operation *>> newFusionOpportunities =
+              fuseConsumersIntoForall(
+                  rewriter, result->tiledAndFusedOps.getArrayRef(), loops,
+                  [&](Operation *op) {
+                    if (isContractionOp(op))
                       return false;
-                  }
-                  return tiledAndFusedOps.contains(op);
-                });
-        if (succeeded(newFusionOpportunities)) {
-          fuseProducersOfSlices(rewriter, *newFusionOpportunities,
-                               tileAndFuseOptions, loops);
+                    return tiledAndFusedOps.contains(op);
+                  });
+          if (succeeded(newFusionOpportunities)) {
+            fuseProducersOfSlices(rewriter, *newFusionOpportunities,
+                                 tileAndFuseOptions, loops);
+          }
         }
       }
       return success();
     };
 
-    // --- Pass 1: Tile contraction ops (matmuls) in forward order -------------
-    // Consumer fusion will pull bias+relu into each matmul's forall.
-    // Re-collect after each matmul tile because consumer fusion may delete
-    // downstream elementwise ops that were in the snapshot list.
-    // Safe pattern: collect fresh list at top of each while iteration, then
-    // process exactly ONE untiled matmul per outer loop.
+    // --- Phase 1a: Tile contraction ops (matmul) first ----
+    // For each contraction, check if consumer fusion is safe: no untiled
+    // contractions sit between the forall and its consumers in IR order.
+    // If safe, fuse consumers immediately (e.g. bias+relu epilogue).
+    // If unsafe (sibling contraction intervenes), defer to Phase 1a-2.
     {
       bool foundOne = true;
       while (foundOne) {
         foundOne = false;
         SmallVector<Operation *> computeOps = getComputeOps(funcOp);
         for (Operation *rootOp : computeOps) {
-          if (!isContractionOp(rootOp))
-            continue;
           if (isInsideWorkgroupForall(rootOp))
             continue;
           if (handledOps.count(rootOp))
             continue;
+          if (!getLoweringConfig(rootOp))
+            continue;
+          if (!isContractionOp(rootOp))
+            continue;
+
+          // Check if consumer fusion is safe: walk ops in the parent block
+          // after rootOp. If we reach a consumer of rootOp's results before
+          // hitting an untiled contraction, it's safe to fuse consumers.
+          // If an untiled contraction appears first, defer consumer fusion.
+          bool safeForConsumerFusion = true;
+          Block *parentBlock = rootOp->getBlock();
+          if (parentBlock) {
+            // Collect rootOp's result users (potential consumers).
+            llvm::SmallPtrSet<Operation *, 8> consumers;
+            for (Value result : rootOp->getResults()) {
+              for (Operation *user : result.getUsers()) {
+                if (user != rootOp)
+                  consumers.insert(user);
+              }
+            }
+            // Walk forward from rootOp in the block.
+            bool foundConsumerFirst = false;
+            bool foundContractionFirst = false;
+            for (auto it = std::next(rootOp->getIterator()),
+                      end = parentBlock->end();
+                 it != end; ++it) {
+              Operation *op = &*it;
+              if (consumers.contains(op)) {
+                foundConsumerFirst = true;
+                break;
+              }
+              if (isContractionOp(op) && !isInsideWorkgroupForall(op) &&
+                  !handledOps.count(op)) {
+                foundContractionFirst = true;
+                break;
+              }
+            }
+            // Unsafe only when an untiled contraction appears before any
+            // consumer — the MLIR consumer fusion utility would drag it in.
+            if (foundContractionFirst && !foundConsumerFirst)
+              safeForConsumerFusion = false;
+          }
+
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[nova-tile-dispatch] Phase 1a: tiling contraction "
+                     << rootOp->getName()
+                     << " consumerFusion="
+                     << (safeForConsumerFusion ? "immediate" : "deferred")
+                     << "\n");
+
           bool didTile = false;
-          if (failed(tileRoot(rootOp, didTile))) {
+          if (failed(tileRoot(rootOp, didTile,
+                              /*doConsumerFusion=*/safeForConsumerFusion))) {
             signalPassFailure();
             return;
           }
           if (didTile) {
-            foundOne = true; // Processed one; re-collect at top of while.
-            break;
+            foundOne = true;
+            break; // Re-collect.
           }
-          // Even if it didn't tile (skipped), mark it handled to avoid infinite loop
           handledOps.insert(rootOp);
         }
       }
     }
 
-    // --- Helper: check if an op is part of a full-reduction chain -----------
-    // Full reductions (all reduction iterators, no parallel dims) are wrapped
-    // by Pass 3 together with their producer and consumer chains. If an op
-    // transitively feeds OR consumes a full-reduction op, skip it in Pass 2
-    // so the entire chain stays untiled for Pass 3 to wrap into one GPU kernel.
-    auto isFullReductionOp = [](Operation *op) -> bool {
-      if (auto lg = dyn_cast<linalg::LinalgOp>(op)) {
-        auto iters = lg.getIteratorTypesArray();
-        return !iters.empty() &&
-               !llvm::any_of(iters, linalg::isParallelIterator) &&
-               llvm::any_of(iters, linalg::isReductionIterator);
-      }
-      return false;
-    };
-    auto isInFullReductionChain = [&](Operation *op) -> bool {
-      // Check transitive consumers for a full-reduction op.
-      {
-        SmallVector<Operation *> worklist;
-        llvm::SmallPtrSet<Operation *, 16> visited;
-        for (auto user : op->getUsers())
-          worklist.push_back(user);
-        while (!worklist.empty()) {
-          Operation *curr = worklist.pop_back_val();
-          if (!visited.insert(curr).second)
-            continue;
-          if (isFullReductionOp(curr))
-            return true;
-          for (auto user : curr->getUsers())
-            worklist.push_back(user);
-        }
-      }
-      // Check transitive producers for a full-reduction op.
-      {
-        SmallVector<Operation *> worklist;
-        llvm::SmallPtrSet<Operation *, 16> visited;
-        for (Value operand : op->getOperands()) {
-          if (auto defOp = operand.getDefiningOp())
-            worklist.push_back(defOp);
-        }
-        while (!worklist.empty()) {
-          Operation *curr = worklist.pop_back_val();
-          if (!visited.insert(curr).second)
-            continue;
-          if (isFullReductionOp(curr))
-            return true;
-          for (Value operand : curr->getOperands()) {
-            if (auto defOp = operand.getDefiningOp())
-              worklist.push_back(defOp);
-          }
-        }
-      }
-      return false;
-    };
-
-    // --- Pass 2: Tile remaining unfused elementwise ops (REVERSE order) ------
-    // Mirrors IREE's tileConsumerAndFuseProducersUsingSCF contract:
-    //   - Tile the LAST (sink) op in a chain as the "consumer/root".
-    //   - Let producer fusion (inside tileConsumerAndFuseProducersUsingSCF)
-    //     pull all chained producers up into the same scf.forall.
-    //
-    // This avoids the consumer fusion path entirely for elementwise chains,
-    // eliminating the stale-tiledAndFusedOps iterator-invalidation bug.
+    // --- Phase 1a-2: Deferred consumer fusion for contraction foralls ----
+    // For contractions where consumer fusion was deferred (unsafe due to
+    // sibling contractions), now that all contractions are in their own
+    // foralls, consumer fusion can safely fuse epilogues.
     {
-      SmallVector<Operation *> remainingOps = getComputeOps(funcOp);
-      // Process in REVERSE so the last (sink) op is tiled first.
-      for (Operation *rootOp : llvm::reverse(remainingOps)) {
-        if (isInsideWorkgroupForall(rootOp))
-          continue;
-        // Skip ops that are part of a full-reduction chain (feed OR consume).
-        // These will be wrapped together with the reduction in Pass 3.
-        if (isInFullReductionChain(rootOp))
-          continue;
-        // Only tile each "sink": skip if this op's result feeds another
-        // untiled compute op (it will be fused as a producer of that op).
-        bool hasTilableConsumer = llvm::any_of(rootOp->getUsers(), [](Operation *user) {
-          return isa<TilingInterface>(user);
-        });
-        // If this op has a tilable consumer that is still outside a forall,
-        // defer it — it will be fused as a producer when that consumer is tiled.
-        if (hasTilableConsumer) {
-          bool consumerPending = llvm::any_of(rootOp->getUsers(), [](Operation *user) {
-            return isa<TilingInterface>(user) && !user->getParentOfType<scf::ForallOp>();
-          });
-          if (consumerPending)
-            continue;
-        }
-        bool didTile = false;
-        if (failed(tileRoot(rootOp, didTile))) {
-          signalPassFailure();
+      SmallVector<scf::ForallOp> contractionForalls;
+      funcOp.walk([&](scf::ForallOp forall) {
+        auto mapping = forall.getMappingAttr();
+        if (!mapping || !llvm::any_of(mapping.getValue(), [](Attribute attr) {
+              return isa<gpu::GPUBlockMappingAttr>(attr);
+            }))
           return;
+        bool hasContraction = false;
+        forall.walk([&](linalg::LinalgOp linalgOp) {
+          if (linalg::isaContractionOpInterface(linalgOp))
+            hasContraction = true;
+        });
+        if (hasContraction)
+          contractionForalls.push_back(forall);
+      });
+
+      for (auto forall : contractionForalls) {
+        // Check if this forall already has non-contraction consumers fused.
+        // If so, consumer fusion was already done in Phase 1a (safe path).
+        bool hasEpilogue = false;
+        forall.walk([&](Operation *op) {
+          if (isa<TilingInterface>(op) && !isContractionOp(op))
+            hasEpilogue = true;
+        });
+        if (hasEpilogue)
+          continue; // Already fused in Phase 1a.
+
+        SmallVector<Operation *> tiledOps;
+        forall.walk([&](Operation *op) {
+          if (isa<TilingInterface>(op))
+            tiledOps.push_back(op);
+        });
+        if (tiledOps.empty())
+          continue;
+
+        SmallVector<LoopLikeOpInterface> loops = {
+            cast<LoopLikeOpInterface>(forall.getOperation())};
+
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[nova-tile-dispatch] Phase 1a-2: deferred consumer "
+                   << "fusion for contraction forall\n");
+
+        FailureOr<std::queue<Operation *>> newFusionOpportunities =
+            fuseConsumersIntoForall(
+                rewriter, tiledOps, loops,
+                [&](Operation *op) {
+                  if (isContractionOp(op))
+                    return false;
+                  return isa<TilingInterface>(op);
+                });
+
+        if (succeeded(newFusionOpportunities) &&
+            !newFusionOpportunities->empty()) {
+          scf::SCFTileAndFuseOptions fakeOptions;
+          fakeOptions.setFusionControlFn(
+              [](tensor::ExtractSliceOp, OpResult, bool)
+                  -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+                return scf::SCFTileAndFuseOptions::ControlFnResult{false};
+              });
+          fuseProducersOfSlices(rewriter, *newFusionOpportunities,
+                               fakeOptions, loops);
         }
       }
     }
-    
-    // --- Pass 3: Wrap remaining un-distributed ops in single-block forall ---
-    // Full reductions (all reduction iterators, no parallel dims) and their
-    // consumer chains have all-zero workgroup tiles and are not tiled by
-    // Pass 1 or Pass 2. We find the "sink" op (last in chain) and wrap the
-    // entire producer/consumer chain in a 1-trip scf.forall with block mapping
-    // so they become single-block GPU kernels.
+
+    // --- Phase 1b: Tile remaining ops with lowering_config in reverse order -
+    // Non-contraction roots (standalone reductions, elementwise that aren't
+    // epilogues) get tiled after all contractions are distributed.
+    // Consumer fusion is enabled since all contractions are already in foralls.
     {
-      llvm::SmallPtrSet<Operation *, 16> alreadyWrapped;
-
-      // Find all un-distributed ops and wrap each connected chain.
-      // Trace back from func.return operands AND from any
-      // bufferization.materialize_in_destination sources. The latter handles
-      // void-return functions (e.g. SCE) where the final computed tensor is
-      // written into a memref argument rather than returned directly, so
-      // returnOp.getOperands() would be empty and the chain would be missed.
-      SmallVector<Value> rootValues;
-      auto returnOp = cast<func::ReturnOp>(funcOp.getBody().back().getTerminator());
-      for (Value retVal : returnOp.getOperands())
-        rootValues.push_back(retVal);
-      funcOp.walk([&](bufferization::MaterializeInDestinationOp matOp) {
-        rootValues.push_back(matOp.getSource());
-      });
-
-      for (Value retVal : rootValues) {
-        // Trace back through the chain to find all un-distributed ops.
-        SmallVector<Operation *> opsToMove;
-        SmallVector<Operation *> worklist;
-        llvm::SmallPtrSet<Operation *, 16> visited;
-
-        if (auto defOp = retVal.getDefiningOp()) {
-          if (!isInsideWorkgroupForall(defOp) &&
-              defOp->getParentOp() == funcOp.getOperation())
-            worklist.push_back(defOp);
-        }
-
-        while (!worklist.empty()) {
-          Operation *curr = worklist.pop_back_val();
-          if (!visited.insert(curr).second)
+      bool foundOne = true;
+      while (foundOne) {
+        foundOne = false;
+        SmallVector<Operation *> computeOps = getComputeOps(funcOp);
+        for (Operation *rootOp : llvm::reverse(computeOps)) {
+          if (isInsideWorkgroupForall(rootOp))
             continue;
-          if (isInsideWorkgroupForall(curr))
+          if (handledOps.count(rootOp))
             continue;
-          if (alreadyWrapped.count(curr))
+          if (!getLoweringConfig(rootOp))
             continue;
-          // Skip function arguments (no defining op).
-          if (curr->getParentOp() != funcOp.getOperation())
-            continue;
-          // Skip scf.forall ops that already have GPU block mapping —
-          // they are already distributed kernels and must not be moved
-          // into the single-block wrapper.
-          if (auto forallOp = dyn_cast<scf::ForallOp>(curr)) {
-            auto mapping = forallOp.getMappingAttr();
-            if (mapping && llvm::any_of(mapping.getValue(), [](Attribute attr) {
-                  return isa<gpu::GPUBlockMappingAttr>(attr);
-                }))
-              continue;
+          bool didTile = false;
+          if (failed(tileRoot(rootOp, didTile,
+                              /*doConsumerFusion=*/true))) {
+            signalPassFailure();
+            return;
           }
-
-          opsToMove.push_back(curr);
-          for (Value operand : curr->getOperands()) {
-            if (auto defOp = operand.getDefiningOp()) {
-              if (defOp->getParentOp() == funcOp.getOperation() &&
-                  !isInsideWorkgroupForall(defOp))
-                worklist.push_back(defOp);
-            }
+          if (didTile) {
+            foundOne = true;
+            break; // Re-collect.
           }
+          handledOps.insert(rootOp);
         }
+      }
+    }
 
-        if (opsToMove.empty())
+    // --- Phase 2: Wrap remaining un-distributed ops in single-block forall
+    // For full-reduction ops (all-zero workgroup tiles) and any compute ops
+    // that didn't get tiled in Phase 1. Each untiled op gets individually
+    // wrapped in a scf.forall(0 to 1) with GPU block mapping.
+    {
+      SmallVector<Operation *> computeOps = getComputeOps(funcOp);
+      for (Operation *op : computeOps) {
+        if (isInsideWorkgroupForall(op))
+          continue;
+        if (op->getParentOp() != funcOp.getOperation())
+          continue;
+        if (op->getNumResults() == 0)
           continue;
 
-        // Filter out ops whose results have uses outside the chain.
-        // These must stay at function level; the wrapper forall will
-        // implicitly capture their values. Without this filter, moving
-        // e.g. bufferization.to_tensor into the wrapper would hide it
-        // from other kernels that also need the same input tensor.
-        //
-        // Exempt: retVal's defining op — its external use will be
-        // replaced by the forall result via replaceUsesWithIf.
-        // Iterative: removing one op may expose another's user as
-        // external, so repeat until stable.
-        {
-          Operation *retDefOp = retVal.getDefiningOp();
-          llvm::SmallPtrSet<Operation *, 16> moveSet(opsToMove.begin(),
-                                                      opsToMove.end());
-          bool changed = true;
-          while (changed) {
-            changed = false;
-            SmallVector<Operation *> filtered;
-            for (Operation *op : opsToMove) {
-              // Never filter the op that defines retVal — its external
-              // use is redirected to the forall result.
-              if (op == retDefOp) {
-                filtered.push_back(op);
-                continue;
-              }
-              bool hasExternalUser = false;
-              for (Value res : op->getResults()) {
-                for (Operation *user : res.getUsers()) {
-                  if (!moveSet.contains(user)) {
-                    hasExternalUser = true;
-                    break;
-                  }
-                }
-                if (hasExternalUser) break;
-              }
-              if (hasExternalUser) {
-                moveSet.erase(op);
-                changed = true;
-              } else {
-                filtered.push_back(op);
-              }
-            }
-            opsToMove = std::move(filtered);
-          }
-        }
-
-        if (opsToMove.empty())
+        // Only wrap ops that produce tensor results.
+        auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+        if (!resultType)
           continue;
 
-        // Check if this chain contains a full-reduction op (all reduction, no
-        // parallel dims). Only wrap chains that actually need GPU distribution.
-        bool hasFullReduction = false;
-        for (Operation *moveOp : opsToMove) {
-          auto lg = dyn_cast<linalg::LinalgOp>(moveOp);
-          if (!lg) continue;
-          auto iters = lg.getIteratorTypesArray();
-          if (!iters.empty() &&
-              !llvm::any_of(iters, linalg::isParallelIterator) &&
-              llvm::any_of(iters, linalg::isReductionIterator)) {
-            hasFullReduction = true;
-            break;
-          }
-        }
-        if (!hasFullReduction)
-          continue;
+        Location loc = op->getLoc();
+        rewriter.setInsertionPoint(op);
 
-        // Sort ops in topological order.
-        llvm::stable_sort(opsToMove, [&](Operation *a, Operation *b) {
-          return a->isBeforeInBlock(b);
-        });
-
-        // Find the last DPS op in the chain to use its result as the
-        // forall's output. If the return value comes from a non-DPS op
-        // (like tensor.expand_shape), use the output type directly.
-        auto retType = dyn_cast<RankedTensorType>(retVal.getType());
-        if (!retType)
-          continue;
-
-        // Use the return value's producer's output as the shared_out.
-        // Create a tensor.empty as the shared_out for the forall.
-        // Insert the wrapper AFTER all external operands are defined.
-        // This handles the case where the reduction consumes the result of
-        // an already-distributed forall (e.g. matmul) that wasn't moved.
-        Operation *insertAfter = nullptr;
-        llvm::SmallPtrSet<Operation *, 16> opsToMoveSet(opsToMove.begin(),
-                                                         opsToMove.end());
-        for (Operation *moveOp : opsToMove) {
-          for (Value operand : moveOp->getOperands()) {
-            if (auto defOp = operand.getDefiningOp()) {
-              if (!opsToMoveSet.contains(defOp) &&
-                  defOp->getParentOp() == funcOp.getOperation()) {
-                if (!insertAfter || defOp->isBeforeInBlock(insertAfter) == false)
-                  insertAfter = defOp;
-              }
-            }
-          }
-        }
-        if (insertAfter)
-          rewriter.setInsertionPointAfter(insertAfter);
-        else
-          rewriter.setInsertionPoint(opsToMove.front());
-        Location loc = opsToMove.front()->getLoc();
-
+        // Create tensor.empty as the shared_out for the forall.
         SmallVector<OpFoldResult> emptySizes;
-        for (int64_t dim = 0; dim < retType.getRank(); ++dim)
-          emptySizes.push_back(rewriter.getIndexAttr(retType.getDimSize(dim)));
+        for (int64_t dim = 0; dim < resultType.getRank(); ++dim)
+          emptySizes.push_back(rewriter.getIndexAttr(resultType.getDimSize(dim)));
         Value emptyTensor = tensor::EmptyOp::create(
-            rewriter, loc, emptySizes, retType.getElementType());
+            rewriter, loc, emptySizes, resultType.getElementType());
 
         SmallVector<OpFoldResult> lbs = {rewriter.getIndexAttr(0)};
         SmallVector<OpFoldResult> ubs = {rewriter.getIndexAttr(1)};
@@ -735,68 +638,46 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
             ArrayAttr::get(&getContext(), blockMapping));
 
         Block *body = forallOp.getBody();
-
-        // Move all ops into the forall body (in topological order).
-        for (Operation *moveOp : opsToMove)
-          moveOp->moveBefore(body, body->without_terminator().end());
+        op->moveBefore(body, body->without_terminator().end());
 
         // Create parallel_insert_slice in the terminator.
-        rewriter.setInsertionPointToEnd(
-            forallOp.getTerminator().getBody());
-        int64_t rank = retType.getRank();
+        rewriter.setInsertionPointToEnd(forallOp.getTerminator().getBody());
+        int64_t rank = resultType.getRank();
         SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
         SmallVector<OpFoldResult> sizes;
         for (int64_t dim = 0; dim < rank; ++dim)
-          sizes.push_back(rewriter.getIndexAttr(retType.getDimSize(dim)));
+          sizes.push_back(rewriter.getIndexAttr(resultType.getDimSize(dim)));
         SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
 
+        Value resultVal = op->getResult(0);
         tensor::ParallelInsertSliceOp::create(
-            rewriter, loc, retVal,
+            rewriter, loc, resultVal,
             forallOp.getRegionIterArgs()[0],
             offsets, sizes, strides);
 
-        // Replace the return value with the forall result, but only for
-        // uses OUTSIDE the forall (the parallel_insert_slice inside must
-        // keep referencing the original value).
+        // Replace uses outside the forall.
         rewriter.replaceUsesWithIf(
-            retVal, forallOp.getResult(0), [&](OpOperand &use) {
+            resultVal, forallOp.getResult(0), [&](OpOperand &use) {
               return !forallOp->isProperAncestor(use.getOwner());
             });
-
-        for (Operation *moveOp : opsToMove)
-          alreadyWrapped.insert(moveOp);
       }
     }
 
-    // Cleanup after tiling and consumer fusion.
-    // Mirrors IREE's TileDispatchUsingForall cleanup (TileDispatchUsingForall.cpp:306-431).
+    // --- Cleanup patterns after tiling ---
     {
       MLIRContext *context = &getContext();
       RewritePatternSet patterns(context);
 
-      // Swap extract_slice(pad(x)) -> pad(extract_slice(x)).
-      // Pushes pads inward so FoldFillIntoPad can eliminate zero-fill pads.
-      // No zero-slice guard: scf.forall loop bounds already prevent empty tiles.
       patterns.insert<linalg::ExtractSliceOfPadTensorSwapPattern>(
           context, [](tensor::ExtractSliceOp) { return false; });
-
-      // Standard tiling canonicalization: fold affine.min/max, remove unit loops.
       linalg::populateLinalgTilingCanonicalizationPatterns(patterns);
-
-      // Fold tensor.empty ops that are no longer needed after padding.
       tensor::populateFoldTensorEmptyPatterns(patterns);
-
-      // Merge consecutive extract/insert slice ops to simplify later patterns.
       tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
-
-      // Canonicalize extract_slice and dim ops.
       tensor::ExtractSliceOp::getCanonicalizationPatterns(patterns, context);
       tensor::DimOp::getCanonicalizationPatterns(patterns, context);
-      // NOTE: scf::ForallOp canonicalization is intentionally OMITTED here.
+      // NOTE: scf::ForallOp canonicalization is intentionally OMITTED.
       // The upstream pattern inlines single-trip foralls, which would pull
-      // reduction ops out of their block-mapped forall and leave them on the
-      // host. The NormalizeLooopBoundsPass (Step 8.5) handles degenerate
-      // foralls after bufferization where it is safe to do so.
+      // reduction ops out of their block-mapped forall.
 
       if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
         funcOp.emitOpError("tiling cleanup failed");
@@ -804,16 +685,21 @@ struct NovaTileAndDistributePass : public PassWrapper<NovaTileAndDistributePass,
       }
     }
 
-    // Final verification: Ensure all compute ops are now inside workgroup loops.
+    // Final verification.
     if (!verifyComputeOpsAfterDistribution(funcOp)) {
-        funcOp.emitOpError("failed to distribute all compute ops to workgroups");
-        signalPassFailure();
-        return;
+      funcOp.emitOpError(
+          "failed to distribute all compute ops to workgroups");
+      signalPassFailure();
+      return;
     }
   }
 
-  StringRef getArgument() const override { return "nova-tile-and-distribute"; }
-  StringRef getDescription() const override { return "Tiles compute operations to workgroups using scf.forall"; }
+  StringRef getArgument() const override {
+    return "nova-tile-and-distribute";
+  }
+  StringRef getDescription() const override {
+    return "Tiles compute operations to workgroups using scf.forall";
+  }
 };
 
 std::unique_ptr<Pass> createNovaTileAndDistributeToWorkgroupsPass() {
@@ -821,7 +707,7 @@ std::unique_ptr<Pass> createNovaTileAndDistributeToWorkgroupsPass() {
 }
 
 void registerNovaTileAndDistributePass() {
-    PassRegistration<NovaTileAndDistributePass>();
+  PassRegistration<NovaTileAndDistributePass>();
 }
 
 } // namespace mlir::nova

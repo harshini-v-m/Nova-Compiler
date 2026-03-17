@@ -26,6 +26,7 @@
 #include "mlir/Dialect/Vector/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
+#include "mlir/Conversion/BufferizationToMemRef/BufferizationToMemRef.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 // Nova frontend translation passes
@@ -56,51 +57,51 @@ using namespace mlir;
 namespace mlir::nova
 {
 
-/*
---------------------------------------------------
-CORE LOGIC — addNovaGPUOptimizedPipeline
+  /*
+  --------------------------------------------------
+  CORE LOGIC — addNovaGPUOptimizedPipeline
 
-Full Nova GPU compilation pipeline, mirroring IREE's
-addGPUTileAndFusePassPipeline (LLVMGPU/Passes.cpp).
+  Full Nova GPU compilation pipeline, mirroring IREE's
+  addGPUTileAndFusePassPipeline (LLVMGPU/Passes.cpp).
 
-Pipeline order (step numbers match IREE reference):
+  Pipeline order (step numbers match IREE reference):
 
-  Step -1   : Fuse elementwise ops before tiling
-              Chains like exp→log must become a single linalg.generic
-              BEFORE the tiling pipeline stamps per-op configs. Without
-              this, each op gets its own thread-mapped forall and
-              FuseAndHoist may not converge.
+    Step -1   : Fuse elementwise ops before tiling
+                Chains like exp→log must become a single linalg.generic
+                BEFORE the tiling pipeline stamps per-op configs. Without
+                this, each op gets its own thread-mapped forall and
+                FuseAndHoist may not converge.
 
-  Step -0.5 : Fold unit-extent dims before tiling
-              Softmax keepdims reductions produce rank-mismatched ops
-              that block fusion.  Folding here collapses them.
+    Step -0.5 : Fold unit-extent dims before tiling
+                Softmax keepdims reductions produce rank-mismatched ops
+                that block fusion.  Folding here collapses them.
 
-  Step 0    : SelectLoweringStrategy
-              Stamps #nova.lowering_config on every matmul/reduction op.
+    Step 0    : SelectLoweringStrategy
+                Stamps #nova.lowering_config on every matmul/reduction op.
 
-  Step 1    : TileAndDistribute → scf.forall {block} per workgroup
-  Step 2    : PadOperands → pad A/B/C to static tile sizes
-  Step 3    : ApplyTilingLevelReduction → K-dim → scf.for [MOVED BEFORE PROMOTE]
-  Step 4    : PromoteMatmulOperands → global→shared copy + barrier
-  Step 5    : ApplyTilingLevelThread → per-thread M/N register tiles
-  Step 6    : FuseAndHoistParallelLoops
-  Step 7    : NormalizeLoopBounds
-  Step 7.75 : Post-tiling Linalg cleanup (GeneralizeNamedOps, ElementwiseFusion)
-  Step 8    : GPU-aware bufferization (tensor → memref)
-  Step 8.5  : Normalize again — remove degenerate (1,1) foralls
-  Step 9    : scf.forall → gpu.launch (dynamic block dims)
-  Step 10   : linalg → scf loops
-  Step 11   : Insert gpu.barrier at workgroup memory write→read transitions
-  Step 12   : Outline gpu.launch bodies → gpu.module kernels
-  Step 12.5 : Convert workgroup memref.alloc → memref.global inside gpu.module
-  Step 12.75: Convert host-side cross-kernel allocs to gpu.alloc
-  Step 13   : Full CUDA/NVVM LLVM lowering
+    Step 1    : TileAndDistribute → scf.forall {block} per workgroup
+    Step 2    : PadOperands → pad A/B/C to static tile sizes
+    Step 3    : PromoteMatmulOperands → global→shared copy + barrier [BEFORE K-TILE]
+    Step 4    : ApplyTilingLevelReduction → K-dim → scf.for [AFTER PROMOTE]
+    Step 5    : ApplyTilingLevelThread → per-thread M/N register tiles
+    Step 6    : FuseAndHoistParallelLoops
+    Step 7    : NormalizeLoopBounds
+    Step 7.75 : Post-tiling Linalg cleanup (GeneralizeNamedOps, ElementwiseFusion)
+    Step 8    : GPU-aware bufferization (tensor → memref)
+    Step 8.5  : Normalize again — remove degenerate (1,1) foralls
+    Step 9    : scf.forall → gpu.launch (dynamic block dims)
+    Step 10   : linalg → scf loops
+    Step 11   : Insert gpu.barrier at workgroup memory write→read transitions
+    Step 12   : Outline gpu.launch bodies → gpu.module kernels
+    Step 12.5 : Convert workgroup memref.alloc → memref.global inside gpu.module
+    Step 12.75: Convert host-side cross-kernel allocs to gpu.alloc
+    Step 13   : Full CUDA/NVVM LLVM lowering
 
-IMPORTANT: After each tiling step, ops are replaced. Plain canonicalize
-drops the `lowering_config` attribute. ConfigTrackingCanonicalize propagates
-it to the replacement ops so every subsequent tiling level can read it.
---------------------------------------------------
-*/
+  IMPORTANT: After each tiling step, ops are replaced. Plain canonicalize
+  drops the `lowering_config` attribute. ConfigTrackingCanonicalize propagates
+  it to the replacement ops so every subsequent tiling level can read it.
+  --------------------------------------------------
+  */
 
   // CORE LOGIC
   void addNovaGPUOptimizedPipeline(OpPassManager &pm,
@@ -167,30 +168,45 @@ it to the replacement ops so every subsequent tiling level can read it.
     pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
-    // Step 2: Pad operands
+    // Step 2: Pad operands to static multiples of tile sizes
+    //
+    // Reads the "padding" list from each op's lowering_config (set by
+    // SelectLoweringStrategy). Pads parallel dims to workgroup tile and
+    // reduction dims to reduction tile. This prevents dynamic alloca in
+    // GPU kernels and ensures correct K-dimension coverage.
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUPadOperandsPass());
     pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
     pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
-    // Step 3: Tile reduction (K) dimension   [MOVED BEFORE PROMOTION]
+    // Step 3: Promote operands to shared memory   [BEFORE K-TILING]
+    //
+    // IREE order: Pad → Promote → Reduction tiling.
+    // Promotion inserts alloc_tensor(workgroup) + copy + fusion_barrier on
+    // the FULL workgroup slice. Then reduction tiling (Step 4) creates the
+    // scf.for K-loop, which tiles the copies along K — each K-iteration
+    // copies only [wgM × kStep] into shared memory. BufferLoopHoisting
+    // (post-bufferize) then hoists the alloc out of the K-loop so it is
+    // reused across iterations.
+    //
+    // If promotion were done AFTER K-tiling, the operand shapes would
+    // already be K-sliced, making the shared memory allocation pattern
+    // harder to set up correctly.
+    // -------------------------------------------------------------------------
+    // pm.addNestedPass<func::FuncOp>(createNovaGPUPromoteMatmulOperandsPass());
+    // pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
+    // pm.addPass(createCSEPass());
+
+    // -------------------------------------------------------------------------
+    // Step 4: Tile reduction (K) dimension   [AFTER PROMOTION]
     //
     // After K-tiling, the matmul operates on [wgM × kStep] and [kStep × wgN]
-    // slices. Promotion in Step 4 then allocates only K-tile-sized shared mem
-    // instead of the full global operand size.
+    // slices. The promoted copies (from Step 3) are also tiled along K,
+    // so each K-iteration loads only kStep-sized data into shared memory.
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(
         createNovaGPUApplyTilingLevelReductionPass());
-    pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-    pm.addPass(createCSEPass());
-
-    // -------------------------------------------------------------------------
-    // Step 4: Promote matmul A/B operands to shared memory  [MOVED AFTER K-TILE]
-    //
-    // Now inside the K-loop, so shared memory holds only one K-tile at a time.
-    // -------------------------------------------------------------------------
-    pm.addNestedPass<func::FuncOp>(createNovaGPUPromoteMatmulOperandsPass());
     pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
     pm.addPass(createCSEPass());
 
@@ -242,8 +258,16 @@ it to the replacement ops so every subsequent tiling level can read it.
 
     // -------------------------------------------------------------------------
     // Step 8: GPU-aware bufferization (tensor → memref)
+    //
+    // Uses NovaGPUComprehensiveBufferizePass which has a GPU-aware copy
+    // function (gpuCopyFn) that emits linalg.copy instead of memref.copy
+    // inside scf.forall bodies. This is critical: memref.copy would later
+    // become gpu.memcpy (via ConvertMemRefToGpu) which convert-gpu-to-nvvm
+    // cannot lower when operands have strided layouts. linalg.copy is
+    // expanded to scf.for + memref.load/store by createConvertLinalgToLoopsPass.
     // -------------------------------------------------------------------------
     addNovaGPUBufferizePasses(pm);
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertBufferizationToMemRefPass());
 
     // -------------------------------------------------------------------------
     // Step 8.5: Eliminate degenerate single-iteration foralls
@@ -333,12 +357,12 @@ it to the replacement ops so every subsequent tiling level can read it.
     //   ftzFlag      → flush denormals to zero (halves operand precision cost)
     //   features=+ptx76 → PTX 7.6 instruction set for Ampere (sm_86)
     GpuNVVMAttachTargetOptions nvvmTargetOptions;
-    nvvmTargetOptions.triple    = "nvptx64-nvidia-cuda";
-    nvvmTargetOptions.chip      = arch.str();
-    nvvmTargetOptions.features  = "+ptx76";
-    nvvmTargetOptions.optLevel  = 3;
-    nvvmTargetOptions.fastFlag  = true;
-    nvvmTargetOptions.ftzFlag   = true;
+    nvvmTargetOptions.triple = "nvptx64-nvidia-cuda";
+    nvvmTargetOptions.chip = arch.str();
+    nvvmTargetOptions.features = "+ptx76";
+    nvvmTargetOptions.optLevel = 3;
+    nvvmTargetOptions.fastFlag = true;
+    nvvmTargetOptions.ftzFlag = true;
     pm.addPass(createGpuNVVMAttachTarget(nvvmTargetOptions));
 
     // 13.1 — Outline GPU kernels and insert async tokens (required by
@@ -376,8 +400,8 @@ it to the replacement ops so every subsequent tiling level can read it.
 
     // 13.3 — Compile the gpu.module blobs to a PTX ISA binary embedded in IR.
     GpuModuleToBinaryPassOptions binaryOptions;
-    binaryOptions.toolkitPath        = "/usr/local/cuda-13.0";
-    binaryOptions.compilationTarget  = "isa";
+    binaryOptions.toolkitPath = "/usr/local/cuda-13.0";
+    binaryOptions.compilationTarget = "isa";
     pm.addPass(createGpuModuleToBinaryPass(binaryOptions));
 
     // 13.4 — Convert any remaining #gpu.address_space<private> on host-side
@@ -475,7 +499,11 @@ it to the replacement ops so every subsequent tiling level can read it.
     pm.addNestedPass<func::FuncOp>(createNovaEliminateEmptyTensorsPass());
     pm.addNestedPass<func::FuncOp>(
         bufferization::createEmptyTensorToAllocTensorPass());
-    pm.addNestedPass<func::FuncOp>(createNovaGPUInferMemorySpacePass());
+    // NOTE: NovaGPUInferMemorySpacePass is disabled for now because thread
+    // tiling (Steps 2-6) is commented out, so there are no thread-mapped
+    // scf.forall ops for the pass to detect as shared memory candidates.
+    // Re-enable when thread tiling is active.
+    // pm.addNestedPass<func::FuncOp>(createNovaGPUInferMemorySpacePass());
 
     // GPU-aware comprehensive bufferize (module-level).
     // Erases nova.fusion_barrier, converts function boundaries with identity

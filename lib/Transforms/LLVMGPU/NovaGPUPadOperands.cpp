@@ -64,64 +64,6 @@ static LogicalResult padLinalgOpToStaticSizes(RewriterBase &rewriter,
   return success();
 }
 
-// IMPORTANT — Returns padding sizes for a linalg op by reading tile sizes
-// from the op's LoweringConfig attribute.
-//
-// Padding rules:
-//   - Parallel dims (M, N): padded to the matching workgroup tile size.
-//   - Reduction dims (K):   padded to the matching reduction tile size.
-//     This is critical — it prevents K-truncation when K is not a multiple
-//     of the reduction step, and makes tile sizes static so PTX avoids
-//     dynamic alloca.
-//
-// If no config is present (op was not annotated by the strategy pass),
-// returns nullopt and the op is left unpadded.
-static std::optional<SmallVector<int64_t>>
-getPaddingSizes(linalg::LinalgOp linalgOp) {
-  // ALGORITHM STEP: Read tile sizes from the lowering_config attribute.
-  // Pad any op that has a lowering_config (contractions, reductions,
-  // elementwise), not just contractions. Non-contraction ops with
-  // non-aligned workgroup tiles produce dynamic thread-forall bounds
-  // that crash MapForallToGPU.
-  DictionaryAttr config = getLoweringConfig(linalgOp);
-  if (!config)
-    return std::nullopt;
-
-  SmallVector<int64_t> wgTiles  = getLoweringConfigTileSizes(config, kWorkgroupKey);
-  SmallVector<int64_t> redTiles = getLoweringConfigTileSizes(config, kReductionKey);
-
-  if (wgTiles.empty() && redTiles.empty())
-    return std::nullopt;
-
-  int numLoops = linalgOp.getNumLoops();
-  SmallVector<int64_t> padding(numLoops, 1);
-  auto iterTypes = linalgOp.getIteratorTypesArray();
-
-  // ALGORITHM STEP: Build the per-dimension padding vector.
-  // NovaKernelConfig stores tile sizes indexed by loop index (direct mapping).
-  // Use direct indexing for ALL ops (both contractions and non-contractions).
-  // The old reverse-index logic was designed for IREE's format but our config
-  // stores tiles[i] = tile for loop dim i.
-  for (int i = 0; i < numLoops; ++i) {
-    if (linalg::isParallelIterator(iterTypes[i])) {
-      int64_t tile = 0;
-      if (i < (int)wgTiles.size())
-        tile = wgTiles[i];
-      // wgTile==0 means "not tiled at this dim" — leave padding at 1.
-      if (tile > 0)
-        padding[i] = tile;
-    } else {
-      // Reduction dim: pad to the reduction tile step.
-      int64_t tile = 0;
-      if (i < (int)redTiles.size())
-        tile = redTiles[i];
-      if (tile > 0)
-        padding[i] = tile;
-    }
-  }
-  return padding;
-}
-
 // Folds tensor.pad(extract_slice*(linalg.fill(cst)), cst) into
 // linalg.fill(cst, tensor.empty(...)) when the padding constant matches the
 // fill constant. Ported from IREE's populateFoldFillIntoPadPattern.
@@ -179,18 +121,27 @@ struct NovaGPUPadOperandsPass
     func::FuncOp funcOp = getOperation();
     IRRewriter rewriter(funcOp);
 
-    // Walk all linalg ops and pad those with a padding config.
-    // IREE reads sizes from LoweringConfig; Nova uses heuristic sizes.
+    // Walk all linalg ops and pad those with a "padding" list in their
+    // lowering_config. Mirrors IREE's GPUPadOperands: all padding
+    // intelligence is in the config (set by SelectLoweringStrategy),
+    // the pass just reads and applies.
+    bool padFailed = false;
     funcOp.walk([&](linalg::LinalgOp op) {
-      std::optional<SmallVector<int64_t>> paddingSizes = getPaddingSizes(op);
+      DictionaryAttr config = getLoweringConfig(op);
+      if (!config)
+        return WalkResult::advance();
+
+      std::optional<SmallVector<int64_t>> paddingSizes = getPaddingList(config);
       if (!paddingSizes)
         return WalkResult::advance();
 
       rewriter.setInsertionPoint(op);
-      // Non-fatal if padding fails (op may already be statically sized).
-      (void)padLinalgOpToStaticSizes(rewriter, op, *paddingSizes);
+      if (::mlir::failed(padLinalgOpToStaticSizes(rewriter, op, *paddingSizes)))
+        padFailed = true;
       return WalkResult::advance();
     });
+    if (padFailed)
+      return signalPassFailure();
 
     // Fold fill+pad sequences: pad(fill(cst), cst) -> fill(cst, empty).
     MLIRContext *context = &getContext();
