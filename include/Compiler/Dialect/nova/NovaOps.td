@@ -31,7 +31,8 @@ def I4 : Type<CPred<"$_self.isInteger(4)">, "4-bit integer">,
          BuildableType<"$_builder.getIntegerType(4)">;
 
 def Nova_ElementType : AnyTypeOf<[
-  I1,I4, I8, I16, I32, I64, 
+  I1,I4, I8, I16, I32, I64,
+  UI16, UI32,
   F16, BF16, F32, F64,
   Complex<F64>,Complex<F32>]>;
 

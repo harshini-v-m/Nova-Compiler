@@ -1927,8 +1927,9 @@ LogicalResult GatherOp::verify() {
            << getAxis() << " is out of bounds for input rank " << inputRank;
   }
 
-  if (!indexType.getElementType().isSignlessInteger()) {
-    return emitOpError("indices must be an integer tensor");
+  auto idxElemTy = indexType.getElementType();
+  if (!idxElemTy.isIntOrIndex()) {
+    return emitOpError("indices must be an integer or index tensor");
   }
 
   return success();
@@ -1972,6 +1973,11 @@ LogicalResult ScatterAddOp::verify() {
   if (axis < 0 || axis >= inputRank) {
     return emitOpError("axis ")
            << getAxis() << " is out of bounds for input rank " << inputRank;
+  }
+
+  auto idxElemTy = indexType.getElementType();
+  if (!idxElemTy.isIntOrIndex()) {
+    return emitOpError("indices must be an integer or index tensor");
   }
 
   // Check shapes match except at axis

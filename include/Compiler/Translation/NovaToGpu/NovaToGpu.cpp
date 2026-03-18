@@ -183,8 +183,17 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
         rewriter.create<memref::LoadOp>(loc, targetsMemRef, rowIndices);
     Value targetIdx = targetIdxVal;
     if (!targetIdx.getType().isIndex())
-      targetIdx = rewriter.create<arith::IndexCastOp>(
+      targetIdx = rewriter.create<arith::IndexCastUIOp>(
           loc, rewriter.getIndexType(), targetIdxVal);
+
+    // Defensive bounds-clamp targetIdx to [0, C) to prevent OOB on corrupt data
+    Value isNegTarget = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::slt, targetIdx, c0_k);
+    Value clampedLow = rewriter.create<arith::SelectOp>(loc, isNegTarget, c0_k, targetIdx);
+    Value isOobTarget = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::sge, clampedLow, cC);
+    Value cMaxC = rewriter.create<arith::ConstantIndexOp>(loc, C - 1);
+    targetIdx = rewriter.create<arith::SelectOp>(loc, isOobTarget, cMaxC, clampedLow);
 
     // B. Parallel Pass 1: strided max over C classes
     //    Each of 32 threads processes elements tid, tid+32, tid+64, ...
@@ -242,7 +251,12 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
                                          gpu::AllReduceOperation::ADD);
 
     // D. Compute row loss: log(sum_exp) - (target_logit - max)
-    Value logSum = rewriter.create<mlir::math::LogOp>(loc, rowSum);
+    //    Guard rowSum with epsilon to prevent log(0) = -Inf when FTZ
+    //    flushes all exp() results to zero.
+    Value epsLoss = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getF32FloatAttr(1e-8f));
+    Value safeRowSum = rewriter.create<arith::AddFOp>(loc, rowSum, epsLoss);
+    Value logSum = rewriter.create<mlir::math::LogOp>(loc, safeRowSum);
     Value t2 = rewriter.create<arith::SubFOp>(loc, targetLogit, rowMax);
     Value rowLoss = rewriter.create<arith::SubFOp>(loc, logSum, t2);
 
@@ -380,16 +394,16 @@ struct SceFwdBwdOpLowering : public OpRewritePattern<mlir::nova::SceFwdBwdOp> {
                                   /*symbolOperands=*/ValueRange{})
             .getMemref();
 
-    auto gradMemRefType = MemRefType::get(
-        logitsType.getShape(), logitsElemTy, MemRefLayoutAttrInterface{},
-        rewriter.getI64IntegerAttr(1));
-    Value gradMemRef =
-        rewriter
-            .create<gpu::AllocOp>(loc, gradMemRefType,
-                                  /*asyncDependencies=*/ValueRange{},
-                                  /*dynamicSizes=*/ValueRange{},
-                                  /*symbolOperands=*/ValueRange{})
-            .getMemref();
+    // auto gradMemRefType = MemRefType::get(
+    //     logitsType.getShape(), logitsElemTy, MemRefLayoutAttrInterface{},
+    //     rewriter.getI64IntegerAttr(1));
+    // Value gradMemRef =
+    //     rewriter
+    //         .create<gpu::AllocOp>(loc, gradMemRefType,
+    //                               /*asyncDependencies=*/ValueRange{},
+    //                               /*dynamicSizes=*/ValueRange{},
+    //                               /*symbolOperands=*/ValueRange{})
+    //         .getMemref();
 
     // ====================================================================
     // Kernel 1: N blocks x 32 threads. Each block computes one row's:
@@ -438,8 +452,17 @@ struct SceFwdBwdOpLowering : public OpRewritePattern<mlir::nova::SceFwdBwdOp> {
         rewriter.create<memref::LoadOp>(loc, targetsMemRef, rowIndices);
     Value targetIdx = targetIdxVal;
     if (!targetIdx.getType().isIndex())
-      targetIdx = rewriter.create<arith::IndexCastOp>(
+      targetIdx = rewriter.create<arith::IndexCastUIOp>(
           loc, rewriter.getIndexType(), targetIdxVal);
+
+    // Defensive bounds-clamp targetIdx to [0, C) to prevent OOB on corrupt data
+    Value isNegTarget = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::slt, targetIdx, c0_k);
+    Value clampedLow = rewriter.create<arith::SelectOp>(loc, isNegTarget, c0_k, targetIdx);
+    Value isOobTarget = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::sge, clampedLow, cC);
+    Value cMaxC = rewriter.create<arith::ConstantIndexOp>(loc, C - 1);
+    targetIdx = rewriter.create<arith::SelectOp>(loc, isOobTarget, cMaxC, clampedLow);
 
     // B. Pass 1: strided max over C classes
     auto maxLoop = rewriter.create<scf::ForOp>(
@@ -492,7 +515,12 @@ struct SceFwdBwdOpLowering : public OpRewritePattern<mlir::nova::SceFwdBwdOp> {
                                          gpu::AllReduceOperation::ADD);
 
     // D. Compute row loss: log(sum_exp) - (target_logit - max)
-    Value logSum = rewriter.create<mlir::math::LogOp>(loc, rowSum);
+    //    Guard rowSum with epsilon to prevent log(0) = -Inf when FTZ
+    //    flushes all exp() results to zero.
+    Value epsFwd = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getF32FloatAttr(1e-8f));
+    Value safeRowSumFwd = rewriter.create<arith::AddFOp>(loc, rowSum, epsFwd);
+    Value logSum = rewriter.create<mlir::math::LogOp>(loc, safeRowSumFwd);
     Value t2 = rewriter.create<arith::SubFOp>(loc, targetLogit, rowMax);
     Value rowLoss = rewriter.create<arith::SubFOp>(loc, logSum, t2);
 
@@ -524,10 +552,10 @@ struct SceFwdBwdOpLowering : public OpRewritePattern<mlir::nova::SceFwdBwdOp> {
           if (val.getType().isF16() || val.getType().isBF16())
             val = ib.create<arith::ExtFOp>(il, ib.getF32Type(), val);
 
-          // softmax = exp(logit - max) / sum
+          // softmax = exp(logit - max) / (sum + eps)
           Value diff = ib.create<arith::SubFOp>(il, val, rowMax);
           Value expVal = ib.create<mlir::math::ExpOp>(il, diff);
-          Value softmax = ib.create<arith::DivFOp>(il, expVal, rowSum);
+          Value softmax = ib.create<arith::DivFOp>(il, expVal, safeRowSumFwd);
 
           // one_hot: 1.0 if target, else 0.0
           Value isTarget = ib.create<arith::CmpIOp>(
@@ -546,7 +574,7 @@ struct SceFwdBwdOpLowering : public OpRewritePattern<mlir::nova::SceFwdBwdOp> {
           if (logitsElemTy.isF16() || logitsElemTy.isBF16())
             gradVal = ib.create<arith::TruncFOp>(il, logitsElemTy, gradVal);
 
-          ib.create<memref::StoreOp>(il, gradVal, gradMemRef, lIdx);
+          ib.create<memref::StoreOp>(il, gradVal, logitsMemRef, lIdx);
           ib.create<scf::YieldOp>(il, ValueRange{});
         });
 
@@ -611,7 +639,7 @@ struct SceFwdBwdOpLowering : public OpRewritePattern<mlir::nova::SceFwdBwdOp> {
         /*writable=*/true);
 
     Value gradTensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, gradResultType, gradMemRef, /*restrict=*/true,
+        loc, gradResultType, logitsMemRef, /*restrict=*/true,
         /*writable=*/true);
 
     rewriter.replaceOp(op, {lossTensor, gradTensor});
@@ -1060,9 +1088,9 @@ struct NovaToGpuGatherPattern : public OpRewritePattern<nova::GatherOp> {
     Value gatherIdx =
         rewriter.create<memref::LoadOp>(loc, indicesMemRef, idxAccessIndices);
 
-    // Cast to index type if needed
+    // Cast to index type if needed (zero-extend for unsigned index types)
     if (!gatherIdx.getType().isIndex())
-      gatherIdx = rewriter.create<arith::IndexCastOp>(
+      gatherIdx = rewriter.create<arith::IndexCastUIOp>(
           loc, rewriter.getIndexType(), gatherIdx);
     // Build the full input access indices
     SmallVector<Value> inputIndices;
@@ -1201,10 +1229,10 @@ struct ScatterAddOpGpuLowering : public OpRewritePattern<nova::ScatterAddOp> {
     //    For nD indices: same shape as src's axis dimensions
     Value idxVal = rewriter.create<memref::LoadOp>(
         loc, indicesMem, ValueRange{srcIndices[axis]});
-    // Cast to index
+    // Cast to index (zero-extend for unsigned index types)
     Value targetIdx = idxVal;
     if (!targetIdx.getType().isIndex())
-      targetIdx = rewriter.create<arith::IndexCastOp>(
+      targetIdx = rewriter.create<arith::IndexCastUIOp>(
           loc, rewriter.getIndexType(), idxVal);
 
     // 8. Load value from src
