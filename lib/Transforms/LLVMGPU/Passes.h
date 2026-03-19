@@ -159,6 +159,12 @@ void registerNovaGPUMapForallToGPUPass();
 std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass();
 void registerNovaGPULowerMemorySpacePass();
 
+// Promotes __global_memory__ LLVM globals from device global (AS 0) to
+// shared memory (AS 3) for per-block isolation.  Runs AFTER full LLVM
+// lowering inside gpu.module, BEFORE GpuModuleToBinaryPass.
+std::unique_ptr<Pass> createNovaGPUPromoteGlobalsToSharedPass();
+void registerNovaGPUPromoteGlobalsToSharedPass();
+
 } // namespace nova
 } // namespace mlir
 

@@ -220,6 +220,59 @@ FailureOr<std::queue<Operation *>> fuseConsumersIntoForall(
             continue;
           }
         }
+
+        // Don't fuse consumers whose OTHER operands (not from the forall)
+        // transitively depend on any result of the forall.  This prevents
+        // circular data dependencies where the fused consumer reads a value
+        // that can only be computed AFTER the forall finishes.
+        //
+        // Example: LayerNorm after residual add:
+        //   residual_add (forall result) → reduce → mean
+        //   x_minus_mean = sub(residual_add, mean)
+        // If x_minus_mean is fused, it reads 'mean' which needs the FULL
+        // residual_add — creating a circular dependency.
+        {
+          bool hasCircularDep = false;
+          // Collect all forall results for fast lookup.
+          SmallPtrSet<Value, 4> forallResults;
+          for (OpResult r : currLoop->getResults())
+            forallResults.insert(r);
+
+          for (OpOperand &opOperand : fusableUser->getOpOperands()) {
+            Value operand = opOperand.get();
+            // Skip operands that come directly from the forall (these are
+            // the ones being fused — they're fine).
+            if (forallResults.contains(operand))
+              continue;
+            // Walk the def chain of this operand to check if it
+            // transitively depends on any forall result.
+            SmallVector<Value, 8> worklist;
+            SmallPtrSet<Value, 16> visited;
+            worklist.push_back(operand);
+            while (!worklist.empty() && !hasCircularDep) {
+              Value v = worklist.pop_back_val();
+              if (!visited.insert(v).second)
+                continue;
+              if (forallResults.contains(v)) {
+                hasCircularDep = true;
+                break;
+              }
+              Operation *defOp = v.getDefiningOp();
+              if (!defOp)
+                continue;
+              for (Value inp : defOp->getOperands())
+                worklist.push_back(inp);
+            }
+          }
+          if (hasCircularDep) {
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[nova-tile-fuse-utils] Skipping consumer fusion: "
+                       << "operand transitively depends on forall result "
+                       << "(circular dependency)\n");
+            continue;
+          }
+        }
+
         // Check all operands from the `scf.forall`
         SmallVector<OpResult> loopResults;
         for (OpOperand &opOperand : fusableUser->getOpOperands()) {

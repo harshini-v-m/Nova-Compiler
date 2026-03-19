@@ -888,6 +888,36 @@ struct HoistForallFromFor final : OpRewritePattern<scf::ForOp> {
                                                 newForallOp.getInductionVars()))
             extractMapping.map(oldIV, newIV);
           extractMapping.map(forallOp.getRegionIterArgs()[0], newForallIterArg);
+          // Clone any ops defined inside the old forall body that the
+          // extract_slice depends on (e.g., affine.min for dynamic tile sizes).
+          // Without this, the cloned extract_slice would reference values from
+          // the old forall's child region, causing a dominance violation.
+          Block *oldBody = forallOp.getBody();
+          for (Value operand : oldExtract->getOperands()) {
+            Operation *defOp = operand.getDefiningOp();
+            if (!defOp || defOp->getBlock() != oldBody)
+              continue;
+            if (extractMapping.contains(operand))
+              continue;
+            // Recursively clone the defining op and its in-body dependencies.
+            SmallVector<Operation *> opsToClone;
+            std::function<void(Operation *)> collectDeps =
+                [&](Operation *op) {
+                  for (Value dep : op->getOperands()) {
+                    Operation *depOp = dep.getDefiningOp();
+                    if (depOp && depOp->getBlock() == oldBody &&
+                        !extractMapping.contains(dep)) {
+                      collectDeps(depOp);
+                    }
+                  }
+                  opsToClone.push_back(op);
+                };
+            collectDeps(defOp);
+            for (Operation *op : opsToClone) {
+              if (!extractMapping.contains(op->getResult(0)))
+                rewriter.clone(*op, extractMapping);
+            }
+          }
           auto *clonedExtract = rewriter.clone(*oldExtract, extractMapping);
           auto newExtract = cast<tensor::ExtractSliceOp>(clonedExtract);
           newForInits.push_back(newExtract.getResult());
@@ -947,6 +977,52 @@ struct HoistForallFromFor final : OpRewritePattern<scf::ForOp> {
       rewriter.eraseOp(parallelInsert.getOperation());
 
       BlockArgument newForallIterArg = newForallOp.getRegionIterArgs()[0];
+      // The insert's offset/size/stride values may reference ops that are now
+      // inside newFor's body (after mergeBlocks). Clone these dependencies
+      // into the forall body (before the terminator) so the new
+      // parallel_insert_slice can reference them.
+      rewriter.setInsertionPoint(newFor->getNextNode()
+                                     ? newFor->getNextNode()
+                                     : newForallOp.getTerminator());
+      IRMapping terminatorMapping;
+      // Map forall IVs and iter args to themselves (they're already correct).
+      auto cloneOFRDeps = [&](SmallVector<OpFoldResult> &ofrs) {
+        for (auto &ofr : ofrs) {
+          auto val = dyn_cast<Value>(ofr);
+          if (!val)
+            continue;
+          Operation *defOp = val.getDefiningOp();
+          if (!defOp)
+            continue;
+          // If the value is defined inside the for loop body, we need to
+          // clone its computation at the forall level.
+          if (defOp->getParentOp() == newFor.getOperation()) {
+            if (!terminatorMapping.contains(val)) {
+              // Collect transitive in-for dependencies.
+              SmallVector<Operation *> opsToClone;
+              std::function<void(Operation *)> collectDeps =
+                  [&](Operation *op) {
+                    for (Value dep : op->getOperands()) {
+                      Operation *depOp = dep.getDefiningOp();
+                      if (depOp &&
+                          depOp->getParentOp() == newFor.getOperation() &&
+                          !terminatorMapping.contains(dep)) {
+                        collectDeps(depOp);
+                      }
+                    }
+                    if (!terminatorMapping.contains(op->getResult(0)))
+                      rewriter.clone(*op, terminatorMapping);
+                  };
+              collectDeps(defOp);
+            }
+            ofr = terminatorMapping.lookup(val);
+          }
+        }
+      };
+      cloneOFRDeps(insertOffsets);
+      cloneOFRDeps(insertSizes);
+      cloneOFRDeps(insertStrides);
+
       rewriter.setInsertionPointToEnd(newForallOp.getTerminator().getBody());
       tensor::ParallelInsertSliceOp::create(
           rewriter, insertLoc,

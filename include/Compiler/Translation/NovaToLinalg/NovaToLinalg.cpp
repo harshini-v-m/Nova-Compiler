@@ -451,6 +451,17 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
           // args[1] is the dummy input element (unused)
           if (llvm::isa<FloatType>(indicesElemType)) {
             indexVal = b.create<arith::FPToSIOp>(l, b.getI32Type(), indexVal);
+          } else if (auto intType =
+                         llvm::dyn_cast<IntegerType>(indicesElemType)) {
+            // Widen narrow integer indices (e.g. i16) to i32 before
+            // IndexCastOp. MLIR's i16 is signless — IndexCastOp may
+            // sign-extend, mapping values > 32767 to negative indices.
+            // Use zero-extension (ExtUIOp) to preserve the unsigned
+            // range 0..65535, which covers vocab sizes up to 65536.
+            if (intType.getWidth() < 32) {
+              indexVal =
+                  b.create<arith::ExtUIOp>(l, b.getI32Type(), indexVal);
+            }
           }
 
           Value classIdx =
@@ -539,62 +550,127 @@ struct NovaScatterAddOpLowering
         processedIndicesType.getShape(), processedIndicesType.getElementType());
 
     Value inputMem =
-        rewriter.create<ToBufferOp>(loc, inputMemType, input, /*restrict=*/true)
+        rewriter.create<ToBufferOp>(loc, inputMemType, input, /*read_only=*/false)
             .getResult();
     Value srcMem =
-        rewriter.create<ToBufferOp>(loc, srcMemType, src, /*restrict=*/true)
+        rewriter.create<ToBufferOp>(loc, srcMemType, src, /*read_only=*/true)
             .getResult();
     Value indicesMem =
         rewriter
             .create<ToBufferOp>(loc, indicesMemType, processedIndices,
-                                /*restrict=*/true)
+                                /*read_only=*/true)
             .getResult();
 
-    // 3. Parallel Loop over ALL dimensions of src
-    SmallVector<OpFoldResult> lbs(srcRank, rewriter.getIndexAttr(0));
-    SmallVector<OpFoldResult> ubs;
-    for (int64_t i = 0; i < srcRank; ++i) {
+    // 3. Two-level parallel loop: outer (blocks) over all dims except the
+    // innermost, inner (threads) over the innermost dim. This gives each
+    // block multiple threads instead of 1 thread per element.
+    constexpr int64_t kMaxThreadsPerBlock = 1024;
+    int64_t innerDim = srcRank - 1;
+    int64_t innerSize = srcShape[innerDim]; // may be dynamic
+
+    // Outer forall: block-mapped dims (all except innermost).
+    SmallVector<OpFoldResult> outerLbs, outerUbs, outerSteps;
+    SmallVector<Attribute> blockMapping;
+    for (int64_t i = 0; i < srcRank - 1; ++i) {
+      outerLbs.push_back(rewriter.getIndexAttr(0));
       if (srcShape[i] == ShapedType::kDynamic) {
         Value dim = rewriter.create<memref::DimOp>(loc, srcMem, i);
-        ubs.push_back(dim);
+        outerUbs.push_back(dim);
       } else {
-        ubs.push_back(rewriter.getIndexAttr(srcShape[i]));
+        outerUbs.push_back(rewriter.getIndexAttr(srcShape[i]));
       }
+      outerSteps.push_back(rewriter.getIndexAttr(1));
+      gpu::MappingId mappingId;
+      if (i == 0) mappingId = gpu::MappingId::DimX;
+      else if (i == 1) mappingId = gpu::MappingId::DimY;
+      else mappingId = gpu::MappingId::DimZ;
+      blockMapping.push_back(
+          gpu::GPUBlockMappingAttr::get(rewriter.getContext(), mappingId));
     }
-    SmallVector<OpFoldResult> steps(srcRank, rewriter.getIndexAttr(1));
 
-    // For GPU compatibility with the optimized pipeline, we add block mapping.
-    SmallVector<Attribute> mapping;
-    if (srcRank <= 3) {
-      for (int64_t i = 0; i < srcRank; ++i) {
-        gpu::MappingId mappingId;
-        if (i == 0) mappingId = gpu::MappingId::DimX;
-        else if (i == 1) mappingId = gpu::MappingId::DimY;
-        else mappingId = gpu::MappingId::DimZ;
-        mapping.push_back(gpu::GPUBlockMappingAttr::get(rewriter.getContext(), mappingId));
+    // If srcRank == 1, tile the single dim into blocks + threads.
+    // Instead of block(1) × thread(N) which exceeds CUDA's 1024-thread
+    // limit for large N, create block(ceil(N/1024)) × thread(min(N,1024)).
+    if (srcRank == 1) {
+      int64_t numBlocks = 1;
+      int64_t threadsPerBlock = innerSize;
+      if (innerSize != ShapedType::kDynamic && innerSize > kMaxThreadsPerBlock) {
+        threadsPerBlock = kMaxThreadsPerBlock;
+        numBlocks = (innerSize + kMaxThreadsPerBlock - 1) / kMaxThreadsPerBlock;
       }
-    }
-    std::optional<ArrayAttr> mappingAttr = std::nullopt;
-    if (!mapping.empty()) {
-      mappingAttr = rewriter.getArrayAttr(mapping);
+      outerLbs.push_back(rewriter.getIndexAttr(0));
+      outerUbs.push_back(rewriter.getIndexAttr(numBlocks));
+      outerSteps.push_back(rewriter.getIndexAttr(1));
+      blockMapping.push_back(
+          gpu::GPUBlockMappingAttr::get(rewriter.getContext(), gpu::MappingId::DimX));
+      // Override innerSize for the thread forall.
+      innerSize = threadsPerBlock;
     }
 
-    // Create forall without builder callback (auto-creates body + terminator).
-    auto forallOp = scf::ForallOp::create(
-        rewriter, loc, lbs, ubs, steps, ValueRange{},
-        mappingAttr ? *mappingAttr : ArrayAttr());
+    auto outerForall = scf::ForallOp::create(
+        rewriter, loc, outerLbs, outerUbs, outerSteps, ValueRange{},
+        rewriter.getArrayAttr(blockMapping));
 
-    // Build the scatter body before the terminator.
+    // Inner forall: thread-mapped over the innermost dim.
     {
-      Block *body = forallOp.getBody();
+      Block *outerBody = outerForall.getBody();
       OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(body, body->without_terminator().begin());
+      rewriter.setInsertionPoint(outerBody, outerBody->without_terminator().begin());
 
-      // Get induction variables from the forall body block args.
-      ValueRange ivs = forallOp.getInductionVars();
+      SmallVector<OpFoldResult> innerLbs = {rewriter.getIndexAttr(0)};
+      SmallVector<OpFoldResult> innerUbs;
+      if (innerSize == ShapedType::kDynamic) {
+        Value dim = rewriter.create<memref::DimOp>(loc, srcMem,
+            rewriter.create<arith::ConstantIndexOp>(loc, innerDim));
+        innerUbs.push_back(dim);
+      } else {
+        innerUbs.push_back(rewriter.getIndexAttr(innerSize));
+      }
+      SmallVector<OpFoldResult> innerSteps = {rewriter.getIndexAttr(1)};
+      SmallVector<Attribute> threadMapping = {
+          gpu::GPUThreadMappingAttr::get(rewriter.getContext(),
+                                         gpu::MappingId::LinearDim0)};
+
+      auto innerForall = scf::ForallOp::create(
+          rewriter, loc, innerLbs, innerUbs, innerSteps, ValueRange{},
+          rewriter.getArrayAttr(threadMapping));
+
+      // Build scatter body inside the inner forall.
+      Block *innerBody = innerForall.getBody();
+      rewriter.setInsertionPoint(innerBody, innerBody->without_terminator().begin());
+
+      // Compose IVs: outer forall IVs + inner forall IV for innermost dim.
+      SmallVector<Value> ivs;
+      ValueRange outerIVs = outerForall.getInductionVars();
+      if (srcRank == 1) {
+        // 1D case: element index = blockIV * threadsPerBlock + threadIV.
+        // When numBlocks > 1, the outer forall iterates over blocks and
+        // the inner forall iterates over threads within each block.
+        Value blockIV = outerIVs[0];
+        Value threadIV = innerForall.getInductionVars()[0];
+        Value tpb = rewriter.create<arith::ConstantIndexOp>(
+            loc, kMaxThreadsPerBlock);
+        Value offset =
+            rewriter.create<arith::MulIOp>(loc, blockIV, tpb);
+        Value elemIdx =
+            rewriter.create<arith::AddIOp>(loc, offset, threadIV);
+        // Guard against out-of-bounds when total elements is not a
+        // multiple of kMaxThreadsPerBlock.
+        Value totalElems = rewriter.create<arith::ConstantIndexOp>(
+            loc, srcShape[0]);
+        Value inBounds = rewriter.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::ult, elemIdx, totalElems);
+        auto ifOp = rewriter.create<scf::IfOp>(
+            loc, inBounds, /*withElseRegion=*/false);
+        rewriter.setInsertionPointToStart(ifOp.thenBlock());
+        ivs.push_back(elemIdx);
+      } else {
+        for (Value iv : outerIVs)
+          ivs.push_back(iv);
+        ivs.push_back(innerForall.getInductionVars()[0]);
+      }
+
       Value updateIdx = ivs[axis];
-
-      // Extract index (already i32 from TOSA cast if was float).
       Value idxVal =
           rewriter.create<memref::LoadOp>(loc, indicesMem, ValueRange{updateIdx});
       Value targetIdx =
@@ -614,7 +690,9 @@ struct NovaScatterAddOpLowering
                                       ? arith::AtomicRMWKind::addf
                                       : arith::AtomicRMWKind::addi;
       rewriter.create<memref::AtomicRMWOp>(loc, kind, val, inputMem, dstCoords);
-    } // InsertionGuard restores insertion point to after forallOp.
+    }
+
+    auto forallOp = outerForall;
 
     // Create result tensor after the forall (back at function level).
     rewriter.setInsertionPointAfter(forallOp);
@@ -1298,7 +1376,7 @@ lowerFullReduceMeanToSCF(nova::ReduceOp op, PatternRewriter &rewriter,
 
   auto inputMemType = MemRefType::get(inputType.getShape(), elemType);
   Value inputMem = rewriter.create<ToBufferOp>(
-      loc, inputMemType, input, /*restrict=*/true).getResult();
+      loc, inputMemType, input, /*read_only=*/true).getResult();
 
   Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);

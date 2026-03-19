@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -538,24 +539,21 @@ struct NovaReluOpLowering : public OpConversionPattern<mlir::nova::ReluOp> {
   }
 };
 // creating a  lowering for softmax
-struct NovaSoftmaxLoweringPattern
-    : public OpConversionPattern<mlir::nova::SoftmaxOp> {
-  using OpConversionPattern<mlir::nova::SoftmaxOp>::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(mlir::nova::SoftmaxOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
 
+struct NovaSoftmaxLoweringPattern : public OpConversionPattern<mlir::nova::SoftmaxOp> { 
+  using OpConversionPattern<mlir::nova::SoftmaxOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::SoftmaxOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+    // e^(x - max) / reduce<sum>(e^x - max)
     Location loc = op.getLoc();
     Value input = adaptor.getInput();
+
     auto restype = cast<RankedTensorType>(op.getType());
     auto inputType = cast<RankedTensorType>(input.getType());
     auto size = inputType.getShape().size();
-    int32_t dimension =
-        op.getDimension().has_value() ? op.getDimension().value() : -1;
-    if (dimension < 0) {
-      //  auto size1=inputType.getShape().size() - 1;
+
+    int32_t dimension = op.getDimension().has_value() ? op.getDimension().value() : -1;
+    if (dimension < 0)
       dimension += size;
-    }
     SmallVector<int64_t> dim;
     dim.push_back(dimension);
 
@@ -566,32 +564,39 @@ struct NovaSoftmaxLoweringPattern
       input = rewriter.create<mlir::tosa::CastOp>(loc, restype, input);
     }
 
+    // 1. find maximum
     SmallVector<int64_t> axes = {dimension};
-    Value op1 = rewriter.create<mlir::nova::ReduceOp>(
-        loc, ReductionKind::MAX, input, tempresult, /*keepdims=*/true, axes);
+    Value op1 = rewriter.create<mlir::nova::ReduceOp>(loc, ReductionKind::MAX, input, tempresult, true, axes);
 
-    // step2
-    // create a TOSA sub op with input and op1
+    // 2. xi - max
     Value op2 = rewriter.create<mlir::nova::SubOp>(loc, restype, input, op1);
-    // step3
-    // create  a TOSA exp op
+    
+    // 3. exp(xi - max)
     Value op3 = rewriter.create<mlir::nova::ExpOp>(loc, restype, op2);
-    // step4
-    // create a TOSA reduce sum
-    Value op4 = rewriter.create<mlir::nova::ReduceOp>(
-        loc, ReductionKind::SUM, op3, tempresult, /*keepdims=*/true, axes);
+    
+    // 4. sum(exp(xi - max))
+    Value op4 = rewriter.create<mlir::nova::ReduceOp>(loc, ReductionKind::SUM, op3, tempresult, true, axes);
 
-    // step 5
+    // 5. 1 / sum
     // create TOSA div: reciprocal(op4) * op3
     // TOSA's native broadcasting will map the 8x1 op4 onto the 8x16 op3.
-    Value recip =
-        rewriter.create<mlir::nova::ReciprocalOp>(loc, op4.getType(), op4);
+    // Guard: clamp sum_exp to at least eps to prevent Inf from reciprocal(~0).
+    // Without this, when logits have extreme variance, exp() underflows for most
+    // entries, making sum_exp ≈ 0 → reciprocal → Inf → NaN in backward pass.
+    auto epsType = cast<RankedTensorType>(op4.getType());
+    auto epsAttr = DenseElementsAttr::get(epsType, rewriter.getFloatAttr(epsType.getElementType(), 1.0e-7));
+    Value epsConst = rewriter.create<mlir::nova::ConstantOp>(loc, epsType, epsAttr);
+    Value safeSumExp = rewriter.create<mlir::nova::MaxOp>(loc, epsType, op4, epsConst);
+    Value recip = rewriter.create<mlir::nova::ReciprocalOp>(loc, safeSumExp.getType(), safeSumExp);
+    
+    // 6. mul(reciprocal * each_value)
     Value op5 = rewriter.create<mlir::nova::MulOp>(loc, restype, op3, recip);
-    rewriter.replaceOp(op, op5);
 
+    rewriter.replaceOp(op, op5);
     return success();
   }
 };
+
 
 // creating a template
 template <typename NovaTopTy>
@@ -685,74 +690,131 @@ struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
   matchAndRewrite(nova::LayerNormOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     //  y = (x - E[x]) / sqrt(Var[x] + eps) * gamma + beta
-    // getting operands
+    //
+    // Fused lowering: 3 linalg.generics instead of 9+ Nova ops.
+    //   Generic 1: mean = sum(x, axis=-1) / D        [reduction]
+    //   Generic 2: var  = sum((x-mean)^2, axis=-1)/D  [reduction, reads mean]
+    //   Generic 3: y = (x-mean)*rsqrt(var+eps)*gamma+beta  [all-parallel]
+    //
+    // Generic 3 is purely elementwise and will fuse as a producer into
+    // the downstream matmul via the tiling pipeline.
     Location loc = op.getLoc();
     Value x = adaptor.getInput();
     Value gamma = adaptor.getGamma();
     Value beta = adaptor.getBeta();
-    auto xres = cast<RankedTensorType>(op.getType());
     auto xType = cast<RankedTensorType>(x.getType());
-
+    auto resultType = cast<RankedTensorType>(op.getType());
     auto elemType = xType.getElementType();
-    // setting up
+    int64_t rank = xType.getRank();
+    int64_t D = xType.getShape().back();
     float eps = 1e-5f;
-    int last_dim = xType.getRank()-1;
-    // 1.finding row mean
-    std::vector<int64_t> meanShape(xType.getShape().begin(),
-                                   xType.getShape().end());
-    float last_dim_n = meanShape[last_dim];
-    meanShape.back() = 1;
-    auto meanType = mlir::RankedTensorType::get(meanShape, elemType);
-    auto mean_sum = rewriter
-                    .create<mlir::nova::ReduceOp>(
-                        loc, mlir::nova::ReductionKind::SUM, x, meanType, true,
-                        llvm::ArrayRef<int64_t>{-1}, false)
-                    .getResult();
-    auto scalarType = mlir::RankedTensorType::get({}, xType.getElementType());
-    auto n = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)(1/last_dim_n))));
-   // auto reciprocal = rewriter.create<nova::ReciprocalOp>(loc, n);
-    auto mean = rewriter.create<mlir::nova::MulOp>(loc, n, mean_sum).getResult();
+    float invD = 1.0f / static_cast<float>(D);
+    MLIRContext *ctx = rewriter.getContext();
 
-    auto x_minus_mean = rewriter.create<mlir::nova::SubOp>(loc, xres, x, mean).getResult();
+    // Shapes: input [B,T,D], stats [B,T] (squeezed — no keepdims)
+    SmallVector<int64_t> statsShape(xType.getShape().begin(),
+                                    xType.getShape().end() - 1);
+    auto statsType = RankedTensorType::get(statsShape, elemType);
 
+    // Iterator types: parallel(B), parallel(T), reduction(D)
+    SmallVector<utils::IteratorType> reductionIterTypes;
+    for (int64_t i = 0; i < rank - 1; ++i)
+      reductionIterTypes.push_back(utils::IteratorType::parallel);
+    reductionIterTypes.push_back(utils::IteratorType::reduction);
 
-    // 3. (x - mean)^2
-    auto sq_diff =
-        rewriter
-            .create<mlir::nova::MulOp>(loc, xres, x_minus_mean, x_minus_mean)
-            .getResult();
-    // 4. Var(x) = Mean((x-mean)^2)
-    auto var_sum = rewriter
-                   .create<mlir::nova::ReduceOp>(
-                       loc, mlir::nova::ReductionKind::SUM, sq_diff, meanType,
-                       true, llvm::ArrayRef<int64_t>{-1}, false)
-                   .getResult();
-    auto var = rewriter.create<mlir::nova::MulOp>(loc, n, var_sum).getResult();
+    // Indexing maps for reduction: input (b,t,d), output (b,t)
+    SmallVector<AffineExpr> inputExprs, statsExprs;
+    for (int64_t i = 0; i < rank; ++i)
+      inputExprs.push_back(rewriter.getAffineDimExpr(i));
+    for (int64_t i = 0; i < rank - 1; ++i)
+      statsExprs.push_back(rewriter.getAffineDimExpr(i));
+    auto inputMap = AffineMap::get(rank, 0, inputExprs, ctx);
+    auto statsMap = AffineMap::get(rank, 0, statsExprs, ctx);
 
-    // 5. sqrt(var + eps)
-    auto epsAttr = mlir::DenseElementsAttr::get(
-        mlir::cast<mlir::RankedTensorType>(var.getType()), eps);
-    auto epsConst =
-        rewriter.create<mlir::nova::ConstantOp>(loc, var.getType(), epsAttr)
-            .getResult();
-    auto var_plus_eps =
-        rewriter.create<mlir::nova::AddOp>(loc, var.getType(), var, epsConst)
-            .getResult();
-    auto std_inv =
-        rewriter.create<mlir::nova::RsqrtOp>(loc, var.getType(), var_plus_eps)
-            .getResult();
-    // 6. Normalize
-    auto norm =
-        rewriter.create<mlir::nova::MulOp>(loc, xres, x_minus_mean, std_inv)
-            .getResult();
-    // 7. scale and shift
-    // multiply by gamma
-    auto res =
-        rewriter.create<mlir::nova::MulOp>(loc, xres, norm, gamma).getResult();
-    // add beta
-    auto result =
-        rewriter.create<mlir::nova::AddOp>(loc, xres, res, beta).getResult();
-    rewriter.replaceOp(op, result);
+    // Identity value for sum reduction
+    Value zero = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getZeroAttr(elemType));
+
+    // ---- Generic 1: mean = sum(x) / D ----
+    Value meanEmpty = rewriter.create<tensor::EmptyOp>(
+        loc, statsShape, elemType);
+    Value meanInit = rewriter.create<linalg::FillOp>(
+        loc, zero, meanEmpty).result();
+
+    auto meanGeneric = rewriter.create<linalg::GenericOp>(
+        loc, statsType, /*inputs=*/x, /*outputs=*/meanInit,
+        SmallVector<AffineMap>{inputMap, statsMap}, reductionIterTypes,
+        [&](OpBuilder &b, Location nl, ValueRange args) {
+          Value sum = b.create<arith::AddFOp>(nl, args[0], args[1]);
+          b.create<linalg::YieldOp>(nl, sum);
+        });
+    // meanSum = sum(x) per row. Keep as sum — fold invD into normalize.
+    Value meanSum = meanGeneric.getResult(0);
+
+    Value invDVal = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(elemType, invD));
+
+    // ---- Generic 2: varSum = sum((x - mean)^2) per row ----
+    // Computes mean inline as meanSum * invD.
+    Value varEmpty = rewriter.create<tensor::EmptyOp>(
+        loc, statsShape, elemType);
+    Value varInit = rewriter.create<linalg::FillOp>(
+        loc, zero, varEmpty).result();
+
+    auto varGeneric = rewriter.create<linalg::GenericOp>(
+        loc, statsType,
+        /*inputs=*/ValueRange{x, meanSum},
+        /*outputs=*/varInit,
+        SmallVector<AffineMap>{inputMap, statsMap, statsMap},
+        reductionIterTypes,
+        [&](OpBuilder &b, Location nl, ValueRange args) {
+          // args[0] = x[b,t,d], args[1] = meanSum[b,t], args[2] = acc
+          Value mean = b.create<arith::MulFOp>(nl, args[1], invDVal);
+          Value diff = b.create<arith::SubFOp>(nl, args[0], mean);
+          Value sq = b.create<arith::MulFOp>(nl, diff, diff);
+          Value s = b.create<arith::AddFOp>(nl, sq, args[2]);
+          b.create<linalg::YieldOp>(nl, s);
+        });
+    // varSum = sum((x-mean)^2). Fold invD into normalize generic.
+    Value varSum = varGeneric.getResult(0);
+
+    // ---- Generic 3: y = (x - mean) * rsqrt(var + eps) * gamma + beta ----
+    // All-parallel: will fuse as producer into downstream matmul.
+    SmallVector<utils::IteratorType> allParallelIters(rank,
+        utils::IteratorType::parallel);
+
+    // Indexing maps: x[b,t,d], mean[b,t], var[b,t], gamma[d], beta[d], out[b,t,d]
+    SmallVector<AffineExpr> gammaExprs = {rewriter.getAffineDimExpr(rank - 1)};
+    auto gammaMap = AffineMap::get(rank, 0, gammaExprs, ctx);
+
+    Value normEmpty = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), elemType);
+
+    Value epsVal = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(elemType, eps));
+
+    auto normOp = rewriter.create<linalg::GenericOp>(
+        loc, resultType,
+        /*inputs=*/ValueRange{x, meanSum, varSum, gamma, beta},
+        /*outputs=*/normEmpty,
+        SmallVector<AffineMap>{inputMap, statsMap, statsMap,
+                               gammaMap, gammaMap, inputMap},
+        allParallelIters,
+        [&](OpBuilder &b, Location nl, ValueRange args) {
+          // args: x, meanSum, varSum, gamma, beta, out_init
+          // Compute mean and var inline from their sums.
+          Value mean = b.create<arith::MulFOp>(nl, args[1], invDVal);
+          Value var = b.create<arith::MulFOp>(nl, args[2], invDVal);
+          Value diff = b.create<arith::SubFOp>(nl, args[0], mean);
+          Value varEps = b.create<arith::AddFOp>(nl, var, epsVal);
+          Value rsqrt = b.create<math::RsqrtOp>(nl, varEps);
+          Value norm = b.create<arith::MulFOp>(nl, diff, rsqrt);
+          Value scaled = b.create<arith::MulFOp>(nl, norm, args[3]);
+          Value result = b.create<arith::AddFOp>(nl, scaled, args[4]);
+          b.create<linalg::YieldOp>(nl, result);
+        });
+
+    rewriter.replaceOp(op, normOp.getResult(0));
     return success();
   }
 };
@@ -766,6 +828,16 @@ struct NovaLayerNormBackwardPattern
  LogicalResult
  matchAndRewrite(nova::LayerNormBackwardOp op, OpAdaptor adaptor,
                  ConversionPatternRewriter &rewriter) const override {
+   // LN backward: given grad_y, x, gamma, compute dx, dgamma, dbeta.
+   //
+   // Fused lowering: 5 linalg.generics instead of 15+ Nova ops.
+   //   1. mean_reduce:     sum(x)/D → mean[B,T]
+   //   2. var_reduce:      sum((x-mean)²)/D → var[B,T]
+   //   3. dx_stats_reduce: sum(gy*gamma) and sum(gy*gamma*x_hat) per row → [B,T]
+   //   4. dx_elementwise:  dx = rstd*(gy*gamma - mean1/D - x_hat*mean2/D)
+   //   5. dgamma_dbeta:    sum(gy*x_hat) and sum(gy) over batch → [D]
+   //
+   // No intermediate [B,T,D] workspace tensors — all computed inline.
    Location loc = op.getLoc();
    Value gy = adaptor.getGradY();
    Value x = adaptor.getX();
@@ -773,108 +845,216 @@ struct NovaLayerNormBackwardPattern
 
    auto xType = cast<RankedTensorType>(x.getType());
    auto gammaType = cast<RankedTensorType>(gamma.getType());
-
-
-   // epsilon
+   auto elemType = xType.getElementType();
+   int64_t rank = xType.getRank();
+   int64_t D = xType.getShape().back();
    float eps = 1e-5f;
+   float invD = 1.0f / static_cast<float>(D);
+   MLIRContext *ctx = rewriter.getContext();
 
+   // Common shapes and maps
+   SmallVector<int64_t> statsShape(xType.getShape().begin(),
+                                   xType.getShape().end() - 1);
+   auto statsType = RankedTensorType::get(statsShape, elemType);
 
-   // calculate mean
-   int64_t last_dim = xType.getRank() - 1;
-   llvm::SmallVector<int64_t, 1> dims = {last_dim};
-   llvm::SmallVector<int64_t, 4> red_shape(xType.getShape().begin(), xType.getShape().end());
-   //create constant of 1/total number of elements 
-    
-   float ndim=red_shape[last_dim];
-   red_shape[last_dim] = 1;
-   auto red_type = mlir::RankedTensorType::get(red_shape, xType.getElementType());
-   auto scalarType = mlir::RankedTensorType::get({}, xType.getElementType());
-   auto dim_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (float)(1/ndim))));
-   auto sum_x = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, x, red_type, true,  llvm::ArrayRef<int64_t>{-1}, false);
-   auto mean = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_x);
-   auto meanType = cast<RankedTensorType>(mean.getType());
+   // Indexing maps
+   SmallVector<AffineExpr> inputExprs, statsExprs, gammaExprs;
+   for (int64_t i = 0; i < rank; ++i)
+     inputExprs.push_back(rewriter.getAffineDimExpr(i));
+   for (int64_t i = 0; i < rank - 1; ++i)
+     statsExprs.push_back(rewriter.getAffineDimExpr(i));
+   gammaExprs.push_back(rewriter.getAffineDimExpr(rank - 1));
 
+   auto inputMap = AffineMap::get(rank, 0, inputExprs, ctx);
+   auto statsMap = AffineMap::get(rank, 0, statsExprs, ctx);
+   auto gammaMap = AffineMap::get(rank, 0, gammaExprs, ctx);
 
-   // calculate standard deviation
-   auto diff = rewriter.create<mlir::nova::SubOp>(loc, x, mean.getResult());
-   auto diff2 = rewriter.create<mlir::nova::MulOp>(loc, diff.getResult(), diff.getResult());
-   auto sum_sq = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, diff2.getResult(), red_type, true,  llvm::ArrayRef<int64_t>{-1}, false);
-   auto var = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_sq);
-   auto eps_const = rewriter.create<mlir::nova::ConstantOp>(loc, scalarType, mlir::DenseElementsAttr::get(scalarType, rewriter.getFloatAttr(xType.getElementType(), (double)eps)));
-   auto var_eps = rewriter.create<mlir::nova::AddOp>(loc, var.getResult(), eps_const.getResult());
-   auto rstd = rewriter.create<mlir::nova::RsqrtOp>(loc, var_eps.getResult());
+   // Iterator types
+   SmallVector<utils::IteratorType> rowReductionIters;
+   for (int64_t i = 0; i < rank - 1; ++i)
+     rowReductionIters.push_back(utils::IteratorType::parallel);
+   rowReductionIters.push_back(utils::IteratorType::reduction);
 
+   SmallVector<utils::IteratorType> allParallelIters(rank,
+       utils::IteratorType::parallel);
 
+   // Batch reduction: reduce(B), reduce(T), parallel(D)
+   SmallVector<utils::IteratorType> batchReductionIters;
+   for (int64_t i = 0; i < rank - 1; ++i)
+     batchReductionIters.push_back(utils::IteratorType::reduction);
+   batchReductionIters.push_back(utils::IteratorType::parallel);
 
+   Value zero = rewriter.create<arith::ConstantOp>(
+       loc, rewriter.getZeroAttr(elemType));
+   Value invDVal = rewriter.create<arith::ConstantOp>(
+       loc, rewriter.getFloatAttr(elemType, invD));
+   Value epsVal = rewriter.create<arith::ConstantOp>(
+       loc, rewriter.getFloatAttr(elemType, eps));
 
-   // 1. Compute x_hat = (x - mean) * rstd
-   Value x_minus_mean =
-       rewriter.create<mlir::nova::SubOp>(loc, xType, x, mean).getResult();
-   Value x_hat =
-       rewriter.create<mlir::nova::MulOp>(loc, xType, x_minus_mean, rstd)
-           .getResult();
+   // Stats-level identity map
+   SmallVector<AffineExpr> statsIdExprs;
+   for (int64_t i = 0; i < rank - 1; ++i)
+     statsIdExprs.push_back(rewriter.getAffineDimExpr(i));
+   auto statsIdMap = AffineMap::get(rank - 1, 0, statsIdExprs, ctx);
+   SmallVector<utils::IteratorType> parallelStatsIters(rank - 1,
+       utils::IteratorType::parallel);
 
+   // ---- Generic 1: meanSum = sum(x) per row → [B,T] ----
+   // Keep raw sum — fold invD into downstream generics.
+   Value meanEmpty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
+   Value meanInit = rewriter.create<linalg::FillOp>(loc, zero, meanEmpty).result();
+   auto meanSumOp = rewriter.create<linalg::GenericOp>(
+       loc, statsType, /*inputs=*/x, /*outputs=*/meanInit,
+       SmallVector<AffineMap>{inputMap, statsMap}, rowReductionIters,
+       [&](OpBuilder &b, Location nl, ValueRange args) {
+         Value sum = b.create<arith::AddFOp>(nl, args[0], args[1]);
+         b.create<linalg::YieldOp>(nl, sum);
+       });
+   Value meanSum = meanSumOp.getResult(0);
 
-   // 3. dgamma = sum(gy * x_hat, over batch dims)
-   Value gy_xhat =
-       rewriter.create<mlir::nova::MulOp>(loc, xType, gy, x_hat).getResult();
+   // ---- Generic 2: varSum = sum((x - meanSum/D)²) per row → [B,T] ----
+   Value varEmpty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
+   Value varInit = rewriter.create<linalg::FillOp>(loc, zero, varEmpty).result();
+   auto varSumOp = rewriter.create<linalg::GenericOp>(
+       loc, statsType, ValueRange{x, meanSum}, varInit,
+       SmallVector<AffineMap>{inputMap, statsMap, statsMap}, rowReductionIters,
+       [&](OpBuilder &b, Location nl, ValueRange args) {
+         Value mean = b.create<arith::MulFOp>(nl, args[1], invDVal);
+         Value diff = b.create<arith::SubFOp>(nl, args[0], mean);
+         Value sq = b.create<arith::MulFOp>(nl, diff, diff);
+         Value s = b.create<arith::AddFOp>(nl, sq, args[2]);
+         b.create<linalg::YieldOp>(nl, s);
+       });
+   Value varSum = varSumOp.getResult(0);
+
+   // ---- dx_stats: two separate row reductions ----
+   // Dual-output linalg.generic reductions don't tile correctly.
+   // Use single-output generics: compute gy*gamma and gy*gamma*x_hat
+   // as elementwise ops, then reduce each with nova.reduce.
+
+   // Compute gy_gamma [B,T,D] and gy_gamma_xhat [B,T,D] in one pass
+   Value gyGammaEmpty = rewriter.create<tensor::EmptyOp>(
+       loc, xType.getShape(), elemType);
+   Value gyGammaXhatEmpty = rewriter.create<tensor::EmptyOp>(
+       loc, xType.getShape(), elemType);
+   auto dxPreOp = rewriter.create<linalg::GenericOp>(
+       loc, TypeRange{xType, xType},
+       /*inputs=*/ValueRange{gy, x, meanSum, varSum, gamma},
+       /*outputs=*/ValueRange{gyGammaEmpty, gyGammaXhatEmpty},
+       SmallVector<AffineMap>{inputMap, inputMap, statsMap, statsMap,
+                              gammaMap, inputMap, inputMap},
+       allParallelIters,
+       [&](OpBuilder &b, Location nl, ValueRange args) {
+         // args: gy, x, meanSum, varSum, gamma, out1_init, out2_init
+         Value gyGamma = b.create<arith::MulFOp>(nl, args[0], args[4]);
+         Value mean = b.create<arith::MulFOp>(nl, args[2], invDVal);
+         Value var = b.create<arith::MulFOp>(nl, args[3], invDVal);
+         Value diff = b.create<arith::SubFOp>(nl, args[1], mean);
+         Value varEps = b.create<arith::AddFOp>(nl, var, epsVal);
+         Value rstd = b.create<math::RsqrtOp>(nl, varEps);
+         Value xHat = b.create<arith::MulFOp>(nl, diff, rstd);
+         Value gyGammaXhat = b.create<arith::MulFOp>(nl, gyGamma, xHat);
+         b.create<linalg::YieldOp>(nl, ValueRange{gyGamma, gyGammaXhat});
+       });
+   Value gyGammaVal = dxPreOp.getResult(0);
+   Value gyGammaXhatVal = dxPreOp.getResult(1);
+
+   // sum(gy*gamma, axis=-1) per row → [B,T]
+   Value sum1Empty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
+   Value sum1Init = rewriter.create<linalg::FillOp>(loc, zero, sum1Empty).result();
+   auto sum1Op = rewriter.create<linalg::GenericOp>(
+       loc, statsType, /*inputs=*/gyGammaVal, /*outputs=*/sum1Init,
+       SmallVector<AffineMap>{inputMap, statsMap}, rowReductionIters,
+       [&](OpBuilder &b, Location nl, ValueRange args) {
+         Value s = b.create<arith::AddFOp>(nl, args[0], args[1]);
+         b.create<linalg::YieldOp>(nl, s);
+       });
+   Value sumGyGamma = sum1Op.getResult(0);
+
+   // sum(gy*gamma*x_hat, axis=-1) per row → [B,T]
+   Value sum2Empty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
+   Value sum2Init = rewriter.create<linalg::FillOp>(loc, zero, sum2Empty).result();
+   auto sum2Op = rewriter.create<linalg::GenericOp>(
+       loc, statsType, /*inputs=*/gyGammaXhatVal, /*outputs=*/sum2Init,
+       SmallVector<AffineMap>{inputMap, statsMap}, rowReductionIters,
+       [&](OpBuilder &b, Location nl, ValueRange args) {
+         Value s = b.create<arith::AddFOp>(nl, args[0], args[1]);
+         b.create<linalg::YieldOp>(nl, s);
+       });
+   Value sumGyGammaXhat = sum2Op.getResult(0);
+
+   // ---- Generic 4: dx — all-parallel elementwise ----
+   // dx = rstd * (gy*gamma - sumGyGamma/D - x_hat * sumGyGammaXhat/D)
+   Value dxEmpty = rewriter.create<tensor::EmptyOp>(
+       loc, xType.getShape(), elemType);
+   auto dxOp = rewriter.create<linalg::GenericOp>(
+       loc, xType,
+       /*inputs=*/ValueRange{gy, x, meanSum, varSum, gamma,
+                             sumGyGamma, sumGyGammaXhat},
+       /*outputs=*/dxEmpty,
+       SmallVector<AffineMap>{inputMap, inputMap, statsMap, statsMap,
+                              gammaMap, statsMap, statsMap, inputMap},
+       allParallelIters,
+       [&](OpBuilder &b, Location nl, ValueRange args) {
+         // args: gy, x, meanSum, varSum, gamma, s1, s2, out_init
+         Value gyGamma = b.create<arith::MulFOp>(nl, args[0], args[4]);
+         Value mean = b.create<arith::MulFOp>(nl, args[2], invDVal);
+         Value var = b.create<arith::MulFOp>(nl, args[3], invDVal);
+         Value diff = b.create<arith::SubFOp>(nl, args[1], mean);
+         Value varEps = b.create<arith::AddFOp>(nl, var, epsVal);
+         Value rstd = b.create<math::RsqrtOp>(nl, varEps);
+         Value xHat = b.create<arith::MulFOp>(nl, diff, rstd);
+         Value meanS1 = b.create<arith::MulFOp>(nl, args[5], invDVal);
+         Value meanS2 = b.create<arith::MulFOp>(nl, args[6], invDVal);
+         Value t1 = b.create<arith::SubFOp>(nl, gyGamma, meanS1);
+         Value t2 = b.create<arith::MulFOp>(nl, xHat, meanS2);
+         Value t3 = b.create<arith::SubFOp>(nl, t1, t2);
+         Value dx = b.create<arith::MulFOp>(nl, t3, rstd);
+         b.create<linalg::YieldOp>(nl, dx);
+       });
+   Value dx = dxOp.getResult(0);
+
+   // ---- dgamma and dbeta via Nova reduce ops ----
+   // The batch reduction [reduce(B), reduce(T), parallel(D)] doesn't tile
+   // correctly as a linalg.generic — the tiling framework treats outer
+   // reduction dims as workgroup distribution, losing the accumulation.
+   // Use Nova reduce ops which the existing ReduceOpConverter handles
+   // correctly with proper indexing maps and initialization.
+   //
+   // First compute gy * x_hat as an all-parallel generic, then reduce.
+   Value gyXhatEmpty = rewriter.create<tensor::EmptyOp>(
+       loc, xType.getShape(), elemType);
+   auto gyXhatOp = rewriter.create<linalg::GenericOp>(
+       loc, xType,
+       /*inputs=*/ValueRange{gy, x, meanSum, varSum},
+       /*outputs=*/gyXhatEmpty,
+       SmallVector<AffineMap>{inputMap, inputMap, statsMap, statsMap, inputMap},
+       allParallelIters,
+       [&](OpBuilder &b, Location nl, ValueRange args) {
+         // args: gy, x, meanSum, varSum, out_init
+         Value mean = b.create<arith::MulFOp>(nl, args[2], invDVal);
+         Value var = b.create<arith::MulFOp>(nl, args[3], invDVal);
+         Value diff = b.create<arith::SubFOp>(nl, args[1], mean);
+         Value varEps = b.create<arith::AddFOp>(nl, var, epsVal);
+         Value rstd = b.create<math::RsqrtOp>(nl, varEps);
+         Value xHat = b.create<arith::MulFOp>(nl, diff, rstd);
+         Value gyXhat = b.create<arith::MulFOp>(nl, args[0], xHat);
+         b.create<linalg::YieldOp>(nl, gyXhat);
+       });
+   Value gyXhat = gyXhatOp.getResult(0);
+
+   // dgamma = sum(gy * x_hat, over batch dims [0..rank-2])
    SmallVector<int64_t> batchDims;
-   for (int64_t i = 0; i < xType.getRank() - 1; ++i)
+   for (int64_t i = 0; i < rank - 1; ++i)
      batchDims.push_back(i);
-   Value dgamma =
-       rewriter
-           .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
-                                         gy_xhat, gammaType, false, batchDims)
-           .getResult();
+   Value dgamma = rewriter.create<nova::ReduceOp>(
+       loc, nova::ReductionKind::SUM, gyXhat, gammaType,
+       /*keepdims=*/false, batchDims).getResult();
 
-
-   // 4. dbeta = sum(gy, over batch dims)
-   Value dbeta =
-       rewriter
-           .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
-                                         gy, gammaType, false, batchDims)
-           .getResult();
-
-
-   // 5. dx
-   Value gy_gamma =
-       rewriter.create<mlir::nova::MulOp>(loc, xType, gy, gamma).getResult();
-
- //Using reduce sum
-   Value sum_gy_gamma =
-       rewriter
-           .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM,
-                                         gy_gamma, meanType, true,
-                                         llvm::ArrayRef<int64_t>{-1})
-           .getResult();
-  //CReating constant of reciprocal 
-  
-  Value mean_gy_gamma = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_gy_gamma);
-   Value gy_gamma_xhat =
-       rewriter.create<mlir::nova::MulOp>(loc, xType, gy_gamma, x_hat)
-           .getResult();
-           
-   Value mean_gy_gamma_xhat =
-       rewriter
-           .create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::MEAN,
-                                         gy_gamma_xhat, meanType, true,
-                                         llvm::ArrayRef<int64_t>{-1})
-           .getResult();
-  // Value mean_gy_gamma_xhat = rewriter.create<mlir::nova::MulOp>(loc,dim_const,sum_gy_gamma_xhat).getResult();
-
-
-   Value t3 =
-       rewriter
-           .create<mlir::nova::MulOp>(loc, xType, x_hat, mean_gy_gamma_xhat)
-           .getResult();
-   Value t4 =
-       rewriter.create<mlir::nova::SubOp>(loc, xType, gy_gamma, mean_gy_gamma)
-           .getResult();
-   Value t5 =
-       rewriter.create<mlir::nova::SubOp>(loc, xType, t4, t3).getResult();
-   Value dx =
-       rewriter.create<mlir::nova::MulOp>(loc, xType, t5, rstd).getResult();
-
+   // dbeta = sum(gy, over batch dims)
+   Value dbeta = rewriter.create<nova::ReduceOp>(
+       loc, nova::ReductionKind::SUM, gy, gammaType,
+       /*keepdims=*/false, batchDims).getResult();
 
    rewriter.replaceOp(op, {dx, dgamma, dbeta});
    return success();

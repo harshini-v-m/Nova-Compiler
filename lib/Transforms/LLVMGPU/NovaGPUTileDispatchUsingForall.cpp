@@ -341,6 +341,18 @@ struct NovaTileAndDistributePass
             // Contractions stay as independent roots.
             if (isContractionOp(producerOp))
               return std::nullopt;
+            // Don't fuse producers that have reduction iterator types.
+            // Reductions (e.g. LayerNorm mean/variance, softmax sum) need
+            // to see ALL elements along the reduction dimension. When fused
+            // as a producer into a consumer's tiled forall, each workgroup
+            // computes a PARTIAL reduction over its tile — producing wrong
+            // results and racing on the reduction output buffer.
+            if (auto linalgOp = dyn_cast<linalg::LinalgOp>(producerOp)) {
+              for (auto iterType : linalgOp.getIteratorTypesArray()) {
+                if (iterType != utils::IteratorType::parallel)
+                  return std::nullopt;
+              }
+            }
             bool yieldProducerReplacement =
                 yieldReplacementsFor.contains(producerOp);
             return scf::SCFTileAndFuseOptions::ControlFnResult{

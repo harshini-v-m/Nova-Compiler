@@ -138,6 +138,133 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// ConvertGlobalMemAllocOp
+//
+// Converts memref.alloc with NO address space inside gpu.func into a
+// module-level memref.global declaration + memref.get_global.
+//
+// After bufferization, workspace tensors (shared_outs init for thread foralls)
+// become memref.alloc() with no address space inside block-level foralls.
+// After kernel outlining these end up inside gpu.func. Without this pattern,
+// ConvertMemRefToGpu would turn them into memref.alloca (per-thread stack),
+// which is catastrophic for large buffers (e.g. 1x1024x384xf32 = 1.5 MB per
+// thread × 1024 threads = 1.5 GB).
+//
+// Instead, we promote them to device global memory (memref.global in the
+// gpu.module). In PTX this becomes a .global variable — one copy per module,
+// accessible by all threads. This is safe because:
+//   - The buffer is written by all threads via parallel_insert_slice (each
+//     thread writes to a disjoint slice)
+//   - The buffer is not needed across kernel launches (workspace, not output)
+//===----------------------------------------------------------------------===//
+struct ConvertGlobalMemAllocOp : public OpRewritePattern<memref::AllocOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::AllocOp allocOp,
+                                PatternRewriter &rewriter) const override {
+    // Only handle allocs with NO address space (default/global memory).
+    // Workgroup allocs are handled by ConvertSharedMemAllocOp.
+    if (allocOp.getType().getMemorySpace())
+      return failure();
+
+    // Only inside GPU functions (after kernel outlining).
+    if (!allocOp->getParentOfType<gpu::GPUFuncOp>())
+      return failure();
+
+    // Dynamic allocs inside GPU kernels: convert to memref.alloca (per-thread
+    // stack). These are per-thread temporaries from boundary tile handling
+    // (e.g. memref<1x?x4xf32> where ? <= tileSize). Cannot use memref.global
+    // because (1) globals require static shape, and (2) a single global would
+    // be shared by all threads, causing race conditions. Per-thread stack
+    // (alloca) is correct — each thread gets its own copy.
+    // Without this, dynamic memref.alloc lowers to device-side malloc() which
+    // crashes with CUDA_ERROR_ILLEGAL_ADDRESS.
+    ArrayRef<int64_t> shape = allocOp.getType().getShape();
+    if (ShapedType::isDynamicShape(shape)) {
+      rewriter.replaceOpWithNewOp<memref::AllocaOp>(
+          allocOp, allocOp.getType(), allocOp.getDynamicSizes(),
+          allocOp.getSymbolOperands());
+      return success();
+    }
+
+    // ---- Three-tier allocation strategy for static allocs ----
+    //
+    // Compute buffer size to decide the right allocation strategy.
+    // Different buffer sizes have fundamentally different semantics:
+    //   - Small (<=1 KB): per-thread accumulators (K-loop iter_args, bias scratch)
+    //   - Medium (1 KB - 48 KB): per-block tile buffers (matmul output tiles)
+    //   - Large (>48 KB): workspace buffers (LN backward full [B,T,D] tensors)
+    int64_t numElements = 1;
+    for (int64_t dim : shape)
+      numElements *= dim;
+    int64_t elemBits = allocOp.getType().getElementTypeBitWidth();
+    int64_t sizeBytes = numElements * (elemBits / 8);
+
+    // Tier 1: SMALL (<=1 KB) → memref.alloca (per-thread stack).
+    // Each thread gets its own copy. Correct for K-reduction accumulators
+    // (e.g. memref<1x1x16xf32> = 64 bytes) where each thread accumulates
+    // independently. Using memref.global here would create a single copy
+    // shared by all threads → race condition on the accumulator.
+    constexpr int64_t kAllocaThreshold = 1024; // 1 KB
+    if (sizeBytes <= kAllocaThreshold) {
+      rewriter.replaceOpWithNewOp<memref::AllocaOp>(
+          allocOp, allocOp.getType(), allocOp.getDynamicSizes(),
+          allocOp.getSymbolOperands());
+      return success();
+    }
+
+    // Tier 2: MEDIUM (1 KB - 48 KB) → memref.global (module-level).
+    // These are per-block tile buffers where all threads in the block
+    // write to disjoint slices. The later NovaGPUPromoteGlobalsToSharedPass
+    // promotes them from .global (cross-block shared) to .shared (per-block)
+    // when they fit in the 48 KB shared memory budget.
+    constexpr int64_t kSharedMemLimit = 48 * 1024; // 48 KB
+    if (sizeBytes <= kSharedMemLimit) {
+      uint64_t alignment;
+      if (std::optional<uint64_t> alignmentInfo = allocOp.getAlignment()) {
+        alignment = alignmentInfo.value();
+      } else {
+        alignment = std::max<uint64_t>(
+            llvm::PowerOf2Ceil(elemBits / 8), 1);
+      }
+
+      MemRefType allocType = allocOp.getType();
+      auto funcOp = allocOp->getParentOfType<mlir::FunctionOpInterface>();
+      Operation *symbolTableOp =
+          SymbolTable::getNearestSymbolTable(funcOp->getParentOp());
+      SymbolTable symbolTable(symbolTableOp);
+
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(
+          &symbolTableOp->getRegion(0).front().front());
+      auto global = memref::GlobalOp::create(
+          rewriter, funcOp.getLoc(), "__global_memory__",
+          /*sym_visibility=*/rewriter.getStringAttr("private"),
+          /*type=*/allocType,
+          /*initial_value=*/ElementsAttr(),
+          /*constant=*/false,
+          /*alignment=*/rewriter.getI64IntegerAttr(alignment));
+      symbolTable.insert(global);
+
+      rewriter.setInsertionPointToStart(
+          &(*funcOp.getFunctionBody().begin()));
+      rewriter.replaceOpWithNewOp<memref::GetGlobalOp>(
+          allocOp, global.getType(), global.getName());
+      return success();
+    }
+
+    // Tier 3: LARGE (>48 KB) → leave as memref.alloc.
+    // Too large for per-thread stack (would overflow) and too large for
+    // shared memory (48 KB limit on sm_86). By returning failure(), the
+    // alloc survives this pass and is later handled by ConvertMemRefToGpuPass
+    // (Step 12.75), which converts it to gpu.alloc → host-side mgpuMemAlloc.
+    // The buffer is allocated on device global memory before the kernel launch
+    // and passed as a kernel argument.
+    return failure();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // DropGPUMemoryDeallocOp
 //
 // Erases ALL memref.dealloc ops inside GPU modules.  GPU kernels do not have
@@ -179,6 +306,7 @@ struct NovaConvertSharedMemAllocsPass
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
     patterns.add<ConvertSharedMemAllocOp>(&getContext());
+    patterns.add<ConvertGlobalMemAllocOp>(&getContext());
     patterns.add<DropGPUMemoryDeallocOp>(&getContext());
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       return signalPassFailure();
@@ -261,6 +389,141 @@ struct NovaGPULowerMemorySpacePass
   }
 };
 
+//===----------------------------------------------------------------------===//
+// NovaGPUPromoteGlobalsToSharedPass
+//
+// Runs AFTER full LLVM lowering inside gpu.module.  Finds llvm.mlir.global
+// ops named "__global_memory__*" (created by ConvertGlobalMemAllocOp) and
+// promotes them from address space 0 (device global) to address space 3
+// (shared / per-block).
+//
+// In PTX this turns `.global` variables into `.shared` variables, giving
+// each thread block its own copy — fixing the cross-block race condition
+// that occurs when multiple blocks in a grid write to the same `.global`.
+//
+// At the LLVM dialect level, pointers are opaque.  We change the global's
+// addr_space and insert llvm.addrspacecast (ptr<3> -> ptr) at each
+// llvm.mlir.addressof use so downstream GEPs/loads/stores continue to
+// use generic pointers.
+//===----------------------------------------------------------------------===//
+struct NovaGPUPromoteGlobalsToSharedPass
+    : public PassWrapper<NovaGPUPromoteGlobalsToSharedPass,
+                         OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUPromoteGlobalsToSharedPass)
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<LLVM::LLVMDialect>();
+  }
+
+  // Returns the size in bytes of an LLVM global's type, or 0 if unknown.
+  static uint64_t getGlobalSizeBytes(LLVM::GlobalOp global) {
+    Type ty = global.getGlobalType();
+    // Flatten nested arrays: e.g. !llvm.array<4096 x i8> → 4096 bytes.
+    uint64_t numElements = 1;
+    while (auto arrTy = dyn_cast<LLVM::LLVMArrayType>(ty)) {
+      numElements *= arrTy.getNumElements();
+      ty = arrTy.getElementType();
+    }
+    // Now ty should be the scalar element type (i8, f32, etc.).
+    if (ty.isIntOrFloat())
+      return numElements * (ty.getIntOrFloatBitWidth() / 8);
+    // Unknown element type — conservatively return a large size to
+    // prevent promotion.
+    return UINT64_MAX;
+  }
+
+  void runOnOperation() override {
+    Operation *moduleOp = getOperation();
+
+    // sm_86 default static shared memory limit.  Conservative: use 48 KB
+    // (the guaranteed minimum without cudaFuncSetAttribute).
+    constexpr uint64_t kMaxSharedBytes = 48 * 1024;
+    constexpr unsigned kSharedAS = 3;
+
+    // Group globals by the gpu.func that uses them.  A global may be used
+    // by multiple functions (unlikely after outlining, but be safe).
+    // For each function, compute total shared bytes if we promoted all its
+    // __global_memory__* globals + any existing __shared_memory__* globals.
+    //
+    // Strategy: per function, sort candidate globals by size (smallest
+    // first) and greedily promote until the budget is exhausted.
+
+    // Step 1: collect all __global_memory__* globals in this module.
+    SmallVector<LLVM::GlobalOp> allCandidates;
+    moduleOp->walk([&](LLVM::GlobalOp global) {
+      if (global.getSymName().starts_with("__global_memory__"))
+        allCandidates.push_back(global);
+    });
+
+    if (allCandidates.empty())
+      return;
+
+    // Step 2: for each function, find which globals it references and
+    // compute existing shared memory usage.
+    // Since globals are module-scoped and typically used by one function,
+    // we just compute a global budget across all functions in the module.
+    uint64_t existingSharedBytes = 0;
+    moduleOp->walk([&](LLVM::GlobalOp global) {
+      if (global.getSymName().starts_with("__shared_memory__") &&
+          global.getAddrSpace() == kSharedAS) {
+        existingSharedBytes += getGlobalSizeBytes(global);
+      }
+    });
+
+    // Step 3: sort candidates by size (smallest first) for greedy packing.
+    llvm::sort(allCandidates, [](LLVM::GlobalOp a, LLVM::GlobalOp b) {
+      return getGlobalSizeBytes(a) < getGlobalSizeBytes(b);
+    });
+
+    // Step 4: greedily promote globals that fit in the shared budget.
+    uint64_t usedSharedBytes = existingSharedBytes;
+    SmallVector<LLVM::GlobalOp> toPromote;
+    for (auto global : allCandidates) {
+      uint64_t size = getGlobalSizeBytes(global);
+      if (usedSharedBytes + size <= kMaxSharedBytes) {
+        toPromote.push_back(global);
+        usedSharedBytes += size;
+      }
+      // else: leave as .global (cross-block shared, but at least no crash)
+    }
+
+    // Step 5: promote selected globals to shared memory.
+    auto ptrShared = LLVM::LLVMPointerType::get(&getContext(), kSharedAS);
+    auto ptrGeneric = LLVM::LLVMPointerType::get(&getContext(), 0);
+
+    for (auto global : toPromote) {
+      global.setAddrSpace(kSharedAS);
+
+      StringRef symName = global.getSymName();
+      auto *symbolTableOp = SymbolTable::getNearestSymbolTable(global);
+      if (!symbolTableOp)
+        continue;
+
+      symbolTableOp->walk([&](LLVM::AddressOfOp addressOf) {
+        if (addressOf.getGlobalName() != symName)
+          return;
+
+        addressOf.getResult().setType(ptrShared);
+
+        OpBuilder builder(addressOf);
+        builder.setInsertionPointAfter(addressOf);
+        auto cast = builder.create<LLVM::AddrSpaceCastOp>(
+            addressOf.getLoc(), ptrGeneric, addressOf.getResult());
+
+        addressOf.getResult().replaceAllUsesExcept(cast.getResult(), cast);
+      });
+    }
+  }
+
+  StringRef getArgument() const override {
+    return "nova-gpu-promote-globals-to-shared";
+  }
+  StringRef getDescription() const override {
+    return "Promotes __global_memory__ LLVM globals from device global (AS 0) "
+           "to shared memory (AS 3) for per-block isolation";
+  }
+};
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -275,12 +538,20 @@ std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass() {
   return std::make_unique<NovaGPULowerMemorySpacePass>();
 }
 
+std::unique_ptr<Pass> createNovaGPUPromoteGlobalsToSharedPass() {
+  return std::make_unique<NovaGPUPromoteGlobalsToSharedPass>();
+}
+
 void registerNovaConvertSharedMemAllocsPass() {
   PassRegistration<NovaConvertSharedMemAllocsPass>();
 }
 
 void registerNovaGPULowerMemorySpacePass() {
   PassRegistration<NovaGPULowerMemorySpacePass>();
+}
+
+void registerNovaGPUPromoteGlobalsToSharedPass() {
+  PassRegistration<NovaGPUPromoteGlobalsToSharedPass>();
 }
 
 } // namespace mlir::nova

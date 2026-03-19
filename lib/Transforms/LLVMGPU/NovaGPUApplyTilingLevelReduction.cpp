@@ -162,7 +162,17 @@ getTileSizes(RewriterBase &rewriter, TilingInterface tilingOp,
   if ((int64_t)tiles.size() > numLoops)
     return SmallVector<OpFoldResult>(numLoops, zero);
 
-  // Thread level: clamp to max threads using actual op dimensions.
+  // Thread level: clamp to max threads using the op's ACTUAL loop ranges.
+  //
+  // The thread forall iterates over actualDim / threadTile for each dim.
+  // When an op is fused into a block forall that doesn't tile some dims
+  // (e.g., a batch_matmul inside a single-block weight-gradient forall),
+  // the actualDims can be much larger than the workgroup tiles from config.
+  // We must clamp based on actualDims to limit real thread count ≤ 1024.
+  //
+  // This is safe because outer parallel dims now have threadTile=0 (not 1),
+  // so they don't create spurious thread iterations. Only dims with
+  // non-zero thread tiles contribute to the thread count.
   if (tilingLevel == NovaTilingLevel::Thread) {
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
       SmallVector<int64_t> actualDims = linalgOp.getStaticLoopRanges();
@@ -252,6 +262,25 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
     } else {
       // Thread / Subgroup: parallel scf.forall with GPU mapping.
       tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
+
+      // Check if any non-zero tile is on a reduction dim (full-reduction ops).
+      // If so, use partial reduction to parallelize the reduction across threads.
+      bool hasReductionTile = false;
+      if (auto linalgOp = dyn_cast<linalg::LinalgOp>(tilingOp.getOperation())) {
+        auto iterTypes = linalgOp.getIteratorTypesArray();
+        for (int i = 0; i < (int)tileSizes.size() && i < (int)iterTypes.size();
+             ++i) {
+          if (!isZeroInteger(tileSizes[i]) &&
+              linalg::isReductionIterator(iterTypes[i])) {
+            hasReductionTile = true;
+            break;
+          }
+        }
+      }
+      if (hasReductionTile) {
+        tilingOptions.setReductionTilingStrategy(
+            ReductionTilingStrategy::PartialReductionOuterParallel);
+      }
 
       SmallVector<Attribute> mapping;
       int idx = 0;

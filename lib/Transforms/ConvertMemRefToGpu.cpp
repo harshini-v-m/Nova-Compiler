@@ -38,13 +38,13 @@ public:
     if (mlir::isa_and_present<gpu::AddressSpaceAttr>(type.getMemorySpace()))
       return failure();
 
-    // Inside GPU kernels: convert to memref.alloca (GPU local memory).
-    // gpu.alloc (cudaMalloc) is a host-side op and illegal inside gpu.func.
-    if (op->getParentOfType<gpu::GPUFuncOp>()) {
-      rewriter.replaceOpWithNewOp<memref::AllocaOp>(
-          op, type, op.getDynamicSizes(), op.getSymbolOperands());
-      return success();
-    }
+    // Inside GPU kernels: skip — these are handled by
+    // NovaConvertSharedMemAllocs which converts them to memref.global +
+    // memref.get_global (device global memory). Converting to alloca here
+    // would create per-thread stack allocations that are catastrophic for
+    // large workspace buffers (e.g. 1x1024x384xf32 = 1.5 MB per thread).
+    if (op->getParentOfType<gpu::GPUFuncOp>())
+      return failure();
 
     rewriter.replaceOpWithNewOp<gpu::AllocOp>(
         op, type, /*asyncToken=*/Type(), /*asyncDependencies=*/ValueRange{},

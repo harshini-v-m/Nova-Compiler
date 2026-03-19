@@ -469,19 +469,78 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
   SmallVector<int64_t> reductionTiles(numLoops, 0);
   SmallVector<int64_t> subgroupTiles(numLoops, 0);
 
-  // Mirroring IREE's setRootDefaultConfig:
-  // - workgroupThreads = 2 * warpSize = 64
-  // - vectorSize = 4 (128-bit loads for f32)
-  // - innermost parallel dim tile = workgroupThreads * vectorSize = 256
-  // - other parallel dims: 1 per thread
-  // - reduction dims: tile = 4
-  constexpr int64_t kWorkgroupThreads = 2 * kWarpSize;  // 64
+  // workgroupThreads = 8 * warpSize = 256 (optimal for Ampere latency hiding)
+  // vectorSize = 4 (128-bit loads for f32)
+  // innermost parallel dim tile = workgroupThreads * vectorSize = 1024
+  // other parallel dims: 1 per thread
+  // reduction dims: tile = 4
+  constexpr int64_t kWorkgroupThreads = 8 * kWarpSize;  // 256
   constexpr int64_t kVectorSize = 4;
 
-  if (parallelDims.empty()) {
+  if (parallelDims.empty() && reductionDims.empty()) {
+    // No loops at all (e.g., rank-0 fill). Nothing to tile.
+  } else if (parallelDims.empty() && !reductionDims.empty()) {
     // Full reduction (all dims are reduction, no parallel dims).
     // Set all workgroup tiles to 0 — the dispatch pass will wrap in a
-    // single-block forall. Set reduction tiles for vectorization.
+    // single-block forall. Set thread tiles on the innermost reduction dim
+    // to enable partial reduction parallelism at the Thread tiling level.
+    // Each thread handles `threadTile` reduction elements; the thread forall
+    // trip count = dim / threadTile = number of threads.
+    unsigned innerRedDim = reductionDims.back();
+    int64_t innerRedSize = loopBounds[innerRedDim];
+    // Target 256 threads on the innermost reduction dim.
+    int64_t numThreads = std::min(innerRedSize, (int64_t)(8 * kWarpSize));
+    // Ensure clean divisibility.
+    while (numThreads > 1 && innerRedSize % numThreads != 0)
+      numThreads /= 2;
+    // threadTile = elements per thread.
+    int64_t redThreadTile = innerRedSize / numThreads;
+    threadTiles[innerRedDim] = redThreadTile;
+    // Don't set sequential reduction tiles on the threaded dim — the partial
+    // reduction handles it. Set vectorization tiles on other reduction dims.
+    for (unsigned dim : reductionDims) {
+      if (dim == innerRedDim) continue;
+      int64_t bound = loopBounds[dim];
+      if (bound % 4 == 0) reductionTiles[dim] = 4;
+      else if (bound % 2 == 0) reductionTiles[dim] = 2;
+      else reductionTiles[dim] = 1;
+    }
+  } else if (!reductionDims.empty() && parallelDims.size() >= 2 &&
+             reductionDims.back() == (unsigned)(numLoops - 1)) {
+    // ROW-REDUCTION pattern: multiple parallel dims + innermost reduction.
+    // Example: LN mean/var: parallel(B), parallel(T), reduction(D).
+    //
+    // Strategy: tile outer parallel dims so each workgroup handles a small
+    // number of rows. The reduction is done SEQUENTIALLY within each thread
+    // (via reductionTiles), NOT distributed across threads (threadTiles=0
+    // for reduction dims). This is correct because reduction needs
+    // cooperative accumulation — parallel thread slices would each compute
+    // partial sums without combining them.
+    //
+    // Distribute the second-to-last parallel dim across blocks and threads.
+    // Innermost parallel dim (if not the reduction) gets workgroup tile = 1.
+    unsigned innerParallelDim = parallelDims.back();
+    int64_t innerSize = loopBounds[innerParallelDim];
+
+    // Tile innermost parallel dim to a modest value so threads handle rows.
+    int64_t innerTile = std::min(innerSize, (int64_t)(kWorkgroupThreads));
+    // Find a tile that divides evenly
+    while (innerTile > 1 && innerSize % innerTile != 0)
+      innerTile /= 2;
+    workgroupTiles[innerParallelDim] = innerTile;
+    // Each thread handles 1 row (threadTile=1 on the parallel dim).
+    threadTiles[innerParallelDim] = 1;
+
+    // Other parallel dims: tile to 1 (fully distributed across blocks).
+    for (unsigned dim : parallelDims) {
+      if (dim == innerParallelDim) continue;
+      workgroupTiles[dim] = 1;
+    }
+
+    // Reduction dims: sequential within each thread via reductionTiles.
+    // DO NOT set threadTiles on reduction dims — that would create a
+    // parallel forall where each thread computes a partial sum without
+    // any cross-thread combination.
     for (unsigned dim : reductionDims) {
       int64_t bound = loopBounds[dim];
       if (bound % 4 == 0) reductionTiles[dim] = 4;
@@ -494,26 +553,61 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
     unsigned innerParallelDim = parallelDims.back();
     int64_t innerSize = loopBounds[innerParallelDim];
 
-    // Innermost: threads * vectorSize elements.
-    int64_t vectorSize = kVectorSize;
-    int64_t innerTile = kWorkgroupThreads * vectorSize;
-
-    // Adjust vectorSize if inner dim doesn't support it.
-    while (vectorSize > 1 && innerSize % (kWorkgroupThreads * vectorSize) != 0)
-      vectorSize /= 2;
-    innerTile = kWorkgroupThreads * vectorSize;
-
-    // Clamp to actual size.
-    innerTile = std::min(innerTile, innerSize);
+    // Find best (threads, vectorSize) combo where tile = threads * vectorSize
+    // divides innerSize evenly.
+    //
+    // Two-pass search: prefer vectorSize >= 2 (meaningful thread tiles that
+    // actually create thread-level foralls). vectorSize=1 means threadTile=1,
+    // which the thread tiling pass may treat as degenerate (especially when
+    // the op is fused into a block forall with different dims, causing
+    // clampThreadTilesToMaxThreads to overcorrect down to 1 thread).
+    int64_t bestThreads = 0;
+    int64_t bestVS = 1;
+    // Pass 1: only vs >= 2.
+    for (int64_t vs = kVectorSize; vs >= 2; vs /= 2) {
+      for (int64_t thr = kWorkgroupThreads; thr >= kWarpSize; thr /= 2) {
+        int64_t tile = thr * vs;
+        if (tile <= innerSize && innerSize % tile == 0) {
+          if (thr > bestThreads || (thr == bestThreads && vs > bestVS)) {
+            bestThreads = thr;
+            bestVS = vs;
+          }
+          break;
+        }
+      }
+    }
+    // Pass 2: fallback to vs=1 only if no vs>=2 combo found.
+    if (bestThreads == 0) {
+      for (int64_t thr = kWorkgroupThreads; thr >= kWarpSize; thr /= 2) {
+        if (thr <= innerSize && innerSize % thr == 0) {
+          bestThreads = thr;
+          bestVS = 1;
+          break;
+        }
+      }
+    }
+    // Fallback for small/non-power-of-2 dims: tile the entire dim (1 block).
+    if (bestThreads == 0) {
+      bestVS = kVectorSize;
+      while (bestVS > 1 && innerSize % bestVS != 0)
+        bestVS /= 2;
+      bestThreads = innerSize / bestVS;
+    }
+    int64_t vectorSize = bestVS;
+    int64_t innerTile = std::min(bestThreads * bestVS, innerSize);
 
     workgroupTiles[innerParallelDim] = innerTile;
     threadTiles[innerParallelDim] = vectorSize;
 
-    // Other parallel dims (outer): tile to 1, thread tile = 1.
+    // Other parallel dims (outer): tile to 1 at workgroup level, no thread
+    // tiling (threadTile = 0). These dims are fully distributed at block level
+    // (1 element per block). Setting threadTile=1 would create threads along
+    // these dims, which is catastrophic when the op is fused into a block
+    // forall that doesn't tile these dims (the thread count explodes).
     for (int i = (int)parallelDims.size() - 2; i >= 0; --i) {
       unsigned dim = parallelDims[i];
       workgroupTiles[dim] = 1;
-      threadTiles[dim] = 1;
+      threadTiles[dim] = 0;
     }
 
     // Reduction dims: tile = 4 for vectorized loads.
@@ -564,6 +658,42 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
 /// grad_weight) are NOT epilogues — they need their own configs. Fusing a
 /// dimension-reducing consumer into a contraction's forall creates overlapping
 /// writes when the consumer's output rank < forall dims.
+/// Returns true if `op` is a "true" contraction (matmul-like), not just any op
+/// that isaContractionOpInterface might match (e.g., elementwise dot-products
+/// like C[i,j] = sum_k A[i,j,k]*B[i,j,k] also match contraction interface but
+/// are semantically reductions, not matmuls).
+static bool isTrueContraction(Operation *op) {
+  // Named contraction ops are always true contractions.
+  if (isa<linalg::BatchMatmulOp, linalg::MatmulOp, linalg::MatvecOp,
+          linalg::VecmatOp, linalg::BatchMatvecOp>(op))
+    return true;
+  // For generics, require contraction interface AND that the contraction
+  // has a non-trivial structure (at least one index that only appears in
+  // one input + reduction, characteristic of matrix multiply).
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  if (!linalgOp || !linalg::isaContractionOpInterface(linalgOp))
+    return false;
+  // A true matmul has dims where each input uses a different subset.
+  // E.g., matmul: A[m,k], B[k,n], C[m,n] — m is only in A+C, n only in B+C.
+  // A reduction: A[i,j,k], B[i,j,k], C[i,j] — i,j appear in both A and B.
+  // Check: at least one parallel dim that does NOT appear in all inputs.
+  auto indexMaps = linalgOp.getIndexingMapsArray();
+  if (indexMaps.size() < 3)
+    return false;
+  auto iterTypes = linalgOp.getIteratorTypesArray();
+  unsigned numLoops = iterTypes.size();
+  for (unsigned i = 0; i < numLoops; ++i) {
+    if (iterTypes[i] != utils::IteratorType::parallel)
+      continue;
+    bool inInput0 = indexMaps[0].isFunctionOfDim(i);
+    bool inInput1 = indexMaps[1].isFunctionOfDim(i);
+    // If a parallel dim is in one input but not the other → true contraction.
+    if (inInput0 != inInput1)
+      return true;
+  }
+  return false;
+}
+
 static bool isContractionEpilogue(Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
   if (!linalgOp)
@@ -577,8 +707,7 @@ static bool isContractionEpilogue(Operation *op) {
     Operation *defOp = operand.getDefiningOp();
     if (!defOp)
       continue;
-    auto linalgDef = dyn_cast<linalg::LinalgOp>(defOp);
-    if (linalgDef && linalg::isaContractionOpInterface(linalgDef))
+    if (isTrueContraction(defOp))
       return true;
     // Also check one level deeper: epilogue chains like
     // matmul → bias_add → relu (relu's input is bias_add, not matmul).
@@ -587,8 +716,7 @@ static bool isContractionEpilogue(Operation *op) {
         Operation *innerDef = innerOp.getDefiningOp();
         if (!innerDef)
           continue;
-        auto innerLinalg = dyn_cast<linalg::LinalgOp>(innerDef);
-        if (innerLinalg && linalg::isaContractionOpInterface(innerLinalg))
+        if (isTrueContraction(innerDef))
           return true;
       }
     }
@@ -603,8 +731,7 @@ static bool isContractionEpilogue(Operation *op) {
 static bool isContractionPrologue(Operation *op) {
   for (OpResult result : op->getResults()) {
     for (Operation *user : result.getUsers()) {
-      auto linalgUser = dyn_cast<linalg::LinalgOp>(user);
-      if (linalgUser && linalg::isaContractionOpInterface(linalgUser))
+      if (isTrueContraction(user))
         return true;
     }
   }

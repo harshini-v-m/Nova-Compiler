@@ -112,16 +112,16 @@ struct NovaToArithOp{
 
     // Step 1: max_val = reduce_max(logits, dim=-1, keepdims=false)
     int64_t rank = logitsType.getRank();
-    int64_t lastDim = rank - 1;
-    auto axisAttr = builder->getI32IntegerAttr(lastDim);
+    int64_t lastDim = rank - 1;\
 
     // keepdims=true shape for broadcast in sub/exp
     auto keepShape = logitsType.getShape().vec();
     keepShape[lastDim] = 1;
     auto keepType = mlir::RankedTensorType::get(keepShape, targetElemType);
-
-    Value maxValKeep = builder->create<tosa::ReduceMaxOp>(op.getLoc(), keepType,
-                                                          logits, axisAttr);
+ //h : create nova reduce max
+  nova::ReductionKind rk = nova::ReductionKind::MAX;
+    Value maxValKeep = builder->create<nova::ReduceOp>(op.getLoc(),rk,
+                                                          logits,keepType, true,llvm::ArrayRef<int64_t>{-1},false);
 
     // Step 2: z_shifted = logits - max_val (broadcast sub)
     Value zShifted =
@@ -142,53 +142,21 @@ struct NovaToArithOp{
     Value sumExp = builder->create<nova::ReduceOp>(
         op.getLoc(), rk_sum, expZShifted, batchType, false, reduceDims);
 
-    // Step 5: log_sum_exp = log(sum_exp) → tensor<4xf32>
-    Value logSumExp = builder->create<nova::LogOp>(op.getLoc(), sumExp);
+
 
     // Step 6: max_val flat (keepdims=false) → tensor<4xf32>
     auto rk_max = nova::ReductionKind::MAX;
     Value maxValFlat = builder->create<nova::ReduceOp>(
         op.getLoc(), rk_max, logits, batchType, false, reduceDims);
 
-    // Step 7: Gather from ORIGINAL logits: gathered[i] = logits[i, targets[i]]
-    // This is safe because logits is a function argument (always dominates).
-    SmallVector<OpFoldResult> gatheredSizes;
-    for (int64_t i = 0; i < batchShape.size(); ++i) {
-      if (ShapedType::isDynamic(batchShape[i])) {
-        Value dimSize = builder->create<tensor::DimOp>(op.getLoc(), targets, i);
-        gatheredSizes.push_back(dimSize);
-      } else {
-        gatheredSizes.push_back(builder->getIndexAttr(batchShape[i]));
-      }
-    }
-    Value emptyGather = builder->create<tensor::EmptyOp>(
-        op.getLoc(), gatheredSizes, targetElemType);
+    // Step 7: Gather target class logit: gathered[b,t] = logits[b, t, targets[b,t]]
+    // Gather along the LAST axis (the class dimension).
+    Value gatheredLogits =
+        builder->create<nova::GatherOp>(op.getLoc(), logits, targets, lastDim)
+            .getResult();
 
-    int64_t numBatchDims = batchShape.size();
-    SmallVector<AffineMap> gatherMaps = {
-        builder->getMultiDimIdentityMap(numBatchDims), // targets
-        builder->getMultiDimIdentityMap(numBatchDims)  // empty (out)
-    };
-    SmallVector<utils::IteratorType> gatherIterTypes(numBatchDims,
-                                                     utils::IteratorType::parallel);
-
-    auto gatherGeneric = builder->create<linalg::GenericOp>(
-        op.getLoc(), TypeRange{batchType}, ValueRange{targets},
-        ValueRange{emptyGather}, gatherMaps, gatherIterTypes,
-        [&](OpBuilder &b, Location loc, ValueRange args) {
-          Value targetVal = args[0];
-          Value targetIdx = b.create<arith::IndexCastOp>(loc, b.getIndexType(),
-                                                         targetVal);
-          SmallVector<Value> extractIndices;
-          for (int i = 0; i < numBatchDims; ++i) {
-            extractIndices.push_back(b.create<linalg::IndexOp>(loc, i));
-          }
-          extractIndices.push_back(targetIdx);
-          Value val = b.create<tensor::ExtractOp>(loc, logits, extractIndices);
-          b.create<linalg::YieldOp>(loc, val);
-        });
-    Value gatheredLogits = gatherGeneric.getResult(0);
-
+    // Step 5: log_sum_exp = log(sum_exp) → tensor<4xf32>
+    Value logSumExp = builder->create<nova::LogOp>(op.getLoc(), sumExp);
     // Step 8: per_sample_loss = log_sum_exp + max_val - gathered_logits
     Value lseMaxSum =
         builder->create<nova::AddOp>(op.getLoc(), logSumExp, maxValFlat);

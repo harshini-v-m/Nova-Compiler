@@ -394,6 +394,10 @@ namespace mlir::nova
       gpuPm.addPass(createArithToLLVMConversionPass());
       gpuPm.addPass(createConvertMathToLLVMPass());
       gpuPm.addPass(createReconcileUnrealizedCastsPass());
+      // Promote __global_memory__ globals from device global (AS 0) to
+      // shared memory (AS 3). Must run after full LLVM lowering so we
+      // operate on opaque pointers and can insert addrspacecast cleanly.
+      gpuPm.addPass(createNovaGPUPromoteGlobalsToSharedPass());
     }
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
@@ -516,12 +520,20 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
 
-    // Hoist memref.alloc ops out of loops where possible.
-    // This moves shared memory allocations out of the K-reduction loop so
-    // they are reused across iterations instead of being re-allocated each
-    // step.
-    pm.addNestedPass<func::FuncOp>(
-        bufferization::createBufferLoopHoistingPass());
+    // NOTE: BufferLoopHoistingPass is DISABLED.
+    //
+    // This pass hoists memref.alloc out of loops to reuse buffers across
+    // iterations. However, it treats scf.forall (parallel) the same as
+    // scf.for (sequential). Hoisting an alloc out of a parallel forall
+    // collapses N per-thread buffers into one shared buffer, creating a
+    // race condition between threads. The per-thread K-accumulator
+    // (memref<1x1x16xf32>) gets hoisted from the thread forall to
+    // function scope, causing all 256 threads to share one 64-byte buffer.
+    //
+    // TODO: Implement a custom hoisting pass that only hoists from
+    // sequential loops (scf.for) and not from parallel loops (scf.forall).
+    // pm.addNestedPass<func::FuncOp>(
+    //     bufferization::createBufferLoopHoistingPass());
 
     // Insert memref.dealloc for all memref.alloc ops.
     bufferization::BufferDeallocationPipelineOptions deallocOpts;
