@@ -106,6 +106,7 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
   pm.addPass(createCanonicalizerPass());
 
   // FUSE ELEMENTWISE (operates on generalized ops)
+  pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaLinalgHorizontalFusionPass());
   pm.addPass(mlir::createLinalgElementwiseOpFusionPass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());

@@ -1420,7 +1420,7 @@ struct NovaToGpuPass
                         nova::SceOp, nova::SceFwdBwdOp,
                         nova::MatmulOp,
                         nova::GatherOp, nova::ScatterAddOp>();
- //   patterns.add<NovaToGpuReducePattern>(context);
+   patterns.add<NovaToGpuReducePattern>(context);
     patterns.add<ToDeviceOpLowering>(context);
     patterns.add<SceOpLowering>(context);
     patterns.add<SceFwdBwdOpLowering>(context);

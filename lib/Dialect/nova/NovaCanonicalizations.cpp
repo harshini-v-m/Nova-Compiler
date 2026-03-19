@@ -56,86 +56,6 @@ void ReduceOp::getCanonicalizationPatterns(RewritePatternSet &results,
 namespace {
 
 //===----------------------------------------------------------------------===//
-// Broadcast Insertion Pattern (Generic for all binary ops)
-//===----------------------------------------------------------------------===//
-
-template <typename OpType>
-struct InsertBroadcastPattern : public OpRewritePattern<OpType> {
-  using OpRewritePattern<OpType>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(OpType op,
-                                PatternRewriter &rewriter) const override {
-    auto lhsType = dyn_cast<RankedTensorType>(op.getLhs().getType());
-    auto rhsType = dyn_cast<RankedTensorType>(op.getRhs().getType());
-    auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
-
-    if (!lhsType || !rhsType || !resultType) {
-      return failure();
-    }
-
-    if (lhsType.getShape() == resultType.getShape() &&
-        rhsType.getShape() == resultType.getShape()) {
-      return failure();
-    }
-
-    Value newLhs = op.getLhs();
-    Value newRhs = op.getRhs();
-    bool changed = false;
-
-    if (lhsType.getShape() != resultType.getShape()) {
-      if (lhsType.getRank() > resultType.getRank()) {
-        return failure();
-      }
-      if (!isBroadcastCompatible(lhsType.getShape(), resultType.getShape())) {
-        return failure();
-      }
-
-      auto broadcastDims =
-          computeBroadcastDimensions(lhsType.getRank(), resultType.getRank());
-
-      auto broadcastDimsAttr = rewriter.getI64ArrayAttr(broadcastDims);
-      auto restype = resultType.clone(lhsType.getElementType());
-
-      newLhs = rewriter
-                   .create<BroadcastInDimOp>(op.getLoc(), restype, newLhs,
-                                             broadcastDimsAttr)
-                   .getResult();
-      changed = true;
-    }
-
-    if (rhsType.getShape() != resultType.getShape()) {
-      if (rhsType.getRank() > resultType.getRank()) {
-        return failure();
-      }
-      if (!isBroadcastCompatible(rhsType.getShape(), resultType.getShape())) {
-        return failure();
-      }
-
-      auto broadcastDims =
-          computeBroadcastDimensions(rhsType.getRank(), resultType.getRank());
-
-      auto broadcastDimsAttr = rewriter.getI64ArrayAttr(broadcastDims);
-      // here instead of creating the op with result type we should
-      // make thedata type of rhs to rhs itself
-      auto restype = resultType.clone(rhsType.getElementType());
-      newRhs = rewriter
-                   .create<BroadcastInDimOp>(op.getLoc(), restype, newRhs,
-                                             broadcastDimsAttr)
-                   .getResult();
-      changed = true;
-    }
-
-    if (!changed) {
-      return failure();
-    }
-
-    rewriter.replaceOpWithNewOp<OpType>(op, op.getResult().getType(), newLhs,
-                                        newRhs);
-    return success();
-  }
-};
-
-//===----------------------------------------------------------------------===//
 // Cast Insertion Pattern (Generic for binary ops)
 //===----------------------------------------------------------------------===//
 template <typename OpType>
@@ -915,7 +835,6 @@ struct SimplifyPowConstant : public OpRewritePattern<PowOp> {
 
 void AddOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<AddOp>>(context);
   results.add<InsertCastPattern<AddOp>>(context);
   results.add<EliminateAddZero>(context);
   results.add<CombineAddConstants>(context);
@@ -924,7 +843,6 @@ void AddOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 void SubOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<SubOp>>(context);
   results.add<InsertCastPattern<SubOp>>(context);
   results.add<EliminateSubZero>(context);
   results.add<EliminateSubSelf>(context);
@@ -933,7 +851,6 @@ void SubOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 void MulOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<MulOp>>(context);
   results.add<InsertCastPattern<MulOp>>(context);
   results.add<EliminateMulOne>(context);
   results.add<EliminateMulZero>(context);
@@ -942,7 +859,6 @@ void MulOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 void DivOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<DivOp>>(context);
   results.add<InsertCastPattern<DivOp>>(context);
   results.add<EliminateDivOne>(context);
   results.add<Reciprocalsquare>(context);
@@ -951,45 +867,27 @@ void DivOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 void ModOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<ModOp>>(context);
   results.add<InsertCastPattern<ModOp>>(context);
 }
 
 void PowOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<PowOp>>(context);
   results.add<InsertCastPattern<PowOp>>(context);
   results.add<SimplifyPowConstant>(context);
 }
 
 void MaxOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<MaxOp>>(context);
   results.add<InsertCastPattern<MaxOp>>(context);
   results.add<SimplifyMaxSelf>(context);
 }
 
 void MinOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<MinOp>>(context);
   results.add<InsertCastPattern<MinOp>>(context);
   results.add<SimplifyMinSelf>(context);
 }
 
-void AndOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                        MLIRContext *context) {
-  results.add<InsertBroadcastPattern<AndOp>>(context);
-}
-
-void OrOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                       MLIRContext *context) {
-  results.add<InsertBroadcastPattern<OrOp>>(context);
-}
-
-void XorOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                        MLIRContext *context) {
-  results.add<InsertBroadcastPattern<XorOp>>(context);
-}
 void NegOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<IdentityNeg>(context);
@@ -1016,81 +914,3 @@ void ReciprocalOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.add<SimplifyReciprocalReciprocal>(context);
 }
 
-struct InsertBroadcastPatterncompare : public OpRewritePattern<CompareOp> {
-  using OpRewritePattern<CompareOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(CompareOp op,
-                                PatternRewriter &rewriter) const override {
-    auto lhsType = dyn_cast<RankedTensorType>(op.getLhs().getType());
-    auto rhsType = dyn_cast<RankedTensorType>(op.getRhs().getType());
-    auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
-    nova::ComparisonType compareType = op.getKind();
-    if (!lhsType || !rhsType || !resultType) {
-      return failure();
-    }
-
-    if (lhsType.getShape() == resultType.getShape() &&
-        rhsType.getShape() == resultType.getShape()) {
-      return failure();
-    }
-
-    Value newLhs = op.getLhs();
-    Value newRhs = op.getRhs();
-    bool changed = false;
-
-    if (lhsType.getShape() != resultType.getShape()) {
-      if (lhsType.getRank() > resultType.getRank()) {
-        return failure();
-      }
-      if (!isBroadcastCompatible(lhsType.getShape(), resultType.getShape())) {
-        return failure();
-      }
-
-      auto broadcastDims =
-          computeBroadcastDimensions(lhsType.getRank(), resultType.getRank());
-
-      auto broadcastDimsAttr = rewriter.getI64ArrayAttr(broadcastDims);
-      auto restype = resultType.clone(lhsType.getElementType());
-
-      newLhs = rewriter
-                   .create<BroadcastInDimOp>(op.getLoc(), restype, newLhs,
-                                             broadcastDimsAttr)
-                   .getResult();
-      changed = true;
-    }
-
-    if (rhsType.getShape() != resultType.getShape()) {
-      if (rhsType.getRank() > resultType.getRank()) {
-        return failure();
-      }
-      if (!isBroadcastCompatible(rhsType.getShape(), resultType.getShape())) {
-        return failure();
-      }
-
-      auto broadcastDims =
-          computeBroadcastDimensions(rhsType.getRank(), resultType.getRank());
-
-      auto broadcastDimsAttr = rewriter.getI64ArrayAttr(broadcastDims);
-      // here instead of creating the op with result type we should
-      // make thedata type of rhs to rhs itself
-      auto restype = resultType.clone(rhsType.getElementType());
-      newRhs = rewriter
-                   .create<BroadcastInDimOp>(op.getLoc(), restype, newRhs,
-                                             broadcastDimsAttr)
-                   .getResult();
-      changed = true;
-    }
-
-    if (!changed) {
-      return failure();
-    }
-
-    rewriter.replaceOpWithNewOp<CompareOp>(op, op.getResult().getType(), newLhs,
-                                           newRhs, compareType);
-    return success();
-  }
-};
-void CompareOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                            MLIRContext *context) {
-  results.add<InsertBroadcastPatterncompare>(context);
-}

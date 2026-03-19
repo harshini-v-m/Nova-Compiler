@@ -20,15 +20,19 @@ std::unique_ptr<Pass> createNovaToLinalgPass();
 void registerNovaToLinalgPass();
 void populateNovaToLinalgPatterns(RewritePatternSet &patterns);
 
+// From NovaLinalgFusion.cpp — Horizontal fusion of linalg.generic ops
+std::unique_ptr<Pass> createNovaLinalgHorizontalFusionPass();
+void registerNovaLinalgHorizontalFusionPass();
+
 } // namespace nova
 } // namespace mlir
 
 #endif
 
 /*
-NovaMatmulOpLoweringgeneric, 
+NovaMatmulOpLoweringgeneric,
 NovaBroadcastInDimOpLowering,
-NovaTransposeOpLowering, 
+NovaTransposeOpLowering,
 NovaToDeviceOpLowering,
 NovaScatterAddOpLowering,
 NovaGatherOpLowering,
@@ -49,8 +53,8 @@ nova::AcoshOp,
 nova::AtanhOp,
 nova::CompareOp,
 nova::SignOp,
-ArgMinConverter, 
-ArgMaxConverter, 
-ReduceOpConverter, 
+ArgMinConverter,
+ArgMaxConverter,
+ReduceOpConverter,
 AdamOpConverter
 */

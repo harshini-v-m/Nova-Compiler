@@ -77,7 +77,6 @@ def Nova_CompareOp:Op<Nova_Dialect,"compare",[Pure,DeclareOpInterfaceMethods<Inf
  ];
  let skipDefaultBuilders=1;
   let hasVerifier=1;
-  let hasCanonicalizer=1; 
   let extraClassDeclaration = [{
   }];
 
@@ -555,7 +554,6 @@ class Nova_BinaryOp<string mnemonic, list<Trait> commonTraits = []>:
     $lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) 
   }];
 
-  let hasCanonicalizer = 1;
   let hasVerifier = 1;
 
   let extraClassDeclaration = [{
@@ -567,6 +565,7 @@ class Nova_BinaryOp<string mnemonic, list<Trait> commonTraits = []>:
 //===----------------------------------------------------------------------===//
 def Nova_AddOp : Nova_BinaryOp<"add", [Commutative]> {
   let summary = "Elementwise tensor addition";
+  
   let description = [{
     Adds two tensors elementwise with broadcasting support.
     
@@ -659,7 +658,6 @@ def Nova_MinOp : Nova_BinaryOp<"min", [Commutative,NoComplexOperands]> {
 }
 
 def Nova_AndOp : Nova_BinaryOp<"and", [Commutative,NoComplexOperands]> {
-  let hasCanonicalizer = 1;
   let summary = "Elementwise logical AND";
   let description = [{
     Performs element-wise logical AND operation on tensors.
@@ -671,7 +669,7 @@ def Nova_AndOp : Nova_BinaryOp<"and", [Commutative,NoComplexOperands]> {
 }
 
 def Nova_OrOp : Nova_BinaryOp<"or", [Commutative,NoComplexOperands]> {
-  let hasCanonicalizer = 1;
+
   let summary = "Elementwise logical OR";
   let description = [{
     Performs element-wise logical OR operation on tensors.
@@ -683,7 +681,6 @@ def Nova_OrOp : Nova_BinaryOp<"or", [Commutative,NoComplexOperands]> {
 }
 
 def Nova_XorOp : Nova_BinaryOp<"xor", [Commutative,NoComplexOperands]> {
-  let hasCanonicalizer = 1;
   let summary = "Elementwise logical XOR";
   let description = [{
     Performs element-wise logical XOR operation on tensors.
@@ -1101,48 +1098,48 @@ def Nova_SoftmaxBackwardOp : Op<Nova_Dialect, "softmax_backward", [Pure, Declare
   let summary = "Backward operation for softmax";
   let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$output, OptionalAttr<I32Attr>:$dimension);
   let results = (outs Nova_Tensor:$grad_input);
-  let assemblyFormat = "$grad_out `,` $output (`dimension` `=` $dimension^)? attr-dict `:` type($grad_out) `,` type($output) `->` type($grad_input)";
+  let assemblyFormat = "$grad_out `,` $output (`dimension` `=` $dimension^)? attr-dict `:` type($grad_out) `,` type($output)  ";
 }
 
 def Nova_TanhBackwardOp : Op<Nova_Dialect, "tanh_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Backward operation for tanh";
   let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$output);
   let results = (outs Nova_Tensor:$grad_input);
-  let assemblyFormat = "$grad_out `,` $output attr-dict `:` type($grad_out) `,` type($output) `->` type($grad_input)";
+  let assemblyFormat = "$grad_out `,` $output attr-dict `:` type($grad_out) `,` type($output)  ";
 }
 
 def Nova_ReluBackwardOp : Op<Nova_Dialect, "relu_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Backward operation for relu";
   let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$input);
   let results = (outs Nova_Tensor:$grad_input);
-  let assemblyFormat = "$grad_out `,` $input attr-dict `:` type($grad_out) `,` type($input) `->` type($grad_input)";
+  let assemblyFormat = "$grad_out `,` $input attr-dict `:` type($grad_out) `,` type($input)  ";
 }
 
 def Nova_SigmoidBackwardOp : Op<Nova_Dialect, "sigmoid_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Backward operation for sigmoid";
   let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$output);
   let results = (outs Nova_Tensor:$grad_input);
-  let assemblyFormat = "$grad_out `,` $output attr-dict `:` type($grad_out) `,` type($output) `->` type($grad_input)";
+  let assemblyFormat = "$grad_out `,` $output attr-dict `:` type($grad_out) `,` type($output)  ";
 }
 
 def Nova_MseBackwardOp : Op<Nova_Dialect, "mse_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Backward operation for MSE loss";
   let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$pred, Nova_Tensor:$target);
   let results = (outs Nova_Tensor:$grad_input);
-  let assemblyFormat = "$grad_out `,` $pred `,` $target attr-dict `:` type($grad_out) `,` type($pred) `,` type($target) `->` type($grad_input)";
+  let assemblyFormat = "$grad_out `,` $pred `,` $target attr-dict `:` type($grad_out) `,` type($pred) `,` type($target)  ";
 }
 
 def Nova_MaeBackwardOp : Op<Nova_Dialect, "mae_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Backward operation for MAE loss";
   let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$pred, Nova_Tensor:$target);
   let results = (outs Nova_Tensor:$grad_input);
-  let assemblyFormat = "$grad_out `,` $pred `,` $target attr-dict `:` type($grad_out) `,` type($pred) `,` type($target) `->` type($grad_input)";
+  let assemblyFormat = "$grad_out `,` $pred `,` $target attr-dict `:` type($grad_out) `,` type($pred) `,` type($target)  ";
 }
 
 def Nova_BceBackwardOp : Op<Nova_Dialect, "bce_backward", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Backward operation for BCE loss";
   let arguments = (ins Nova_Tensor:$grad_out, Nova_Tensor:$pred, Nova_Tensor:$target);
   let results = (outs Nova_Tensor:$grad_input);
-  let assemblyFormat = "$grad_out `,` $pred `,` $target attr-dict `:` type($grad_out) `,` type($pred) `,` type($target) `->` type($grad_input)";
+  let assemblyFormat = "$grad_out `,` $pred `,` $target attr-dict `:` type($grad_out) `,` type($pred) `,` type($target)  ";
 }
 #endif // NOVA_OPS
