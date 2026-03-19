@@ -271,7 +271,6 @@ struct NovaOpTosaOp {
   
     return builder->create<nova::MulOp>(op.getLoc(), mean, minus1);
   }
-
   // BCE lowering pattern
   static Value mappingtosa(nova::BceOp op, Type resultType, ValueRange input, OpBuilder *builder) {
     // loss = -1 * reduce_mean[yA * log(yP) + (1 - yA) * log(1 - yP)]
@@ -513,7 +512,6 @@ struct NovaGeluBackwardPattern
     auto op5 = rewriter.create<mlir::nova::AddOp>(loc, inputType, op4, cst_1);
     auto term1 =rewriter.create<mlir::nova::MulOp>(loc, inputType, op5, cst_05);
 
-    auto op6 =rewriter.create<mlir::nova::MulOp>(loc, inputType, input, cst_05);
     //adding two terms
     auto d_gelu =rewriter.create<mlir::nova::AddOp>(loc, inputType, term1, secondterm);
 
@@ -685,8 +683,6 @@ struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
     }
 
     auto loc = op.getLoc();
-    auto elementType = resultType.getElementType();
-    int64_t inputRank = inputType.getRank();
 
     //create nova::matmul and nova::add 
     auto matmulOperation = rewriter.create<mlir::nova::MatmulOp>(loc, input, weight).getResult();
@@ -1182,7 +1178,7 @@ struct NovaSoftmaxBackwardPattern : public OpConversionPattern<mlir::nova::Softm
     outShape[dim] = 1;
     auto outType = mlir::RankedTensorType::get(outShape, type.getElementType());
     Value sum_gs = rewriter.create<mlir::nova::ReduceOp>(loc, mlir::nova::ReductionKind::SUM, gs, outType, true, dims, false).getResult();
-    Value diff = rewriter.create<mlir::nova::SubOp>(loc, type, g, sum_gs).getResult();
+    Value diff = rewriter.create<mlir::nova::SubOp>(loc, g, sum_gs).getResult();
     Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, s, diff).getResult();
     rewriter.replaceOp(op, dx);
     return success();
@@ -1206,23 +1202,6 @@ struct NovaTanhBackwardPattern : public OpConversionPattern<mlir::nova::TanhBack
   }
 };
 
-struct NovaReluBackwardPattern : public OpConversionPattern<mlir::nova::ReluBackwardOp> {
-  using OpConversionPattern<mlir::nova::ReluBackwardOp>::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::nova::ReluBackwardOp op, OpAdaptor adaptor,
-                                ConversionPatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    Value g = adaptor.getGradOut();
-    Value x = adaptor.getInput();
-    auto type = llvm::cast<mlir::RankedTensorType>(x.getType());
-    Value zero = rewriter.create<mlir::nova::ConstantOp>(loc, type,  DenseElementsAttr::get( type,rewriter.getFloatAttr(type.getElementType(), 0.0f))).getResult();
-    auto i1Type = mlir::RankedTensorType::get(type.getShape(), rewriter.getI1Type());
-    Value mask = rewriter.create<mlir::nova::CompareOp>(loc, i1Type, x, zero, mlir::nova::ComparisonType::GT).getResult();
-    Value mask_f = rewriter.create<mlir::nova::CastOp>(loc, type, mask).getResult();
-    Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, g, mask_f).getResult();
-    rewriter.replaceOp(op, dx);
-    return success();
-  }
-};
 
 struct NovaSigmoidBackwardPattern : public OpConversionPattern<mlir::nova::SigmoidBackwardOp> {
   using OpConversionPattern<mlir::nova::SigmoidBackwardOp>::OpConversionPattern;
@@ -1238,69 +1217,7 @@ struct NovaSigmoidBackwardPattern : public OpConversionPattern<mlir::nova::Sigmo
     Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, g, dy).getResult();
     rewriter.replaceOp(op, dx);
     return success();
-  }
-};
 
-struct NovaMseBackwardPattern : public OpConversionPattern<mlir::nova::MseBackwardOp> {
-  using OpConversionPattern<mlir::nova::MseBackwardOp>::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::nova::MseBackwardOp op, OpAdaptor adaptor,
-                                ConversionPatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    Value g = adaptor.getGradOut();
-    Value pred = adaptor.getPred();
-    Value target = adaptor.getTarget();
-    auto type = llvm::cast<mlir::RankedTensorType>(pred.getType());
-    Value diff = rewriter.create<mlir::nova::SubOp>(loc, type, pred, target).getResult();
-    int64_t numel = type.getNumElements();
-    Value scale = rewriter.create<mlir::nova::ConstantOp>(loc, type,  DenseElementsAttr::get( type,rewriter.getFloatAttr(type.getElementType(), 2.0f / numel))).getResult();
-    Value dx_pre = rewriter.create<mlir::nova::MulOp>(loc, type, diff, scale).getResult();
-    Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, dx_pre, g).getResult();
-    rewriter.replaceOp(op, dx);
-    return success();
-  }
-};
-
-struct NovaMaeBackwardPattern : public OpConversionPattern<mlir::nova::MaeBackwardOp> {
-  using OpConversionPattern<mlir::nova::MaeBackwardOp>::OpConversionPattern;
-  LogicalResult matchAndRewrite(mlir::nova::MaeBackwardOp op, OpAdaptor adaptor,
-                                ConversionPatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    Value g = adaptor.getGradOut();
-    Value pred = adaptor.getPred();
-    Value target = adaptor.getTarget();
-    auto type = llvm::cast<mlir::RankedTensorType>(pred.getType());
-    Value diff = rewriter.create<mlir::nova::SubOp>(loc, type, pred, target).getResult();
-    Value sign = rewriter.create<mlir::nova::SignOp>(loc, type, diff).getResult();
-    int64_t numel = type.getNumElements();
-    Value scale = rewriter.create<mlir::nova::ConstantOp>(loc, type,  DenseElementsAttr::get( type,rewriter.getFloatAttr(type.getElementType(), 1.0f / numel))).getResult();
-    Value dx_pre = rewriter.create<mlir::nova::MulOp>(loc, type, sign, scale).getResult();
-    Value dx = rewriter.create<mlir::nova::MulOp>(loc, type, dx_pre, g).getResult();
-    rewriter.replaceOp(op, dx);
-    return success();
-  }
-};
-
-struct NovaBceBackwardPattern : public OpConversionPattern<nova::BceBackwardOp> {
-  using OpConversionPattern<nova::BceBackwardOp>::OpConversionPattern;
-  LogicalResult matchAndRewrite(nova::BceBackwardOp op, OpAdaptor adaptor,
-                                ConversionPatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    Value g = adaptor.getGradOut();
-    Value pred = adaptor.getPred();
-    Value target = adaptor.getTarget();
-    auto type = cast<RankedTensorType>(pred.getType());
-    Value one = rewriter.create<nova::ConstantOp>(loc, type, DenseElementsAttr::get(type, {1.0f}));
-    Value one_minus_pred = rewriter.create<nova::SubOp>(loc, type, one, pred);
-    Value denom = rewriter.create<nova::MulOp>(loc, type, pred, one_minus_pred);
-    Value num = rewriter.create<nova::SubOp>(loc, type, pred, target);
-    Value inv_denom = rewriter.create<nova::ReciprocalOp>(loc, type, denom);
-    Value raw_grad = rewriter.create<nova::MulOp>(loc, type, num, inv_denom);
-    int64_t numel = type.getNumElements();
-    Value scale = rewriter.create<nova::ConstantOp>(loc, type, DenseElementsAttr::get(type, {1.0f / numel}));
-    Value dx_pre = rewriter.create<nova::MulOp>(loc, type, raw_grad, scale);
-    Value dx = rewriter.create<nova::MulOp>(loc, type, dx_pre, g);
-    rewriter.replaceOp(op, dx);
-    return success();
   }
 };
 
@@ -1358,11 +1275,7 @@ struct NovaToTosaLoweringPass
     target.addIllegalOp<nova::MatmulBackwardOp>();
     target.addIllegalOp<nova::SoftmaxBackwardOp>();
     target.addIllegalOp<nova::TanhBackwardOp>();
-    target.addIllegalOp<nova::ReluBackwardOp>();
     target.addIllegalOp<nova::SigmoidBackwardOp>();
-    target.addIllegalOp<nova::MseBackwardOp>();
-    target.addIllegalOp<nova::MaeBackwardOp>();
-    target.addIllegalOp<nova::BceBackwardOp>();
 
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     TypeConverter typeConverter;
@@ -1388,15 +1301,13 @@ void populateNovaToTosaConversionPatterns(RewritePatternSet &patterns) {
               NovaToTosaLoweringTemplate<nova::MseOp>,
               NovaToTosaLoweringTemplate<nova::CceOp>,
               NovaToTosaLoweringTemplate<nova::BceOp>,
-              NovaToTosaLoweringTemplate<nova::CceBackwardOp>,
-              NovaToTosaLoweringTemplate<nova::SigmoidOp>,
-              NovaToTosaLoweringTemplate<nova::CastOp>,
-              NovaAddBackwardPattern, NovaSubBackwardPattern,
-              NovaMulBackwardPattern, NovaDivBackwardPattern, 
-              NovaMatmulBackwardPattern, NovaSoftmaxBackwardPattern,
-              NovaTanhBackwardPattern, NovaReluBackwardPattern, 
-              NovaSigmoidBackwardPattern, NovaMseBackwardPattern, 
-              NovaMaeBackwardPattern, NovaBceBackwardPattern> (patterns.getContext());
+               NovaToTosaLoweringTemplate<nova::SigmoidOp>,
+               NovaToTosaLoweringTemplate<nova::CastOp>,
+               NovaAddBackwardPattern, NovaSubBackwardPattern,
+               NovaMulBackwardPattern, NovaDivBackwardPattern, 
+               NovaMatmulBackwardPattern, NovaSoftmaxBackwardPattern,
+               NovaTanhBackwardPattern, 
+               NovaSigmoidBackwardPattern> (patterns.getContext());
 }
 
 // creating a pointer for this pass

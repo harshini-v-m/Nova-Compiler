@@ -125,6 +125,7 @@ int main(int argc, char **argv) {
   mlir::nova::registerNovaToTosaLoweringPass();
   mlir::nova::registerNovaElementwiseToLinalgPass();
   mlir::nova::registerNovaToLinalgPass();
+  mlir::nova::registerNovaLinalgHorizontalFusionPass();
   mlir::nova::registerNovaFusionKernelEmitterPass();
   mlir::registerDependencyAnalysisTestPass();
 

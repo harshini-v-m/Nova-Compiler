@@ -110,6 +110,8 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
 
             // Tiling is handled in Section 6 after parallel loop conversion
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgElementwiseOpFusionPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaLinalgHorizontalFusionPass());
+
             // pm.addNestedPass<mlir::func::FuncOp>(
             //     mlir::createLinalgGeneralizeNamedOpsPass());
 

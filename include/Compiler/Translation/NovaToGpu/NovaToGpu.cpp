@@ -969,7 +969,7 @@ struct NovaToGpuPass
     target.addLegalOp<gpu::BarrierOp>();
     target.addIllegalOp<nova::ToDeviceOp, nova::SceOp, nova::MatmulOp,
                         nova::GatherOp, nova::ScatterAddOp>();
- //   patterns.add<NovaToGpuReducePattern>(context);
+   patterns.add<NovaToGpuReducePattern>(context);
     patterns.add<ToDeviceOpLowering>(context);
     patterns.add<SceOpLowering>(context);
     patterns.add<NovaToGpuGatherPattern>(context);

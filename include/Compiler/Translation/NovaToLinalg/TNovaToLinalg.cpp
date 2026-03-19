@@ -782,6 +782,156 @@ private:
     }
     return nullptr;
   }
+  // Relu backward operation
+  static Value mapOpImpl(nova::ReluBackwardOp op, Type resultType,
+                         ArrayRef<Value> args, OpBuilder *builder) {
+    Value grad_out = args[0];
+    Value input = args[1];
+    Location loc = op.getLoc();
+    Type elemType = input.getType();
+
+    if (auto floatType = dyn_cast<FloatType>(elemType)) {
+      Value zero = builder->create<arith::ConstantOp>(
+          loc, builder->getFloatAttr(floatType, 0.0));
+      Value mask = builder->create<arith::CmpFOp>(
+          loc, arith::CmpFPredicate::OGT, input, zero);
+      Value maskCast = builder->create<arith::UIToFPOp>(loc, floatType, mask);
+      return builder->create<arith::MulFOp>(loc, grad_out, maskCast);
+    }
+    if (auto intType = dyn_cast<IntegerType>(elemType)) {
+      Value zero = builder->create<arith::ConstantOp>(
+          loc, builder->getIntegerAttr(intType, 0));
+      Value mask = builder->create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::sgt, input, zero);
+      Value maskCast = builder->create<arith::ExtUIOp>(loc, intType, mask);
+      return builder->create<arith::MulIOp>(loc, grad_out, maskCast);
+    }
+    return nullptr;
+  }
+
+  // MSE backward operation
+  static Value mapOpImpl(nova::MseBackwardOp op, Type resultType,
+                         ArrayRef<Value> args, OpBuilder *builder) {
+    Value grad_out = args[0];
+    Value pred = args[1];
+    Value target = args[2];
+    Location loc = op.getLoc();
+    Type elemType = pred.getType();
+
+    if (auto floatType = dyn_cast<FloatType>(elemType)) {
+      Value two = builder->create<arith::ConstantOp>(
+          loc, builder->getFloatAttr(floatType, 2.0));
+      auto pred_type = cast<RankedTensorType>(op.getPred().getType());
+      int64_t numel = pred_type.getNumElements();
+      Value scale = builder->create<arith::ConstantOp>(
+          loc, builder->getFloatAttr(floatType, 1.0 / numel));
+      
+      Value diff = builder->create<arith::SubFOp>(loc, pred, target);
+      Value scaled_diff = builder->create<arith::MulFOp>(loc, diff, scale);
+      Value scaled_diff_2 = builder->create<arith::MulFOp>(loc, scaled_diff, two);
+      return builder->create<arith::MulFOp>(loc, scaled_diff_2, grad_out);
+    }
+    return nullptr;
+  }
+
+  // MAE backward operation
+  static Value mapOpImpl(nova::MaeBackwardOp op, Type resultType,
+                         ArrayRef<Value> args, OpBuilder *builder) {
+    Value grad_out = args[0];
+    Value pred = args[1];
+    Value target = args[2];
+    Location loc = op.getLoc();
+    Type elemType = pred.getType();
+
+    if (auto floatType = dyn_cast<FloatType>(elemType)) {
+      auto pred_type = cast<RankedTensorType>(op.getPred().getType());
+      int64_t numel = pred_type.getNumElements();
+      Value scale = builder->create<arith::ConstantOp>(
+          loc, builder->getFloatAttr(floatType, 1.0 / numel));
+      
+      Value diff = builder->create<arith::SubFOp>(loc, pred, target);
+      Value zero = builder->create<arith::ConstantOp>(loc, builder->getFloatAttr(floatType, 0.0));
+      Value one = builder->create<arith::ConstantOp>(loc, builder->getFloatAttr(floatType, 1.0));
+      Value neg_one = builder->create<arith::ConstantOp>(loc, builder->getFloatAttr(floatType, -1.0));
+      
+      Value gt = builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT, diff, zero);
+      Value lt = builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT, diff, zero);
+      
+      Value sign = builder->create<arith::SelectOp>(loc, gt, one, 
+                     builder->create<arith::SelectOp>(loc, lt, neg_one, zero));
+      
+      Value dx_pre = builder->create<arith::MulFOp>(loc, sign, scale);
+      return builder->create<arith::MulFOp>(loc, dx_pre, grad_out);
+    }
+    return nullptr;
+  }
+
+  // BCE backward operation
+  static Value mapOpImpl(nova::BceBackwardOp op, Type resultType,
+                         ArrayRef<Value> args, OpBuilder *builder) {
+    Value grad_out = args[0];
+    Value pred = args[1];
+    Value target = args[2];
+    Location loc = op.getLoc();
+    Type elemType = pred.getType();
+
+    if (auto floatType = dyn_cast<FloatType>(elemType)) {
+      auto pred_type = cast<RankedTensorType>(op.getPred().getType());
+      int64_t numel = pred_type.getNumElements();
+      Value scale = builder->create<arith::ConstantOp>(
+          loc, builder->getFloatAttr(floatType, 1.0 / numel));
+      
+      Value eps = builder->create<arith::ConstantOp>(loc, builder->getFloatAttr(floatType, 1e-7));
+      Value one = builder->create<arith::ConstantOp>(loc, builder->getFloatAttr(floatType, 1.0));
+      Value oneminuseps = builder->create<arith::SubFOp>(loc, one, eps);
+      
+      Value p_clamped_low = builder->create<arith::MaximumFOp>(loc, pred, eps);
+      Value p_clipped = builder->create<arith::MinimumFOp>(loc, p_clamped_low, oneminuseps);
+      
+      Value num = builder->create<arith::SubFOp>(loc, p_clipped, target);
+      Value oneminusp = builder->create<arith::SubFOp>(loc, one, p_clipped);
+      Value denom = builder->create<arith::MulFOp>(loc, p_clipped, oneminusp);
+      Value raw_grad = builder->create<arith::DivFOp>(loc, num, denom);
+      
+      Value dx_pre = builder->create<arith::MulFOp>(loc, raw_grad, scale);
+      return builder->create<arith::MulFOp>(loc, dx_pre, grad_out);
+    }
+    return nullptr;
+  }
+
+  // CCE backward operation
+  static Value mapOpImpl(nova::CceBackwardOp op, Type resultType,
+                         ArrayRef<Value> args, OpBuilder *builder) {
+    Value grad_out = args[0];
+    Value pred = args[1];
+    Value target = args[2];
+    Location loc = op.getLoc();
+    Type elemType = pred.getType();
+
+    if (auto floatType = dyn_cast<FloatType>(elemType)) {
+      auto pred_type = cast<RankedTensorType>(op.getInput().getType());
+      int64_t batch_size = pred_type.getShape()[0];
+      Value scale = builder->create<arith::ConstantOp>(
+          loc, builder->getFloatAttr(floatType, 1.0 / batch_size));
+      
+      Value eps = builder->create<arith::ConstantOp>(loc, builder->getFloatAttr(floatType, 1e-7));
+      Value one = builder->create<arith::ConstantOp>(loc, builder->getFloatAttr(floatType, 1.0));
+      Value oneminuseps = builder->create<arith::SubFOp>(loc, one, eps);
+      Value zero = builder->create<arith::ConstantOp>(loc, builder->getFloatAttr(floatType, 0.0));
+      
+      Value ge_eps = builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGE, pred, eps);
+      Value le_ome = builder->create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLE, pred, oneminuseps);
+      Value valid = builder->create<arith::AndIOp>(loc, ge_eps, le_ome);
+      
+      Value neg_target = builder->create<arith::NegFOp>(loc, target);
+      Value raw_grad = builder->create<arith::DivFOp>(loc, neg_target, pred);
+      
+      Value masked_grad = builder->create<arith::SelectOp>(loc, valid, raw_grad, zero);
+      Value dx_pre = builder->create<arith::MulFOp>(loc, masked_grad, scale);
+      return builder->create<arith::MulFOp>(loc, dx_pre, grad_out);
+    }
+    return nullptr;
+  }
 };
 
 template <typename NovaOpTy>
@@ -905,7 +1055,8 @@ struct NovaElementwiseToLinalgPass
                         SinOp, CosOp, CompareOp, NotOp, AndOp, OrOp, XorOp,
                         PowOp, SignOp, AddOp, SubOp, MulOp, DivOp, MaxOp, MinOp,
                         AbsOp, LogOp, ExpOp, SquareOp, NegOp, TanhOp, SqrtOp,
-                        ReciprocalOp, nova::RsqrtOp>();
+                        ReciprocalOp, nova::RsqrtOp, ReluBackwardOp, 
+                        MseBackwardOp, MaeBackwardOp, BceBackwardOp, CceBackwardOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     RewritePatternSet patterns(context);
     populateNovaToLinalgPatternsTemplate(patterns);
@@ -953,6 +1104,7 @@ void populateNovaToLinalgPatternsTemplate(RewritePatternSet &patterns) {
                NovaToLinalgElementwiseConverter<PowOp>,
                NovaToLinalgElementwiseConverter<SignOp>,
                NovaToLinalgElementwiseConverter<AddOp>,
+               NovaToLinalgElementwiseConverter<ReluBackwardOp>,
                NovaToLinalgElementwiseConverter<SubOp>,
                NovaToLinalgElementwiseConverter<MulOp>,
                NovaToLinalgElementwiseConverter<DivOp>,
@@ -966,7 +1118,11 @@ void populateNovaToLinalgPatternsTemplate(RewritePatternSet &patterns) {
                NovaToLinalgElementwiseConverter<NegOp>,
                NovaToLinalgElementwiseConverter<nova::TanhOp>,
                NovaToLinalgElementwiseConverter<nova::SqrtOp>,
-               NovaToLinalgElementwiseConverter<nova::ReciprocalOp>>(
+               NovaToLinalgElementwiseConverter<nova::ReciprocalOp>,
+               NovaToLinalgElementwiseConverter<MseBackwardOp>,
+               NovaToLinalgElementwiseConverter<MaeBackwardOp>,
+               NovaToLinalgElementwiseConverter<BceBackwardOp>,
+               NovaToLinalgElementwiseConverter<CceBackwardOp>>(
       patterns.getContext());
 }
 
