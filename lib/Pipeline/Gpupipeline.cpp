@@ -171,6 +171,7 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
             //     llvm::errs() << "Failed to parse vectorize pipeline\n";  
             // }  
             pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createAffineLoopNormalizePass());  
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createLoopUnrollPass(/*unrollFactor=*/4));
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addPass(mlir::createCSEPass());
 

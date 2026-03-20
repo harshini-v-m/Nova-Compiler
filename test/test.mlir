@@ -57,103 +57,103 @@ module {
     %54 = nova.transpose %25 : tensor<384x50304xf32, #nova.device<"1">>
     %55 = nova.matmul %52, %54 : tensor<8192x50304xf32>, tensor<50304x384xf32>
     %56 = nova.matmul %53, %52 : tensor<384x8192xf32>, tensor<8192x50304xf32>
-    %57 = nova.reshape %55 : tensor<8192x384xf32> -> tensor<8x1024x384xf32>
-    %grad_x, %grad_gamma, %grad_beta = nova.layer_norm_backward %57, %43, %23 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>, tensor<384xf32, #nova.device<"1">>
+    %57 = bufferization.to_tensor %arg50 restrict writable : memref<384x50304xf32, 1> to tensor<384x50304xf32>
+    %58 = nova.add %57, %56 {in_place = true} : tensor<384x50304xf32>, tensor<384x50304xf32>
+    bufferization.materialize_in_destination %58 in writable %arg50 : (tensor<384x50304xf32>, memref<384x50304xf32, 1>) -> ()
+    %59 = nova.reshape %55 : tensor<8192x384xf32> -> tensor<8x1024x384xf32>
+    %grad_x, %grad_gamma, %grad_beta = nova.layer_norm_backward %59, %43, %23 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>, tensor<384xf32, #nova.device<"1">>
+    %60 = bufferization.to_tensor %arg48 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %61 = nova.add %60, %grad_gamma {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %61 in writable %arg48 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
+    %62 = bufferization.to_tensor %arg49 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %63 = nova.add %62, %grad_beta {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %63 in writable %arg49 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
     %grad_input, %grad_weight, %grad_bias = nova.linear_backward %grad_x, %41, %21 : tensor<8x1024x384xf32>, tensor<8x1024x1536xf32>, tensor<1536x384xf32, #nova.device<"1">>
-    %58 = nova.gelu_backward %grad_input, %40 : tensor<8x1024x1536xf32>, tensor<8x1024x1536xf32>
-    %grad_input_0, %grad_weight_1, %grad_bias_2 = nova.linear_backward %58, %39, %19 : tensor<8x1024x1536xf32>, tensor<8x1024x384xf32>, tensor<384x1536xf32, #nova.device<"1">>
+    %64 = bufferization.to_tensor %arg46 restrict writable : memref<1536x384xf32, 1> to tensor<1536x384xf32>
+    %65 = nova.add %64, %grad_weight {in_place = true} : tensor<1536x384xf32>, tensor<1536x384xf32>
+    bufferization.materialize_in_destination %65 in writable %arg46 : (tensor<1536x384xf32>, memref<1536x384xf32, 1>) -> ()
+    %66 = bufferization.to_tensor %arg47 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %67 = nova.add %66, %grad_bias {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %67 in writable %arg47 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
+    %68 = nova.gelu_backward %grad_input, %40 : tensor<8x1024x1536xf32>, tensor<8x1024x1536xf32>
+    %grad_input_0, %grad_weight_1, %grad_bias_2 = nova.linear_backward %68, %39, %19 : tensor<8x1024x1536xf32>, tensor<8x1024x384xf32>, tensor<384x1536xf32, #nova.device<"1">>
+    %69 = bufferization.to_tensor %arg44 restrict writable : memref<384x1536xf32, 1> to tensor<384x1536xf32>
+    %70 = nova.add %69, %grad_weight_1 {in_place = true} : tensor<384x1536xf32>, tensor<384x1536xf32>
+    bufferization.materialize_in_destination %70 in writable %arg44 : (tensor<384x1536xf32>, memref<384x1536xf32, 1>) -> ()
+    %71 = bufferization.to_tensor %arg45 restrict writable : memref<1536xf32, 1> to tensor<1536xf32>
+    %72 = nova.add %71, %grad_bias_2 {in_place = true} : tensor<1536xf32>, tensor<1536xf32>
+    bufferization.materialize_in_destination %72 in writable %arg45 : (tensor<1536xf32>, memref<1536xf32, 1>) -> ()
     %grad_x_3, %grad_gamma_4, %grad_beta_5 = nova.layer_norm_backward %grad_input_0, %38, %17 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>, tensor<384xf32, #nova.device<"1">>
-    %59 = nova.add %grad_x, %grad_x_3 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>
-    %grad_input_6, %grad_weight_7, %grad_bias_8 = nova.linear_backward %59, %36, %15 : tensor<8x1024x384xf32>, tensor<8x1024x1536xf32>, tensor<1536x384xf32, #nova.device<"1">>
-    %60 = nova.gelu_backward %grad_input_6, %35 : tensor<8x1024x1536xf32>, tensor<8x1024x1536xf32>
-    %grad_input_9, %grad_weight_10, %grad_bias_11 = nova.linear_backward %60, %34, %13 : tensor<8x1024x1536xf32>, tensor<8x1024x384xf32>, tensor<384x1536xf32, #nova.device<"1">>
+    %73 = nova.add %grad_x, %grad_x_3 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>
+    %74 = bufferization.to_tensor %arg42 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %75 = nova.add %74, %grad_gamma_4 {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %75 in writable %arg42 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
+    %76 = bufferization.to_tensor %arg43 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %77 = nova.add %76, %grad_beta_5 {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %77 in writable %arg43 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
+    %grad_input_6, %grad_weight_7, %grad_bias_8 = nova.linear_backward %73, %36, %15 : tensor<8x1024x384xf32>, tensor<8x1024x1536xf32>, tensor<1536x384xf32, #nova.device<"1">>
+    %78 = bufferization.to_tensor %arg40 restrict writable : memref<1536x384xf32, 1> to tensor<1536x384xf32>
+    %79 = nova.add %78, %grad_weight_7 {in_place = true} : tensor<1536x384xf32>, tensor<1536x384xf32>
+    bufferization.materialize_in_destination %79 in writable %arg40 : (tensor<1536x384xf32>, memref<1536x384xf32, 1>) -> ()
+    %80 = bufferization.to_tensor %arg41 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %81 = nova.add %80, %grad_bias_8 {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %81 in writable %arg41 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
+    %82 = nova.gelu_backward %grad_input_6, %35 : tensor<8x1024x1536xf32>, tensor<8x1024x1536xf32>
+    %grad_input_9, %grad_weight_10, %grad_bias_11 = nova.linear_backward %82, %34, %13 : tensor<8x1024x1536xf32>, tensor<8x1024x384xf32>, tensor<384x1536xf32, #nova.device<"1">>
+    %83 = bufferization.to_tensor %arg38 restrict writable : memref<384x1536xf32, 1> to tensor<384x1536xf32>
+    %84 = nova.add %83, %grad_weight_10 {in_place = true} : tensor<384x1536xf32>, tensor<384x1536xf32>
+    bufferization.materialize_in_destination %84 in writable %arg38 : (tensor<384x1536xf32>, memref<384x1536xf32, 1>) -> ()
+    %85 = bufferization.to_tensor %arg39 restrict writable : memref<1536xf32, 1> to tensor<1536xf32>
+    %86 = nova.add %85, %grad_bias_11 {in_place = true} : tensor<1536xf32>, tensor<1536xf32>
+    bufferization.materialize_in_destination %86 in writable %arg39 : (tensor<1536xf32>, memref<1536xf32, 1>) -> ()
     %grad_x_12, %grad_gamma_13, %grad_beta_14 = nova.layer_norm_backward %grad_input_9, %33, %11 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>, tensor<384xf32, #nova.device<"1">>
-    %61 = nova.add %59, %grad_x_12 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>
-    %grad_input_15, %grad_weight_16, %grad_bias_17 = nova.linear_backward %61, %31, %9 : tensor<8x1024x384xf32>, tensor<8x1024x1536xf32>, tensor<1536x384xf32, #nova.device<"1">>
-    %62 = nova.gelu_backward %grad_input_15, %30 : tensor<8x1024x1536xf32>, tensor<8x1024x1536xf32>
-    %grad_input_18, %grad_weight_19, %grad_bias_20 = nova.linear_backward %62, %29, %7 : tensor<8x1024x1536xf32>, tensor<8x1024x384xf32>, tensor<384x1536xf32, #nova.device<"1">>
+    %87 = nova.add %73, %grad_x_12 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>
+    %88 = bufferization.to_tensor %arg36 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %89 = nova.add %88, %grad_gamma_13 {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %89 in writable %arg36 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
+    %90 = bufferization.to_tensor %arg37 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %91 = nova.add %90, %grad_beta_14 {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %91 in writable %arg37 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
+    %grad_input_15, %grad_weight_16, %grad_bias_17 = nova.linear_backward %87, %31, %9 : tensor<8x1024x384xf32>, tensor<8x1024x1536xf32>, tensor<1536x384xf32, #nova.device<"1">>
+    %92 = bufferization.to_tensor %arg34 restrict writable : memref<1536x384xf32, 1> to tensor<1536x384xf32>
+    %93 = nova.add %92, %grad_weight_16 {in_place = true} : tensor<1536x384xf32>, tensor<1536x384xf32>
+    bufferization.materialize_in_destination %93 in writable %arg34 : (tensor<1536x384xf32>, memref<1536x384xf32, 1>) -> ()
+    %94 = bufferization.to_tensor %arg35 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %95 = nova.add %94, %grad_bias_17 {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %95 in writable %arg35 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
+    %96 = nova.gelu_backward %grad_input_15, %30 : tensor<8x1024x1536xf32>, tensor<8x1024x1536xf32>
+    %grad_input_18, %grad_weight_19, %grad_bias_20 = nova.linear_backward %96, %29, %7 : tensor<8x1024x1536xf32>, tensor<8x1024x384xf32>, tensor<384x1536xf32, #nova.device<"1">>
+    %97 = bufferization.to_tensor %arg32 restrict writable : memref<384x1536xf32, 1> to tensor<384x1536xf32>
+    %98 = nova.add %97, %grad_weight_19 {in_place = true} : tensor<384x1536xf32>, tensor<384x1536xf32>
+    bufferization.materialize_in_destination %98 in writable %arg32 : (tensor<384x1536xf32>, memref<384x1536xf32, 1>) -> ()
+    %99 = bufferization.to_tensor %arg33 restrict writable : memref<1536xf32, 1> to tensor<1536xf32>
+    %100 = nova.add %99, %grad_bias_20 {in_place = true} : tensor<1536xf32>, tensor<1536xf32>
+    bufferization.materialize_in_destination %100 in writable %arg33 : (tensor<1536xf32>, memref<1536xf32, 1>) -> ()
     %grad_x_21, %grad_gamma_22, %grad_beta_23 = nova.layer_norm_backward %grad_input_18, %28, %5 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>, tensor<384xf32, #nova.device<"1">>
-    %63 = nova.add %61, %grad_x_21 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>
-    %64 = nova.reduce<sum> %63 dimension = [0] : tensor<8x1024x384xf32>
-    %65 = nova.reshape %64 : tensor<1024x384xf32> -> tensor<1x1024x384xf32>
-    %66 = nova.reshape %2 : tensor<1x1024xi64, #nova.device<"1">> -> tensor<1024xi64>
-    %67 = nova.reshape %65 : tensor<1x1024x384xf32> -> tensor<1024x384xf32>
-    %68 = nova.constant {value = dense<0.000000e+00> : tensor<1024x384xf32>} : tensor<1024x384xf32>
-    %69 = nova.scatter_add %68, %66, %67 : tensor<1024x384xf32>, tensor<1024xi64>, tensor<1024x384xf32> -> tensor<1024x384xf32>
-    %70 = nova.reshape %0 : tensor<8x1024xi16, #nova.device<"1">> -> tensor<8192xi16>
-    %71 = nova.reshape %63 : tensor<8x1024x384xf32> -> tensor<8192x384xf32>
-    %72 = nova.constant {value = dense<0.000000e+00> : tensor<50304x384xf32>} : tensor<50304x384xf32>
-    %73 = nova.scatter_add %72, %70, %71 : tensor<50304x384xf32>, tensor<8192xi16>, tensor<8192x384xf32> -> tensor<50304x384xf32>
+    %101 = nova.add %87, %grad_x_21 : tensor<8x1024x384xf32>, tensor<8x1024x384xf32>
+    %102 = bufferization.to_tensor %arg30 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %103 = nova.add %102, %grad_gamma_22 {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %103 in writable %arg30 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
+    %104 = bufferization.to_tensor %arg31 restrict writable : memref<384xf32, 1> to tensor<384xf32>
+    %105 = nova.add %104, %grad_beta_23 {in_place = true} : tensor<384xf32>, tensor<384xf32>
+    bufferization.materialize_in_destination %105 in writable %arg31 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
+    %106 = nova.reduce<sum> %101 dimension = [0] : tensor<8x1024x384xf32>
+    %107 = nova.reshape %106 : tensor<1024x384xf32> -> tensor<1x1024x384xf32>
+    %108 = nova.reshape %2 : tensor<1x1024xi64, #nova.device<"1">> -> tensor<1024xi64>
+    %109 = nova.reshape %107 : tensor<1x1024x384xf32> -> tensor<1024x384xf32>
+    %110 = nova.constant {value = dense<0.000000e+00> : tensor<1024x384xf32>} : tensor<1024x384xf32>
+    %111 = nova.scatter_add %110, %108, %109 : tensor<1024x384xf32>, tensor<1024xi64>, tensor<1024x384xf32> -> tensor<1024x384xf32>
+    %112 = bufferization.to_tensor %arg29 restrict writable : memref<1024x384xf32, 1> to tensor<1024x384xf32>
+    %113 = nova.add %112, %111 {in_place = true} : tensor<1024x384xf32>, tensor<1024x384xf32>
+    bufferization.materialize_in_destination %113 in writable %arg29 : (tensor<1024x384xf32>, memref<1024x384xf32, 1>) -> ()
+    %114 = nova.reshape %0 : tensor<8x1024xi16, #nova.device<"1">> -> tensor<8192xi16>
+    %115 = nova.reshape %101 : tensor<8x1024x384xf32> -> tensor<8192x384xf32>
+    %116 = nova.constant {value = dense<0.000000e+00> : tensor<50304x384xf32>} : tensor<50304x384xf32>
+    %117 = nova.scatter_add %116, %114, %115 : tensor<50304x384xf32>, tensor<8192xi16>, tensor<8192x384xf32> -> tensor<50304x384xf32>
+    %118 = bufferization.to_tensor %arg28 restrict writable : memref<50304x384xf32, 1> to tensor<50304x384xf32>
+    %119 = nova.add %118, %117 {in_place = true} : tensor<50304x384xf32>, tensor<50304x384xf32>
+    bufferization.materialize_in_destination %119 in writable %arg28 : (tensor<50304x384xf32>, memref<50304x384xf32, 1>) -> ()
     bufferization.materialize_in_destination %48 in writable %arg26 : (tensor<1xf32>, memref<1xf32, 1>) -> ()
-    %74 = bufferization.to_tensor %arg28 restrict writable : memref<50304x384xf32, 1> to tensor<50304x384xf32>
-    %75 = nova.add %74, %73 {in_place = true} : tensor<50304x384xf32>, tensor<50304x384xf32>
-    bufferization.materialize_in_destination %75 in writable %arg28 : (tensor<50304x384xf32>, memref<50304x384xf32, 1>) -> ()
-    %76 = bufferization.to_tensor %arg29 restrict writable : memref<1024x384xf32, 1> to tensor<1024x384xf32>
-    %77 = nova.add %76, %69 {in_place = true} : tensor<1024x384xf32>, tensor<1024x384xf32>
-    bufferization.materialize_in_destination %77 in writable %arg29 : (tensor<1024x384xf32>, memref<1024x384xf32, 1>) -> ()
-    %78 = bufferization.to_tensor %arg30 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %79 = nova.add %78, %grad_gamma_22 {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %79 in writable %arg30 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %80 = bufferization.to_tensor %arg31 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %81 = nova.add %80, %grad_beta_23 {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %81 in writable %arg31 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %82 = bufferization.to_tensor %arg32 restrict writable : memref<384x1536xf32, 1> to tensor<384x1536xf32>
-    %83 = nova.add %82, %grad_weight_19 {in_place = true} : tensor<384x1536xf32>, tensor<384x1536xf32>
-    bufferization.materialize_in_destination %83 in writable %arg32 : (tensor<384x1536xf32>, memref<384x1536xf32, 1>) -> ()
-    %84 = bufferization.to_tensor %arg33 restrict writable : memref<1536xf32, 1> to tensor<1536xf32>
-    %85 = nova.add %84, %grad_bias_20 {in_place = true} : tensor<1536xf32>, tensor<1536xf32>
-    bufferization.materialize_in_destination %85 in writable %arg33 : (tensor<1536xf32>, memref<1536xf32, 1>) -> ()
-    %86 = bufferization.to_tensor %arg34 restrict writable : memref<1536x384xf32, 1> to tensor<1536x384xf32>
-    %87 = nova.add %86, %grad_weight_16 {in_place = true} : tensor<1536x384xf32>, tensor<1536x384xf32>
-    bufferization.materialize_in_destination %87 in writable %arg34 : (tensor<1536x384xf32>, memref<1536x384xf32, 1>) -> ()
-    %88 = bufferization.to_tensor %arg35 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %89 = nova.add %88, %grad_bias_17 {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %89 in writable %arg35 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %90 = bufferization.to_tensor %arg36 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %91 = nova.add %90, %grad_gamma_13 {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %91 in writable %arg36 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %92 = bufferization.to_tensor %arg37 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %93 = nova.add %92, %grad_beta_14 {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %93 in writable %arg37 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %94 = bufferization.to_tensor %arg38 restrict writable : memref<384x1536xf32, 1> to tensor<384x1536xf32>
-    %95 = nova.add %94, %grad_weight_10 {in_place = true} : tensor<384x1536xf32>, tensor<384x1536xf32>
-    bufferization.materialize_in_destination %95 in writable %arg38 : (tensor<384x1536xf32>, memref<384x1536xf32, 1>) -> ()
-    %96 = bufferization.to_tensor %arg39 restrict writable : memref<1536xf32, 1> to tensor<1536xf32>
-    %97 = nova.add %96, %grad_bias_11 {in_place = true} : tensor<1536xf32>, tensor<1536xf32>
-    bufferization.materialize_in_destination %97 in writable %arg39 : (tensor<1536xf32>, memref<1536xf32, 1>) -> ()
-    %98 = bufferization.to_tensor %arg40 restrict writable : memref<1536x384xf32, 1> to tensor<1536x384xf32>
-    %99 = nova.add %98, %grad_weight_7 {in_place = true} : tensor<1536x384xf32>, tensor<1536x384xf32>
-    bufferization.materialize_in_destination %99 in writable %arg40 : (tensor<1536x384xf32>, memref<1536x384xf32, 1>) -> ()
-    %100 = bufferization.to_tensor %arg41 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %101 = nova.add %100, %grad_bias_8 {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %101 in writable %arg41 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %102 = bufferization.to_tensor %arg42 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %103 = nova.add %102, %grad_gamma_4 {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %103 in writable %arg42 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %104 = bufferization.to_tensor %arg43 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %105 = nova.add %104, %grad_beta_5 {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %105 in writable %arg43 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %106 = bufferization.to_tensor %arg44 restrict writable : memref<384x1536xf32, 1> to tensor<384x1536xf32>
-    %107 = nova.add %106, %grad_weight_1 {in_place = true} : tensor<384x1536xf32>, tensor<384x1536xf32>
-    bufferization.materialize_in_destination %107 in writable %arg44 : (tensor<384x1536xf32>, memref<384x1536xf32, 1>) -> ()
-    %108 = bufferization.to_tensor %arg45 restrict writable : memref<1536xf32, 1> to tensor<1536xf32>
-    %109 = nova.add %108, %grad_bias_2 {in_place = true} : tensor<1536xf32>, tensor<1536xf32>
-    bufferization.materialize_in_destination %109 in writable %arg45 : (tensor<1536xf32>, memref<1536xf32, 1>) -> ()
-    %110 = bufferization.to_tensor %arg46 restrict writable : memref<1536x384xf32, 1> to tensor<1536x384xf32>
-    %111 = nova.add %110, %grad_weight {in_place = true} : tensor<1536x384xf32>, tensor<1536x384xf32>
-    bufferization.materialize_in_destination %111 in writable %arg46 : (tensor<1536x384xf32>, memref<1536x384xf32, 1>) -> ()
-    %112 = bufferization.to_tensor %arg47 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %113 = nova.add %112, %grad_bias {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %113 in writable %arg47 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %114 = bufferization.to_tensor %arg48 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %115 = nova.add %114, %grad_gamma {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %115 in writable %arg48 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %116 = bufferization.to_tensor %arg49 restrict writable : memref<384xf32, 1> to tensor<384xf32>
-    %117 = nova.add %116, %grad_beta {in_place = true} : tensor<384xf32>, tensor<384xf32>
-    bufferization.materialize_in_destination %117 in writable %arg49 : (tensor<384xf32>, memref<384xf32, 1>) -> ()
-    %118 = bufferization.to_tensor %arg50 restrict writable : memref<384x50304xf32, 1> to tensor<384x50304xf32>
-    %119 = nova.add %118, %56 {in_place = true} : tensor<384x50304xf32>, tensor<384x50304xf32>
-    bufferization.materialize_in_destination %119 in writable %arg50 : (tensor<384x50304xf32>, memref<384x50304xf32, 1>) -> ()
     return
   }
 }

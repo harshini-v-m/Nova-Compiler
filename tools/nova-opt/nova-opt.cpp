@@ -41,6 +41,7 @@
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/GPUCommon/GPUToLLVM.h"
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVM.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
@@ -102,8 +103,29 @@ struct DeviceAsyncCopyOpMemEffectModel
                   llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
                       mlir::MemoryEffects::Effect>> &effects) const {
     // Portably report Read and Write effects without binding to a specific Value
-    effects.emplace_back(mlir::MemoryEffects::Read::get(),
+    effects.emplace_back(mlir::MemoryEffects::Write::get(),
                          mlir::SideEffects::DefaultResource::get());
+    effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                         mlir::SideEffects::DefaultResource::get());
+  }
+};
+struct CpAsyncCommitGroupOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          CpAsyncCommitGroupOpMemEffectModel, mlir::NVVM::CpAsyncCommitGroupOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                         mlir::SideEffects::DefaultResource::get());
+  }
+};
+
+struct CpAsyncWaitGroupOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          CpAsyncWaitGroupOpMemEffectModel, mlir::NVVM::CpAsyncWaitGroupOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
     effects.emplace_back(mlir::MemoryEffects::Write::get(),
                          mlir::SideEffects::DefaultResource::get());
   }
@@ -130,6 +152,15 @@ int main(int argc, char **argv) {
         DeviceAsyncWaitOpMemEffectModel>(*ctx);
     mlir::nvgpu::DeviceAsyncCopyOp::attachInterface<
         DeviceAsyncCopyOpMemEffectModel>(*ctx);
+  });
+
+  // NVVM cp.async ops used directly for synchronisation (bypasses nvgpu tokens)
+  registry.addExtension(+[](mlir::MLIRContext *ctx,
+                            mlir::NVVM::NVVMDialect *dialect) {
+    mlir::NVVM::CpAsyncCommitGroupOp::attachInterface<
+        CpAsyncCommitGroupOpMemEffectModel>(*ctx);
+    mlir::NVVM::CpAsyncWaitGroupOp::attachInterface<
+        CpAsyncWaitGroupOpMemEffectModel>(*ctx);
   });
 
   // Register the AddGpuMemoryCopies pass

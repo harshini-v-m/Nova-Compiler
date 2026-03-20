@@ -152,6 +152,30 @@ struct DeviceAsyncCopyOpMemEffectModel
   }
 };
 
+struct CpAsyncCommitGroupOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          CpAsyncCommitGroupOpMemEffectModel, mlir::NVVM::CpAsyncCommitGroupOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // Declare Write so the canonicalizer/DCE does not remove this op.
+    effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                         mlir::SideEffects::DefaultResource::get());
+  }
+};
+
+struct CpAsyncWaitGroupOpMemEffectModel
+    : public mlir::MemoryEffectOpInterface::ExternalModel<
+          CpAsyncWaitGroupOpMemEffectModel, mlir::NVVM::CpAsyncWaitGroupOp> {
+  void getEffects(mlir::Operation *op,
+                  llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>> &effects) const {
+    // Declare Write so the canonicalizer/DCE does not remove this op.
+    effects.emplace_back(mlir::MemoryEffects::Write::get(),
+                         mlir::SideEffects::DefaultResource::get());
+  }
+};
+
 NovaCompilerAPI::NovaCompilerAPI() {
   // Register all MLIR passes globally so they can be parsed from strings
   // Register specific passes needed for parsed pipelines
@@ -324,6 +348,15 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
     mlir::nvgpu::DeviceAsyncCopyOp::attachInterface<
         DeviceAsyncCopyOpMemEffectModel>(*ctx);
   });
+
+  // NVVM cp.async ops used directly for synchronisation (bypasses nvgpu tokens)
+  registry.addExtension(+[](mlir::MLIRContext *ctx,
+                            mlir::NVVM::NVVMDialect *dialect) {
+    mlir::NVVM::CpAsyncCommitGroupOp::attachInterface<
+        CpAsyncCommitGroupOpMemEffectModel>(*ctx);
+    mlir::NVVM::CpAsyncWaitGroupOp::attachInterface<
+        CpAsyncWaitGroupOpMemEffectModel>(*ctx);
+  });
 }
 
 std::unique_ptr<llvm::Module>
@@ -338,8 +371,44 @@ NovaCompilerAPI::compileToLLVMModule(ModuleOp module,
   DialectRegistry registry;
   registerAllDialects(registry);
 
+  // Re-register side-effect interfaces needed by buffer deallocation
+  registry.addExtension(+[](mlir::MLIRContext *c,
+                            mlir::gpu::GPUDialect *) {
+    mlir::gpu::AllReduceOp::attachInterface<AllReduceOpMemEffectModel>(*c);
+    mlir::gpu::DynamicSharedMemoryOp::attachInterface<DynamicSharedMemoryOpMemEffectModel>(*c);
+    mlir::gpu::BarrierOp::attachInterface<BarrierOpMemEffectModel>(*c);
+  });
+  registry.addExtension(+[](mlir::MLIRContext *c,
+                            mlir::nvgpu::NVGPUDialect *) {
+    mlir::nvgpu::DeviceAsyncCreateGroupOp::attachInterface<
+        DeviceAsyncCreateGroupOpMemEffectModel>(*c);
+    mlir::nvgpu::DeviceAsyncWaitOp::attachInterface<
+        DeviceAsyncWaitOpMemEffectModel>(*c);
+    mlir::nvgpu::DeviceAsyncCopyOp::attachInterface<
+        DeviceAsyncCopyOpMemEffectModel>(*c);
+  });
+  registry.addExtension(+[](mlir::MLIRContext *c,
+                            mlir::NVVM::NVVMDialect *) {
+    mlir::NVVM::CpAsyncCommitGroupOp::attachInterface<
+        CpAsyncCommitGroupOpMemEffectModel>(*c);
+    mlir::NVVM::CpAsyncWaitGroupOp::attachInterface<
+        CpAsyncWaitGroupOpMemEffectModel>(*c);
+  });
+
   ctx->appendDialectRegistry(registry);
   ctx->loadAllAvailableDialects();
+
+  // Extensions only fire when a dialect is *first* loaded. If the NVVM/NVGPU/GPU
+  // dialects were loaded before appendDialectRegistry, the callbacks never ran.
+  // Attach interfaces directly to already-loaded dialects as a safety net.
+  mlir::NVVM::CpAsyncCommitGroupOp::attachInterface<CpAsyncCommitGroupOpMemEffectModel>(*ctx);
+  mlir::NVVM::CpAsyncWaitGroupOp::attachInterface<CpAsyncWaitGroupOpMemEffectModel>(*ctx);
+  mlir::nvgpu::DeviceAsyncCreateGroupOp::attachInterface<DeviceAsyncCreateGroupOpMemEffectModel>(*ctx);
+  mlir::nvgpu::DeviceAsyncWaitOp::attachInterface<DeviceAsyncWaitOpMemEffectModel>(*ctx);
+  mlir::nvgpu::DeviceAsyncCopyOp::attachInterface<DeviceAsyncCopyOpMemEffectModel>(*ctx);
+  mlir::gpu::AllReduceOp::attachInterface<AllReduceOpMemEffectModel>(*ctx);
+  mlir::gpu::DynamicSharedMemoryOp::attachInterface<DynamicSharedMemoryOpMemEffectModel>(*ctx);
+  mlir::gpu::BarrierOp::attachInterface<BarrierOpMemEffectModel>(*ctx);
 
   if (failed(verify(module))) {
     llvm::errs() << "Module verification failed\n";
