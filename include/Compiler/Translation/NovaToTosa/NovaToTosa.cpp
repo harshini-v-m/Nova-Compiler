@@ -194,7 +194,7 @@ struct NovaOpTosaOp {
     return builder->create<mlir::nova::MulOp>(op.getLoc(), n, mean_sum).getResult();
   }
 
-  // CCE lowering pattern
+    // CCE lowering pattern
   static Value mappingtosa(nova::CceOp op, Type resultType, ValueRange input, OpBuilder *builder) {
     // loss = -1 * yA * log(yP)
     auto restensor = dyn_cast<mlir::RankedTensorType>(resultType);
@@ -257,20 +257,19 @@ struct NovaOpTosaOp {
 
     auto finalResultType = llvm::cast<RankedTensorType>(resultType);
     auto scalarType = mlir::RankedTensorType::get({1}, finalResultType.getElementType());
-    auto mean_sum = builder->create<mlir::nova::ReduceOp> (
+    auto sum = builder->create<mlir::nova::ReduceOp> (
                         op.getLoc(), mlir::nova::ReductionKind::SUM, term, 
                         scalarType, false, dimensions
                     ).getResult();     
-    auto n = builder->create<mlir::nova::ConstantOp>(op.getLoc(), scalarType, mlir::DenseElementsAttr::get(scalarType, builder->getFloatAttr(inputType.getElementType(), (double)(1.0f/num_of_elements))));  
-    auto mean = builder->create<mlir::nova::MulOp>(op.getLoc(), n, mean_sum).getResult();
 
-    // 6. (-1) * mean
+    // 6. (-1) * sum
     auto constType = mlir::RankedTensorType::get({}, targetElemType);
     auto minus1Attr = DenseElementsAttr::get(constType, builder->getFloatAttr(targetElemType, -1.0));
     Value minus1 = builder->create<nova::ConstantOp>(op.getLoc(), constType, minus1Attr);
   
-    return builder->create<nova::MulOp>(op.getLoc(), mean, minus1);
+    return builder->create<nova::MulOp>(op.getLoc(), sum, minus1);
   }
+  
   // BCE lowering pattern
   static Value mappingtosa(nova::BceOp op, Type resultType, ValueRange input, OpBuilder *builder) {
     // loss = -1 * reduce_mean[yA * log(yP) + (1 - yA) * log(1 - yP)]

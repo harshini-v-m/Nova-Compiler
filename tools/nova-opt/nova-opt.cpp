@@ -126,6 +126,7 @@ int main(int argc, char **argv) {
   mlir::nova::registerNovaElementwiseToLinalgPass();
   mlir::nova::registerNovaToLinalgPass();
   mlir::nova::registerNovaLinalgHorizontalFusionPass();
+  mlir::nova::registerNovaLinalgVerticalFusionPass();
   mlir::nova::registerNovaFusionKernelEmitterPass();
   mlir::registerDependencyAnalysisTestPass();
 
@@ -141,6 +142,9 @@ int main(int argc, char **argv) {
   mlir::registerConvertComplexToLLVMInterface(registry);
   mlir::registerConvertNVVMToLLVMInterface(registry);
   mlir::gpu::registerConvertGpuToLLVMInterface(registry);
+
+  mlir::nova::registerNovaFuseReductionIntoProducerPass();
+  mlir::nova::registerNovaElementwiseOpFusionPass();
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "Nova dialect optimizer\n", registry));

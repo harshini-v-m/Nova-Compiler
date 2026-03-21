@@ -24,6 +24,11 @@ void populateNovaToLinalgPatterns(RewritePatternSet &patterns);
 std::unique_ptr<Pass> createNovaLinalgHorizontalFusionPass();
 void registerNovaLinalgHorizontalFusionPass();
 
+// From NovaLinalgVerticalFusion.cpp — Vertical fusion: absorb elementwise
+// consumers into reduction linalg.generic ops
+std::unique_ptr<Pass> createNovaLinalgVerticalFusionPass();
+void registerNovaLinalgVerticalFusionPass();
+
 } // namespace nova
 } // namespace mlir
 
