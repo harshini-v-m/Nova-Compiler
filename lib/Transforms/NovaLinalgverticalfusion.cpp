@@ -53,8 +53,6 @@ namespace mlir {
 namespace nova {
 
 // ── Affine-expression evaluator ──────────────────────────────────────────────
-// Recursively walks an AffineExpr and emits arith ops to compute its value
-// at runtime, using the supplied induction-variable array indexed by dim.
 
 static Value evalAffineExpr(OpBuilder &b, Location loc, AffineExpr expr,
                              ArrayRef<Value> ivs) {
@@ -77,13 +75,25 @@ static Value evalAffineExpr(OpBuilder &b, Location loc, AffineExpr expr,
   }
 }
 
-// Evaluate every result expression of an AffineMap at the given IVs.
 static SmallVector<Value> evalAffineMap(OpBuilder &b, Location loc,
                                         AffineMap map, ArrayRef<Value> ivs) {
   SmallVector<Value> indices;
   for (AffineExpr expr : map.getResults())
     indices.push_back(evalAffineExpr(b, loc, expr, ivs));
   return indices;
+}
+
+// ── Dominance helper ─────────────────────────────────────────────────────────
+
+static void hoistBeforeOp(Operation *op, Operation *target) {
+  if (!op || op->getBlock() != target->getBlock())
+    return;
+  if (op->isBeforeInBlock(target))
+    return;
+  for (Value operand : op->getOperands())
+    if (Operation *defOp = operand.getDefiningOp())
+      hoistBeforeOp(defOp, target);
+  op->moveBefore(target);
 }
 
 // ── Predicate helpers ────────────────────────────────────────────────────────
@@ -101,24 +111,6 @@ static bool hasReductionIterator(linalg::GenericOp op) {
 }
 
 // ── Core lowering + fusion ───────────────────────────────────────────────────
-// Lowers `reduceOp` (reduction linalg.generic) and its single all-parallel
-// consumer `elemOp` into one fused SCF loop nest.
-//
-// The reduction body is cloned into the innermost loop.  Immediately after
-// the inner loops return the reduced scalar, the elementwise body is cloned
-// at the same insertion point — no intermediate tensor is allocated.
-//
-// elemOp inputs fall into two categories:
-//   • The operand that IS reduceOp's result  → replaced by the reduced scalar.
-//   • Every other operand (independent tensor) → extracted at the current
-//     parallel-IVs position using that operand's affine map in elemOp.
-//
-// The outer loop carries the reduction's init tensor (filled with the
-// identity value) so that:
-//   1. The per-position identity scalar can be extracted to seed the inner
-//      accumulator without an extra constant-extraction step.
-//   2. The same tensor becomes the fused output: the elementwise result is
-//      inserted back, overwriting the identity placeholder.
 
 static LogicalResult lowerFusedReductionElemToSCF(linalg::GenericOp reduceOp,
                                                    linalg::GenericOp elemOp) {
@@ -168,16 +160,19 @@ static LogicalResult lowerFusedReductionElemToSCF(linalg::GenericOp reduceOp,
   AffineMap elemOutputMap = elemMaps[numElemInputs];
   Block *elemBody = elemOp.getBody();
 
+  // ── Dominance fixup ──────────────────────────────────────────────────────
+  for (Value val : elemInputs) {
+    if (val == reduceOp.getResult(0))
+      continue;
+    if (Operation *defOp = val.getDefiningOp())
+      hoistBeforeOp(defOp, reduceOp);
+  }
+
   // ── Shared IV array ──────────────────────────────────────────────────────
-  // ivs[d] = the loop IV for reduction-op logical dimension d.
-  // Parallel dims are filled as each outer loop opens; initialised to c0
-  // so that evalAffineMap on the output map is always safe.
+  // ivs[d] holds the live loop IV for reduction-op logical dimension d.
+  // Initialised to c0; entries are overwritten as each loop opens.
   SmallVector<Value> ivs(numLoops, c0);
 
-  // elemIVs[i] = ivs[parallelDims[i]].  These are the loop IVs as seen by
-  // the elementwise op (its iteration space == the reduction's output shape).
-  // We return a fresh snapshot whenever needed so the lambda always sees the
-  // up-to-date Values even after ivs is mutated.
   auto makeElemIVs = [&]() {
     SmallVector<Value> ev;
     for (int64_t d : parallelDims)
@@ -185,12 +180,11 @@ static LogicalResult lowerFusedReductionElemToSCF(linalg::GenericOp reduceOp,
     return ev;
   };
 
-  // ── Inner: reduction loop nest ───────────────────────────────────────────
+  // ── Inner: reduction loop nest (scf.for, carries scalar accumulator) ─────
   std::function<Value(OpBuilder &, int64_t, Value)> buildReductionLoops;
   buildReductionLoops = [&](OpBuilder &b, int64_t ridx, Value acc) -> Value {
 
     if (ridx == (int64_t)reductionDims.size()) {
-      // Leaf: clone reduction body once at the current (ivs) position.
       IRMapping mapping;
       for (int64_t i = 0; i < numReduceInputs; i++) {
         SmallVector<Value> idx = evalAffineMap(b, loc, reduceInputMaps[i], ivs);
@@ -217,33 +211,37 @@ static LogicalResult lowerFusedReductionElemToSCF(linalg::GenericOp reduceOp,
     return loop.getResult(0);
   };
 
-  // ── Outer: parallel loop nest ────────────────────────────────────────────
+  // ── Outer: parallel loop nest (scf.for, carries output tensor) ───────────
+  //
+  // We use scf.for rather than scf.parallel because we need to carry the
+  // output tensor through iter_args.  scf.parallel only supports scalar
+  // reductions via scf.reduce — it cannot thread an evolving tensor value
+  // across iterations.  The tensor updates (tensor.insert) are sequential
+  // in the SSA value chain; the underlying bufferization or a later
+  // vectorisation pass can exploit parallelism if it is safe to do so.
   std::function<Value(OpBuilder &, int64_t, Value)> buildParallelLoops;
   buildParallelLoops = [&](OpBuilder &b, int64_t pidx,
                             Value currentTensor) -> Value {
 
     if (pidx == (int64_t)parallelDims.size()) {
-      // All parallel IVs are live.
+      // All parallel IVs are live in `ivs`.
 
-      // ── Step 1: seed the scalar accumulator from the init tensor ─────────
+      // Step 1: seed the scalar accumulator from the init tensor.
       SmallVector<Value> redOutIdx = evalAffineMap(b, loc, reduceOutputMap, ivs);
       Value initAcc = b.create<tensor::ExtractOp>(loc, currentTensor, redOutIdx);
 
-      // ── Step 2: run the reduction nest → reduced scalar ──────────────────
+      // Step 2: run the reduction nest → reduced scalar.
       Value finalAcc = buildReductionLoops(b, 0, initAcc);
 
-      // ── Step 3: inline the elementwise body ──────────────────────────────
-      // Build the IV snapshot for the elementwise op's affine maps.
+      // Step 3: inline the elementwise body.
       SmallVector<Value> elemIVs = makeElemIVs();
 
       IRMapping elemMapping;
       for (int64_t i = 0; i < numElemInputs; i++) {
         Value argVal;
         if (elemInputs[i] == reduceOp.getResult(0)) {
-          // Case 1 / 2: this input IS the reduction result → use the scalar.
           argVal = finalAcc;
         } else {
-          // Case 2 / 3: independent tensor → extract at current position.
           SmallVector<Value> idx =
               evalAffineMap(b, loc, elemInputMaps[i], elemIVs);
           argVal = b.create<tensor::ExtractOp>(loc, elemInputs[i], idx);
@@ -251,8 +249,6 @@ static LogicalResult lowerFusedReductionElemToSCF(linalg::GenericOp reduceOp,
         elemMapping.map(elemBody->getArgument(i), argVal);
       }
 
-      // Map the output block-arg to the current tensor value at that slot.
-      // (Rarely used in pure-elementwise bodies; safe to always provide it.)
       SmallVector<Value> elemOutIdx =
           evalAffineMap(b, loc, elemOutputMap, elemIVs);
       Value outArgVal =
@@ -265,17 +261,20 @@ static LogicalResult lowerFusedReductionElemToSCF(linalg::GenericOp reduceOp,
       auto elemYield = cast<linalg::YieldOp>(elemBody->getTerminator());
       Value fusedResult = elemMapping.lookupOrDefault(elemYield.getOperand(0));
 
-      // ── Step 4: store the fused scalar into the output tensor ─────────────
+      // Step 4: store fused scalar into the output tensor.
       return b.create<tensor::InsertOp>(loc, fusedResult, currentTensor,
                                         elemOutIdx);
     }
 
-    // Emit one parallel loop carrying the tensor and recurse inside.
+    // Emit one scf.for loop for this parallel dimension.
+    // iter_args carries the evolving output tensor; the loop IV is written
+    // into ivs[dim] so that evalAffineMap can see it from nested lambdas.
     int64_t dim = parallelDims[pidx];
     auto loop = b.create<scf::ForOp>(
-        loc, c0, bounds[dim], c1, ValueRange{currentTensor},
+        loc, c0, bounds[dim], c1,
+        /*iterArgs=*/ValueRange{currentTensor},
         [&](OpBuilder &ib, Location, Value iv, ValueRange args) {
-          ivs[dim] = iv;
+          ivs[dim] = iv;   // publish IV into the shared ivs array
           Value newTensor = buildParallelLoops(ib, pidx + 1, args[0]);
           ib.create<scf::YieldOp>(loc, newTensor);
         });
@@ -285,9 +284,7 @@ static LogicalResult lowerFusedReductionElemToSCF(linalg::GenericOp reduceOp,
   // ── Emit and wire up ──────────────────────────────────────────────────────
   Value fusedResult = buildParallelLoops(builder, 0, initTensor);
 
-  // The fused loop produces what elemOp used to produce.
   elemOp.getResult(0).replaceAllUsesWith(fusedResult);
-  // Erase elemOp first (it holds the only use of reduceOp's result).
   elemOp->erase();
   reduceOp->erase();
   return success();
@@ -315,30 +312,20 @@ struct NovaLinalgVerticalFusionPass
   void runOnOperation() override {
     func::FuncOp func = getOperation();
 
-    // Collect (reduceOp, elemOp) pairs before mutating the IR.
     SmallVector<std::pair<linalg::GenericOp, linalg::GenericOp>> candidates;
 
     func.walk([&](linalg::GenericOp op) {
-      // Must have at least one reduction iterator.
       if (!hasReductionIterator(op))
         return;
-      // Must produce exactly one result.
       if (op->getNumResults() != 1)
         return;
-      // That result must have exactly one use.
       if (!op->getResult(0).hasOneUse())
         return;
-      // The single user must be an all-parallel linalg.generic.
       Operation *user = *op->getResult(0).getUsers().begin();
       auto parallelOp = dyn_cast<linalg::GenericOp>(user);
       if (!parallelOp || !isAllParallelGeneric(parallelOp))
         return;
 
-      // The consumer's loop count must equal the reduction's parallel-dim
-      // count.  If the consumer is higher-rank (e.g. it broadcasts the
-      // reduction result across an extra dimension), our loop-nest fusion
-      // would need more IVs than are available from the parallel loops —
-      // leading to an out-of-bounds IV lookup in evalAffineExpr.
       int64_t numParallelDims = llvm::count_if(
           op.getIteratorTypesArray(), [](utils::IteratorType t) {
             return t == utils::IteratorType::parallel;
@@ -361,7 +348,7 @@ struct NovaLinalgVerticalFusionPass
   }
 };
 
-// ── Entry points (declared in NovaToLinalg.h) ────────────────────────────────
+// ── Entry points ─────────────────────────────────────────────────────────────
 
 std::unique_ptr<Pass> createNovaLinalgVerticalFusionPass() {
   return std::make_unique<NovaLinalgVerticalFusionPass>();
