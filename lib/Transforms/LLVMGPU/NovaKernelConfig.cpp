@@ -13,14 +13,17 @@
 //
 //   2. Default (setDefaultConfig): For reductions and elementwise ops.
 //      Mirrors IREE's setRootDefaultConfig:
-//      - workgroupThreads = 2 * warpSize = 64
+//      - workgroupThreads = kTargetThreadsPerBlock = 256
 //      - vectorSize = 4 (128-bit loads for f32)
-//      - inner parallel dim tile = threads * vectorSize = 256
+//      - inner parallel dim tile = threads * vectorSize (up to 1024)
+//      - outer parallel dims: remaining thread budget distributed inward->outward
 //      - reduction dims tile = 4
 //      - thread tile for inner dim = vectorSize
 //
 //   3. initNovaGPULaunchConfig: Single-root model per compute cluster.
 //      Walks all linalg ops, finds roots, stamps configs.
+//      Root ops = true contractions + any op with a reduction iterator.
+//      Non-root ops (prologues, epilogues, fills) fuse into their root.
 //===----------------------------------------------------------------------===//
 
 #include "Compiler/Transforms/LLVMGPU/NovaKernelConfig.h"
@@ -35,8 +38,11 @@
 
 namespace mlir::nova {
 
-/// CUDA's maximum number of threads per block.
-static constexpr int64_t kMaxThreadsPerBlock = 1024;
+/// Preferred maximum threads per block for this target (Ampere RTX 3060).
+/// CUDA's hard limit is 1024; we cap at 256 to leave register file headroom
+/// and improve occupancy on the 28-SM GA106 die.
+// [Doc5] Changed from kMaxThreadsPerBlock=1024 → kTargetThreadsPerBlock=256
+static constexpr int64_t kTargetThreadsPerBlock = 256;
 
 /// Warp size for NVIDIA GPUs.
 static constexpr int64_t kWarpSize = 32;
@@ -64,7 +70,7 @@ static constexpr SimtTilePair kSimtTable[] = {
 };
 
 //===----------------------------------------------------------------------===//
-// clampThreadTilesToMaxThreads — enforce CUDA 1024-thread limit
+// clampThreadTilesToMaxThreads — enforce target thread limit
 //===----------------------------------------------------------------------===//
 
 static void clampThreadTilesToMaxThreads(ArrayRef<int64_t> workgroupTiles,
@@ -82,7 +88,8 @@ static void clampThreadTilesToMaxThreads(ArrayRef<int64_t> workgroupTiles,
     return total;
   };
 
-  while (computeTotal() > kMaxThreadsPerBlock) {
+  // [Doc5] Uses kTargetThreadsPerBlock (256) instead of kMaxThreadsPerBlock (1024)
+  while (computeTotal() > kTargetThreadsPerBlock) {
     int worstDim = -1;
     int64_t worstTrips = 0;
     for (int i = 0; i < n; ++i) {
@@ -100,7 +107,7 @@ static void clampThreadTilesToMaxThreads(ArrayRef<int64_t> workgroupTiles,
     if (worstDim < (int)workgroupTiles.size())
       threadTiles[worstDim] = std::min(threadTiles[worstDim],
                                         workgroupTiles[worstDim]);
-    if (computeTotal() > kMaxThreadsPerBlock && worstTrips <= 1)
+    if (computeTotal() > kTargetThreadsPerBlock && worstTrips <= 1)
       break;
   }
 }
@@ -198,7 +205,7 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   if (!info)
     return failure();
 
-  // 2×2 subgroups per workgroup, 4 MMA tiles per subgroup.
+  // 2x2 subgroups per workgroup, 4 MMA tiles per subgroup.
   constexpr int64_t kNumSubgroupsM  = 2;
   constexpr int64_t kNumSubgroupsN  = 2;
   constexpr int64_t kSubgroupTilesM = 4;
@@ -213,15 +220,11 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   wgN   = std::min(wgN, dims.N);
   kStep = std::min(kStep, dims.K);
 
-  // Thread count = (wgM / threadTileM) * (wgN / threadTileN).
-  // Use subgroup-derived thread tiles: wgM / (numSubgroupsM * subgroupTilesM)
-  // and wgN / (numSubgroupsN * subgroupTilesN) gives per-thread work.
-  // But for the thread forall, use 8×8 to get 256 threads for 128×128.
   int64_t threadTileM = 8;
   int64_t threadTileN = 8;
 
-  // Ensure thread count doesn't exceed 1024.
-  while ((wgM / threadTileM) * (wgN / threadTileN) > kMaxThreadsPerBlock &&
+  // [Doc5] Uses kTargetThreadsPerBlock (256) instead of kMaxThreadsPerBlock (1024)
+  while ((wgM / threadTileM) * (wgN / threadTileN) > kTargetThreadsPerBlock &&
          wgN > threadTileN) {
     wgN /= 2;
   }
@@ -232,25 +235,21 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   SmallVector<int64_t> threadTiles(numLoops, 0);
   SmallVector<int64_t> subgroupTiles(numLoops, 0);
 
-  // Batch dims → 1.
   for (int64_t b : contractionDims->batch) {
     workgroupTiles[b] = 1;
     threadTiles[b] = 1;
     subgroupTiles[b] = 1;
   }
-  // Outer M dims → 1.
   for (int64_t m : llvm::drop_end(contractionDims->m)) {
     workgroupTiles[m] = 1;
     threadTiles[m] = 1;
     subgroupTiles[m] = 1;
   }
-  // Outer N dims → 1.
   for (int64_t n : llvm::drop_end(contractionDims->n)) {
     workgroupTiles[n] = 1;
     threadTiles[n] = 1;
     subgroupTiles[n] = 1;
   }
-  // Outer K dims → 1.
   for (int64_t k : llvm::drop_end(contractionDims->k))
     reductionTiles[k] = 1;
 
@@ -287,7 +286,6 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
 static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
                                    const MatmulDims &dims,
                                    int numLoops) {
-  // Pick first table entry whose M,N tile divides the problem dims.
   const SimtTilePair *chosen = nullptr;
   for (const auto &entry : kSimtTable) {
     if (dims.M % entry.tileMNK[0] == 0 &&
@@ -298,7 +296,6 @@ static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
     }
   }
 
-  // If nothing divides perfectly, try M,N alignment only.
   if (!chosen) {
     for (const auto &entry : kSimtTable) {
       if (dims.M % entry.tileMNK[0] == 0 &&
@@ -309,7 +306,6 @@ static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
     }
   }
 
-  // Last resort: pick the first entry.
   if (!chosen)
     chosen = &kSimtTable[0];
 
@@ -319,11 +315,9 @@ static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
   int64_t wgX = chosen->workgroup[0];
   int64_t wgY = chosen->workgroup[1];
 
-  // Align K tile to actual K size if not evenly divisible.
   while (tileK > 1 && dims.K % tileK != 0)
     tileK >>= 1;
 
-  // Thread tiles: workgroup tile / workgroup size (like IREE).
   int64_t threadTileM = std::max((int64_t)1, tileM / wgX);
   int64_t threadTileN = std::max((int64_t)1, tileN / wgY);
 
@@ -382,7 +376,6 @@ LogicalResult setContractConfig(linalg::LinalgOp op,
   if (!linalg::isaContractionOpInterface(op))
     return failure();
 
-  // Must have at least 2 parallel dims (M and N).
   if (op.getNumParallelLoops() < 2)
     return failure();
 
@@ -390,13 +383,11 @@ LogicalResult setContractConfig(linalg::LinalgOp op,
   if (!dims.valid())
     return failure();
 
-  // Reject matvec (one of M,N == 1) — should go through reduction pipeline.
   if (dims.M == 1 || dims.N == 1)
     return failure();
 
   int numLoops = op.getNumLoops();
 
-  // Very small matmul (M*N <= warpSize): scalar-per-thread config.
   if (dims.M * dims.N <= kWarpSize) {
     SmallVector<int64_t> workgroupTiles(numLoops, 0);
     SmallVector<int64_t> reductionTiles(numLoops, 0);
@@ -426,13 +417,11 @@ LogicalResult setContractConfig(linalg::LinalgOp op,
     return success();
   }
 
-  // Try MMA-based config first.
   if (!target.mmaIntrinsics.empty()) {
     if (succeeded(trySetMMAConfig(op, target, dims, numLoops)))
       return success();
   }
 
-  // Fall back to SIMT tile table.
   return setSimtConfig(op, dims, numLoops);
 }
 
@@ -447,7 +436,6 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
   if (loopBounds.size() != static_cast<size_t>(numLoops))
     return failure();
 
-  // Reject if any loop bound is dynamic.
   for (int64_t b : loopBounds) {
     if (ShapedType::isDynamic(b))
       return failure();
@@ -455,7 +443,6 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
 
   auto iterTypes = op.getIteratorTypesArray();
 
-  // Classify parallel and reduction dims.
   SmallVector<unsigned> parallelDims, reductionDims;
   for (int i = 0; i < numLoops; ++i) {
     if (linalg::isParallelIterator(iterTypes[i]))
@@ -469,35 +456,21 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
   SmallVector<int64_t> reductionTiles(numLoops, 0);
   SmallVector<int64_t> subgroupTiles(numLoops, 0);
 
-  // workgroupThreads = 8 * warpSize = 256 (optimal for Ampere latency hiding)
-  // vectorSize = 4 (128-bit loads for f32)
-  // innermost parallel dim tile = workgroupThreads * vectorSize = 1024
-  // other parallel dims: 1 per thread
-  // reduction dims: tile = 4
-  constexpr int64_t kWorkgroupThreads = 8 * kWarpSize;  // 256
+  // [Doc5] kWorkgroupThreads now mirrors kTargetThreadsPerBlock (256)
+  constexpr int64_t kWorkgroupThreads = kTargetThreadsPerBlock;
   constexpr int64_t kVectorSize = 4;
 
   if (parallelDims.empty() && reductionDims.empty()) {
     // No loops at all (e.g., rank-0 fill). Nothing to tile.
   } else if (parallelDims.empty() && !reductionDims.empty()) {
     // Full reduction (all dims are reduction, no parallel dims).
-    // Set all workgroup tiles to 0 — the dispatch pass will wrap in a
-    // single-block forall. Set thread tiles on the innermost reduction dim
-    // to enable partial reduction parallelism at the Thread tiling level.
-    // Each thread handles `threadTile` reduction elements; the thread forall
-    // trip count = dim / threadTile = number of threads.
     unsigned innerRedDim = reductionDims.back();
     int64_t innerRedSize = loopBounds[innerRedDim];
-    // Target 256 threads on the innermost reduction dim.
     int64_t numThreads = std::min(innerRedSize, (int64_t)(8 * kWarpSize));
-    // Ensure clean divisibility.
     while (numThreads > 1 && innerRedSize % numThreads != 0)
       numThreads /= 2;
-    // threadTile = elements per thread.
     int64_t redThreadTile = innerRedSize / numThreads;
     threadTiles[innerRedDim] = redThreadTile;
-    // Don't set sequential reduction tiles on the threaded dim — the partial
-    // reduction handles it. Set vectorization tiles on other reduction dims.
     for (unsigned dim : reductionDims) {
       if (dim == innerRedDim) continue;
       int64_t bound = loopBounds[dim];
@@ -516,28 +489,20 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
     // for reduction dims). This is correct because reduction needs
     // cooperative accumulation — parallel thread slices would each compute
     // partial sums without combining them.
-    //
-    // Distribute the second-to-last parallel dim across blocks and threads.
-    // Innermost parallel dim (if not the reduction) gets workgroup tile = 1.
     unsigned innerParallelDim = parallelDims.back();
     int64_t innerSize = loopBounds[innerParallelDim];
 
-    // Tile innermost parallel dim to a modest value so threads handle rows.
     int64_t innerTile = std::min(innerSize, (int64_t)(kWorkgroupThreads));
-    // Find a tile that divides evenly
     while (innerTile > 1 && innerSize % innerTile != 0)
       innerTile /= 2;
     workgroupTiles[innerParallelDim] = innerTile;
-    // Each thread handles 1 row (threadTile=1 on the parallel dim).
     threadTiles[innerParallelDim] = 1;
 
-    // Other parallel dims: tile to 1 (fully distributed across blocks).
     for (unsigned dim : parallelDims) {
       if (dim == innerParallelDim) continue;
       workgroupTiles[dim] = 1;
     }
 
-    // Reduction dims: sequential within each thread via reductionTiles.
     // DO NOT set threadTiles on reduction dims — that would create a
     // parallel forall where each thread computes a partial sum without
     // any cross-thread combination.
@@ -553,9 +518,6 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
     unsigned innerParallelDim = parallelDims.back();
     int64_t innerSize = loopBounds[innerParallelDim];
 
-    // Find best (threads, vectorSize) combo where tile = threads * vectorSize
-    // divides innerSize evenly.
-    //
     // Two-pass search: prefer vectorSize >= 2 (meaningful thread tiles that
     // actually create thread-level foralls). vectorSize=1 means threadTile=1,
     // which the thread tiling pass may treat as degenerate (especially when
@@ -591,7 +553,7 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
       bestVS = kVectorSize;
       while (bestVS > 1 && innerSize % bestVS != 0)
         bestVS /= 2;
-      bestThreads = innerSize / bestVS;
+      bestThreads = std::min(innerSize / bestVS, kWorkgroupThreads);
     }
     int64_t vectorSize = bestVS;
     int64_t innerTile = std::min(bestThreads * bestVS, innerSize);
@@ -599,18 +561,37 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
     workgroupTiles[innerParallelDim] = innerTile;
     threadTiles[innerParallelDim] = vectorSize;
 
-    // Other parallel dims (outer): tile to 1 at workgroup level, no thread
-    // tiling (threadTile = 0). These dims are fully distributed at block level
-    // (1 element per block). Setting threadTile=1 would create threads along
-    // these dims, which is catastrophic when the op is fused into a block
-    // forall that doesn't tile these dims (the thread count explodes).
+    // Outer parallel dims: distribute the remaining thread budget inward->outward
+    // so that each block handles multiple rows/slices rather than a single one.
+    //
+    // Without this, a [B, M, N] all-parallel op (e.g. LayerNorm elementwise)
+    // with innerTile covering only the N dim produces workgroupTile_M=1, which
+    // multiplies the grid Y dimension by M (e.g. 1024) — spawning orders of
+    // magnitude more blocks than needed and blowing the SRAM per-block budget
+    // when shared-memory promotion is active.
+    //
+    // threadTile=0 on budget-exhausted dims means the thread tiling pass skips
+    // them entirely — they are fully block-distributed with no thread forall.
+    // Setting threadTile=1 instead would create threads along these dims, which
+    // is catastrophic when the op is fused into a block forall that doesn't
+    // tile these dims (the thread count explodes).
+    int64_t remainingBudget = kWorkgroupThreads / bestThreads;
     for (int i = (int)parallelDims.size() - 2; i >= 0; --i) {
       unsigned dim = parallelDims[i];
-      workgroupTiles[dim] = 1;
-      threadTiles[dim] = 0;
+      int64_t dimSize = loopBounds[dim];
+      if (remainingBudget > 1 && dimSize > 1) {
+        int64_t tile = std::min(dimSize, remainingBudget);
+        while (tile > 1 && dimSize % tile != 0)
+          tile /= 2;
+        workgroupTiles[dim] = tile;
+        threadTiles[dim] = 1;
+        remainingBudget /= tile;
+      } else {
+        workgroupTiles[dim] = 1;
+        threadTiles[dim] = 0;
+      }
     }
 
-    // Reduction dims: tile = 4 for vectorized loads.
     for (unsigned dim : reductionDims) {
       int64_t bound = loopBounds[dim];
       if (bound % 4 == 0) reductionTiles[dim] = 4;
@@ -618,7 +599,6 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
       else reductionTiles[dim] = 1;
     }
 
-    // Clamp total thread count to <= 1024.
     clampThreadTilesToMaxThreads(workgroupTiles, threadTiles);
   }
 
@@ -637,11 +617,19 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
       computePaddingSizes(op, workgroupTiles, reductionTiles);
 
   MLIRContext *ctx = op.getContext();
+  SmallVector<int64_t> promotedOps;
+  auto linalgOp = cast<linalg::LinalgOp>(op.getOperation());
+  auto maps = linalgOp.getIndexingMapsArray();
+  unsigned numInputs = linalgOp.getNumDpsInputs();
+  for (unsigned i = 0; i < numInputs; ++i) {
+    if (maps[i].getNumResults() < (unsigned)numLoops)
+      promotedOps.push_back(i);
+  }
   setMatmulLoweringConfigAttrs(op.getOperation(), ctx,
                                workgroupTiles, reductionTiles,
                                threadTiles, subgroupTiles,
                                static_cast<int32_t>(NVMMAIntrinsicValues::NONE),
-                               /*promotedOperands=*/{}, padding);
+                               promotedOps, padding);
   return success();
 }
 
@@ -649,34 +637,17 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
 // initNovaGPULaunchConfig — Main entry point
 //===----------------------------------------------------------------------===//
 
-/// Returns true if `op` is a purely elementwise (all-parallel) consumer of a
-/// contraction op. Such ops are "epilogues" (bias add, relu, etc.) and should
-/// NOT get independent lowering configs — they fuse into the contraction's
-/// scf.forall as consumers during TileDispatch.
-///
-/// IMPORTANT: Consumers with reduction iterators (e.g., batch-reduce for
-/// grad_weight) are NOT epilogues — they need their own configs. Fusing a
-/// dimension-reducing consumer into a contraction's forall creates overlapping
-/// writes when the consumer's output rank < forall dims.
 /// Returns true if `op` is a "true" contraction (matmul-like), not just any op
 /// that isaContractionOpInterface might match (e.g., elementwise dot-products
 /// like C[i,j] = sum_k A[i,j,k]*B[i,j,k] also match contraction interface but
 /// are semantically reductions, not matmuls).
 static bool isTrueContraction(Operation *op) {
-  // Named contraction ops are always true contractions.
   if (isa<linalg::BatchMatmulOp, linalg::MatmulOp, linalg::MatvecOp,
           linalg::VecmatOp, linalg::BatchMatvecOp>(op))
     return true;
-  // For generics, require contraction interface AND that the contraction
-  // has a non-trivial structure (at least one index that only appears in
-  // one input + reduction, characteristic of matrix multiply).
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
   if (!linalgOp || !linalg::isaContractionOpInterface(linalgOp))
     return false;
-  // A true matmul has dims where each input uses a different subset.
-  // E.g., matmul: A[m,k], B[k,n], C[m,n] — m is only in A+C, n only in B+C.
-  // A reduction: A[i,j,k], B[i,j,k], C[i,j] — i,j appear in both A and B.
-  // Check: at least one parallel dim that does NOT appear in all inputs.
   auto indexMaps = linalgOp.getIndexingMapsArray();
   if (indexMaps.size() < 3)
     return false;
@@ -687,14 +658,42 @@ static bool isTrueContraction(Operation *op) {
       continue;
     bool inInput0 = indexMaps[0].isFunctionOfDim(i);
     bool inInput1 = indexMaps[1].isFunctionOfDim(i);
-    // If a parallel dim is in one input but not the other → true contraction.
     if (inInput0 != inInput1)
       return true;
   }
   return false;
 }
 
-static bool isContractionEpilogue(Operation *op) {
+/// Returns true if `op` is a "root" op that should get its own lowering_config
+/// and be independently tiled into its own scf.forall. Roots are:
+///   - True contractions (matmul-like ops)
+///   - Ops with reduction iterator types (e.g., LN mean/var, softmax reduce)
+/// All other ops (elementwise, broadcasts) should fuse into a root's forall.
+static bool isRootOp(Operation *op) {
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  if (!linalgOp)
+    return false;
+  if (isTrueContraction(op))
+    return true;
+  for (auto iterType : linalgOp.getIteratorTypesArray()) {
+    if (iterType != utils::IteratorType::parallel)
+      return true;
+  }
+  return false;
+}
+
+/// Returns true if `op` is a purely elementwise (all-parallel) consumer of a
+/// root op. Such ops are "epilogues" (bias add, relu, etc.) and should NOT get
+/// independent lowering configs — they fuse into the root's scf.forall as
+/// consumers during TileDispatch.
+///
+/// IMPORTANT: Consumers with reduction iterators (e.g., batch-reduce for
+/// grad_weight) are NOT epilogues — they need their own configs.
+///
+/// [Doc5] Added projected permutation guard on all indexing maps before the
+/// operand chain walk. Prevents incorrect fusion when maps have transposes or
+/// non-trivial reindexing that would cause consumer fusion to silently fail.
+static bool isEpilogue(Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
   if (!linalgOp)
     return false;
@@ -703,36 +702,65 @@ static bool isContractionEpilogue(Operation *op) {
     if (iterType != utils::IteratorType::parallel)
       return false;
   }
+  // [Doc5] All indexing maps must be projected permutations to safely fuse.
+  // Transposes or complex maps will fail consumer fusion in TileDispatch.
+  for (AffineMap map : linalgOp.getIndexingMapsArray()) {
+    if (!map.isProjectedPermutation())
+      return false;
+  }
+  // Check if any operand traces to a root op (up to 2 levels deep).
   for (Value operand : op->getOperands()) {
     Operation *defOp = operand.getDefiningOp();
     if (!defOp)
       continue;
-    if (isTrueContraction(defOp))
+    if (isRootOp(defOp))
       return true;
-    // Also check one level deeper: epilogue chains like
-    // matmul → bias_add → relu (relu's input is bias_add, not matmul).
-    if (auto genericDef = dyn_cast<linalg::GenericOp>(defOp)) {
-      for (Value innerOp : genericDef->getOperands()) {
-        Operation *innerDef = innerOp.getDefiningOp();
-        if (!innerDef)
-          continue;
-        if (isTrueContraction(innerDef))
-          return true;
-      }
+    // One level deeper: epilogue chains like root -> bias_add -> relu.
+    for (Value innerOp : defOp->getOperands()) {
+      Operation *innerDef = innerOp.getDefiningOp();
+      if (!innerDef)
+        continue;
+      if (isRootOp(innerDef))
+        return true;
     }
   }
   return false;
 }
 
-/// Returns true if `op` is a direct producer (input) to a contraction op.
-/// Such ops are "prologues" (weight broadcast, input transform, etc.) and
-/// should NOT get independent lowering configs — they fuse into the
-/// contraction's scf.forall as producers during TileDispatch.
-static bool isContractionPrologue(Operation *op) {
+/// Returns true if `op` is a direct producer (input) to any root op
+/// AND the root accesses this operand through a projected permutation
+/// (no transpose/reindex), so tile-based producer fusion is feasible.
+///
+/// If the root reindexes this operand (e.g., the op produces [8,1024,384]
+/// but the root accesses it as [8,384,1024] via a transposed indexing map),
+/// producer fusion will fail during TileDispatch, and the op will be left
+/// un-tiled -> serialized to 1 workgroup in Phase 2. In that case we must
+/// NOT skip the config — the op needs its own lowering_config.
+static bool isPrologue(Operation *op) {
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  if (!linalgOp)
+    return false;
+  // Only all-parallel ops can safely fuse as prologues.
+  for (auto iterType : linalgOp.getIteratorTypesArray()) {
+    if (iterType != utils::IteratorType::parallel)
+      return false;
+  }
+  // Check if any result feeds a root via projected permutation.
   for (OpResult result : op->getResults()) {
     for (Operation *user : result.getUsers()) {
-      if (isTrueContraction(user))
-        return true;
+      if (!isRootOp(user))
+        continue;
+      auto consumerLinalgOp = dyn_cast<linalg::LinalgOp>(user);
+      if (!consumerLinalgOp)
+        continue;
+      for (OpOperand &operand : consumerLinalgOp->getOpOperands()) {
+        if (operand.get() != result)
+          continue;
+        AffineMap map = consumerLinalgOp.getMatchingIndexingMap(&operand);
+        if (map.isProjectedPermutation() && !map.isEmpty())
+          return true;
+        break;
+      }
     }
   }
   return false;
@@ -742,42 +770,53 @@ void initNovaGPULaunchConfig(mlir::func::FuncOp funcOp,
                               const NVIDIATargetInfo &target) {
   // Walk all linalg ops and attach configs. Unlike IREE (which has one root
   // per dispatch), Nova has multiple compute clusters in a single function.
-  // We stamp configs on each root independently:
-  //   1. Contractions get contraction config
-  //   2. Generics that are NOT contraction epilogues get default config
+  // We stamp configs only on ROOT ops:
+  //   - Contractions get contraction config
+  //   - Other root ops (reductions) get default config
   //
-  // Epilogue ops (bias, relu, etc. following a contraction) do NOT get
-  // configs — they fuse into the contraction's forall via consumer fusion.
-
+  // Non-root ops (prologues, epilogues, fills) do NOT get configs — they
+  // fuse into their root's scf.forall via producer/consumer fusion.
   funcOp.walk([&](linalg::LinalgOp op) {
     // Skip ops that already have a config.
     if (getLoweringConfig(op.getOperation()))
       return;
 
-    // Priority 1: Contraction ops → MMA or SIMT config.
+    // FillOps always fuse as DPS init — never need a config.
+    if (isa<linalg::FillOp>(op.getOperation()))
+      return;
+
+    // Epilogues (all-parallel consumers of roots) fuse as consumers.
+    if (isEpilogue(op.getOperation())) {
+      LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] Skipping epilogue: "
+                               << op->getName() << "\n");
+      return;
+    }
+
+    // Prologues (all-parallel producers feeding roots via projected
+    // permutation) fuse as producers — no independent config needed.
+    if (isPrologue(op.getOperation())) {
+      LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] Skipping prologue: "
+                               << op->getName() << "\n");
+      return;
+    }
+
+    // Root ops: contractions get contraction config, others get default.
     if (linalg::isaContractionOpInterface(op)) {
       if (succeeded(setContractConfig(op, target)))
         return;
       // If contraction config fails (matvec, dynamic), fall through to default.
     }
 
-    // Priority 2: Any linalg.generic → default config, unless it's an
-    // epilogue/prologue of a contraction (those fuse as consumers/producers,
-    // no independent config needed).
     if (isa<linalg::GenericOp>(op.getOperation())) {
-      if (isContractionEpilogue(op.getOperation())) {
-        LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] Skipping epilogue: "
-                                 << op->getName() << "\n");
-        return;
-      }
-      if (isContractionPrologue(op.getOperation())) {
-        LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] Skipping prologue: "
-                                 << op->getName() << "\n");
-        return;
-      }
+      // Epilogues and prologues are already handled by the generic isEpilogue /
+      // isPrologue checks above — no separate contraction-specific pass needed.
+      // Any generic that reaches here is a true root (reduction or standalone
+      // elementwise not fused into any contraction) → give it a default config.
       (void)setDefaultConfig(op, target);
       return;
     }
+
+    (void)setDefaultConfig(op, target);
   });
 }
 

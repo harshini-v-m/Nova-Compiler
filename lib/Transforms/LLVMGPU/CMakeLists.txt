@@ -26,12 +26,20 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaGPUSelectLoweringStrategy.cpp
   # Phase 6: Fuse and hoist parallel loops (mirrors IREE GPUFuseAndHoistParallelLoops)
   NovaGPUFuseAndHoistParallelLoops.cpp
+  # Phase 6.5: Greedily distribute orphaned ops to threads (mirrors IREE GPUGreedilyDistributeToThreads)
+  NovaGPUGreedilyDistributeToThreads.cpp
+  # Lower nova.barrier_region → two nova.value_barrier ops (mirrors IREE LowerBarrierRegion)
+  NovaGPULowerBarrierRegion.cpp
   # Normalize scf.forall bounds to lb=0, step=1 (mirrors IREE NormalizeLoopBounds)
   NovaNormalizeLoopBounds.cpp
   # Convert workgroup memref.alloc → memref.global + drop deallocs (mirrors IREE)
   NovaConvertSharedMemAllocs.cpp
   # Convert scf.forall → gpu.launch with dynamic block dims (replaces transform script)
   NovaGPUMapForallToGPU.cpp
+
+  NovaGPUFillCopyForwarding.cpp
+  # Step 8.2: Coalesce workgroup allocs with non-overlapping live ranges.
+  NovaGPUCoalesceWorkgroupBuffers.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include

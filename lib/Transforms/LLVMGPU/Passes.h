@@ -96,6 +96,20 @@ void registerNovaGPUApplyTilingLevelSubgroupPass();
 std::unique_ptr<Pass> createNovaGPUFuseAndHoistParallelLoopsPass();
 void registerNovaGPUFuseAndHoistParallelLoopsPass();
 
+// Greedily distributes orphaned parallel ops (not inside thread-mapped
+// scf.forall) to GPU threads.  Derives thread tile sizes from loop ranges.
+// Must run AFTER FuseAndHoist, BEFORE LowerBarrierRegion.
+// Mirrors IREE's GPUGreedilyDistributeToThreads pass.
+std::unique_ptr<Pass> createNovaGPUGreedilyDistributeToThreadsPass();
+void registerNovaGPUGreedilyDistributeToThreadsPass();
+
+// Lowers nova.barrier_region ops into two nova.value_barrier ops (one for
+// writes, one for reads) with the body inlined between them.
+// Must run after FuseAndHoistParallelLoops and before bufferization.
+// Mirrors IREE's LowerBarrierRegion pattern.
+std::unique_ptr<Pass> createNovaGPULowerBarrierRegionPass();
+void registerNovaGPULowerBarrierRegionPass();
+
 // Erases all nova.fusion_barrier ops by replacing them with their source
 // operand. Must run as the first step of addNovaGPUBufferizePasses.
 // Mirrors what IREE's IREEComprehensiveBufferizePass does at its start.
@@ -165,6 +179,12 @@ void registerNovaGPULowerMemorySpacePass();
 std::unique_ptr<Pass> createNovaGPUPromoteGlobalsToSharedPass();
 void registerNovaGPUPromoteGlobalsToSharedPass();
 
+
+std::unique_ptr<Pass> createNovaGPUFillCopyForwardingPass();
+void registerNovaGPUFillCopyForwardingPass();
+
+std::unique_ptr<Pass> createNovaGPUCoalesceWorkgroupBuffersPass();
+void registerNovaGPUCoalesceWorkgroupBuffersPass();
 } // namespace nova
 } // namespace mlir
 

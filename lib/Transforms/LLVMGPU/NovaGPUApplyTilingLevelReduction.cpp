@@ -33,7 +33,11 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "nova-tiling"
 
 using namespace mlir;
 
@@ -161,6 +165,30 @@ getTileSizes(RewriterBase &rewriter, TilingInterface tilingOp,
     tiles.push_back(0);
   if ((int64_t)tiles.size() > numLoops)
     return SmallVector<OpFoldResult>(numLoops, zero);
+
+  // Derived-thread config: recompute thread tiles from the op's actual
+  // (K-tiled) loop ranges and the stored target_threads count.  This ensures
+  // the copy forall trip count matches the matmul forall trip count, enabling
+  // FuseForalls in Step 6.  Mirrors IREE's DerivedThreadConfigAttr.
+  if (tilingLevel == NovaTilingLevel::Thread && isDerivedThreadConfig(config)) {
+    int64_t targetThreads = getTargetThreadCount(config);
+    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+      SmallVector<int64_t> loopRanges = linalgOp.getStaticLoopRanges();
+      unsigned elemBits =
+          getElementTypeOrSelf(linalgOp->getResultTypes()[0])
+              .getIntOrFloatBitWidth();
+      tiles = deriveThreadTileSizes(loopRanges, targetThreads, elemBits);
+      // Pad/truncate to numLoops.
+      while ((int64_t)tiles.size() < numLoops)
+        tiles.push_back(0);
+      tiles.resize(numLoops);
+
+      LLVM_DEBUG(llvm::dbgs() << "[nova-tiling] derived thread tiles for "
+                               << op->getName() << ": [";
+                 for (int64_t t : tiles) llvm::dbgs() << t << " ";
+                 llvm::dbgs() << "] target=" << targetThreads << "\n");
+    }
+  }
 
   // Thread level: clamp to max threads using the op's ACTUAL loop ranges.
   //
