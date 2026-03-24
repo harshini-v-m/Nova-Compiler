@@ -1,6 +1,8 @@
 add_mlir_library(CompilerTransforms
+  AddGpuMemoryCopies.cpp
   FuseMatmulBias.cpp
   ConvertMemRefToGpu.cpp
+  FixGpuLaunch.cpp
   GenerateDynamicWrapper.cpp
   VectorOpt.cpp
   RemDevAttr.cpp

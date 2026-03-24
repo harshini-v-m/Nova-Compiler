@@ -1,6 +1,6 @@
 #include "Compiler/API/NovaCompilerAPI.h"
 #include "Compiler/Pipeline/Pipeline.h"
-
+#include "Compiler/Pipeline/Gpupipeline.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -107,9 +107,7 @@ int main(int argc, char **argv) {
     // Run the pipeline
     PassManager pm(&context);
     if (options.device == "gpu") {
-      // Legacy GPU pipeline removed. Use optimized pipeline in NovaCompilerAPI or custom passes.
-      // createNovaGPUPipelines(pm); 
-
+      createNovaGPUPipelines(pm);
     } else {
       createNovaPipelines(pm);
     }
