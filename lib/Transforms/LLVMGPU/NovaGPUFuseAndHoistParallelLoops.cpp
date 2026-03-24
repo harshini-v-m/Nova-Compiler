@@ -358,6 +358,19 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
     // insert_slice. A barrier synchronizes, then the consumer reads its
     // slice from the shared result.
 
+    // [Fix] For thread-mapped foralls, we refuse to fuse if the trip counts
+    // do not match exactly. Fusing mismatched thread-counts (e.g. 256 into 64)
+    // requires a serial loop inside the consumer, which is dangerous if the
+    // producer contains barriers (resulting in divergent barriers under masking).
+    if (isThreadMappedForall(producerForall) && isThreadMappedForall(consumerForall)) {
+      auto pTrip = getStaticForallTripCount(producerForall);
+      auto cTrip = getStaticForallTripCount(consumerForall);
+      if (pTrip && cTrip && *pTrip != *cTrip) {
+        return rewriter.notifyMatchFailure(producerForall, 
+          "mismatched thread-counts are unsafe for barrier-based fusion");
+      }
+    }
+
     Location loc = producerForall.getLoc();
 
     // Step 1: Create shared memory alloc_tensor for the producer destination.

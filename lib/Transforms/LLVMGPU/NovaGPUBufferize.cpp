@@ -69,11 +69,34 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
       builder.getContext(), gpu::GPUDialect::getWorkgroupAddressSpace());
 
   // Workgroup (shared) memory → heap allocated for the whole workgroup.
+  //
+  // IMPORTANT: GPU workgroup (shared) memory is statically partitioned at
+  // kernel launch. Allocating inside an scf.for loop body produces a new
+  // alloc/dealloc pair every iteration, which is semantically wrong — the
+  // shared memory slot is fixed for the lifetime of the kernel. We hoist
+  // the alloc to just before the outermost enclosing scf.for that is still
+  // inside the gpu.launch / scf.forall kernel boundary.
   if (memSpace && cast<gpu::AddressSpaceAttr>(memSpace).getValue() ==
                       gpu::GPUDialect::getWorkgroupAddressSpace()) {
     auto allocType =
         MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
                         AffineMap(), wkgpSpace);
+
+    // Walk up the op-parent chain and record the outermost scf.for that is
+    // still inside the kernel. Stop at gpu.launch / scf.forall boundaries.
+    OpBuilder::InsertionGuard guard(builder);
+    Operation *hoistTarget = nullptr;
+    Operation *cur = builder.getInsertionBlock()->getParentOp();
+    while (cur) {
+      if (isa<gpu::LaunchOp, scf::ForallOp>(cur))
+        break;
+      if (isa<scf::ForOp>(cur))
+        hoistTarget = cur;
+      cur = cur->getParentOp();
+    }
+    if (hoistTarget)
+      builder.setInsertionPoint(hoistTarget);
+
     return memref::AllocOp::create(builder, loc, allocType, dynamicSizes)
         .getResult();
   }
@@ -382,38 +405,22 @@ struct NovaGPUInsertWorkgroupBarriersPass
     func::FuncOp funcOp = getOperation();
     OpBuilder builder(funcOp.getContext());
 
-    // Strategy: walk inside gpu.launch bodies and find transition points
-    // where workgroup stores are followed by workgroup loads. Insert
-    // gpu.barrier at each such transition.
-    //
-    // The pattern in the K-loop body is:
-    //   scf.for { store to workgroup }    // global → shared copy
-    //   scf.for { load from workgroup }   // shared → private copy
-    //   scf.for { store to workgroup }    // global → shared copy (op B)
-    //   scf.for { load from workgroup }   // shared → private copy (op B)
-    //   scf.for { compute }               // matmul from private
-    //
-    // We need barriers between write-then-read transitions.
-
+    // Walk each gpu.launch body. insertBarriersInBlock recurses into
+    // scf.for bodies itself, so a single top-level call per launch suffices.
     funcOp.walk([&](gpu::LaunchOp launchOp) {
-      // Walk all scf.for ops to find K-loops or any loop with workgroup
-      // write→read transitions in its body.
-      launchOp.walk([&](scf::ForOp forOp) {
-        insertBarriersAtTransitions(builder, forOp);
-      });
+      Region &launchRegion = launchOp.getBody();
+      for (Block &block : launchRegion)
+        insertBarriersInBlock(builder, &block);
     });
 
-    // Also handle memref.copy ops (in case any remain un-lowered).
+    // Handle any memref.copy ops involving workgroup memory that remain
+    // un-lowered after bufferization.
     funcOp.walk([&](memref::CopyOp copyOp) {
-      bool needsBarrier = false;
-      if (isWorkgroupMemref(cast<MemRefType>(copyOp.getSource().getType())))
-        needsBarrier = true;
-      if (isWorkgroupMemref(cast<MemRefType>(copyOp.getTarget().getType())))
-        needsBarrier = true;
-
+      bool needsBarrier =
+          isWorkgroupMemref(cast<MemRefType>(copyOp.getSource().getType())) ||
+          isWorkgroupMemref(cast<MemRefType>(copyOp.getTarget().getType()));
       if (!needsBarrier)
         return;
-
       builder.setInsertionPoint(copyOp);
       builder.create<NVVM::Barrier0Op>(copyOp.getLoc());
       builder.setInsertionPointAfter(copyOp);
@@ -421,47 +428,58 @@ struct NovaGPUInsertWorkgroupBarriersPass
     });
   }
 
-  /// Walk the body of `forOp` and insert gpu.barrier between workgroup
-  /// memory writes and subsequent reads.  Tracks whether ANY prior op in
-  /// the block has workgroup stores, so intermediate ops (affine.apply,
-  /// memref.subview, etc.) don't break the write→read detection.
-  void insertBarriersAtTransitions(OpBuilder &builder, scf::ForOp forOp) {
-    Block *body = forOp.getBody();
+  /// Walk the ops in `body` and insert nvvm.barrier0 at workgroup memory
+  /// write → read transitions. Recurses into scf.for bodies only.
+  ///
+  /// scf.if branches are intentionally NOT recursed into: nvvm.barrier0
+  /// requires ALL threads in the block to reach it. Inserting a barrier
+  /// inside a non-uniform conditional (e.g. `if thread_id < 64`) causes
+  /// deadlock because the remaining threads never arrive at the barrier.
+  /// Instead the parent-level scan treats the entire scf.if as one unit:
+  /// if it contains workgroup loads, the barrier is placed before the
+  /// scf.if op itself, where all threads execute.
+  void insertBarriersInBlock(OpBuilder &builder, Block *body) {
     SmallVector<Operation *> barrierPoints;
-
     bool seenWorkgroupStore = false;
-    bool seenWorkgroupLoad = false;
-    bool seenNonAtomicWorkgroupStore = false;
+    bool seenNonAtomicStore = false;
 
     for (Operation &op : body->getOperations()) {
-      if (isa<scf::YieldOp>(op))
+      if (isa<scf::YieldOp, gpu::TerminatorOp>(op))
         continue;
 
-      // If we've seen a store and this op reads workgroup mem, need barrier.
-      if (seenWorkgroupStore && hasWorkgroupLoads(&op)) {
+      bool hasLoads  = hasWorkgroupLoads(&op);
+      bool hasStores = hasWorkgroupStores(&op);
+
+      // Write → read transition: place barrier before the reading op so
+      // all threads see completed stores before any thread proceeds to load.
+      if (seenWorkgroupStore && hasLoads) {
         barrierPoints.push_back(&op);
-        seenWorkgroupStore = false; // reset
+        seenWorkgroupStore = false;
       }
 
-      if (hasWorkgroupStores(&op))
+      if (hasStores) {
         seenWorkgroupStore = true;
-      if (hasNonAtomicWorkgroupStores(&op))
-        seenNonAtomicWorkgroupStore = true;
-      if (hasWorkgroupLoads(&op))
-        seenWorkgroupLoad = true;
+        if (hasNonAtomicWorkgroupStores(&op))
+          seenNonAtomicStore = true;
+      }
+
+      // Recurse into scf.for bodies to handle write→read transitions across
+      // ops within a single loop iteration.
+      if (auto forOp = dyn_cast<scf::ForOp>(op))
+        insertBarriersInBlock(builder, forOp.getBody());
     }
 
-    // Only add a tail barrier if we have loads AND there's a possible
-    // unsafe write in the next iteration. Purely atomic loops or
-    // read-only loops do not need synchronization between iterations.
-    if (seenWorkgroupLoad && seenNonAtomicWorkgroupStore) {
+    // Tail barrier: protect the next loop iteration from reading shared
+    // memory before this iteration's non-atomic stores are globally visible.
+    // Only needed inside a loop (scf.yield terminator). At gpu.launch level
+    // (gpu.terminator) there is no next iteration so no tail barrier.
+    if (seenNonAtomicStore && isa<scf::YieldOp>(body->getTerminator()))
       barrierPoints.push_back(body->getTerminator());
-    }
 
-    // Insert barriers (in reverse to avoid invalidating iterators).
-    for (Operation *readerOp : llvm::reverse(barrierPoints)) {
-      builder.setInsertionPoint(readerOp);
-      builder.create<NVVM::Barrier0Op>(readerOp->getLoc()); 
+    // Insert in reverse order to preserve iterator validity.
+    for (Operation *pt : llvm::reverse(barrierPoints)) {
+      builder.setInsertionPoint(pt);
+      builder.create<NVVM::Barrier0Op>(pt->getLoc());
     }
   }
 
