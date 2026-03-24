@@ -902,63 +902,6 @@ def Nova_Rndm2DOp:Op<Nova_Dialect,"rndm2d",[Pure]>{
   }];
 }
 
-def AdamOp : Op<Nova_Dialect,"adam",[Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]>{
-  let summary = "Adam optimizer stepping";
-  let description = [{
-    Implements adam optimizer step 
-    Returns updated params and moments 
-    Inputs:
-     - param: Current parameters
-    - m: Current first moment
-    - v: Current second moment
-    - grad: Gradient with respect to parameters
-    - lr: Learning rate
-    - t: Time step (for bias correction)
-
-    Attributes:
-    - beta1: Exponential decay rate for first moment (default 0.9)
-    - beta2: Exponential decay rate for second moment (default 0.999)
-    - epsilon: Small constant for numerical stability (default 1e-8)
-    
-      Returns:
-    - new_param: Updated parameters
-    - new_m: Updated first moment
-    - new_v: Updated second moment
-
-    Example:
-    ```mlir
-    %np, %nm, %nv = nova.adam %p, %m, %v, %g 
-      {beta1 = 0.9, beta2 = 0.999, epsilon = 1.0e-8, lr = 0.001, t = 1} 
-      : tensor<64xf32>, tensor<64xf32>, tensor<64xf32>, tensor<64xf32>
-    ```
-  }];
-  let arguments = (ins
-    Nova_Tensor:$param,
-    Nova_Tensor:$m,
-    Nova_Tensor:$v,
-    Nova_Tensor:$grad,
-    
-    // Hyperparameters as attributes for now
-    DefaultValuedAttr<F32Attr, "0.001f">:$lr,
-    DefaultValuedAttr<F32Attr, "0.9f">:$beta1,
-    DefaultValuedAttr<F32Attr, "0.999f">:$beta2,
-    DefaultValuedAttr<F32Attr, "1.0e-8f">:$epsilon,
-    I32Attr:$t
-  );
-  
-  let results = (outs 
-    Nova_Tensor:$new_param,
-    Nova_Tensor:$new_m,
-    Nova_Tensor:$new_v
-  );
-  
-  let assemblyFormat = [{
-    $param `,` $m `,` $v `,` $grad attr-dict `:` type($param) `,` type($m) `,` type($v) `,` type($grad) `->` type($new_param) `,` type($new_m) `,` type($new_v)
-  }];
-
-  let extraClassDeclaration = [{
-  }];
-}
 def GatherOp : Op<Nova_Dialect, "gather", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Gather Operation";
   let description = [{The nova gather operation takes an input tensor and extracts slices along the specified `axis` using the provided `indices`}];
