@@ -30,7 +30,9 @@
 // Directly mirrors IREE: Common/GPU/GPUFuseAndHoistParallelLoops.cpp
 
 #include "Passes.h"
+#include "Compiler/Dialect/nova/NovaOps.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -145,32 +147,92 @@ applyPatternsGreedilyWithConfig(func::FuncOp funcOp,
 // a scf.forall with the same thread mapping + workgroup trip count, merge the
 // producer into the consumer by direct body inlining.
 //
-// Mirrors IREE's fuseForallIntoConsumer() but without iree_gpu.barrier_region
-// or affine.delinearize_index. Instead, for matching-trip-count foralls we
-// clone the producer body into the consumer and map producer IVs → consumer IVs
-// directly. This is valid because each thread computes and reads the same
-// element (same offsets in parallel_insert_slice and extract_slice).
+// Mirrors IREE's fuseForallIntoConsumer(). When producer and consumer foralls
+// have matching flat trip counts (product of all upper bounds), we fuse them
+// by cloning the producer body into the consumer. If dimensions differ (e.g.,
+// copy forall (1,32,4) into matmul forall (1,16,8)), we linearize consumer
+// IVs into a flat index and delinearize into the producer's dimension space.
+// When dimensions match 1:1, we map IVs directly (fast path).
 //===----------------------------------------------------------------------===//
 
-/// Returns true if the foralls have matching upper bounds (dimension-wise).
-static bool forallBoundsMatch(scf::ForallOp producer, scf::ForallOp consumer) {
-  auto producerUB = producer.getMixedUpperBound();
-  auto consumerUB = consumer.getMixedUpperBound();
-  if (producerUB.size() != consumerUB.size())
+/// Returns true if the foralls have matching flat trip counts (product of all
+/// upper bounds). Unlike the old dimension-wise check, this allows fusing
+/// foralls with different dimensionality or different per-dim bounds, as long
+/// as the total number of threads matches. This mirrors IREE's approach where
+/// fusion only requires flat trip count == flatWorkgroupSize.
+static bool forallFlatTripCountsMatch(scf::ForallOp producer,
+                                      scf::ForallOp consumer) {
+  auto pTrip = getStaticForallTripCount(producer);
+  auto cTrip = getStaticForallTripCount(consumer);
+  if (!pTrip || !cTrip)
     return false;
-  for (auto [pUB, cUB] : llvm::zip_equal(producerUB, consumerUB)) {
-    auto pCst = getConstantIntValue(pUB);
-    auto cCst = getConstantIntValue(cUB);
-    if (!pCst || !cCst || *pCst != *cCst)
-      return false;
+  return *pTrip == *cTrip;
+}
+
+/// Linearize multi-dimensional forall IVs into a single flat index.
+/// For IVs [iv0, iv1, iv2] with upper bounds [ub0, ub1, ub2]:
+///   flatIdx = iv0 * (ub1 * ub2) + iv1 * ub2 + iv2
+static Value linearizeForallIVs(OpBuilder &b, Location loc,
+                                scf::ForallOp forall) {
+  auto ivs = forall.getInductionVars();
+  SmallVector<int64_t> ubs;
+  for (OpFoldResult ub : forall.getMixedUpperBound()) {
+    auto cst = getConstantIntValue(ub);
+    assert(cst && "expected static upper bounds");
+    ubs.push_back(*cst);
   }
-  return true;
+  unsigned rank = ivs.size();
+  Value flatIdx = b.create<arith::ConstantIndexOp>(loc, 0);
+  for (unsigned d = 0; d < rank; ++d) {
+    Value iv = ivs[d];
+    // Compute stride = product of ubs[d+1..rank-1]
+    int64_t stride = 1;
+    for (unsigned k = d + 1; k < rank; ++k)
+      stride *= ubs[k];
+    if (stride != 1) {
+      Value strideVal = b.create<arith::ConstantIndexOp>(loc, stride);
+      iv = b.create<arith::MulIOp>(loc, iv, strideVal);
+    }
+    flatIdx = b.create<arith::AddIOp>(loc, flatIdx, iv);
+  }
+  return flatIdx;
+}
+
+/// Delinearize a flat index into multi-dimensional IVs for a target forall.
+/// For upper bounds [ub0, ub1, ub2]:
+///   iv0 = flatIdx / (ub1 * ub2)
+///   iv1 = (flatIdx / ub2) % ub1
+///   iv2 = flatIdx % ub2
+static SmallVector<Value> delinearizeToForallIVs(OpBuilder &b, Location loc,
+                                                 Value flatIdx,
+                                                 scf::ForallOp forall) {
+  SmallVector<int64_t> ubs;
+  for (OpFoldResult ub : forall.getMixedUpperBound()) {
+    auto cst = getConstantIntValue(ub);
+    assert(cst && "expected static upper bounds");
+    ubs.push_back(*cst);
+  }
+  unsigned rank = ubs.size();
+  SmallVector<Value> ivs(rank);
+  Value remaining = flatIdx;
+  for (unsigned d = 0; d < rank; ++d) {
+    int64_t stride = 1;
+    for (unsigned k = d + 1; k < rank; ++k)
+      stride *= ubs[k];
+    Value strideVal = b.create<arith::ConstantIndexOp>(loc, stride);
+    Value idx = b.create<arith::DivUIOp>(loc, remaining, strideVal);
+    ivs[d] = idx;
+    if (d < rank - 1) {
+      Value mul = b.create<arith::MulIOp>(loc, idx, strideVal);
+      remaining = b.create<arith::SubIOp>(loc, remaining, mul);
+    }
+  }
+  return ivs;
 }
 
 struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
-  FuseForalls(MLIRContext *ctx, int64_t flatWorkgroupSize, PatternBenefit b = 1)
-      : OpRewritePattern<scf::ForallOp>(ctx, b),
-        flatWorkgroupSize(flatWorkgroupSize) {}
+  FuseForalls(MLIRContext *ctx, PatternBenefit b = 1)
+      : OpRewritePattern<scf::ForallOp>(ctx, b) {}
 
   LogicalResult matchAndRewrite(scf::ForallOp producerForall,
                                 PatternRewriter &rewriter) const override {
@@ -210,20 +272,35 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
                                          "no consumer after chain");
 
     auto consumerForall = currUser->getParentOfType<scf::ForallOp>();
-    if (!consumerForall ||
-        !tripCountMatchesWorkgroupSize(consumerForall, flatWorkgroupSize))
+    if (!consumerForall || !isThreadMappedForall(consumerForall))
       return rewriter.notifyMatchFailure(
           producerForall,
-          "consumer forall trip count mismatch or not thread-mapped");
+          "consumer not inside a thread-mapped forall");
 
     if (!isNormalized(consumerForall))
       return rewriter.notifyMatchFailure(consumerForall,
                                          "consumer is not normalized");
 
-    // Require matching dimension-wise bounds so we can map IVs 1:1.
-    if (!forallBoundsMatch(producerForall, consumerForall))
+    // Check if dimensions match 1:1 for the fast path (direct IV remapping).
+    auto producerUBs = producerForall.getMixedUpperBound();
+    auto consumerUBs = consumerForall.getMixedUpperBound();
+    bool dimsMatch = (producerUBs.size() == consumerUBs.size());
+    if (dimsMatch) {
+      for (auto [pUB, cUB] : llvm::zip_equal(producerUBs, consumerUBs)) {
+        auto pCst = getConstantIntValue(pUB);
+        auto cCst = getConstantIntValue(cUB);
+        if (!pCst || !cCst || *pCst != *cCst) {
+          dimsMatch = false;
+          break;
+        }
+      }
+    }
+
+    // If dimensions don't match, require flat trip count match for
+    // barrier_region-based fusion.
+    if (!dimsMatch && !forallFlatTripCountsMatch(producerForall, consumerForall))
       return rewriter.notifyMatchFailure(
-          producerForall, "producer/consumer bounds don't match dimension-wise");
+          producerForall, "flat trip counts do not match");
 
     // Find the extract_slice in the consumer that reads from the producer.
     tensor::ExtractSliceOp consumerSlice;
@@ -246,50 +323,168 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
     auto producerInsert =
         cast<tensor::ParallelInsertSliceOp>(producerInserts[0]);
 
-    // Direct body inlining (mirrors IREE fuseForallIntoConsumer):
-    // Clone producer body ops into the consumer body, mapping:
-    //   producer IVs  → consumer IVs  (same trip counts)
-    //   producer iter args → fresh tensor.empty (or the init value)
+    if (dimsMatch) {
+      // ========== FAST PATH: dimension-wise bounds match ==========
+      // Direct body inlining: map producer IVs → consumer IVs 1:1.
+      IRMapping mapping;
+      for (auto [pIV, cIV] : llvm::zip_equal(
+               producerForall.getInductionVars(),
+               consumerForall.getInductionVars())) {
+        mapping.map(pIV, cIV);
+      }
+      for (auto [iterArg, init] : llvm::zip_equal(
+               producerForall.getRegionIterArgs(),
+               producerForall.getDpsInits())) {
+        mapping.map(iterArg, init);
+      }
+
+      rewriter.setInsertionPoint(consumerSlice);
+      for (Operation &op : producerForall.getBody()->without_terminator()) {
+        rewriter.clone(op, mapping);
+      }
+
+      Value fusedValue = mapping.lookupOrDefault(producerInsert.getSource());
+      rewriter.replaceOp(consumerSlice, fusedValue);
+      rewriter.eraseOp(producerForall);
+      return success();
+    }
+
+    // ========== BARRIER PATH: dimension mismatch, flat counts match ==========
+    // Use nova.barrier_region with shared memory + linearize/delinearize.
     //
-    // Then replace the consumer's extract_slice(producer_result) with the
-    // cloned producer's computed value (the source of parallel_insert_slice).
+    // The producer forall writes into a shared memory tensor. Each consumer
+    // thread linearizes its IDs, then delinearizes into the producer's ID
+    // space to execute the producer body, writing into shared memory via
+    // insert_slice. A barrier synchronizes, then the consumer reads its
+    // slice from the shared result.
 
+    // [Fix] For thread-mapped foralls, we refuse to fuse if the trip counts
+    // do not match exactly. Fusing mismatched thread-counts (e.g. 256 into 64)
+    // requires a serial loop inside the consumer, which is dangerous if the
+    // producer contains barriers (resulting in divergent barriers under masking).
+    if (isThreadMappedForall(producerForall) && isThreadMappedForall(consumerForall)) {
+      auto pTrip = getStaticForallTripCount(producerForall);
+      auto cTrip = getStaticForallTripCount(consumerForall);
+      if (pTrip && cTrip && *pTrip != *cTrip) {
+        return rewriter.notifyMatchFailure(producerForall, 
+          "mismatched thread-counts are unsafe for barrier-based fusion");
+      }
+    }
+
+    Location loc = producerForall.getLoc();
+
+    // Step 1: Create shared memory alloc_tensor for the producer destination.
+    // The destination of the producer forall (its DPS init) should be a
+    // tensor.empty — convert it to a workgroup-addressed alloc_tensor.
+    Value producerDest = producerForall.getDpsInits()[0];
+    auto emptyOp = producerDest.getDefiningOp<tensor::EmptyOp>();
+    if (!emptyOp)
+      return rewriter.notifyMatchFailure(
+          producerForall, "producer dest is not tensor.empty");
+
+    rewriter.setInsertionPointToStart(consumerForall.getBody());
+    Attribute sharedMemAddrSpace = gpu::AddressSpaceAttr::get(
+        rewriter.getContext(), gpu::GPUDialect::getWorkgroupAddressSpace());
+    auto allocTensor = rewriter.create<bufferization::AllocTensorOp>(
+        loc, cast<TensorType>(emptyOp.getResult().getType()),
+        emptyOp.getDynamicSizes(),
+        /*copy=*/Value(), /*size_hint=*/Value(),
+        /*memory_space=*/sharedMemAddrSpace);
+    Value sharedDest = allocTensor.getResult();
+
+    // Step 2: Create nova.barrier_region wrapping the producer computation.
+    auto barrierOp = rewriter.create<nova::BarrierRegionOp>(
+        loc, /*resultTypes=*/sharedDest.getType(), /*inputs=*/sharedDest);
+    rewriter.setInsertionPointToStart(barrierOp.getBody());
+
+    // Step 3: Compute producer IDs from consumer IDs via linearize/delinearize.
+    // Linearize consumer IVs into a flat index.
+    Value flatConsumerId = linearizeForallIVs(rewriter, loc, consumerForall);
+
+    // Compute flat trip counts for the scf.for loop bounds.
+    int64_t producerFlatTrip = *getStaticForallTripCount(producerForall);
+    int64_t consumerFlatTrip = *getStaticForallTripCount(consumerForall);
+    bool perfectlyDivides = (producerFlatTrip % consumerFlatTrip == 0);
+
+    // Step 4: Create scf.for to iterate over producer work items.
+    // Each consumer thread handles ceil(producerTrip / consumerTrip) items.
+    Value lb = perfectlyDivides
+                   ? rewriter.create<arith::ConstantIndexOp>(loc, 0)
+                   : flatConsumerId;
+    Value ub = rewriter.create<arith::ConstantIndexOp>(loc, producerFlatTrip);
+    Value step = rewriter.create<arith::ConstantIndexOp>(loc, consumerFlatTrip);
+    auto forOp = rewriter.create<scf::ForOp>(
+        loc, lb, ub, step, barrierOp.getBody()->getArgument(0));
+    Block *loopBody = forOp.getBody();
+
+    // Step 5: Inside the loop, compute producer IVs from flat index.
+    rewriter.setInsertionPointToStart(loopBody);
+    Value flatProducerId =
+        perfectlyDivides
+            ? rewriter.create<arith::AddIOp>(loc, forOp.getInductionVar(),
+                                             flatConsumerId)
+            : forOp.getInductionVar();
+
+    // Delinearize flat producer ID into producer's dimension space.
+    SmallVector<OpFoldResult> producerRanges;
+    for (OpFoldResult ub : producerForall.getMixedUpperBound())
+      producerRanges.push_back(ub);
+    auto delinearize = rewriter.create<affine::AffineDelinearizeIndexOp>(
+        loc, flatProducerId, llvm::to_vector(producerRanges));
+
+    // Step 6: Clone producer body into the loop, mapping IVs.
+    SmallVector<Value> newProducerIVs = delinearize.getResults();
     IRMapping mapping;
-    // Map producer induction variables → consumer induction variables.
-    for (auto [pIV, cIV] : llvm::zip_equal(
-             producerForall.getInductionVars(),
-             consumerForall.getInductionVars())) {
-      mapping.map(pIV, cIV);
+    for (auto [pIV, newIV] : llvm::zip_equal(
+             producerForall.getInductionVars(), newProducerIVs)) {
+      mapping.map(pIV, newIV);
     }
-    // Map producer region iter args → producer init values (they flow through).
-    for (auto [iterArg, init] : llvm::zip_equal(
+    // Map producer region iter args → loop iter args.
+    for (auto [iterArg, loopArg] : llvm::zip_equal(
              producerForall.getRegionIterArgs(),
-             producerForall.getDpsInits())) {
-      mapping.map(iterArg, init);
+             forOp.getRegionIterArgs())) {
+      mapping.map(iterArg, loopArg);
     }
 
-    // Clone producer body ops (except the terminator) into the consumer body,
-    // right before the consumer's extract_slice.
-    rewriter.setInsertionPoint(consumerSlice);
     for (Operation &op : producerForall.getBody()->without_terminator()) {
       rewriter.clone(op, mapping);
     }
 
-    // The value that the producer would have inserted is the "source" of
-    // its parallel_insert_slice, now remapped to cloned values.
-    Value fusedValue = mapping.lookupOrDefault(producerInsert.getSource());
+    // Step 7: Convert parallel_insert_slice → insert_slice + scf.yield.
+    Value insertSource = mapping.lookupOrDefault(producerInsert.getSource());
+    Value insertDest = mapping.lookupOrDefault(producerInsert.getDest());
 
-    // Replace the consumer's extract_slice with the fused value.
-    rewriter.replaceOp(consumerSlice, fusedValue);
+    // Helper: remap an OpFoldResult through the IRMapping. Attribute constants
+    // pass through unchanged; Value operands are looked up in the mapping.
+    auto remapOFR = [&](OpFoldResult ofr) -> OpFoldResult {
+      if (auto val = dyn_cast<Value>(ofr))
+        return mapping.lookupOrDefault(val);
+      return ofr; // Attribute constant — no remapping needed.
+    };
 
-    // Erase the producer forall (it has no more uses after replacement).
-    rewriter.eraseOp(producerForall);
+    SmallVector<OpFoldResult> offsets, sizes, strides;
+    for (OpFoldResult off : producerInsert.getMixedOffsets())
+      offsets.push_back(remapOFR(off));
+    for (OpFoldResult sz : producerInsert.getMixedSizes())
+      sizes.push_back(remapOFR(sz));
+    for (OpFoldResult st : producerInsert.getMixedStrides())
+      strides.push_back(remapOFR(st));
+
+    Value insertedSlice = rewriter.create<tensor::InsertSliceOp>(
+        loc, insertSource, insertDest, offsets, sizes, strides);
+    rewriter.create<scf::YieldOp>(loc, insertedSlice);
+
+    // Step 8: Yield the loop result from the barrier region.
+    rewriter.setInsertionPointToEnd(barrierOp.getBody());
+    rewriter.create<nova::YieldOp>(loc, forOp.getResults());
+
+    // Step 9: Replace producer forall with the barrier_region result and
+    // erase the producer.
+    rewriter.replaceOp(producerForall, barrierOp.getResults());
 
     return success();
   }
 
-private:
-  int64_t flatWorkgroupSize;
 };
 
 //===----------------------------------------------------------------------===//
@@ -1055,31 +1250,23 @@ struct NovaGPUFuseAndHoistParallelLoopsPass
       const NovaGPUFuseAndHoistParallelLoopsPass &) = default;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<scf::SCFDialect, tensor::TensorDialect,
-                    linalg::LinalgDialect, gpu::GPUDialect,
-                    affine::AffineDialect>();
+    registry.insert<arith::ArithDialect, scf::SCFDialect,
+                    tensor::TensorDialect, linalg::LinalgDialect,
+                    gpu::GPUDialect, affine::AffineDialect>();
   }
 
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
     MLIRContext *ctx = funcOp.getContext();
 
-    std::optional<int64_t> maybeFlatWorkgroupSize = std::nullopt;
-    funcOp.walk([&](scf::ForallOp forall) {
-      if (!maybeFlatWorkgroupSize && isThreadMappedForall(forall)) {
-        maybeFlatWorkgroupSize = getStaticForallTripCount(forall);
-      }
-      return WalkResult::advance();
-    });
-
     // -------------------------------------------------------------------
     // Round 1: Hoist + fuse foralls (matches IREE Phase 1)
+    // FuseForalls no longer needs a global flatWorkgroupSize — it matches
+    // producer/consumer foralls by flat trip count equality directly.
     // -------------------------------------------------------------------
     {
       RewritePatternSet patterns(ctx);
-      if (maybeFlatWorkgroupSize) {
-        patterns.add<FuseForalls>(ctx, *maybeFlatWorkgroupSize, /*benefit=*/2);
-      }
+      patterns.add<FuseForalls>(ctx, /*benefit=*/2);
       patterns.add<FuseTilableForallConsumers>(ctx);
       patterns.add<HoistForallFromFor>(ctx);
       tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);

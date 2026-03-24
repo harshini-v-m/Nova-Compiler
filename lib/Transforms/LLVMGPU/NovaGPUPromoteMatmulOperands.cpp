@@ -1,34 +1,40 @@
 //===- NovaGPUPromoteMatmulOperands.cpp - Promote operands to shared mem ===//
 //
-// Config-driven promotion of operands to GPU shared memory using a two-stage
-// copy pattern. Mirrors IREE's GPUPromoteMatmulOperands.cpp.
+// Config-driven promotion of operands to GPU shared memory.
+// Mirrors IREE's GPUPromoteMatmulOperands.cpp.
 //
 // The pass walks ALL ops with a "promoted_operands" list in their
 // lowering_config attribute, not just contractions. This handles matmuls,
 // reductions, and elementwise ops uniformly.
 //
 // For each promoted operand index:
-//   - index < numDpsInputs  → promote input operand (two-stage shared copy)
+//   - index < numDpsInputs  → promote input operand (shared copy)
 //   - index >= numDpsInputs → promote result (DPS init → shared copy)
 //
-// Two-stage promotion for input operands:
+// Input promotion (two-phase IREE approach):
+//   %empty = tensor.empty(sizes) : tensor<...>
+//   %copy  = linalg.copy(%operand -> %empty)
+//            {lowering_config = {thread = [1, 1, vectorSize], ...}}
+//   The original operand use is replaced with %copy result.
 //
-//   Stage 1 — Cooperative global→shared copy:
-//     %alloc  = bufferization.alloc_tensor {memory_space = workgroup}
-//     %shared = linalg.copy(%operand -> %alloc)
+//   NO memory space annotation at this stage. The copy has a thread-only
+//   lowering_config (zero workgroup/reduction tiles, non-zero thread tiles):
+//     - K-tiling (Step 4) fuses the copy as a producer into the K-loop,
+//       shrinking it from [wgM × K] to [wgM × kStep].
+//     - Thread tiling (Step 5) sees non-zero thread tiles and creates a
+//       separate cooperative-loading scf.forall for the copy.
+//     - InferMemorySpace (Step 8) detects the tensor.empty is used as
+//       shared_outs of a thread-mapped forall → tags as workgroup memory.
+//     - InsertWorkgroupBarriers (Step 11) adds gpu.barrier between the
+//       cooperative store and the matmul read.
 //
-//   Fence — prevent Stage 1 from fusing into Stage 2's loop:
-//     %fence  = nova.fusion_barrier %shared
+// Result promotion:
+//   Uses alloc_tensor(workgroup) + copy + nova.fusion_barrier + per-thread
+//   copy, so the result is written to shared and then consumed per-thread.
 //
-//   Stage 2 — Per-thread promoted local copy:
-//     %empty  = tensor.empty(sizes)
-//     %local  = linalg.copy(%fence -> %empty)
-//
-//   The original operand use is replaced with %local.
-//
-// Optimizations (ported from IREE):
+// Optimizations:
 //   - Fill producers are skipped (no benefit from promoting constants)
-//   - Existing linalg producers are left as-is (thread tiling handles them)
+//   - Contraction producers are skipped (they manage their own shared memory)
 //
 //===----------------------------------------------------------------------===//
 
@@ -78,12 +84,22 @@ static bool isFillProducer(Value operand) {
   return false;
 }
 
-/// Full two-stage promotion for a single input operand.
+/// Promote a single input operand to workgroup (shared) memory.
 ///
-///  Stage 1: Allocate in workgroup shared memory, cooperative copy global→shared.
-///  Fence:   Insert nova.fusion_barrier to prevent Stage 1 fusing into Stage 2.
-///  Stage 2: Per-thread copy from shared into private (register) tensor.
-///           Replace the original operand use with the per-thread copy.
+/// Inserts: alloc_tensor(workgroup) + linalg.copy(global → shared).
+/// The operand is replaced with the copy result (in workgroup space).
+///
+/// NO fusion_barrier or per-thread copy is inserted for inputs.  The copy
+/// is left as a plain producer so that:
+///   - K-reduction tiling (Step 4) fuses it into the K-loop, giving each
+///     iteration a [wgM × kStep]-sized shared tile instead of [wgM × K].
+///   - Thread tiling (Step 5) distributes the copy across threads for
+///     cooperative loading.
+///   - InsertWorkgroupBarriers (Step 11) adds gpu.barrier between the
+///     cooperative store and the matmul read after bufferization.
+///
+/// This matches IREE's input promotion strategy where the copy tiles
+/// naturally with the consumer — no opaque barrier to block tiling.
 static void promoteOperandToShared(OpBuilder &builder,
                                    Operation *op,
                                    unsigned inputIdx) {
@@ -100,47 +116,89 @@ static void promoteOperandToShared(OpBuilder &builder,
   if (!tensorType)
     return;
 
-  // Optimization: skip fill producers (no benefit from shared memory).
+  // Skip fill producers (no benefit from promoting constants to shared).
   if (isFillProducer(operand))
     return;
 
-  // Optimization: if the producer is already a linalg op (not a fill),
-  // don't insert a copy — thread tiling will handle it naturally.
-  // This mirrors IREE's promotionImpl() producer annotation logic.
+  // Skip contraction producers — they manage their own shared memory via
+  // their own lowering_config and promotion. All other linalg producers
+  // (broadcasts, LN normalize, elementwise) benefit from promotion because
+  // K-tiling creates a loop and without promotion each K-iteration reads
+  // from global memory independently. With promotion, cooperative loading
+  // into shared memory enables reuse across threads.
   if (auto producer = dyn_cast_if_present<linalg::LinalgOp>(
           operand.getDefiningOp())) {
-    if (!isa<linalg::FillOp>(producer.getOperation()))
+    if (linalg::isaContractionOpInterface(producer))
       return;
   }
 
-  // Stage 1: Allocate in workgroup shared memory + cooperative copy.
+  // Phase 1: tensor.empty() + linalg.copy with thread-only lowering_config.
+  //
+  // The copy has NO workgroup or reduction tiles, so:
+  //   - K-tiling (Step 4) fuses it as a producer into the K-loop, naturally
+  //     shrinking the copy to [wgM × kStep] or [kStep × wgN].
+  //   - Thread tiling (Step 5) sees the non-zero thread tiles and creates a
+  //     separate cooperative-loading scf.forall for the copy. This makes the
+  //     tensor.empty() a shared_outs arg of the forall.
+  //   - InferMemorySpace (Step 8) detects the alloc_tensor is used as
+  //     shared_outs of a thread-mapped forall → tags as workgroup memory.
+  //
+  // This mirrors IREE's DerivedThreadConfigAttr approach.
   SmallVector<OpFoldResult> mixedSizes =
       tensor::getMixedSizes(builder, loc, operand);
-  SmallVector<Value> dynSizes;
-  for (auto ofr : mixedSizes)
-    if (auto val = dyn_cast<Value>(ofr))
-      dynSizes.push_back(val);
+  Value empty = tensor::EmptyOp::create(builder, loc, mixedSizes,
+                                        tensorType.getElementType());
+  auto copyOp = linalg::CopyOp::create(builder, loc, operand, empty);
 
-  Attribute workgroupSpace = gpu::AddressSpaceAttr::get(
-      builder.getContext(), gpu::GPUDialect::getWorkgroupAddressSpace());
-  auto allocOp =
-      bufferization::AllocTensorOp::create(builder, loc, tensorType, dynSizes);
-  allocOp.setMemorySpaceAttr(workgroupSpace);
+  // Attach a derived-thread lowering_config: placeholder thread tiles [1,..,1]
+  // plus a "derived_thread = true" marker and the contraction's target thread
+  // count.  At thread-tiling time (Step 5), the tiling pass detects the marker
+  // and recomputes tile sizes from the copy's actual (K-tiled) loop ranges so
+  // that trip_count == targetThreads.  This guarantees the copy forall and
+  // matmul forall have matching bounds, enabling FuseForalls (Step 6).
+  //
+  // Mirrors IREE's DerivedThreadConfigAttr pattern.
+  unsigned numLoops = copyOp.getNumLoops();
+  SmallVector<int64_t> threadTiles(numLoops, 1); // placeholder (non-zero)
 
-  auto stage1Copy =
-      linalg::CopyOp::create(builder, loc, operand, allocOp.getResult());
-  Value stage1Result = stage1Copy.getResult(0);
+  // Compute the contraction's thread count from its lowering_config.
+  int64_t targetThreads = 0;
+  DictionaryAttr parentConfig = getLoweringConfig(op);
+  if (parentConfig) {
+    auto wgTiles = getLoweringConfigTileSizes(parentConfig, kWorkgroupKey);
+    auto thTiles = getLoweringConfigTileSizes(parentConfig, kThreadKey);
+    if (wgTiles.size() == thTiles.size()) {
+      targetThreads = 1;
+      for (size_t i = 0; i < wgTiles.size(); ++i) {
+        if (thTiles[i] > 0 && wgTiles[i] > 0)
+          targetThreads *= (wgTiles[i] / thTiles[i]);
+      }
+    }
+  }
 
-  // Fence: Insert nova.fusion_barrier to prevent Stage 1 from fusing
-  // into Stage 2's per-thread loop.
-  Value fenced = FusionBarrierOp::create(builder, loc, stage1Result).getResult();
+  SmallVector<int64_t> zeros(numLoops, 0);
+  // Build the base config with placeholder thread tiles.
+  SmallVector<NamedAttribute> attrs;
+  MLIRContext *ctx = builder.getContext();
+  setLoweringConfigTileSizes(ctx, attrs, kWorkgroupKey, zeros);
+  setLoweringConfigTileSizes(ctx, attrs, kReductionKey, zeros);
+  setLoweringConfigTileSizes(ctx, attrs, kThreadKey, threadTiles);
+  setLoweringConfigTileSizes(ctx, attrs, kSubgroupKey, zeros);
+  setMmaKindRaw(ctx, attrs, 0);
+  appendPromotedOperandsList(ctx, attrs, {});
+  // Mark as derived-thread config with the target thread count.
+  if (targetThreads > 0) {
+    Builder b(ctx);
+    attrs.emplace_back(StringAttr::get(ctx, kDerivedThreadKey),
+                       b.getBoolAttr(true));
+    attrs.emplace_back(StringAttr::get(ctx, kTargetThreadsKey),
+                       b.getI64IntegerAttr(targetThreads));
+  }
+  setLoweringConfig(copyOp, DictionaryAttr::get(ctx, attrs));
 
-  // Stage 2: Per-thread copy from shared memory into private registers.
-  Value promoted = buildPerThreadCopy(builder, loc, fenced);
-
-  // Replace the operand with the promoted per-thread copy.
+  // Replace the operand with the copy result.
   op->setOperand(dpsOp.getDpsInputOperand(inputIdx)->getOperandNumber(),
-                 promoted);
+                 copyOp.getResult(0));
 }
 
 /// Result promotion: promote a DPS init result to shared memory.
@@ -239,7 +297,7 @@ struct NovaGPUPromoteMatmulOperandsPass
       for (int64_t idx : *promotedOperands) {
         unsigned i = static_cast<unsigned>(idx);
         if (i < numInputs) {
-          // Input operand promotion: two-stage shared memory copy.
+          // Input operand promotion: shared memory copy.
           promoteOperandToShared(builder, op, i);
         } else {
           // Result promotion: index beyond inputs refers to DPS init result.

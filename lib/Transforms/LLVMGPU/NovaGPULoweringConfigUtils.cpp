@@ -128,6 +128,86 @@ void appendPromotedOperandsList(MLIRContext *ctx,
 }
 
 //===----------------------------------------------------------------------===//
+// Derived thread config helpers
+//===----------------------------------------------------------------------===//
+
+bool isDerivedThreadConfig(DictionaryAttr config) {
+  if (!config)
+    return false;
+  auto attr = config.get(kDerivedThreadKey);
+  if (!attr)
+    return false;
+  if (auto boolAttr = dyn_cast<BoolAttr>(attr))
+    return boolAttr.getValue();
+  return false;
+}
+
+int64_t getTargetThreadCount(DictionaryAttr config) {
+  if (!config)
+    return 0;
+  auto attr = config.get(kTargetThreadsKey);
+  if (!attr)
+    return 0;
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+    return intAttr.getInt();
+  return 0;
+}
+
+SmallVector<int64_t> deriveThreadTileSizes(ArrayRef<int64_t> loopRanges,
+                                           int64_t targetThreads,
+                                           unsigned elemBitWidth) {
+  int64_t rank = loopRanges.size();
+  SmallVector<int64_t> tileSizes(rank, 1);
+  if (targetThreads <= 0 || rank == 0)
+    return tileSizes;
+
+  // Total elements in the copy.
+  int64_t flatTrips = 1;
+  for (int64_t r : loopRanges)
+    flatTrips *= r;
+
+  // If not evenly divisible, fall back to all-ones (each thread gets 1 elem).
+  if (flatTrips % targetThreads != 0)
+    return tileSizes;
+
+  // Per-thread work = total elements / target thread count.
+  int64_t perThread = flatTrips / targetThreads;
+
+  // Max vector width from 128-bit loads (e.g., 4 for f32, 8 for f16).
+  int64_t maxVec = std::max<int64_t>(1, 128 / elemBitWidth);
+
+  // Distribute per-thread work across dims, innermost first.
+  // Innermost dim gets up to maxVec elements (for coalesced vector loads).
+  // Remaining per-thread work is spread to outer dims.
+  int64_t remaining = perThread;
+  for (int64_t d = rank - 1; d >= 0 && remaining > 1; --d) {
+    int64_t range = loopRanges[d];
+    // For innermost dim, cap at maxVec for vector load width.
+    int64_t maxTile = (d == rank - 1) ? std::min(maxVec, range)
+                                      : range;
+    // Find largest tile that divides both remaining and range.
+    int64_t tile = std::min(maxTile, remaining);
+    while (tile > 1 && (range % tile != 0 || remaining % tile != 0))
+      --tile;
+    tileSizes[d] = tile;
+    remaining /= tile;
+  }
+
+  // Verify: product(loopRanges) / product(tileSizes) == targetThreads.
+  int64_t actualThreads = 1;
+  for (int64_t d = 0; d < rank; ++d)
+    actualThreads *= (loopRanges[d] / tileSizes[d]);
+
+  if (actualThreads != targetThreads) {
+    // Fallback: couldn't achieve exact match, use all-ones.
+    // This means trip count = flatTrips, which won't fuse but is safe.
+    return SmallVector<int64_t>(rank, 1);
+  }
+
+  return tileSizes;
+}
+
+//===----------------------------------------------------------------------===//
 // Op-level helpers
 //===----------------------------------------------------------------------===//
 
@@ -151,6 +231,10 @@ DictionaryAttr getLoweringConfig(Operation *op) {
 
 void setLoweringConfig(Operation *op, DictionaryAttr configDict) {
   op->setAttr(kLoweringConfigAttrName, configDict);
+}
+
+void removeLoweringConfig(Operation *op) {
+  op->removeAttr(kLoweringConfigAttrName);
 }
 
 // CORE LOGIC: Builds a complete lowering_config DictionaryAttr and attaches

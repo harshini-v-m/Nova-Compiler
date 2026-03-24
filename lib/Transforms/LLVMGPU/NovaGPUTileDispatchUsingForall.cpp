@@ -1,6 +1,8 @@
 #include "Passes.h"
 #include "NovaGPUTileAndFuseUtils.h"
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
+#include "Compiler/Transforms/LLVMGPU/NovaKernelConfig.h"
+#include "Compiler/Transforms/LLVMGPU/NVIDIATargetUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -336,11 +338,19 @@ struct NovaTileAndDistributePass
               -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
             Operation *producerOp = producer.getOwner();
             // Don't fuse pad ops into the workgroup loop.
-            if (isa<tensor::PadOp>(producerOp))
+            if (isa<tensor::PadOp>(producerOp)) {
+              LLVM_DEBUG(llvm::dbgs()
+                         << "[nova-tile-dispatch] Fusion BLOCKED (pad): "
+                         << producerOp->getName() << "\n");
               return std::nullopt;
+            }
             // Contractions stay as independent roots.
-            if (isContractionOp(producerOp))
+            if (isContractionOp(producerOp)) {
+              LLVM_DEBUG(llvm::dbgs()
+                         << "[nova-tile-dispatch] Fusion BLOCKED (contraction): "
+                         << producerOp->getName() << "\n");
               return std::nullopt;
+            }
             // Don't fuse producers that have reduction iterator types.
             // Reductions (e.g. LayerNorm mean/variance, softmax sum) need
             // to see ALL elements along the reduction dimension. When fused
@@ -349,10 +359,18 @@ struct NovaTileAndDistributePass
             // results and racing on the reduction output buffer.
             if (auto linalgOp = dyn_cast<linalg::LinalgOp>(producerOp)) {
               for (auto iterType : linalgOp.getIteratorTypesArray()) {
-                if (iterType != utils::IteratorType::parallel)
+                if (iterType != utils::IteratorType::parallel) {
+                  LLVM_DEBUG(llvm::dbgs()
+                             << "[nova-tile-dispatch] Fusion BLOCKED "
+                             << "(has reduction): "
+                             << producerOp->getName() << "\n");
                   return std::nullopt;
+                }
               }
             }
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[nova-tile-dispatch] Fusion ALLOWED: "
+                       << producerOp->getName() << "\n");
             bool yieldProducerReplacement =
                 yieldReplacementsFor.contains(producerOp);
             return scf::SCFTileAndFuseOptions::ControlFnResult{
@@ -389,8 +407,19 @@ struct NovaTileAndDistributePass
       if (succeeded(result)) {
         didTile = true;
         handledOps.insert(rootOp);
-        for (auto op : result->tiledAndFusedOps)
+        for (auto op : result->tiledAndFusedOps) {
           handledOps.insert(op);
+          // Strip lowering_config from fused non-root ops (defense-in-depth).
+          // Only roots should retain configs for thread tiling.
+          // Check by op type: all-parallel ops are non-roots that fused in.
+          if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+            bool isAllParallel = llvm::all_of(
+                linalgOp.getIteratorTypesArray(),
+                [](auto t) { return t == utils::IteratorType::parallel; });
+            if (isAllParallel && getLoweringConfig(op))
+              removeLoweringConfig(op);
+          }
+        }
       } else {
         return failure();
       }
@@ -423,6 +452,18 @@ struct NovaTileAndDistributePass
           if (succeeded(newFusionOpportunities)) {
             fuseProducersOfSlices(rewriter, *newFusionOpportunities,
                                  tileAndFuseOptions, loops);
+          }
+          // Strip configs from fused all-parallel consumer ops (they are now
+          // inside the root's forall and should not get independent thread
+          // foralls). Root ops (contractions/reductions) keep their configs.
+          for (auto op : result->tiledAndFusedOps) {
+            if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+              bool isAllParallel = llvm::all_of(
+                  linalgOp.getIteratorTypesArray(),
+                  [](auto t) { return t == utils::IteratorType::parallel; });
+              if (isAllParallel && getLoweringConfig(op))
+                removeLoweringConfig(op);
+            }
           }
         }
       }
@@ -576,7 +617,67 @@ struct NovaTileAndDistributePass
           fuseProducersOfSlices(rewriter, *newFusionOpportunities,
                                fakeOptions, loops);
         }
+        // Strip configs from all-parallel ops inside the forall
+        // (they are now fused and should not get independent thread foralls).
+        // Root ops (contractions/reductions) keep their configs.
+        forall.walk([&](linalg::LinalgOp linalgOp) {
+          bool isAllParallel = llvm::all_of(
+              linalgOp.getIteratorTypesArray(),
+              [](auto t) { return t == utils::IteratorType::parallel; });
+          if (isAllParallel && getLoweringConfig(linalgOp.getOperation()))
+            removeLoweringConfig(linalgOp.getOperation());
+        });
       }
+    }
+
+    // --- Phase 1a-3: Rescue prologues that failed producer fusion -----------
+    // Prologues (LN normalize, weight broadcast, etc.) were correctly
+    // identified in SelectLoweringStrategy and skipped (no config), expecting
+    // to be pulled into contraction foralls via producer fusion in Phase 1a.
+    // If producer fusion failed (MLIR tileAndFuseProducerOfSlice returned
+    // std::nullopt — e.g., non-contiguous slice, dynamic shape, or the
+    // producer's result isn't a direct extract_slice source), the prologue
+    // is still outside any forall with no config → Phase 2 serializes it.
+    //
+    // Fix: stamp a default config on these stranded ops so Phase 1b tiles
+    // them independently (multi-block). Suboptimal vs. fusion (extra global
+    // memory round-trip), but orders of magnitude better than single-block.
+    {
+      // Use sm_86 target for default config computation. The target is only
+      // used for padding heuristics; tile sizes use hardcoded constants.
+      NVIDIATargetInfo rescueTarget = getNVIDIATargetInfo("sm_86");
+      funcOp.walk([&](linalg::LinalgOp op) {
+        Operation *rawOp = op.getOperation();
+        // Only rescue ops that are outside foralls and have no config.
+        if (isInsideWorkgroupForall(rawOp))
+          return;
+        if (getLoweringConfig(rawOp))
+          return;
+        // FillOps always fuse as DPS inits — leave them for Phase 2.
+        if (isa<linalg::FillOp>(rawOp))
+          return;
+        // Only rescue ops with tensor results (Phase 2 requirement).
+        if (rawOp->getNumResults() == 0)
+          return;
+        auto resultType =
+            dyn_cast<RankedTensorType>(rawOp->getResult(0).getType());
+        if (!resultType)
+          return;
+        // Only rescue large ops (small ones are fine single-block).
+        int64_t numElements = 1;
+        for (int64_t dim : resultType.getShape()) {
+          if (!ShapedType::isDynamic(dim))
+            numElements *= dim;
+        }
+        if (numElements <= 1024)
+          return;
+
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[nova-tile-dispatch] Phase 1a-3: rescuing unfused "
+                   << rawOp->getName() << " (" << numElements
+                   << " elements) with default config\n");
+        (void)setDefaultConfig(op, rescueTarget);
+      });
     }
 
     // --- Phase 1b: Tile remaining ops with lowering_config in reverse order -
@@ -628,6 +729,30 @@ struct NovaTileAndDistributePass
         auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
         if (!resultType)
           continue;
+
+        // Warn if a large op is being serialized to a single workgroup.
+        // This usually indicates a bug in SelectLoweringStrategy (op should
+        // have received a lowering_config but didn't).
+        int64_t numElements = 1;
+        for (int64_t dim : resultType.getShape()) {
+          if (!ShapedType::isDynamic(dim))
+            numElements *= dim;
+        }
+        if (numElements > 1024) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[nova-tile-dispatch] WARNING: wrapping large op ("
+                     << numElements << " elements) in single-block forall: "
+                     << *op << "\n");
+          // Only warn for ops that genuinely lack a config. Ops with configs
+          // (all-zero workgroup tiles, reductions) are intentionally single-
+          // block. Fill ops always fuse as DPS inits — single-block is expected.
+          if (!getLoweringConfig(op) && !isa<linalg::FillOp>(op)) {
+            op->emitWarning("large op (")
+                << numElements
+                << " elements) serialized to 1 workgroup — missing "
+                   "lowering_config?";
+          }
+        }
 
         Location loc = op->getLoc();
         rewriter.setInsertionPoint(op);

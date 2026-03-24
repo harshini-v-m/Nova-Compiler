@@ -1862,13 +1862,24 @@ GatherOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   if (axis < 0)
     axis += inputRank;
 
+  int64_t batchDims = 0;
+  int64_t maxBatchDims = std::min<int64_t>(axis, indexType.getRank());
+  for (int64_t i = 0; i < maxBatchDims; ++i) {
+    bool inputDyn = inputType.getDimSize(i) == ShapedType::kDynamic;
+    bool indexDyn = indexType.getDimSize(i) == ShapedType::kDynamic;
+    if (!inputDyn && !indexDyn && inputType.getDimSize(i) != indexType.getDimSize(i)) {
+      break;
+    }
+    batchDims++;
+  }
+
   llvm::SmallVector<int64_t, 4> outputShape;
   // Dimensions before axis
   for (int64_t i = 0; i < axis; ++i) {
     outputShape.push_back(inputType.getDimSize(i));
   }
-  // Indices dimensions
-  for (int64_t i = 0; i < indexType.getRank(); ++i) {
+  // Indices dimensions (excluding batch dims)
+  for (int64_t i = batchDims; i < indexType.getRank(); ++i) {
     outputShape.push_back(indexType.getDimSize(i));
   }
   // Dimensions after axis
@@ -2143,3 +2154,96 @@ LogicalResult SceBackwardOp::verify() {
 }
 
 OpFoldResult SceBackwardOp::fold(FoldAdaptor adaptor) { return nullptr; }
+
+//===----------------------------------------------------------------------===//
+// BarrierRegionOp
+//===----------------------------------------------------------------------===//
+
+void BarrierRegionOp::build(OpBuilder &b, OperationState &result,
+                            TypeRange resultTypes, ValueRange inputs) {
+  result.addOperands(inputs);
+  (void)result.addRegion();
+  result.addTypes(resultTypes);
+  SmallVector<Location> blockArgLocs(inputs.size(), result.location);
+
+  Region *region = result.regions[0].get();
+
+  // `builder.createBlock` changes the insertion point within the block. Create
+  // a guard to reset the insertion point of the builder after it is destroyed.
+  OpBuilder::InsertionGuard guard(b);
+  b.createBlock(region, region->end(), inputs.getTypes(), blockArgLocs);
+}
+
+LogicalResult BarrierRegionOp::verify() { return success(); }
+
+LogicalResult BarrierRegionOp::verifyRegions() {
+  auto &region = getRegion();
+  Block &block = region.front();
+  if (block.getNumArguments() != getNumOperands()) {
+    return emitError(
+        "expected the block argument count to match operand count");
+  }
+
+  for (auto [blockArg, operand] :
+       llvm::zip_equal(block.getArgumentTypes(), getOperandTypes())) {
+    if (blockArg != operand) {
+      return emitError("expected block argument types to match operand types");
+    }
+  }
+
+  // Ensure that the region yields the right number and types of values.
+  auto yieldOp = cast<nova::YieldOp>(block.getTerminator());
+  if (yieldOp->getNumOperands() != getNumResults()) {
+    return emitOpError(
+        "expected body to yield same number of values as results");
+  }
+
+  for (auto [yielded, result] :
+       llvm::zip_equal(yieldOp->getOperandTypes(), getResultTypes())) {
+    if (yielded != result) {
+      return emitError("expected yielded value types to match result types");
+    }
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ValueBarrierOp
+//===----------------------------------------------------------------------===//
+
+void ValueBarrierOp::build(OpBuilder &builder, OperationState &result,
+                           ValueRange inputs) {
+  result.addOperands(inputs);
+  result.addTypes(llvm::map_range(inputs, [](Value v) { return v.getType(); }));
+}
+
+LogicalResult ValueBarrierOp::verify() {
+  if (getNumOperands() == 0) {
+    return emitOpError("at least one input required");
+  }
+
+  // All inputs must be either all tensors or all vectors.
+  bool firstIsTensor = isa<RankedTensorType>(getOperand(0).getType());
+  bool firstIsVector = isa<VectorType>(getOperand(0).getType());
+
+  if (!firstIsTensor && !firstIsVector) {
+    return emitOpError(
+        "all inputs should be either of tensor or vector type");
+  }
+
+  for (Value input : getInputs()) {
+    bool isTensor = isa<RankedTensorType>(input.getType());
+    bool isVector = isa<VectorType>(input.getType());
+    if (firstIsTensor && !isTensor) {
+      return emitOpError(
+          "all inputs should be either of tensor or vector type");
+    }
+    if (firstIsVector && !isVector) {
+      return emitOpError(
+          "all inputs should be either of tensor or vector type");
+    }
+  }
+
+  return success();
+}

@@ -37,6 +37,8 @@ constexpr llvm::StringLiteral kSubgroupKey      = "subgroup";
 constexpr llvm::StringLiteral kMmaKindKey       = "mma_kind";
 constexpr llvm::StringLiteral kPromotedOpsKey   = "promoted_operands";
 constexpr llvm::StringLiteral kPaddingKey       = "padding";
+constexpr llvm::StringLiteral kDerivedThreadKey = "derived_thread";
+constexpr llvm::StringLiteral kTargetThreadsKey = "target_threads";
 
 // Attribute name attached to linalg ops for the config dict.
 constexpr llvm::StringLiteral kLoweringConfigAttrName = "lowering_config";
@@ -89,6 +91,23 @@ void appendPaddingList(MLIRContext *ctx,
 // Op-level helpers
 //===----------------------------------------------------------------------===//
 
+/// Returns true if the config has the "derived_thread" marker, meaning
+/// thread tile sizes should be computed at tiling time from the op's
+/// loop ranges and the stored target_threads count.
+bool isDerivedThreadConfig(DictionaryAttr config);
+
+/// Reads the target thread count from a derived-thread config.
+/// Returns 0 if the key is absent.
+int64_t getTargetThreadCount(DictionaryAttr config);
+
+/// Computes thread tile sizes for a copy op so that the resulting
+/// scf.forall trip count equals exactly `targetThreads`.
+/// `loopRanges` are the op's static loop ranges (after K-tiling).
+/// `elemBitWidth` is used to pick the vectorization width (128-bit loads).
+SmallVector<int64_t> deriveThreadTileSizes(ArrayRef<int64_t> loopRanges,
+                                           int64_t targetThreads,
+                                           unsigned elemBitWidth);
+
 /// Retrieve the lowering_config DictionaryAttr from an op, if present.
 DictionaryAttr getLoweringConfig(Operation *op);
 
@@ -107,6 +126,11 @@ void setMatmulLoweringConfigAttrs(Operation *op,
                                   int32_t mmaKindValue,
                                   ArrayRef<int64_t> promotedOperands,
                                   ArrayRef<int64_t> paddingSizes = {});
+
+/// Remove the lowering_config attribute from an op.
+/// Used to strip configs from non-root ops after they fuse into a root's
+/// scf.forall (defense-in-depth against stale configs at thread tiling).
+void removeLoweringConfig(Operation *op);
 
 } // namespace mlir::nova
 

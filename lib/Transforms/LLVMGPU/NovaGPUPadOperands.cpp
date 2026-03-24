@@ -132,7 +132,12 @@ struct NovaGPUPadOperandsPass
         return WalkResult::advance();
 
       std::optional<SmallVector<int64_t>> paddingSizes = getPaddingList(config);
-      if (!paddingSizes)
+      if (!paddingSizes || paddingSizes->empty())
+        return WalkResult::advance();
+      // Skip ops whose padding is all zeros — prologue ops stamped with a
+      // minimal config (promoted_operands only) get zeros here. Passing zero
+      // to setPadToMultipleOf crashes in PaddedShape::initialize.
+      if (llvm::all_of(*paddingSizes, [](int64_t s) { return s == 0; }))
         return WalkResult::advance();
 
       rewriter.setInsertionPoint(op);

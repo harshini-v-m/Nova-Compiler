@@ -194,9 +194,9 @@ namespace mlir::nova
     // already be K-sliced, making the shared memory allocation pattern
     // harder to set up correctly.
     // -------------------------------------------------------------------------
-    // pm.addNestedPass<func::FuncOp>(createNovaGPUPromoteMatmulOperandsPass());
-    // pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-    // pm.addPass(createCSEPass());
+    pm.addNestedPass<func::FuncOp>(createNovaGPUPromoteMatmulOperandsPass());
+    pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
+    pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
     // Step 4: Tile reduction (K) dimension   [AFTER PROMOTION]
@@ -224,17 +224,41 @@ namespace mlir::nova
     //   pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
-    // Step 6: Fuse and hoist parallel loops
+    // Step 6: Normalize forall loop bounds (lb=0, step=1)
+    // Must run BEFORE FuseAndHoist — FuseForalls requires isNormalized()
+    // (step==1) to compute flat trip counts for fusion matching.
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+    // -------------------------------------------------------------------------
+    // Step 6.5: Fuse and hoist parallel loops
+    // Now that foralls are normalized (lb=0, step=1), FuseForalls can compare
+    // flat trip counts and merge copy foralls into matmul foralls.
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(
         createNovaGPUFuseAndHoistParallelLoopsPass());
 
     // -------------------------------------------------------------------------
-    // Step 7: Normalize forall loop bounds (lb=0, step=1)
+    // Step 6.6: Greedily distribute orphaned ops to threads
+    // After FuseAndHoist, any parallel op NOT inside a thread-mapped forall
+    // is distributed here as a fallback.  Without this, orphaned ops launch
+    // kernels with threads(1,1,1).
+    // Mirrors IREE's GPUGreedilyDistributeToThreads pass.
     // -------------------------------------------------------------------------
-    pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
+    pm.addNestedPass<func::FuncOp>(
+        createNovaGPUGreedilyDistributeToThreadsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
+
+    // -------------------------------------------------------------------------
+    // Step 6.75: Lower barrier_region → two value_barrier ops
+    // FuseAndHoist generates nova.barrier_region for dimension-mismatched
+    // forall fusion. Lower these before bufferization.
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(
+        createNovaGPULowerBarrierRegionPass());
 
     // -------------------------------------------------------------------------
     // Step 7.75: Post-tiling Linalg cleanup — runs AFTER all tiling/fusion
@@ -277,6 +301,19 @@ namespace mlir::nova
     // degenerate foralls inside thread-mapped contexts cause the transform
     // interpreter to fail. Re-running normalize-loop-bounds eliminates them.
     // -------------------------------------------------------------------------
+       pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+
+    pm.addNestedPass<func::FuncOp>(createNovaGPUFillCopyForwardingPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+   pm.addNestedPass<func::FuncOp>(createNovaGPUCoalesceWorkgroupBuffersPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+   
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
@@ -450,6 +487,8 @@ namespace mlir::nova
     registerNovaGPUApplyTilingLevelThreadPass();
     registerNovaGPUApplyTilingLevelSubgroupPass();
     registerNovaGPUFuseAndHoistParallelLoopsPass();
+    registerNovaGPUGreedilyDistributeToThreadsPass();
+    registerNovaGPULowerBarrierRegionPass();
     registerNovaGPUEraseFusionBarriersPass();
     registerNovaGPUInferMemorySpacePass();
     registerNovaGPUComprehensiveBufferizePass();
@@ -459,6 +498,8 @@ namespace mlir::nova
     registerNovaConvertSharedMemAllocsPass();
     registerNovaGPUMapForallToGPUPass();
     registerNovaGPULowerMemorySpacePass();
+    registerNovaGPUFillCopyForwardingPass();
+    registerNovaGPUCoalesceWorkgroupBuffersPass();
 
     // Register the full optimized pipeline as a named pipeline so it can be
     // invoked from mlir-opt with --nova-gpu-optimized-pipeline.
@@ -503,11 +544,7 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(createNovaEliminateEmptyTensorsPass());
     pm.addNestedPass<func::FuncOp>(
         bufferization::createEmptyTensorToAllocTensorPass());
-    // NOTE: NovaGPUInferMemorySpacePass is disabled for now because thread
-    // tiling (Steps 2-6) is commented out, so there are no thread-mapped
-    // scf.forall ops for the pass to detect as shared memory candidates.
-    // Re-enable when thread tiling is active.
-    // pm.addNestedPass<func::FuncOp>(createNovaGPUInferMemorySpacePass());
+    pm.addNestedPass<func::FuncOp>(createNovaGPUInferMemorySpacePass());
 
     // GPU-aware comprehensive bufferize (module-level).
     // Erases nova.fusion_barrier, converts function boundaries with identity

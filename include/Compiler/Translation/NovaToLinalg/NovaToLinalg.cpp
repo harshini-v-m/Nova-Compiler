@@ -410,10 +410,25 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
 
     if (axis < 0)
       axis += inputRank;
-    // Map for indices: (d0, ..., d_{resRank-1}) -> (d_axis, ..., d_{axis +
-    // indicesRank - 1})
+
+    int64_t batchDims = 0;
+    int64_t maxBatchDims = std::min<int64_t>(axis, indicesRank);
+    for (int64_t i = 0; i < maxBatchDims; ++i) {
+      bool inputDyn = inputType.getDimSize(i) == ShapedType::kDynamic;
+      bool indexDyn = indicesType.getDimSize(i) == ShapedType::kDynamic;
+      if (!inputDyn && !indexDyn && inputType.getDimSize(i) != indicesType.getDimSize(i)) {
+        break;
+      }
+      batchDims++;
+    }
+
+    // Map for indices: first batchDims map to loops [0, batchDims).
+    // Remaining indices map to loops [axis, axis + indicesRank - batchDims).
     SmallVector<AffineExpr> indicesExprs;
-    for (int i = 0; i < indicesRank; ++i) {
+    for (int i = 0; i < batchDims; ++i) {
+      indicesExprs.push_back(rewriter.getAffineDimExpr(i));
+    }
+    for (int i = 0; i < indicesRank - batchDims; ++i) {
       indicesExprs.push_back(rewriter.getAffineDimExpr(axis + i));
     }
     auto indicesMap =
@@ -477,7 +492,7 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
           // After axis
           for (int64_t i = axis + 1; i < inputRank; ++i) {
             extractionIndices.push_back(
-                b.create<linalg::IndexOp>(l, i + indicesRank - 1));
+                b.create<linalg::IndexOp>(l, i + indicesRank - batchDims - 1));
           }
 
           Value extracted =
@@ -673,6 +688,16 @@ struct NovaScatterAddOpLowering
       Value updateIdx = ivs[axis];
       Value idxVal =
           rewriter.create<memref::LoadOp>(loc, indicesMem, ValueRange{updateIdx});
+      
+      // Widen narrow integer indices (e.g. i16) to i32 before IndexCastOp.
+      // IndexCastOp may sign-extend, mapping values > 32767 to negative indices.
+      // Use zero-extension (ExtUIOp) to preserve the unsigned range 0..65535.
+      if (auto intType = llvm::dyn_cast<IntegerType>(indicesElemType)) {
+          if (intType.getWidth() < 32) {
+              idxVal = rewriter.create<arith::ExtUIOp>(loc, rewriter.getI32Type(), idxVal);
+          }
+      }
+
       Value targetIdx =
           rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), idxVal);
 
@@ -685,6 +710,22 @@ struct NovaScatterAddOpLowering
         else
           dstCoords.push_back(ivs[d]);
       }
+
+      // 4. Bounds check: only perform atomic_rmw if targetIdx is in range [0, inputShape[axis])
+      Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value axisSize;
+      if (resultType.getShape()[axis] == ShapedType::kDynamic) {
+        axisSize = rewriter.create<memref::DimOp>(loc, inputMem, axis);
+      } else {
+        axisSize = rewriter.create<arith::ConstantIndexOp>(loc, resultType.getShape()[axis]);
+      }
+
+      Value geZero = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, targetIdx, zero);
+      Value ltSize = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, targetIdx, axisSize);
+      Value inBounds = rewriter.create<arith::AndIOp>(loc, geZero, ltSize);
+
+      auto ifOp = rewriter.create<scf::IfOp>(loc, inBounds, /*withElseRegion=*/false);
+      rewriter.setInsertionPointToStart(ifOp.thenBlock());
 
       arith::AtomicRMWKind kind = llvm::isa<FloatType>(elementTy)
                                       ? arith::AtomicRMWKind::addf

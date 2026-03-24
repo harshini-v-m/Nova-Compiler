@@ -64,6 +64,13 @@ static const NVMMAIntrinsicInfo kMmaSyncBf16_16x8x16 = {
     /*warpSize=*/32,
     /*lhsKind=*/kBF16, /*rhsKind=*/kBF16, /*accKind=*/kF32};
 
+// mma.sync (Ampere+): 16×8×8, f32 inputs (TF32 truncation in HW) → f32 accumulator
+static const NVMMAIntrinsicInfo kMmaSyncTf32_16x8x8 = {
+    NVMMAIntrinsicValues::MMA_SYNC_TF32_16x8x8,
+    /*mSize=*/16, /*nSize=*/8, /*kSize=*/8,
+    /*warpSize=*/32,
+    /*lhsKind=*/kF32, /*rhsKind=*/kF32, /*accKind=*/kF32};
+
 //===----------------------------------------------------------------------===//
 // SM architecture capability table
 //
@@ -107,28 +114,32 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
     info.archName = "sm_90";
     info.smCount  = 132; // H100 SXM has 132 SMs
     info.maxWorkgroupMemBytes = 228 * 1024;
-    info.mmaIntrinsics = {kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
+    info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
+                          kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 89) {
     // Ada Lovelace (RTX 4090, L40, L4, etc.)
     info.archName = "sm_89";
     info.smCount  = 128; // RTX 4090 has 128 SMs
     info.maxWorkgroupMemBytes = 100 * 1024;
-    info.mmaIntrinsics = {kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
+    info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
+                          kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 86) {
     // Ampere GA106 / GA107 (RTX 3060 has 28 SMs, RTX 3090 has 84 SMs)
     info.archName = "sm_86";
     info.smCount  = 28; // Targeting RTX 3060 as the reference device
     info.maxWorkgroupMemBytes = 100 * 1024;
-    info.mmaIntrinsics = {kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
+    info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
+                          kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 80) {
     // Ampere GA100 (A100 SXM has 108 SMs; 164 KB max shared mem)
     info.archName = "sm_80";
     info.smCount  = 108;
     info.maxWorkgroupMemBytes = 164 * 1024;
-    info.mmaIntrinsics = {kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
+    info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
+                          kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 75) {
     // Turing (T4, RTX 20xx series)

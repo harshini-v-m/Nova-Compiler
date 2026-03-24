@@ -4,13 +4,14 @@
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/IR/BuiltinTypeInterfaces.td"
 include "mlir/IR/SymbolInterfaces.td"
 
 include "NovaDialect.td"
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/PatternBase.td"
-include "mlir/IR/BuiltinTypes.td" 
+include "mlir/IR/BuiltinTypes.td"
 
 //traits
 def NoComplexOperands : NativeOpTrait<"NoComplexOperands">;
@@ -1037,6 +1038,141 @@ def Nova_SceBackwardOp : Op<Nova_Dialect, "sce_backward",
 //
 // Usage at bufferization (NovaGPUBufferize / Passes.cpp):
 //   Erase all nova.fusion_barrier by replacing with their source value.
+
+//===----------------------------------------------------------------------===//
+// YieldOp — terminator for BarrierRegionOp
+//===----------------------------------------------------------------------===//
+def Nova_YieldOp : Op<Nova_Dialect, "yield", [
+    Pure, ReturnLike, Terminator,
+    ParentOneOf<["BarrierRegionOp"]>
+]> {
+  let summary = "Yield values from a barrier region";
+  let description = [{
+    Terminates the body of a `nova.barrier_region` op, yielding the computed
+    values back to the enclosing operation. The types and count of yielded
+    values must match the result types and count of the parent barrier_region.
+  }];
+  let arguments = (ins Variadic<AnyType>:$values);
+  let assemblyFormat = "attr-dict ($values^ `:` type($values))?";
+  let builders = [
+    OpBuilder<(ins), [{ /* empty yield */ }]>
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// BarrierRegionOp
+//===----------------------------------------------------------------------===//
+// Synchronizes workers on a region of shared code. This operation naturally
+// arises when combining the regions of producer-consumer scf.forall operations
+// that share a mapping type but have different per-dimension trip counts.
+//
+// Because these two loops have the same worker type and the total count is the
+// same, the bodies can be merged with a barrier, insert_slice and a shuffle.
+//
+// A barrier_region can be lowered to two barriers: one on the input operands
+// and a second one on the results (via nova.value_barrier).
+//
+// Mirrors IREE's iree_gpu.barrier_region (IREEGPUOps.td).
+
+def Nova_BarrierRegionOp : Op<Nova_Dialect, "barrier_region", [
+    Pure,
+    SingleBlockImplicitTerminator<"::mlir::nova::YieldOp">
+]> {
+  let summary = "Synchronizes workers on a region of shared code";
+  let description = [{
+    This op represents synchronization of workers on the operands and results
+    of the given region. It naturally arises when combining the regions of
+    producer-consumer `scf.forall` operations that share a mapping type.
+
+    For example, when a producer forall with bounds (2, 32) and a consumer
+    forall with bounds (8, 8) have the same flat trip count (64), they can be
+    fused by wrapping the producer's computation in a barrier_region:
+
+    ```mlir
+    %barrier = nova.barrier_region ins(%alloc : tensor<4x128xf32>) {
+    ^bb0(%shared: tensor<4x128xf32>):
+      // ... producer computation writing into %shared ...
+      nova.yield %result : tensor<4x128xf32>
+    } : tensor<4x128xf32>
+    ```
+
+    A barrier_region can be lowered to two `nova.value_barrier` ops — one on
+    the input operands (write barrier) and a second on the results (read
+    barrier).
+  }];
+
+  let arguments = (ins
+    Variadic<AnyType>:$inputs
+  );
+  let regions = (region SizedRegion<1>:$region);
+  let results = (outs Variadic<AnyType>:$results);
+
+  let assemblyFormat = [{
+    (`ins` `(` $inputs^ `:` type($inputs) `)` )?
+    $region attr-dict `:` type($results)
+  }];
+
+  let builders = [
+    OpBuilder<(ins "TypeRange":$resultTypes, "ValueRange":$inputs)>
+  ];
+  let skipDefaultBuilders = 1;
+  let hasVerifier = 1;
+  let hasRegionVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ValueBarrierOp
+//===----------------------------------------------------------------------===//
+// Synchronizes workers on value semantic tensors or vectors. This is the
+// primitive that barrier_region lowers into (two value_barriers — one for
+// writes, one for reads).
+//
+// Mirrors IREE's iree_gpu.value_barrier (IREEGPUOps.td).
+
+def Nova_ValueBarrierOp : Op<Nova_Dialect, "value_barrier", [
+    Pure, AllTypesMatch<["inputs", "results"]>
+]> {
+  let summary = "Synchronizes workers on value semantic tensors or vectors";
+  let description = [{
+    This operation acts as a barrier on value semantic SSA values (tensor or
+    vector). It takes multiple operands and produces a value equivalent to each
+    input. This does not have copy and/or data movement semantics and simply
+    represents a barrier on all writes in the tensor case, and a barrier until
+    all threads acquire the input vector in the vector case.
+
+    The inputs must be either all tensors or all vectors (not mixed).
+
+    This operation is a no-op when not present in a parallel context. This
+    operation is pure as it only requires synchronization for the value it
+    produces.
+  }];
+
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>:$results);
+
+  let assemblyFormat = [{
+    $inputs attr-dict `:` type($inputs)
+  }];
+
+  let builders = [
+    OpBuilder<(ins "ValueRange":$inputs)>
+  ];
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    bool hasTensorSemantics() {
+      return isa<::mlir::RankedTensorType>(getOperand(0).getType());
+    }
+    ::mlir::ShapedType getInputType(int operandNum) {
+      return ::llvm::cast<::mlir::ShapedType>(
+          getInputs()[operandNum].getType());
+    }
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// FusionBarrierOp
+//===----------------------------------------------------------------------===//
 
 def Nova_FusionBarrierOp : Op<Nova_Dialect, "fusion_barrier", [
     SameOperandsAndResultType, Pure]> {

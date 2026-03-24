@@ -35,6 +35,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "Passes.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -171,19 +173,92 @@ struct ConvertGlobalMemAllocOp : public OpRewritePattern<memref::AllocOp> {
     if (!allocOp->getParentOfType<gpu::GPUFuncOp>())
       return failure();
 
-    // Dynamic allocs inside GPU kernels: convert to memref.alloca (per-thread
-    // stack). These are per-thread temporaries from boundary tile handling
-    // (e.g. memref<1x?x4xf32> where ? <= tileSize). Cannot use memref.global
-    // because (1) globals require static shape, and (2) a single global would
-    // be shared by all threads, causing race conditions. Per-thread stack
-    // (alloca) is correct — each thread gets its own copy.
-    // Without this, dynamic memref.alloc lowers to device-side malloc() which
-    // crashes with CUDA_ERROR_ILLEGAL_ADDRESS.
+    // Dynamic allocs inside GPU kernels: convert to a STATIC memref.alloca
+    // placed at the gpu.func entry block. This is critical because:
+    //   - memref.alloc with dynamic sizes inside gpu.func becomes device-side
+    //     malloc() which crashes with CUDA_ERROR_ILLEGAL_ADDRESS.
+    //   - Placing alloca in-place (inside a loop body) causes PTX alloca to
+    //     grow the stack each iteration → stack overflow when the K-reduction
+    //     loop runs many iterations (e.g. 12 × 2KB = 24KB per thread).
+    //   - The dynamic dimension is bounded by the tile config (typically ≤ 16
+    //     or ≤ 128) and does NOT change across loop iterations — it depends
+    //     only on blockIdx and threadIdx.
+    //
+    // Strategy: replace each dynamic dim with the maximum possible value
+    // (inferred from the tile configuration or a conservative upper bound),
+    // then place the alloca at the function entry so it's allocated once.
     ArrayRef<int64_t> shape = allocOp.getType().getShape();
     if (ShapedType::isDynamicShape(shape)) {
-      rewriter.replaceOpWithNewOp<memref::AllocaOp>(
-          allocOp, allocOp.getType(), allocOp.getDynamicSizes(),
-          allocOp.getSymbolOperands());
+      auto funcOp = allocOp->getParentOfType<gpu::GPUFuncOp>();
+      if (!funcOp)
+        return failure();
+
+      // Build a static shape by replacing dynamic dims with upper bounds.
+      // For tile-based GPU kernels, dynamic dims come from boundary handling
+      // (min(remaining, tileSize)) so the tile size IS the upper bound.
+      SmallVector<int64_t> staticShape;
+      unsigned dynIdx = 0;
+      for (int64_t dim : shape) {
+        if (ShapedType::isDynamic(dim)) {
+          // Try to infer upper bound from the dynamic size operand.
+          // Common pattern: affine.min or arith.minsi/minui with a constant
+          // tile size → use that constant as the upper bound.
+          int64_t upperBound = 128; // conservative default for tile dims
+          if (dynIdx < allocOp.getDynamicSizes().size()) {
+            Value dynSize = allocOp.getDynamicSizes()[dynIdx];
+            // Walk through min operations to find the constant bound
+            if (auto minOp = dynSize.getDefiningOp<arith::MinSIOp>()) {
+              for (Value operand : {minOp.getLhs(), minOp.getRhs()}) {
+                if (auto cst = operand.getDefiningOp<arith::ConstantIndexOp>())
+                  upperBound = std::min(upperBound, cst.value());
+              }
+            } else if (auto minOp = dynSize.getDefiningOp<arith::MinUIOp>()) {
+              for (Value operand : {minOp.getLhs(), minOp.getRhs()}) {
+                if (auto cst = operand.getDefiningOp<arith::ConstantIndexOp>())
+                  upperBound = std::min(upperBound, cst.value());
+              }
+            } else if (auto cst = dynSize.getDefiningOp<arith::ConstantIndexOp>()) {
+              upperBound = cst.value();
+            }
+          }
+          staticShape.push_back(upperBound);
+          ++dynIdx;
+        } else {
+          staticShape.push_back(dim);
+        }
+      }
+
+      auto staticType = MemRefType::get(
+          staticShape, allocOp.getType().getElementType(),
+          AffineMap(), allocOp.getType().getMemorySpace());
+
+      // Place alloca at function entry — allocated once per kernel invocation.
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&funcOp.getBody().front());
+      auto alloca = memref::AllocaOp::create(rewriter, allocOp.getLoc(),
+                                              staticType);
+
+      // Create a subview with the original dynamic sizes so downstream code
+      // sees the correct (possibly smaller) shape.
+      SmallVector<OpFoldResult> offsets(shape.size(), rewriter.getIndexAttr(0));
+      SmallVector<OpFoldResult> sizes;
+      dynIdx = 0;
+      for (unsigned i = 0; i < shape.size(); ++i) {
+        if (ShapedType::isDynamic(shape[i])) {
+          sizes.push_back(allocOp.getDynamicSizes()[dynIdx++]);
+        } else {
+          sizes.push_back(rewriter.getIndexAttr(shape[i]));
+        }
+      }
+      SmallVector<OpFoldResult> strides(shape.size(), rewriter.getIndexAttr(1));
+
+      // Insert subview at the original alloc location (where dynamic sizes
+      // are available).
+      rewriter.setInsertionPoint(allocOp);
+      auto subview = memref::SubViewOp::create(
+          rewriter, allocOp.getLoc(), alloca.getResult(), offsets, sizes,
+          strides);
+      rewriter.replaceOp(allocOp, subview.getResult());
       return success();
     }
 
@@ -253,14 +328,55 @@ struct ConvertGlobalMemAllocOp : public OpRewritePattern<memref::AllocOp> {
       return success();
     }
 
-    // Tier 3: LARGE (>48 KB) → leave as memref.alloc.
+    // Tier 3: LARGE (>48 KB) → memref.global (device global memory).
+    //
     // Too large for per-thread stack (would overflow) and too large for
-    // shared memory (48 KB limit on sm_86). By returning failure(), the
-    // alloc survives this pass and is later handled by ConvertMemRefToGpuPass
-    // (Step 12.75), which converts it to gpu.alloc → host-side mgpuMemAlloc.
-    // The buffer is allocated on device global memory before the kernel launch
-    // and passed as a kernel argument.
-    return failure();
+    // shared memory (48 KB limit on sm_86). We convert to memref.global
+    // in the gpu.module, which becomes a .global PTX variable — one copy
+    // in device global memory shared by all thread blocks.
+    //
+    // This is correct when the buffer is used for:
+    //   - Constant fills (e.g. dOutput = dense<1.0>) — all blocks write
+    //     the same value, benign write-write race.
+    //   - Workspace where blocks access disjoint regions (indexed by blockIdx).
+    //
+    // Without this, the alloc survives to LLVM lowering and becomes a
+    // device-side malloc() call, which crashes with CUDA_ERROR_ILLEGAL_ADDRESS
+    // because device malloc has a tiny default heap (8 MB) and each of the
+    // thousands of threads calls it independently.
+    {
+      uint64_t alignment;
+      if (std::optional<uint64_t> alignmentInfo = allocOp.getAlignment()) {
+        alignment = alignmentInfo.value();
+      } else {
+        alignment = std::max<uint64_t>(
+            llvm::PowerOf2Ceil(elemBits / 8), 1);
+      }
+
+      MemRefType allocType = allocOp.getType();
+      auto funcOp = allocOp->getParentOfType<mlir::FunctionOpInterface>();
+      Operation *symbolTableOp =
+          SymbolTable::getNearestSymbolTable(funcOp->getParentOp());
+      SymbolTable symbolTable(symbolTableOp);
+
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(
+          &symbolTableOp->getRegion(0).front().front());
+      auto global = memref::GlobalOp::create(
+          rewriter, funcOp.getLoc(), "__global_memory_large__",
+          /*sym_visibility=*/rewriter.getStringAttr("private"),
+          /*type=*/allocType,
+          /*initial_value=*/ElementsAttr(),
+          /*constant=*/false,
+          /*alignment=*/rewriter.getI64IntegerAttr(alignment));
+      symbolTable.insert(global);
+
+      rewriter.setInsertionPointToStart(
+          &(*funcOp.getFunctionBody().begin()));
+      rewriter.replaceOpWithNewOp<memref::GetGlobalOp>(
+          allocOp, global.getType(), global.getName());
+      return success();
+    }
   }
 };
 

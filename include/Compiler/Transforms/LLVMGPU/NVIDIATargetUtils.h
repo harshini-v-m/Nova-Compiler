@@ -25,6 +25,7 @@ enum class NVMMAIntrinsicValues : int32_t {
   WMMA_F16_16x16x16  = 2,
   MMA_SYNC_F16_16x8x16  = 3,
   MMA_SYNC_BF16_16x8x16 = 4,
+  MMA_SYNC_TF32_16x8x8  = 5,
 };
 
 //===----------------------------------------------------------------------===//
