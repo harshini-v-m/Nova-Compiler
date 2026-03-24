@@ -1139,6 +1139,8 @@ struct NovaSceBackwardOpLowering
     Value negOnesConst = negOnesConstOp.getResult();
 
     // 5. Scatter Add
+    // Note: NovaScatterAddOpLowering now includes bounds checking, so negative 
+    // indices (like those from ignore_index = -100) will be safely ignored.
     auto scatterAddOp = rewriter.create<mlir::nova::ScatterAddOp>(
         loc, flatProbType, probFlat, indicesFlat, negOnesConst, rewriter.getI64IntegerAttr(0));
     Value diffFlat = scatterAddOp.getResult();

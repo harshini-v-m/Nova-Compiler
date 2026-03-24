@@ -35,6 +35,7 @@
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Transforms.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -311,8 +312,9 @@ void registerNovaGPUComprehensiveBufferizePass() {
 // OneShotBufferize analysis.
 // ---------------------------------------------------------------------------
 
-/// Returns true if `op` (or any op nested inside it) stores to workgroup memory.
-static bool hasWorkgroupStores(Operation *op) {
+/// Returns true if `op` (or any op nested inside it) performs a non-atomic
+/// store to workgroup memory.
+static bool hasNonAtomicWorkgroupStores(Operation *op) {
   bool found = false;
   op->walk([&](memref::StoreOp storeOp) {
     if (isWorkgroupMemref(cast<MemRefType>(storeOp.getMemRef().getType())))
@@ -327,6 +329,19 @@ static bool hasWorkgroupStores(Operation *op) {
   return found;
 }
 
+/// Returns true if `op` (or any op nested inside it) performs ANY store
+/// (atomic or non-atomic) to workgroup memory.
+static bool hasWorkgroupStores(Operation *op) {
+  if (hasNonAtomicWorkgroupStores(op))
+    return true;
+  bool found = false;
+  op->walk([&](memref::AtomicRMWOp rmwOp) {
+    if (isWorkgroupMemref(cast<MemRefType>(rmwOp.getMemref().getType())))
+      found = true;
+  });
+  return found;
+}
+
 /// Returns true if `op` (or any op nested inside it) loads from workgroup memory.
 static bool hasWorkgroupLoads(Operation *op) {
   bool found = false;
@@ -334,6 +349,12 @@ static bool hasWorkgroupLoads(Operation *op) {
     if (isWorkgroupMemref(cast<MemRefType>(loadOp.getMemRef().getType())))
       found = true;
   });
+  if (!found) {
+    op->walk([&](memref::AtomicRMWOp rmwOp) {
+      if (isWorkgroupMemref(cast<MemRefType>(rmwOp.getMemref().getType())))
+        found = true;
+    });
+  }
   if (!found) {
     op->walk([&](memref::CopyOp copyOp) {
       if (isWorkgroupMemref(cast<MemRefType>(copyOp.getSource().getType())))
@@ -354,7 +375,7 @@ struct NovaGPUInsertWorkgroupBarriersPass
       const NovaGPUInsertWorkgroupBarriersPass &) = default;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect>();
+    registry.insert<gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect,NVVM::NVVMDialect>();
   }
 
   void runOnOperation() override {
@@ -394,9 +415,9 @@ struct NovaGPUInsertWorkgroupBarriersPass
         return;
 
       builder.setInsertionPoint(copyOp);
-      gpu::BarrierOp::create(builder, copyOp.getLoc());
+      builder.create<NVVM::Barrier0Op>(copyOp.getLoc());
       builder.setInsertionPointAfter(copyOp);
-      gpu::BarrierOp::create(builder, copyOp.getLoc());
+      builder.create<NVVM::Barrier0Op>(copyOp.getLoc());
     });
   }
 
@@ -409,6 +430,9 @@ struct NovaGPUInsertWorkgroupBarriersPass
     SmallVector<Operation *> barrierPoints;
 
     bool seenWorkgroupStore = false;
+    bool seenWorkgroupLoad = false;
+    bool seenNonAtomicWorkgroupStore = false;
+
     for (Operation &op : body->getOperations()) {
       if (isa<scf::YieldOp>(op))
         continue;
@@ -416,17 +440,28 @@ struct NovaGPUInsertWorkgroupBarriersPass
       // If we've seen a store and this op reads workgroup mem, need barrier.
       if (seenWorkgroupStore && hasWorkgroupLoads(&op)) {
         barrierPoints.push_back(&op);
-        seenWorkgroupStore = false; // reset — barrier will separate regions
+        seenWorkgroupStore = false; // reset
       }
 
       if (hasWorkgroupStores(&op))
         seenWorkgroupStore = true;
+      if (hasNonAtomicWorkgroupStores(&op))
+        seenNonAtomicWorkgroupStore = true;
+      if (hasWorkgroupLoads(&op))
+        seenWorkgroupLoad = true;
+    }
+
+    // Only add a tail barrier if we have loads AND there's a possible
+    // unsafe write in the next iteration. Purely atomic loops or
+    // read-only loops do not need synchronization between iterations.
+    if (seenWorkgroupLoad && seenNonAtomicWorkgroupStore) {
+      barrierPoints.push_back(body->getTerminator());
     }
 
     // Insert barriers (in reverse to avoid invalidating iterators).
     for (Operation *readerOp : llvm::reverse(barrierPoints)) {
       builder.setInsertionPoint(readerOp);
-      gpu::BarrierOp::create(builder, readerOp->getLoc());
+      builder.create<NVVM::Barrier0Op>(readerOp->getLoc()); 
     }
   }
 

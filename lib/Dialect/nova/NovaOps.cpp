@@ -1890,13 +1890,24 @@ GatherOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
   if (axis < 0)
     axis += inputRank;
 
+  int64_t batchDims = 0;
+  int64_t maxBatchDims = std::min<int64_t>(axis, indexType.getRank());
+  for (int64_t i = 0; i < maxBatchDims; ++i) {
+    bool inputDyn = inputType.getDimSize(i) == ShapedType::kDynamic;
+    bool indexDyn = indexType.getDimSize(i) == ShapedType::kDynamic;
+    if (!inputDyn && !indexDyn && inputType.getDimSize(i) != indexType.getDimSize(i)) {
+      break;
+    }
+    batchDims++;
+  }
+
   llvm::SmallVector<int64_t, 4> outputShape;
   // Dimensions before axis
   for (int64_t i = 0; i < axis; ++i) {
     outputShape.push_back(inputType.getDimSize(i));
   }
-  // Indices dimensions
-  for (int64_t i = 0; i < indexType.getRank(); ++i) {
+  // Indices dimensions (excluding batch dims)
+  for (int64_t i = batchDims; i < indexType.getRank(); ++i) {
     outputShape.push_back(indexType.getDimSize(i));
   }
   // Dimensions after axis
