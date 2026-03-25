@@ -16,6 +16,7 @@ add_mlir_library(MLIRNovaToLinalgTransforms
   MLIRFuncDialect
   MLIRArithDialect
   MLIRSCFDialect
+  MLIRTosaDialect
   MLIRIR
   MLIRPass
   MLIRTransforms

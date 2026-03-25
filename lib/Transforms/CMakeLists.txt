@@ -9,7 +9,10 @@ add_mlir_library(CompilerTransforms
   VectorOpt.cpp
   RemDevAttr.cpp
   RenameGpuKernels.cpp
-
+  NovaLinalgverticalfusion.cpp
+  NovaFuseReductionIntoProducer.cpp
+  NovaElementwiseOpFusionPass.cpp
+  
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRPass
