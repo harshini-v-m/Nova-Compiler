@@ -5,6 +5,9 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaGPUPadOperands.cpp
   NovaGPUPromoteMatmulOperands.cpp
   SCFScalarizeAccumulator.cpp
+  LoopSplit.cpp
+  NovaScfLoopUnroll.cpp
+  NovaScfLoopVectorize.cpp
   NovaGPUApplyTilingLevelReduction.cpp
   # GAP 2: Erase fusion barriers before bufferization
   NovaGPUEraseFusionBarriers.cpp
@@ -40,6 +43,17 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaGPUFillCopyForwarding.cpp
   # Step 8.2: Coalesce workgroup allocs with non-overlapping live ranges.
   NovaGPUCoalesceWorkgroupBuffers.cpp
+
+  # rematerialization pass
+  NovaFuseReductionIntoProducer.cpp
+  # custom element-wise fusion pass to prevent matmul fusion
+  NovaElementwiseOpFusionPass.cpp
+  # parallel fusion case with same inputs
+  NovaCheckInsParallelFuse.cpp
+  # horizontal fusion pass for reduction cases
+  NovaLinalgFusion.cpp
+  # vertical fusion pass for reduction producer and parallel consumer case
+  NovaVerticalFusion.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include

@@ -49,8 +49,14 @@
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
 #include "Compiler/Transforms/FixGpuLaunch.h"
+
+#include "Compiler/Transforms/LLVMGPU/LoopSplit.h"
+#include "Compiler/Transforms/LLVMGPU/NovaScfLoopUnroll.h"
+#include "Compiler/Transforms/LLVMGPU/NovaScfLoopVectorize.h"
 
 using namespace mlir;
 
@@ -111,6 +117,12 @@ namespace mlir::nova
     StringRef arch = cudaArch.empty() ? "sm_86" : cudaArch;
 
     // ---- Nova dialect → Arith / Tosa / Linalg lowering ----
+    // Strip #nova.device encoding from all tensor types before conversion.
+    // The conversion passes (NovaToArith/Tosa/Linalg) use applyPartialConversion
+    // with no TypeConverter, so they cannot materialize device-encoded types to
+    // plain tensor types. RemDevAttrPass rewrites all result types in-place,
+    // making every tensor<..., #nova.device<"N">> into a plain tensor<...>.
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(mlir::nova::createNovaToArithLoweringPass());
     pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
@@ -135,7 +147,13 @@ namespace mlir::nova
     // (non-deterministic pattern ordering causes intermittent stalls).
     // IREE performs the same fusion before its tile-and-fuse pipeline.
     // -------------------------------------------------------------------------
-    pm.addPass(createLinalgElementwiseOpFusionPass());
+    // pm.addPass(createLinalgElementwiseOpFusionPass());
+    // pm.addNestedPass<mlir::func::FuncOp>(createNovaFuseReductionIntoProducerPass());
+    pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
+    pm.addNestedPass<mlir::func::FuncOp>(createNovaCheckInsParallelFuse());
+    pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgHorizontalFusionPass());
+    // pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgVerticalFusionPass());
+
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
@@ -336,6 +354,30 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
+
+    // start of my Pass
+    
+
+    pm.addNestedPass<func::FuncOp>(
+        mlir::nova::createSCFScalarizeAccumulatorPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+    pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
+    pm.addPass(createCanonicalizerPass());
+
+    pm.addNestedPass<func::FuncOp>(
+        mlir::nova::createNovaScfLoopVectorizePass(16));
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopUnrollPass(2));
+    // pm.addPass(createCanonicalizerPass());
+    // pm.addPass(createCSEPass());
+
+
+    // // end of my pass
+
     // -------------------------------------------------------------------------
     // Step 11: Insert gpu.barrier at workgroup memory write→read transitions
     //
@@ -431,6 +473,7 @@ namespace mlir::nova
       gpuPm.addPass(createArithToLLVMConversionPass());
       gpuPm.addPass(createConvertMathToLLVMPass());
       gpuPm.addPass(createReconcileUnrealizedCastsPass());
+      gpuPm.addPass(createConvertVectorToLLVMPass());
       // Promote __global_memory__ globals from device global (AS 0) to
       // shared memory (AS 3). Must run after full LLVM lowering so we
       // operate on opaque pointers and can insert addrspacecast cleanly.
@@ -503,6 +546,28 @@ namespace mlir::nova
 
     // Register the full optimized pipeline as a named pipeline so it can be
     // invoked from mlir-opt with --nova-gpu-optimized-pipeline.
+
+
+    // nova-scf-loop-unroll: wraps mlir::scf::loopUnrollByFactor.
+    // Usage from nova-opt: --nova-scf-loop-unroll
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return mlir::nova::createNovaScfLoopUnrollPass();
+    });
+
+    // scf-for-loop-specialization: already registered by registerAllPasses()
+    // in nova-opt.cpp, but registered here explicitly so it appears in the
+    // Nova pass list when --help is run against the pipeline.
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return mlir::createForLoopSpecializationPass();
+    });
+
+    // scf-for-loop-peeling: peels the last partial iteration off each scf.for.
+    // Usage from nova-opt: --scf-for-loop-peeling
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+        return mlir::createForLoopPeelingPass();
+    });
+
+
     PassPipelineRegistration<>(
         "nova-gpu-optimized-pipeline",
         "Nova GPU Optimized Pipeline (tile+fuse → normalize → bufferize → "

@@ -30,6 +30,7 @@
 // Directly mirrors IREE: Common/GPU/GPUFuseAndHoistParallelLoops.cpp
 
 #include "Passes.h"
+#include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -323,6 +324,19 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
     auto producerInsert =
         cast<tensor::ParallelInsertSliceOp>(producerInserts[0]);
 
+    // Verify that the consumer's extract_slice and producer's
+    // parallel_insert_slice operate on equivalent subsets. Without this check,
+    // fusion can create invalid IR when the producer and consumer distribute
+    // their threads differently over shared dimensions (e.g., layer norm with
+    // K-per-thread=4 fused into matmul with K-per-thread=16).
+    if (!cast<SubsetOpInterface>(*consumerSlice).operatesOnEquivalentSubset(
+            cast<SubsetOpInterface>(*producerInsert),
+            [](Value v1, Value v2) { return v1 == v2; }))
+      return rewriter.notifyMatchFailure(
+          producerForall,
+          "producer insert and consumer extract operate on incompatible "
+          "tensor slices");
+
     if (dimsMatch) {
       // ========== FAST PATH: dimension-wise bounds match ==========
       // Direct body inlining: map producer IVs → consumer IVs 1:1.
@@ -357,19 +371,6 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
     // space to execute the producer body, writing into shared memory via
     // insert_slice. A barrier synchronizes, then the consumer reads its
     // slice from the shared result.
-
-    // [Fix] For thread-mapped foralls, we refuse to fuse if the trip counts
-    // do not match exactly. Fusing mismatched thread-counts (e.g. 256 into 64)
-    // requires a serial loop inside the consumer, which is dangerous if the
-    // producer contains barriers (resulting in divergent barriers under masking).
-    if (isThreadMappedForall(producerForall) && isThreadMappedForall(consumerForall)) {
-      auto pTrip = getStaticForallTripCount(producerForall);
-      auto cTrip = getStaticForallTripCount(consumerForall);
-      if (pTrip && cTrip && *pTrip != *cTrip) {
-        return rewriter.notifyMatchFailure(producerForall, 
-          "mismatched thread-counts are unsafe for barrier-based fusion");
-      }
-    }
 
     Location loc = producerForall.getLoc();
 
@@ -812,6 +813,15 @@ struct FuseTilableForallConsumers final
     // Consumer fusion currently requires DPS ops.
     auto dpsOp = dyn_cast<DestinationStyleOpInterface>(*tilableOp);
     if (!dpsOp)
+      return failure();
+
+    // Don't fuse ops that were independently tiled by TileDispatch.
+    // If the consumer already lives inside its own scf.forall (from its own
+    // lowering_config), pulling it into another forall creates mega-kernels
+    // with 17+ shared memory globals that overflow SM_86's 100KB limit.
+    // This matches IREE's approach where independently-configured ops are
+    // excluded from each other's fusion clusters via the `payloadOps` set.
+    if (tilableOp->getParentOfType<scf::ForallOp>())
       return failure();
 
     // Don't fuse cooperative copies that write to workgroup shared memory.

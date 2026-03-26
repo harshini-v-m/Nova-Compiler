@@ -1647,9 +1647,14 @@ SceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> loc,
       outElemTy = Float32Type::get(context);
   }
 
-  auto outType = RankedTensorType::get({1}, outElemTy);
+  // result[0]: softmax — same shape as logits, elem type promoted to float
+  auto softmaxType = RankedTensorType::get(logitsType.getShape(), outElemTy);
+  inferredReturnTypes.push_back(softmaxType);
 
-  inferredReturnTypes.push_back(outType);
+  // result[1]: scalar loss — shape {1}
+  auto lossType = RankedTensorType::get({1}, outElemTy);
+  inferredReturnTypes.push_back(lossType);
+
   return success();
 }
 LogicalResult
@@ -2117,18 +2122,18 @@ SceBackwardOp::inferReturnTypes(MLIRContext *context, std::optional<Location> lo
                                 ValueRange operands, DictionaryAttr attributes,
                                 OpaqueProperties properties, RegionRange regions,
     llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
+  // operands[1] = logits; grad_logits has the same shape/type as logits
   auto logitsType = dyn_cast<RankedTensorType>(operands[0].getType());
   if (!logitsType)
     return failure();
 
-  // Output gradient has the same shape and element type as logits
   inferredReturnTypes.push_back(
       RankedTensorType::get(logitsType.getShape(), logitsType.getElementType()));
   return success();
 }
 
 LogicalResult SceBackwardOp::verify() {
-  auto logitsType = dyn_cast<RankedTensorType>(getLogits().getType());
+  auto logitsType = dyn_cast<RankedTensorType>(getSoftmax().getType());
   auto targetsType = dyn_cast<RankedTensorType>(getTargets().getType());
 
   if (!logitsType || !targetsType)
@@ -2182,7 +2187,6 @@ LogicalResult SceBackwardOp::verify() {
 }
 
 OpFoldResult SceBackwardOp::fold(FoldAdaptor adaptor) { return nullptr; }
-
 //===----------------------------------------------------------------------===//
 // BarrierRegionOp
 //===----------------------------------------------------------------------===//

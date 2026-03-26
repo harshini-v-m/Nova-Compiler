@@ -214,7 +214,116 @@ class NovaArithConversionPattern : public OpConversionPattern<NovaArithOp>{
    }
 };
 
+class NovaSceConversionPattern : public OpConversionPattern<nova::SceOp> {
+public:
+  using OpConversionPattern<nova::SceOp>::OpConversionPattern;
+  using OpAdaptor = nova::SceOp::Adaptor;
 
+  LogicalResult matchAndRewrite(nova::SceOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value logits  = adaptor.getLogits();
+    Value targets = adaptor.getTargets();
+
+    // ── type setup ──────────────────────────────────────────────────────────
+    auto softmaxResultType = cast<RankedTensorType>(op.getSoftmax().getType());
+    auto lossResultType    = cast<RankedTensorType>(op.getResult().getType());
+    auto elemType          = softmaxResultType.getElementType();
+
+    // Ensure targets are i32
+    auto targetsType = cast<RankedTensorType>(targets.getType());
+    if (isa<FloatType>(targetsType.getElementType())) {
+      auto i32TargetsType =
+          RankedTensorType::get(targetsType.getShape(), rewriter.getI32Type());
+      targets = rewriter.create<tosa::CastOp>(loc, i32TargetsType, targets);
+    }
+
+    auto logitsType = cast<RankedTensorType>(logits.getType());
+    if (logitsType.getElementType() != elemType) {
+      auto newLogitsType = RankedTensorType::get(logitsType.getShape(), elemType);
+      logits    = rewriter.create<tosa::CastOp>(loc, newLogitsType, logits);
+      logitsType = newLogitsType;
+    }
+
+    int64_t rank    = logitsType.getRank();
+    int64_t lastDim = rank - 1;
+    llvm::SmallVector<int64_t, 1> reduceDims = {lastDim};
+
+    // keepdims=true shape for broadcast operations (e.g. [4,1])
+    auto keepShape = logitsType.getShape().vec();
+    keepShape[lastDim] = 1;
+    auto keepType = RankedTensorType::get(keepShape, elemType);
+
+    // batch shape with last dim removed (e.g. [4])
+    auto batchShape = logitsType.getShape().vec();
+    batchShape.pop_back();
+    auto batchType = RankedTensorType::get(batchShape, elemType);
+
+    // ── Step 1: max per row, keepdims=true  (for numerical stability) 
+    Value maxValKeep = rewriter.create<nova::ReduceOp>(
+        loc, nova::ReductionKind::MAX, logits, keepType,
+         true, llvm::ArrayRef<int64_t>{-1},  false);
+
+    // ── Step 2: z_shifted = logits - max_val  
+    Value zShifted = rewriter.create<nova::SubOp>(loc, logits, maxValKeep);
+
+    // ── Step 3: exp_z = exp(z_shifted)  
+    Value expZ = rewriter.create<nova::ExpOp>(loc, zShifted);
+
+    // ── Step 4: sum_exp keepdims=true  (for softmax division)  
+    Value sumExpKeep = rewriter.create<nova::ReduceOp>(
+        loc, nova::ReductionKind::SUM, expZ, keepType,
+         true, llvm::ArrayRef<int64_t>{-1},  false);
+
+    // ── Step 5: softmax = exp_z / sum_exp  
+    Value softmax = rewriter.create<nova::DivOp>(loc, expZ, sumExpKeep);
+
+    // ── Step 6: sum_exp flat (keepdims=false) for loss  
+    Value sumExpFlat = rewriter.create<nova::ReduceOp>(
+        loc, nova::ReductionKind::SUM, expZ, batchType,
+         false, reduceDims,  false);
+
+    // ── Step 7: max flat (keepdims=false) for loss  
+    Value maxValFlat = rewriter.create<nova::ReduceOp>(
+        loc, nova::ReductionKind::MAX, logits, batchType,
+         false, reduceDims,  false);
+
+    // ── Step 8: gather target logit per sample  
+    Value gatheredLogits =
+        rewriter.create<nova::GatherOp>(loc, logits, targets, lastDim)
+            .getResult();
+
+    // ── Step 9: per_sample_loss = log(sum_exp) + max_flat - gathered  
+    Value logSumExp     = rewriter.create<nova::LogOp>(loc, sumExpFlat);
+    Value lseMaxSum     = rewriter.create<nova::AddOp>(loc, logSumExp, maxValFlat);
+    Value perSampleLoss = rewriter.create<nova::SubOp>(loc, lseMaxSum, gatheredLogits);
+
+    // ── Step 10: loss = mean(per_sample_loss) → tensor<1xf32>  
+    llvm::SmallVector<int64_t> allDims;
+    auto pslType = cast<RankedTensorType>(perSampleLoss.getType());
+    for (int64_t i = 0; i < pslType.getRank(); ++i)
+      allDims.push_back(i);
+
+    auto scalarType = RankedTensorType::get({1}, elemType);
+    Value reducedLoss = rewriter.create<nova::ReduceOp>(
+        loc, nova::ReductionKind::MEAN, perSampleLoss, scalarType,
+         false, allDims,  false);
+
+    // Reshape reduced loss to match declared result type (tensor<1xf32>)
+    llvm::SmallVector<int64_t> lossShape = {1};
+    auto shapeAttrType = RankedTensorType::get({1}, rewriter.getIndexType());
+    auto shapeAttr     = DenseIntElementsAttr::get(shapeAttrType, lossShape);
+    Value shapeConst   = rewriter.create<tosa::ConstShapeOp>(
+        loc, mlir::tosa::shapeType::get(rewriter.getContext(), 1), shapeAttr);
+
+    Value finalLoss = rewriter.create<tosa::ReshapeOp>(
+        loc, lossResultType, reducedLoss, shapeConst);
+
+    // ── Replace both results 
+    rewriter.replaceOp(op, {softmax, finalLoss});
+    return success();
+  }
+};
 // Pass Definition
 
 namespace {
@@ -266,9 +375,8 @@ void populateNovaToArithConversionPatterns(RewritePatternSet &patterns) {
   patterns.add<NovaArithConversionPattern<nova::ConstantOp>>(
     patterns.getContext()
   );
-  patterns.add<NovaArithConversionPattern<nova::SceOp>>(
-    patterns.getContext()
-  );
+  // patterns.add<NovaArithConversionPattern<nova::SceOp>>( patterns.getContext() );
+ patterns.add< NovaSceConversionPattern>(patterns.getContext());
 }
 
 std::unique_ptr<Pass> createNovaToArithLoweringPass() {

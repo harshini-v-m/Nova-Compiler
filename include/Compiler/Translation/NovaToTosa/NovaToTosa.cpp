@@ -1069,10 +1069,10 @@ struct NovaSceBackwardOpLowering
   matchAndRewrite(mlir::nova::SceBackwardOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value logits = adaptor.getLogits();
+    Value softmaxRes = adaptor.getSoftmax();
     Value targets = adaptor.getTargets();
     auto resultType = cast<RankedTensorType>(op.getType());
-    auto logitsType = cast<RankedTensorType>(logits.getType());
+    auto logitsType = cast<RankedTensorType>(softmaxRes.getType());
     auto targetsType = cast<RankedTensorType>(targets.getType());
     int64_t rank = logitsType.getRank();
     auto resultElemType = resultType.getElementType();
@@ -1082,10 +1082,7 @@ struct NovaSceBackwardOpLowering
     if (dim < 0)
       dim += rank;
 
-    // 1. Calculate Softmax
-    auto softmaxOp = rewriter.create<mlir::nova::SoftmaxOp>(
-        loc, logitsType, logits, rewriter.getI32IntegerAttr(dim));
-    Value softmaxRes = softmaxOp.getResult();
+    // 1. Softmax is passed in directly from the forward SceOp result
 
     // 2. Flattened Probabilities
     int64_t totalel = 1;
@@ -1113,11 +1110,22 @@ struct NovaSceBackwardOpLowering
     // Force i64 indices throughout
     auto i64Type = rewriter.getI64Type();
     auto offsetsType = RankedTensorType::get({B}, i64Type);
-    std::vector<int64_t> offsets(B);
-    for (int64_t i = 0; i < B; ++i) offsets[i] = i * C;
-    auto offsetsAttr = DenseIntElementsAttr::get(offsetsType, llvm::ArrayRef<int64_t>(offsets));
-    auto offsetsConstOp = rewriter.create<mlir::nova::ConstantOp>(loc, offsetsType, offsetsAttr);
-    Value offsetsConst = offsetsConstOp.getResult();
+
+    // Compute row offsets at runtime via linalg.generic: offsets[i] = i * C
+    // Avoids embedding a large (B-element) compile-time constant in the IR.
+    Value offsetsEmpty = rewriter.create<mlir::tensor::EmptyOp>(loc, llvm::ArrayRef<int64_t>{B}, i64Type);
+    Value cConst = rewriter.create<mlir::arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(C));
+    auto offsetsMap = mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext());
+    Value offsetsConst = rewriter.create<mlir::linalg::GenericOp>(
+        loc, TypeRange{offsetsType}, ValueRange{}, ValueRange{offsetsEmpty},
+        ArrayRef<mlir::AffineMap>{offsetsMap},
+        ArrayRef<mlir::utils::IteratorType>{mlir::utils::IteratorType::parallel},
+        [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
+          Value idx = b.create<mlir::linalg::IndexOp>(l, 0);
+          Value idxI64 = b.create<mlir::arith::IndexCastOp>(l, i64Type, idx);
+          Value offset = b.create<mlir::arith::MulIOp>(l, idxI64, cConst);
+          b.create<mlir::linalg::YieldOp>(l, offset);
+        }).getResult(0);
 
     Value targetsI64 = targets;
     if (!targetIdxElemType.isInteger(64)) {
@@ -1139,8 +1147,6 @@ struct NovaSceBackwardOpLowering
     Value negOnesConst = negOnesConstOp.getResult();
 
     // 5. Scatter Add
-    // Note: NovaScatterAddOpLowering now includes bounds checking, so negative 
-    // indices (like those from ignore_index = -100) will be safely ignored.
     auto scatterAddOp = rewriter.create<mlir::nova::ScatterAddOp>(
         loc, flatProbType, probFlat, indicesFlat, negOnesConst, rewriter.getI64IntegerAttr(0));
     Value diffFlat = scatterAddOp.getResult();
@@ -1161,7 +1167,6 @@ struct NovaSceBackwardOpLowering
     return success();
   }
 };
-
 struct NovaLinearBackwardPattern
     : public OpConversionPattern<mlir::nova::LinearBackwardOp> {
   using OpConversionPattern<mlir::nova::LinearBackwardOp>::OpConversionPattern;

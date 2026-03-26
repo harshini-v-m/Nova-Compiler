@@ -24,6 +24,22 @@ std::unique_ptr<Pass> createRenameGpuKernelsPass();
 void addNovaGPUOptimizedPipeline(OpPassManager &pm, llvm::StringRef cudaArch);
 void registerNovaLLVMGPUPasses();
 
+std::unique_ptr<Pass> createNovaFuseReductionIntoProducerPass();
+void registerNovaFuseReductionIntoProducerPass();
+
+std::unique_ptr<Pass> createNovaElementwiseOpFusionPass();
+void registerNovaElementwiseOpFusionPass();
+
+std::unique_ptr<Pass> createNovaCheckInsParallelFuse();
+void registerNovaCheckInsParallelFuse();
+
+std::unique_ptr<Pass> createNovaLinalgHorizontalFusionPass();
+void registerNovaLinalgHorizontalFusionPass();
+
+std::unique_ptr<Pass> createNovaLinalgVerticalFusionPass();
+void registerNovaLinalgVerticalFusionPass();
+
+
 }  // namespace nova
 }  // namespace mlir
 

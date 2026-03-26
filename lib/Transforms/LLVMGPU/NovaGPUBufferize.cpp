@@ -14,15 +14,21 @@
 //       → uses contiguous memref types (no strided layouts)
 //       → produces clean `memref<NxMxf32>` function args for GPU kernels
 //     - GPU-aware allocation function:
-//       * #gpu.address_space<workgroup>  → memref.alloc   (shared SRAM)
+//       * #gpu.address_space<workgroup>  → memref.alloc   (shared SRAM),
+//         hoisted above any enclosing scf.for to avoid per-iteration
+//         reallocation of statically-partitioned shared memory.
 //       * #gpu.address_space<private>   → memref.alloca  (per-thread register)
 //         BUT only when the insertion point is inside an scf.forall kernel;
 //         at function scope, falls back to memref.alloc (global memory).
 //       * no memory space specified     → memref.alloc   (default/global)
 //     - GPU-aware copy function:
-//       * emits memref.copy
-//       * wraps the copy with gpu.barrier when either operand is in
-//         workgroup (shared) memory.
+//       * inside scf.forall → linalg.copy (expands to load/store loops,
+//         avoids host-only @memrefCopy symbol inside gpu.func)
+//       * outside scf.forall → memref.copy (host runtime path)
+//     - Barriers are NOT inserted during bufferization (gpu.barrier has
+//       "unknown side effects" that break OneShotBufferize analysis).
+//       They are inserted post-bufferization by
+//       NovaGPUInsertWorkgroupBarriersPass.
 //
 // IREE reference:
 //   IREEComprehensiveBufferizePass::runOnOperation()
@@ -104,21 +110,20 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
   // Private → memref.alloca (per-thread register/stack storage)
   //
   // IMPORTANT: memref.alloca with a private address space is only valid *inside*
-  // a GPU kernel (an scf.forall that maps to GPU blocks/threads).  If the
+  // a GPU kernel (an scf.forall that maps to GPU blocks/threads). If the
   // builder insertion point is at function scope (outside every scf.forall),
   // the alloca would appear between kernels — which is illegal because there is
   // no active GPU thread to own the private storage at host scope.
   //
   // Defence-in-depth guard: if we are outside every scf.forall, demote this
-  // private allocation to a plain global-memory memref.alloc.  The primary
+  // private allocation to a plain global-memory memref.alloc. The primary
   // prevention is in NovaGPUInferMemorySpacePass (which now only tags private
   // for alloc_tensors nested inside kernels), but this guard catches any edge
   // cases that slip through.
   if (memSpace) {
     // Check whether the current builder insertion point is inside a kernel.
     bool insideKernel = false;
-    Operation *insertionParent =
-        builder.getInsertionBlock()->getParentOp();
+    Operation *insertionParent = builder.getInsertionBlock()->getParentOp();
     while (insertionParent) {
       if (isa<scf::ForallOp>(insertionParent)) {
         insideKernel = true;
@@ -134,34 +139,33 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
       auto globalType = MemRefType::get(memRefType.getShape(),
                                         memRefType.getElementType());
       return memref::AllocOp::create(builder, loc, globalType, dynamicSizes)
-                 .getResult();
+          .getResult();
     }
 
     auto allocType =
         MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
                         AffineMap(), privateSpace);
 
-    // GPU cannot allocate dynamic private memory (illegal on NVIDIA with PTX < 7.3)
-    // If we have dynamic dimensions, allocate a conservative static size instead
+    // GPU cannot allocate dynamic private memory (illegal on NVIDIA with PTX < 7.3).
+    // If we have dynamic dimensions, allocate a conservative static size instead.
     if (!dynamicSizes.empty()) {
-      // Convert dynamic dimensions to static using maximum thread tile size
       SmallVector<int64_t> staticShape;
       for (int d = 0; d < memRefType.getRank(); ++d) {
         if (memRefType.isDynamicDim(d)) {
-          // Use conservative maximum: 4 (standard thread tile size)
-          // This matches the thread-level tiling configuration used in NovaGPUApplyTilingLevelThreadPass
+          // Use conservative maximum: 4 (standard thread tile size).
+          // This matches the thread-level tiling configuration used in
+          // NovaGPUApplyTilingLevelThreadPass.
           staticShape.push_back(4);
         } else {
           staticShape.push_back(memRefType.getDimSize(d));
         }
       }
-
       auto staticAllocType =
           MemRefType::get(staticShape, memRefType.getElementType(),
                           AffineMap(), privateSpace);
-      // Create allocation without dynamic sizes - bufferization will handle subview
       SmallVector<Value> emptyDynamicSizes;
-      return memref::AllocaOp::create(builder, loc, staticAllocType, emptyDynamicSizes)
+      return memref::AllocaOp::create(builder, loc, staticAllocType,
+                                      emptyDynamicSizes)
           .getResult();
     }
 
@@ -175,17 +179,21 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
       .getResult();
 }
 
-// Helper: true when the memref is in GPU workgroup (shared) address space.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Returns true when the memref is in GPU workgroup (shared) address space.
 static bool isWorkgroupMemref(MemRefType t) {
   auto space = dyn_cast_or_null<gpu::AddressSpaceAttr>(t.getMemorySpace());
   return space &&
          space.getValue() == gpu::GPUDialect::getWorkgroupAddressSpace();
 }
 
+// ---------------------------------------------------------------------------
 // GPU copy function — mirrors IREE's defaultMemCpyFn.
 //
-// Emits a linalg.copy op instead of memref.copy. This is critical for GPU
-// kernels:
+// Emits linalg.copy inside GPU kernels (scf.forall), memref.copy on the host.
 //
 //   memref.copy → FinalizeMemRefToLLVM emits llvm.call @memrefCopy (a HOST
 //                 runtime symbol) which does not exist inside a gpu.func.
@@ -196,18 +204,12 @@ static bool isWorkgroupMemref(MemRefType t) {
 //                 compile cleanly to PTX load/store instructions inside the
 //                 kernel. This is exactly how IREE handles padding copies.
 //
-// NOTE: gpu.barrier is NOT inserted here for the same reason as before
-// ("unknown memory side effects" break OneShotBufferize analysis).
-// Barriers around workgroup memory copies are inserted post-bufferization
+// NOTE: gpu.barrier is NOT inserted here — "unknown memory side effects"
+// break OneShotBufferize analysis. Barriers are inserted post-bufferization
+// by NovaGPUInsertWorkgroupBarriersPass.
+// ---------------------------------------------------------------------------
 static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
                                Value to) {
-  // If we are inside an scf.forall (which will be lowered to a GPU kernel),
-  // we use linalg.copy. This is expanded into scf.for + memref.load/store
-  // loops that compile cleanly to PTX load/store instructions.
-  //
-  // Outside scf.forall (host side), we use memref.copy, which can be
-  // efficiently handled by the host runtime or lowered to specialized
-  // host-side copy routines.
   Operation *parent = builder.getInsertionBlock()->getParentOp();
   bool insideForall = false;
   while (parent) {
@@ -221,19 +223,22 @@ static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
   if (insideForall) {
     if (auto memRefType = llvm::dyn_cast<MemRefType>(from.getType())) {
       if (memRefType.getRank() == 0) {
-        // Only hoist if `from` is defined OUTSIDE the scf.forall loop.
+        // Scalar (rank-0) copy: hoist the load outside the forall if `from`
+        // is defined outside the kernel, then store inside.
         bool isDefinedOutside = true;
         if (Operation *defOp = from.getDefiningOp()) {
-          if (parent->isAncestor(defOp)) isDefinedOutside = false;
+          if (parent->isAncestor(defOp))
+            isDefinedOutside = false;
         } else if (auto arg = llvm::dyn_cast<BlockArgument>(from)) {
-          if (parent->isAncestor(arg.getOwner()->getParentOp())) isDefinedOutside = false;
+          if (parent->isAncestor(arg.getOwner()->getParentOp()))
+            isDefinedOutside = false;
         }
 
         if (isDefinedOutside) {
           Value scalarInit;
           {
             OpBuilder::InsertionGuard guard(builder);
-            builder.setInsertionPoint(parent); // parent is the scf::ForallOp
+            builder.setInsertionPoint(parent);
             scalarInit = builder.create<memref::LoadOp>(loc, from);
           }
           builder.create<memref::StoreOp>(loc, scalarInit, to);
@@ -263,28 +268,28 @@ struct NovaGPUComprehensiveBufferizePass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<affine::AffineDialect, bufferization::BufferizationDialect,
-                    gpu::GPUDialect, linalg::LinalgDialect, memref::MemRefDialect,
-                    nova::NovaDialect, scf::SCFDialect>();
+                    gpu::GPUDialect, linalg::LinalgDialect,
+                    memref::MemRefDialect, nova::NovaDialect, scf::SCFDialect>();
   }
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
 
-    // Erase nova.fusion_barrier ops across all functions.
+    // Erase nova.fusion_barrier ops across all functions. These are pure
+    // identity ops used only to block fusion analysis during tiling; they
+    // have no bufferized form.
     IRRewriter rewriter(moduleOp.getContext());
     SmallVector<FusionBarrierOp> fusionBarriers;
-    moduleOp.walk(
-        [&](FusionBarrierOp b) { fusionBarriers.push_back(b); });
+    moduleOp.walk([&](FusionBarrierOp b) { fusionBarriers.push_back(b); });
     for (FusionBarrierOp b : fusionBarriers)
       rewriter.replaceOp(b, b.getSource());
 
-    // Erase nova.value_barrier ops — these are tensor-level synchronization
-    // markers generated by LowerBarrierRegion. At the memref level, the
-    // actual gpu.barrier synchronization is inserted post-bufferization
-    // around workgroup memory accesses.
+    // Erase nova.value_barrier ops — tensor-level synchronization markers
+    // generated by LowerBarrierRegion. At the memref level, actual
+    // gpu.barrier synchronization is inserted post-bufferization around
+    // workgroup memory accesses by NovaGPUInsertWorkgroupBarriersPass.
     SmallVector<ValueBarrierOp> valueBarriers;
-    moduleOp.walk(
-        [&](ValueBarrierOp b) { valueBarriers.push_back(b); });
+    moduleOp.walk([&](ValueBarrierOp b) { valueBarriers.push_back(b); });
     for (ValueBarrierOp b : valueBarriers)
       rewriter.replaceOp(b, b.getInputs());
 
@@ -302,8 +307,7 @@ struct NovaGPUComprehensiveBufferizePass
     opts.checkParallelRegions = false;
 
     bufferization::BufferizationState bufState;
-    if (failed(
-            bufferization::runOneShotBufferize(moduleOp, opts, bufState))) {
+    if (failed(bufferization::runOneShotBufferize(moduleOp, opts, bufState))) {
       moduleOp.emitOpError("GPU-aware bufferization failed");
       return signalPassFailure();
     }
@@ -329,10 +333,24 @@ void registerNovaGPUComprehensiveBufferizePass() {
 
 // ---------------------------------------------------------------------------
 // Post-bufferization barrier insertion pass
-// Walks memref.copy ops and inserts gpu.barrier before/after copies
-// involving workgroup (shared) memory. This must run AFTER bufferization
-// because gpu.barrier has "unknown side effects" that break
-// OneShotBufferize analysis.
+//
+// Walks gpu.launch bodies and inserts nvvm.barrier0 at workgroup memory
+// write→read transitions. Must run AFTER bufferization because nvvm.barrier0
+// has "unknown side effects" that break OneShotBufferize analysis.
+//
+// Strategy:
+//   insertBarriersInBlock walks ANY block recursively (gpu.launch body or
+//   scf.for body) and detects write→read transitions at every level.
+//   This ensures transitions at the top-level launch block (outside any
+//   scf.for) are not missed — a gap present in approaches that only walk
+//   scf.for bodies.
+//
+//   scf.if branches are intentionally NOT recursed into: nvvm.barrier0
+//   requires ALL threads in the workgroup to reach it. Inserting a barrier
+//   inside a non-uniform conditional (e.g. `if thread_id < 64`) causes
+//   deadlock. The parent-level scan treats the entire scf.if as one unit:
+//   if it contains workgroup loads, the barrier is placed before the
+//   scf.if op itself, where all threads execute.
 // ---------------------------------------------------------------------------
 
 /// Returns true if `op` (or any op nested inside it) performs a non-atomic
@@ -398,7 +416,8 @@ struct NovaGPUInsertWorkgroupBarriersPass
       const NovaGPUInsertWorkgroupBarriersPass &) = default;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect,NVVM::NVVMDialect>();
+    registry.insert<gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect,
+                    NVVM::NVVMDialect>();
   }
 
   void runOnOperation() override {
@@ -406,7 +425,9 @@ struct NovaGPUInsertWorkgroupBarriersPass
     OpBuilder builder(funcOp.getContext());
 
     // Walk each gpu.launch body. insertBarriersInBlock recurses into
-    // scf.for bodies itself, so a single top-level call per launch suffices.
+    // scf.for bodies itself, so a single top-level call per launch suffices
+    // and correctly handles transitions both at the launch-body level and
+    // inside any nested loops.
     funcOp.walk([&](gpu::LaunchOp launchOp) {
       Region &launchRegion = launchOp.getBody();
       for (Block &block : launchRegion)
@@ -414,7 +435,7 @@ struct NovaGPUInsertWorkgroupBarriersPass
     });
 
     // Handle any memref.copy ops involving workgroup memory that remain
-    // un-lowered after bufferization.
+    // un-lowered after bufferization. Wrap each with a barrier on both sides.
     funcOp.walk([&](memref::CopyOp copyOp) {
       bool needsBarrier =
           isWorkgroupMemref(cast<MemRefType>(copyOp.getSource().getType())) ||
@@ -428,30 +449,24 @@ struct NovaGPUInsertWorkgroupBarriersPass
     });
   }
 
-  /// Walk the ops in `body` and insert nvvm.barrier0 at workgroup memory
-  /// write → read transitions. Recurses into scf.for bodies only.
+  /// Walk the ops in `block` and insert nvvm.barrier0 at workgroup memory
+  /// write→read transitions. Recurses into scf.for bodies only.
   ///
-  /// scf.if branches are intentionally NOT recursed into: nvvm.barrier0
-  /// requires ALL threads in the block to reach it. Inserting a barrier
-  /// inside a non-uniform conditional (e.g. `if thread_id < 64`) causes
-  /// deadlock because the remaining threads never arrive at the barrier.
-  /// Instead the parent-level scan treats the entire scf.if as one unit:
-  /// if it contains workgroup loads, the barrier is placed before the
-  /// scf.if op itself, where all threads execute.
-  void insertBarriersInBlock(OpBuilder &builder, Block *body) {
+  /// scf.if branches are intentionally NOT recursed into — see class comment.
+  void insertBarriersInBlock(OpBuilder &builder, Block *block) {
     SmallVector<Operation *> barrierPoints;
     bool seenWorkgroupStore = false;
     bool seenNonAtomicStore = false;
 
-    for (Operation &op : body->getOperations()) {
+    for (Operation &op : block->getOperations()) {
       if (isa<scf::YieldOp, gpu::TerminatorOp>(op))
         continue;
 
       bool hasLoads  = hasWorkgroupLoads(&op);
       bool hasStores = hasWorkgroupStores(&op);
 
-      // Write → read transition: place barrier before the reading op so
-      // all threads see completed stores before any thread proceeds to load.
+      // Write→read transition: place barrier before the reading op so all
+      // threads see completed stores before any thread proceeds to load.
       if (seenWorkgroupStore && hasLoads) {
         barrierPoints.push_back(&op);
         seenWorkgroupStore = false;
@@ -469,12 +484,12 @@ struct NovaGPUInsertWorkgroupBarriersPass
         insertBarriersInBlock(builder, forOp.getBody());
     }
 
-    // Tail barrier: protect the next loop iteration from reading shared
-    // memory before this iteration's non-atomic stores are globally visible.
+    // Tail barrier: protect the next loop iteration from reading shared memory
+    // before this iteration's non-atomic stores are globally visible.
     // Only needed inside a loop (scf.yield terminator). At gpu.launch level
-    // (gpu.terminator) there is no next iteration so no tail barrier.
-    if (seenNonAtomicStore && isa<scf::YieldOp>(body->getTerminator()))
-      barrierPoints.push_back(body->getTerminator());
+    // (gpu.terminator) there is no next iteration, so no tail barrier needed.
+    if (seenNonAtomicStore && isa<scf::YieldOp>(block->getTerminator()))
+      barrierPoints.push_back(block->getTerminator());
 
     // Insert in reverse order to preserve iterator validity.
     for (Operation *pt : llvm::reverse(barrierPoints)) {
@@ -487,7 +502,7 @@ struct NovaGPUInsertWorkgroupBarriersPass
     return "nova-gpu-insert-workgroup-barriers";
   }
   StringRef getDescription() const override {
-    return "Inserts gpu.barrier at workgroup memory write→read transitions "
+    return "Inserts nvvm.barrier0 at workgroup memory write→read transitions "
            "inside gpu.launch bodies. Runs post-bufferization.";
   }
 };
