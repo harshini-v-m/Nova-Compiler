@@ -129,7 +129,7 @@ def Nova_CompareOp:Op<Nova_Dialect,"compare",[Pure,DeclareOpInterfaceMethods<Inf
  ];
  let skipDefaultBuilders=1;
   let hasVerifier=1;
-  let hasCanonicalizer=1; 
+
   let extraClassDeclaration = [{
   }];
 
@@ -607,7 +607,6 @@ class Nova_BinaryOp<string mnemonic, list<Trait> commonTraits = []>:
     $lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) 
   }];
 
-  let hasCanonicalizer = 1;
   let hasVerifier = 1;
 
   let extraClassDeclaration = [{
@@ -711,7 +710,6 @@ def Nova_MinOp : Nova_BinaryOp<"min", [Commutative,NoComplexOperands]> {
 }
 
 def Nova_AndOp : Nova_BinaryOp<"and", [Commutative,NoComplexOperands]> {
-  let hasCanonicalizer = 1;
   let summary = "Elementwise logical AND";
   let description = [{
     Performs element-wise logical AND operation on tensors.
@@ -723,7 +721,6 @@ def Nova_AndOp : Nova_BinaryOp<"and", [Commutative,NoComplexOperands]> {
 }
 
 def Nova_OrOp : Nova_BinaryOp<"or", [Commutative,NoComplexOperands]> {
-  let hasCanonicalizer = 1;
   let summary = "Elementwise logical OR";
   let description = [{
     Performs element-wise logical OR operation on tensors.
@@ -735,7 +732,6 @@ def Nova_OrOp : Nova_BinaryOp<"or", [Commutative,NoComplexOperands]> {
 }
 
 def Nova_XorOp : Nova_BinaryOp<"xor", [Commutative,NoComplexOperands]> {
-  let hasCanonicalizer = 1;
   let summary = "Elementwise logical XOR";
   let description = [{
     Performs element-wise logical XOR operation on tensors.

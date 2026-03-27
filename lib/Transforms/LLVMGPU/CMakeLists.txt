@@ -5,6 +5,7 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaGPUPadOperands.cpp
   NovaGPUPromoteMatmulOperands.cpp
   SCFScalarizeAccumulator.cpp
+  NovaWarpShuffleReduction.cpp
   LoopSplit.cpp
   NovaScfLoopUnroll.cpp
   NovaScfLoopVectorize.cpp

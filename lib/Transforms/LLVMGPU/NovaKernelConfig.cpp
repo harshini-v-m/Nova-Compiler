@@ -464,15 +464,47 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
     // No loops at all (e.g., rank-0 fill). Nothing to tile.
   } else if (parallelDims.empty() && !reductionDims.empty()) {
     // Full reduction (all dims are reduction, no parallel dims).
-    unsigned innerRedDim = reductionDims.back();
-    int64_t innerRedSize = loopBounds[innerRedDim];
-    int64_t numThreads = std::min(innerRedSize, (int64_t)(8 * kWarpSize));
-    while (numThreads > 1 && innerRedSize % numThreads != 0)
-      numThreads /= 2;
-    int64_t redThreadTile = innerRedSize / numThreads;
-    threadTiles[innerRedDim] = redThreadTile;
+    // Distribute one reduction dim across 32 threads (one warp) using
+    // partial reduction. The thread tiling pass uses
+    // PartialReductionOuterParallel to correctly split + merge partials,
+    // and NovaWarpShuffleReduction converts the merge into shfl.bfly.
+    constexpr int64_t kWarpThreads = 32;
+
+    // Score each reduction dim: maximize thread count, then minimize
+    // threadTile (prefer threadTile=1 so each thread's slice is trivial
+    // along the split dim — avoids inner-reduction edge cases in
+    // PartialReductionOuterParallel).
+    unsigned bestRedDim = reductionDims[0];
+    int64_t bestNumThreads = 0;
+    int64_t bestThreadTile = INT64_MAX;
     for (unsigned dim : reductionDims) {
-      if (dim == innerRedDim) continue;
+      int64_t bound = loopBounds[dim];
+      int64_t nt = std::min(kWarpThreads, bound);
+      while (nt > 1 && bound % nt != 0)
+        nt /= 2;
+      int64_t tt = (nt > 1) ? bound / nt : bound;
+      if (nt > bestNumThreads ||
+          (nt == bestNumThreads && tt < bestThreadTile)) {
+        bestRedDim = dim;
+        bestNumThreads = nt;
+        bestThreadTile = tt;
+      }
+    }
+
+    if (bestNumThreads > 1) {
+      threadTiles[bestRedDim] = bestThreadTile;
+      workgroupTiles[bestRedDim] = loopBounds[bestRedDim];
+    } else {
+      // Dim too small to parallelize — keep it sequential.
+      int64_t bound = loopBounds[bestRedDim];
+      if (bound % 4 == 0) reductionTiles[bestRedDim] = 4;
+      else if (bound % 2 == 0) reductionTiles[bestRedDim] = 2;
+      else reductionTiles[bestRedDim] = 1;
+    }
+
+    // Remaining reduction dims stay sequential.
+    for (unsigned dim : reductionDims) {
+      if (dim == bestRedDim) continue;
       int64_t bound = loopBounds[dim];
       if (bound % 4 == 0) reductionTiles[dim] = 4;
       else if (bound % 2 == 0) reductionTiles[dim] = 2;

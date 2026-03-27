@@ -39,6 +39,13 @@ constexpr llvm::StringLiteral kPromotedOpsKey   = "promoted_operands";
 constexpr llvm::StringLiteral kPaddingKey       = "padding";
 constexpr llvm::StringLiteral kDerivedThreadKey = "derived_thread";
 constexpr llvm::StringLiteral kTargetThreadsKey = "target_threads";
+/// Marker attribute placed on linalg.copy ops created by promoteOperandToShared.
+/// InferMemorySpace uses this to unconditionally classify the copy destination
+/// as workgroup memory, bypassing the isCrossThreadAccess heuristic which cannot
+/// detect cross-thread reads when the matmul consumes the copy result as an input
+/// (rather than a DPS init).  Survives K-tiling and Thread-tiling because MLIR's
+/// tiling infrastructure clones op attributes onto tiled successors.
+constexpr llvm::StringLiteral kPromoteToWorkgroupAttr = "nova.promote_to_workgroup";
 
 // Attribute name attached to linalg ops for the config dict.
 constexpr llvm::StringLiteral kLoweringConfigAttrName = "lowering_config";

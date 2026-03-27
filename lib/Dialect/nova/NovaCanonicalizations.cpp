@@ -56,86 +56,6 @@ void ReduceOp::getCanonicalizationPatterns(RewritePatternSet &results,
 namespace {
 
 //===----------------------------------------------------------------------===//
-// Broadcast Insertion Pattern (Generic for all binary ops)
-//===----------------------------------------------------------------------===//
-
-template <typename OpType>
-struct InsertBroadcastPattern : public OpRewritePattern<OpType> {
-  using OpRewritePattern<OpType>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(OpType op,
-                                PatternRewriter &rewriter) const override {
-    auto lhsType = dyn_cast<RankedTensorType>(op.getLhs().getType());
-    auto rhsType = dyn_cast<RankedTensorType>(op.getRhs().getType());
-    auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
-
-    if (!lhsType || !rhsType || !resultType) {
-      return failure();
-    }
-
-    if (lhsType.getShape() == resultType.getShape() &&
-        rhsType.getShape() == resultType.getShape()) {
-      return failure();
-    }
-
-    Value newLhs = op.getLhs();
-    Value newRhs = op.getRhs();
-    bool changed = false;
-
-    if (lhsType.getShape() != resultType.getShape()) {
-      if (lhsType.getRank() > resultType.getRank()) {
-        return failure();
-      }
-      if (!isBroadcastCompatible(lhsType.getShape(), resultType.getShape())) {
-        return failure();
-      }
-
-      auto broadcastDims =
-          computeBroadcastDimensions(lhsType.getRank(), resultType.getRank());
-
-      auto broadcastDimsAttr = rewriter.getI64ArrayAttr(broadcastDims);
-      auto restype = resultType.clone(lhsType.getElementType());
-
-      newLhs = rewriter
-                   .create<BroadcastInDimOp>(op.getLoc(), restype, newLhs,
-                                             broadcastDimsAttr)
-                   .getResult();
-      changed = true;
-    }
-
-    if (rhsType.getShape() != resultType.getShape()) {
-      if (rhsType.getRank() > resultType.getRank()) {
-        return failure();
-      }
-      if (!isBroadcastCompatible(rhsType.getShape(), resultType.getShape())) {
-        return failure();
-      }
-
-      auto broadcastDims =
-          computeBroadcastDimensions(rhsType.getRank(), resultType.getRank());
-
-      auto broadcastDimsAttr = rewriter.getI64ArrayAttr(broadcastDims);
-      // here instead of creating the op with result type we should
-      // make thedata type of rhs to rhs itself
-      auto restype = resultType.clone(rhsType.getElementType());
-      newRhs = rewriter
-                   .create<BroadcastInDimOp>(op.getLoc(), restype, newRhs,
-                                             broadcastDimsAttr)
-                   .getResult();
-      changed = true;
-    }
-
-    if (!changed) {
-      return failure();
-    }
-
-    rewriter.replaceOpWithNewOp<OpType>(op, op.getResult().getType(), newLhs,
-                                        newRhs);
-    return success();
-  }
-};
-
-//===----------------------------------------------------------------------===//
 // Cast Insertion Pattern (Generic for binary ops)
 //===----------------------------------------------------------------------===//
 template <typename OpType>
@@ -422,36 +342,72 @@ struct EliminateSubSelf : public OpRewritePattern<SubOp> {
 // MulOp Canonicalization Patterns
 //===----------------------------------------------------------------------===//
 
-/// Eliminate A * 1 -> A
+/// Eliminate A * 1 -> A (or broadcast(A) when shapes differ)
+/// Handles: nova.constant, arith.constant, and broadcast_in_dim(constant)
 struct EliminateMulOne : public OpRewritePattern<MulOp> {
   using OpRewritePattern<MulOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(MulOp op,
                                 PatternRewriter &rewriter) const override {
-    // Check RHS for constant 1
-    if (auto rhsDefOp = op.getRhs().getDefiningOp<arith::ConstantOp>()) {
-      if (auto denseAttr = dyn_cast<DenseElementsAttr>(rhsDefOp.getValue())) {
-        if (denseAttr.isSplat() && isSplatOne(denseAttr)) {
-          rewriter.replaceOp(op, op.getLhs());
-          return success();
-        }
-      }
+    auto resultType = llvm::dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+
+    // Identify which operand is the constant-one and which is the "real" value
+    Value kept;
+    if (isConstantOne(op.getRhs()))
+      kept = op.getLhs();
+    else if (isConstantOne(op.getLhs()))
+      kept = op.getRhs();
+    else
+      return failure();
+
+    auto keptType = llvm::dyn_cast<RankedTensorType>(kept.getType());
+    if (!keptType)
+      return failure();
+
+    // Same shape: just drop the multiply
+    if (keptType.getShape() == resultType.getShape()) {
+      rewriter.replaceOp(op, kept);
+      return success();
     }
 
-    // Check LHS for constant 1
-    if (auto lhsDefOp = op.getLhs().getDefiningOp<arith::ConstantOp>()) {
-      if (auto denseAttr = dyn_cast<DenseElementsAttr>(lhsDefOp.getValue())) {
-        if (denseAttr.isSplat() && isSplatOne(denseAttr)) {
-          rewriter.replaceOp(op, op.getRhs());
-          return success();
-        }
-      }
-    }
+    // Different shapes: the multiply was acting as a broadcast.
+    // Replace with an explicit broadcast_in_dim.
+    // Map each dim of the kept operand to the corresponding trailing dim
+    // of the result (numpy-style broadcast alignment).
+    int64_t keptRank = keptType.getRank();
+    int64_t resultRank = resultType.getRank();
+    SmallVector<int64_t> dims;
+    for (int64_t i = 0; i < keptRank; ++i)
+      dims.push_back(resultRank - keptRank + i);
 
-    return failure();
+    rewriter.replaceOpWithNewOp<BroadcastInDimOp>(
+        op, resultType, kept, rewriter.getI64ArrayAttr(dims));
+    return success();
   }
 
 private:
+  bool isConstantOne(Value val) const {
+    // Look through broadcast_in_dim
+    if (auto broadcast = val.getDefiningOp<BroadcastInDimOp>())
+      val = broadcast.getOperand();
+
+    // Check nova::ConstantOp
+    if (auto novaConst = val.getDefiningOp<nova::ConstantOp>()) {
+      if (auto denseAttr = dyn_cast<DenseElementsAttr>(novaConst.getValue()))
+        return denseAttr.isSplat() && isSplatOne(denseAttr);
+    }
+
+    // Check arith::ConstantOp
+    if (auto arithConst = val.getDefiningOp<arith::ConstantOp>()) {
+      if (auto denseAttr = dyn_cast<DenseElementsAttr>(arithConst.getValue()))
+        return denseAttr.isSplat() && isSplatOne(denseAttr);
+    }
+
+    return false;
+  }
+
   bool isSplatOne(DenseElementsAttr attr) const {
     auto elementType = attr.getElementType();
 
@@ -472,37 +428,42 @@ struct EliminateMulZero : public OpRewritePattern<MulOp> {
 
   LogicalResult matchAndRewrite(MulOp op,
                                 PatternRewriter &rewriter) const override {
-    Value zeroOperand = nullptr;
+    auto resultType = llvm::dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
 
-    // Check RHS for zero constant
-    if (auto rhsDefOp = op.getRhs().getDefiningOp<arith::ConstantOp>()) {
-      if (auto denseAttr = dyn_cast<DenseElementsAttr>(rhsDefOp.getValue())) {
-        if (denseAttr.isSplat() && isSplatZero(denseAttr)) {
-          zeroOperand = op.getRhs();
-        }
-      }
-    }
+    bool hasZero = isConstantZero(op.getRhs()) || isConstantZero(op.getLhs());
+    if (!hasZero)
+      return failure();
 
-    // Check LHS for zero constant
-    if (!zeroOperand) {
-      if (auto lhsDefOp = op.getLhs().getDefiningOp<arith::ConstantOp>()) {
-        if (auto denseAttr = dyn_cast<DenseElementsAttr>(lhsDefOp.getValue())) {
-          if (denseAttr.isSplat() && isSplatZero(denseAttr)) {
-            zeroOperand = op.getLhs();
-          }
-        }
-      }
-    }
-
-    if (zeroOperand) {
-      rewriter.replaceOp(op, zeroOperand);
-      return success();
-    }
-
-    return failure();
+    // Always foldable: replace with a zero constant of the broadcast result shape
+    auto zeroAttr = DenseElementsAttr::get(
+        resultType, rewriter.getZeroAttr(resultType.getElementType()));
+    rewriter.replaceOpWithNewOp<ConstantOp>(op, resultType, zeroAttr);
+    return success();
   }
 
 private:
+  bool isConstantZero(Value val) const {
+    // Look through broadcast_in_dim
+    if (auto broadcast = val.getDefiningOp<BroadcastInDimOp>())
+      val = broadcast.getOperand();
+
+    // Check nova::ConstantOp
+    if (auto novaConst = val.getDefiningOp<nova::ConstantOp>()) {
+      if (auto denseAttr = dyn_cast<DenseElementsAttr>(novaConst.getValue()))
+        return denseAttr.isSplat() && isSplatZero(denseAttr);
+    }
+
+    // Check arith::ConstantOp
+    if (auto arithConst = val.getDefiningOp<arith::ConstantOp>()) {
+      if (auto denseAttr = dyn_cast<DenseElementsAttr>(arithConst.getValue()))
+        return denseAttr.isSplat() && isSplatZero(denseAttr);
+    }
+
+    return false;
+  }
+
   bool isSplatZero(DenseElementsAttr attr) const {
     auto elementType = attr.getElementType();
 
@@ -897,7 +858,6 @@ struct SimplifyPowConstant : public OpRewritePattern<PowOp> {
 
 void AddOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<AddOp>>(context);
   results.add<InsertCastPattern<AddOp>>(context);
   results.add<EliminateAddZero>(context);
   results.add<CombineAddConstants>(context);
@@ -906,7 +866,6 @@ void AddOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 void SubOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<SubOp>>(context);
   results.add<InsertCastPattern<SubOp>>(context);
   results.add<EliminateSubZero>(context);
   results.add<EliminateSubSelf>(context);
@@ -915,7 +874,6 @@ void SubOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 void MulOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<MulOp>>(context);
   results.add<InsertCastPattern<MulOp>>(context);
   results.add<EliminateMulOne>(context);
   results.add<EliminateMulZero>(context);
@@ -924,7 +882,6 @@ void MulOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 void DivOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<DivOp>>(context);
   results.add<InsertCastPattern<DivOp>>(context);
   results.add<EliminateDivOne>(context);
   results.add<Reciprocalsquare>(context);
@@ -933,45 +890,27 @@ void DivOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 void ModOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<ModOp>>(context);
   results.add<InsertCastPattern<ModOp>>(context);
 }
 
 void PowOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<PowOp>>(context);
   results.add<InsertCastPattern<PowOp>>(context);
   results.add<SimplifyPowConstant>(context);
 }
 
 void MaxOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<MaxOp>>(context);
   results.add<InsertCastPattern<MaxOp>>(context);
   results.add<SimplifyMaxSelf>(context);
 }
 
 void MinOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.add<InsertBroadcastPattern<MinOp>>(context);
   results.add<InsertCastPattern<MinOp>>(context);
   results.add<SimplifyMinSelf>(context);
 }
 
-void AndOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                        MLIRContext *context) {
-  results.add<InsertBroadcastPattern<AndOp>>(context);
-}
-
-void OrOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                       MLIRContext *context) {
-  results.add<InsertBroadcastPattern<OrOp>>(context);
-}
-
-void XorOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                        MLIRContext *context) {
-  results.add<InsertBroadcastPattern<XorOp>>(context);
-}
 void NegOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
   results.add<IdentityNeg>(context);
@@ -998,81 +937,3 @@ void ReciprocalOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.add<SimplifyReciprocalReciprocal>(context);
 }
 
-struct InsertBroadcastPatterncompare : public OpRewritePattern<CompareOp> {
-  using OpRewritePattern<CompareOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(CompareOp op,
-                                PatternRewriter &rewriter) const override {
-    auto lhsType = dyn_cast<RankedTensorType>(op.getLhs().getType());
-    auto rhsType = dyn_cast<RankedTensorType>(op.getRhs().getType());
-    auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
-    nova::ComparisonType compareType = op.getKind();
-    if (!lhsType || !rhsType || !resultType) {
-      return failure();
-    }
-
-    if (lhsType.getShape() == resultType.getShape() &&
-        rhsType.getShape() == resultType.getShape()) {
-      return failure();
-    }
-
-    Value newLhs = op.getLhs();
-    Value newRhs = op.getRhs();
-    bool changed = false;
-
-    if (lhsType.getShape() != resultType.getShape()) {
-      if (lhsType.getRank() > resultType.getRank()) {
-        return failure();
-      }
-      if (!isBroadcastCompatible(lhsType.getShape(), resultType.getShape())) {
-        return failure();
-      }
-
-      auto broadcastDims =
-          computeBroadcastDimensions(lhsType.getRank(), resultType.getRank());
-
-      auto broadcastDimsAttr = rewriter.getI64ArrayAttr(broadcastDims);
-      auto restype = resultType.clone(lhsType.getElementType());
-
-      newLhs = rewriter
-                   .create<BroadcastInDimOp>(op.getLoc(), restype, newLhs,
-                                             broadcastDimsAttr)
-                   .getResult();
-      changed = true;
-    }
-
-    if (rhsType.getShape() != resultType.getShape()) {
-      if (rhsType.getRank() > resultType.getRank()) {
-        return failure();
-      }
-      if (!isBroadcastCompatible(rhsType.getShape(), resultType.getShape())) {
-        return failure();
-      }
-
-      auto broadcastDims =
-          computeBroadcastDimensions(rhsType.getRank(), resultType.getRank());
-
-      auto broadcastDimsAttr = rewriter.getI64ArrayAttr(broadcastDims);
-      // here instead of creating the op with result type we should
-      // make thedata type of rhs to rhs itself
-      auto restype = resultType.clone(rhsType.getElementType());
-      newRhs = rewriter
-                   .create<BroadcastInDimOp>(op.getLoc(), restype, newRhs,
-                                             broadcastDimsAttr)
-                   .getResult();
-      changed = true;
-    }
-
-    if (!changed) {
-      return failure();
-    }
-
-    rewriter.replaceOpWithNewOp<CompareOp>(op, op.getResult().getType(), newLhs,
-                                           newRhs, compareType);
-    return success();
-  }
-};
-void CompareOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                            MLIRContext *context) {
-  results.add<InsertBroadcastPatterncompare>(context);
-}

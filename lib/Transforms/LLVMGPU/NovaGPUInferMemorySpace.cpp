@@ -39,6 +39,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Passes.h"
+#include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -267,6 +268,59 @@ static bool isAtWorkgroupScope(bufferization::AllocTensorOp alloc) {
 }
 
 //===----------------------------------------------------------------------===//
+// isPromotedInputDest
+//
+// Returns true if alloc is the destination of a promoted-input copy, i.e. a
+// copy created by promoteOperandToShared and marked "nova.promote_to_workgroup".
+//
+// Two structural patterns are handled:
+//
+//   Pattern A — after Thread-tiling (normal pipeline path):
+//     alloc_tensor is a shared_out of a thread-mapped scf.forall, and
+//     the forall body contains a linalg.copy{nova.promote_to_workgroup}.
+//     This is the cooperative-loading tile: K-tiling already shrunk the copy
+//     to [wgM × kStep] and thread-tiling distributed it into the forall.
+//
+//   Pattern B — before Thread-tiling (defensive fallback):
+//     alloc_tensor is the direct DPS init of a linalg.copy{nova.promote_to_workgroup}.
+//     This path is unlikely in the full pipeline but is handled for robustness.
+//
+// Motivation: isCrossThreadAccess cannot detect cross-thread reads when the
+// consumer (linalg.matmul) uses the copy result as an *input* operand rather
+// than a DPS init. isAtWorkgroupScope compensates in the common case, but
+// fails for single-workgroup dispatches (no enclosing workgroup forall) and
+// for allocs hoisted to function scope by CSE. The explicit marker is reliable.
+//===----------------------------------------------------------------------===//
+
+static bool isPromotedInputDest(bufferization::AllocTensorOp alloc) {
+  for (Operation *user : alloc.getResult().getUsers()) {
+    // Pattern B: direct DPS init of a promoted copy (pre-Thread-tiling).
+    if (auto copyOp = dyn_cast<linalg::CopyOp>(user)) {
+      if (copyOp->hasAttr(kPromoteToWorkgroupAttr))
+        return true;
+    }
+    // Pattern A: shared_out of a thread-forall that contains a promoted copy.
+    auto forallOp = dyn_cast<scf::ForallOp>(user);
+    if (!forallOp || !hasThreadMapping(forallOp))
+      continue;
+    bool isSharedOut = llvm::any_of(forallOp.getOutputs(), [&](Value out) {
+      return out == alloc.getResult();
+    });
+    if (!isSharedOut)
+      continue;
+    // Walk the forall body looking for a promoted copy.
+    bool found = false;
+    forallOp.walk([&](linalg::CopyOp copy) {
+      if (copy->hasAttr(kPromoteToWorkgroupAttr))
+        found = true;
+    });
+    if (found)
+      return true;
+  }
+  return false;
+}
+
+//===----------------------------------------------------------------------===//
 // findScopeBlock
 //
 // Walks the parent-op chain from `op` upward to find the body Block of the
@@ -447,6 +501,25 @@ struct NovaGPUInferMemorySpacePass
       if (isCrossWorkgroupUsed(alloc))
         return; // leave untagged → global
 
+      // ── Promoted-input-copy destination: force workgroup ───────────────
+      // Input operands promoted by promoteOperandToShared are marked with
+      // "nova.promote_to_workgroup" on the linalg.copy. Classify their
+      // destination unconditionally as workgroup to avoid relying on the
+      // isCrossThreadAccess heuristic, which misses the pattern where the
+      // matmul reads the copy result as an input (not a DPS init).
+      if (isPromotedInputDest(alloc)) {
+        alloc.setMemorySpaceAttr(workgroupSpace);
+        int64_t b = allocBytes(alloc);
+        if (b > 0) {
+          preCommittedBytes[scopeBlock] += b;
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[" DEBUG_TYPE "]  promoted-input workgroup bytes=" << b
+                     << "  scope running=" << preCommittedBytes[scopeBlock]
+                     << "\n");
+        }
+        return;
+      }
+
       // ── Tier 1: private ───────────────────────────────────────────────
       bool threadLocal = !isCrossThreadAccess(alloc) &&
                          !isAtWorkgroupScope(alloc);
@@ -499,6 +572,17 @@ struct NovaGPUInferMemorySpacePass
                    << "[" DEBUG_TYPE "]  WARNING: effectiveBudget exhausted by"
                       " phantom/pre-committed bytes (" << effectiveBudget
                    << " B); all candidates will be demoted to global.\n");
+        // Emit a compiler diagnostic so the user sees the overflow.
+        if (it != scopeToForall.end()) {
+          it->second.emitWarning()
+              << "[nova-gpu-infer-memory-space] workgroup SRAM budget "
+                 "exhausted: pre-committed="
+              << preCommitted << " B + phantom=" << phantomBytes
+              << " B = " << (preCommitted + phantomBytes)
+              << " B exceeds 48 KB limit. All remaining Tier-2 candidates "
+                 "will fall back to global memory. Reduce tile sizes or "
+                 "the number of promoted operands.";
+        }
       }
 
       // Separate dynamic from static candidates.

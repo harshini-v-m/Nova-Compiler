@@ -196,6 +196,13 @@ static void promoteOperandToShared(OpBuilder &builder,
   }
   setLoweringConfig(copyOp, DictionaryAttr::get(ctx, attrs));
 
+  // Mark this copy as a promoted-input copy so InferMemorySpace can
+  // unconditionally classify its destination as workgroup memory.
+  // The marker survives K-tiling and Thread-tiling because MLIR clones
+  // preserve all op attributes on tiled successors.
+  copyOp->setAttr(StringAttr::get(ctx, kPromoteToWorkgroupAttr),
+                  UnitAttr::get(ctx));
+
   // Replace the operand with the copy result.
   op->setOperand(dpsOp.getDpsInputOperand(inputIdx)->getOperandNumber(),
                  copyOp.getResult(0));

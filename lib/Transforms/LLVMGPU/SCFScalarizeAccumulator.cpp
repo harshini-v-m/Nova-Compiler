@@ -213,13 +213,21 @@ struct SCFScalarizeAccumulatorPass
         isShared = true;
     }
 
-    // Pick the atomic kind by inspecting the arithmetic op in the body.
+    // Pick the atomic kind from the op that feeds the store (the actual
+    // reduction combiner), NOT just any arith op in the body.  For fused
+    // elementwise+reduction bodies like relu+sum the body contains both
+    // maxnumf (relu) and addf (sum); picking the first one gives the wrong
+    // atomic kind.
     arith::AtomicRMWKind atomicKind = arith::AtomicRMWKind::addf;
-    for (auto &op : bodyOps) {
-      if (isa<arith::AddFOp>(op))       { atomicKind = arith::AtomicRMWKind::addf;     break; }
-      if (isa<arith::MulFOp>(op))       { atomicKind = arith::AtomicRMWKind::mulf;     break; }
-      if (isa<arith::MaxNumFOp>(op))    { atomicKind = arith::AtomicRMWKind::maximumf; break; }
-      if (isa<arith::MinNumFOp>(op))    { atomicKind = arith::AtomicRMWKind::minimumf; break; }
+    if (Operation *storeValDef = storeOp.getValueToStore().getDefiningOp()) {
+      if (isa<arith::AddFOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::addf;
+      else if (isa<arith::MulFOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::mulf;
+      else if (isa<arith::MaxNumFOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::maximumf;
+      else if (isa<arith::MinNumFOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::minimumf;
     }
 
     // Look for an initialisation store immediately before the loop.

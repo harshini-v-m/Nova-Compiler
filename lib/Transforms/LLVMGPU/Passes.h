@@ -180,6 +180,9 @@ std::unique_ptr<Pass> createNovaGPUPromoteGlobalsToSharedPass();
 void registerNovaGPUPromoteGlobalsToSharedPass();
 
 
+std::unique_ptr<Pass> createNovaWarpShuffleReductionPass();
+void registerNovaWarpShuffleReductionPass();
+
 std::unique_ptr<Pass> createNovaGPUFillCopyForwardingPass();
 void registerNovaGPUFillCopyForwardingPass();
 

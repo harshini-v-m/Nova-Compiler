@@ -363,6 +363,13 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
+    // Warp butterfly shuffle: replace double-atomic reduction patterns
+    // (which over-count by N×) with register-based shuffle + thread-0 write.
+    pm.addNestedPass<func::FuncOp>(
+        mlir::nova::createNovaWarpShuffleReductionPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
     pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
     pm.addPass(createCanonicalizerPass());
 
@@ -371,7 +378,7 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopUnrollPass(2));
+    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopUnrollPass(4));
     // pm.addPass(createCanonicalizerPass());
     // pm.addPass(createCSEPass());
 
@@ -541,6 +548,7 @@ namespace mlir::nova
     registerNovaConvertSharedMemAllocsPass();
     registerNovaGPUMapForallToGPUPass();
     registerNovaGPULowerMemorySpacePass();
+    registerNovaWarpShuffleReductionPass();
     registerNovaGPUFillCopyForwardingPass();
     registerNovaGPUCoalesceWorkgroupBuffersPass();
 

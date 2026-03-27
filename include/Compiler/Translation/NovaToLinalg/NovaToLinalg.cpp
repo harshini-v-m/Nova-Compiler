@@ -1579,12 +1579,12 @@ public:
 
     // Full-reduction MEAN → scf.forall (GPU block) + nested scf.for loops.
     // All other kinds and all partial reductions go through linalg.generic.
-    bool isFullReduction = (static_cast<int64_t>(axes.size()) == rank);
-    if (kind == nova::ReductionKind::MEAN && isFullReduction &&
-        isa<FloatType>(elemType)) {
-      return lowerFullReduceMeanToSCF(op, rewriter, loc, input, inputType,
-                                      resultType, elemType, rank, axes);
-    }
+    // bool isFullReduction = (static_cast<int64_t>(axes.size()) == rank);
+    // if (kind == nova::ReductionKind::MEAN && isFullReduction &&
+    //     isa<FloatType>(elemType)) {
+    //   return lowerFullReduceMeanToSCF(op, rewriter, loc, input, inputType,
+    //                                   resultType, elemType, rank, axes);
+    // }
 
     // Use linalg.generic path for everything else (partial reductions,
     // other reduction kinds, non-float MEAN, …).
