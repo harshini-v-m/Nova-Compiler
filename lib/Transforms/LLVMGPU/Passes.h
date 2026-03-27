@@ -185,6 +185,27 @@ void registerNovaGPUFillCopyForwardingPass();
 
 std::unique_ptr<Pass> createNovaGPUCoalesceWorkgroupBuffersPass();
 void registerNovaGPUCoalesceWorkgroupBuffersPass();
+
+// ---------------------------------------------------------------------------
+// Vectorization Passes
+// ---------------------------------------------------------------------------
+
+/// Vectorizes linalg operations using IREE-style Generic Vectorization.
+std::unique_ptr<Pass> createNovaGPUGenericVectorizationPass();
+void registerNovaGPUGenericVectorizationPass();
+
+/// Hoists vector transfers out of sequential loops (Subset Hoisting).
+std::unique_ptr<Pass> createNovaGPUSubsetHoistingPass();
+void registerNovaGPUSubsetHoistingPass();
+
+/// Optimized copies using 128-bit vector loads/stores.
+std::unique_ptr<Pass> createNovaGPUVectorizeMemrefCopyPass();
+void registerNovaGPUVectorizeMemrefCopyPass();
+
+/// Unrolls high-level vector ops to hardware-specific widths (FMA/MMA).
+std::unique_ptr<Pass> createNovaGPUUnrollToIntrinsicsPass();
+void registerNovaGPUUnrollToIntrinsicsPass();
+
 } // namespace nova
 } // namespace mlir
 

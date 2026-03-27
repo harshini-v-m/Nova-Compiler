@@ -7,7 +7,7 @@
 #include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
-
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/ViewOpGraph.h"
 
@@ -26,6 +26,10 @@
 #include "Compiler/Transforms/FuseMatmulBias.h"
 #include "Compiler/Transforms/Passes.h"
 
+namespace mlir::nova {
+void registerNovaLLVMGPUPasses();
+} // namespace mlir::nova
+
 #include "Compiler/Pipeline/Gpupipeline.h"
 #include "Compiler/Pipeline/Pipeline.h"
 #include "Compiler/Transforms/Affine/DependencyAnalysisTestPass.h"
@@ -33,7 +37,6 @@
 #include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 #include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
-
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
@@ -46,10 +49,6 @@
 #include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
-
-namespace mlir {
-namespace nova {}
-} // namespace mlir
 
 #include "Compiler/Transforms/AddGpuMemoryCopies.h"
 

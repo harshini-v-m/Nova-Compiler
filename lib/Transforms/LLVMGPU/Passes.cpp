@@ -103,6 +103,34 @@ namespace mlir::nova
   --------------------------------------------------
   */
 
+  // ---------------------------------------------------------------------------
+  // Vectorization Pipeline Builders
+  // ---------------------------------------------------------------------------
+
+  /// Path A: CUDA Core (Generic Vectorization)
+  void addNovaGPUVectorizationPasses(OpPassManager &pm) {
+    pm.addNestedPass<func::FuncOp>(createLinalgGeneralizeNamedOpsPass());
+    pm.addNestedPass<func::FuncOp>(createNovaGPUGenericVectorizationPass());
+    pm.addNestedPass<func::FuncOp>(createNovaGPUSubsetHoistingPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+  }
+
+  /// Path B: Tensor Core (MMA Vectorization)
+  void addNovaGPUTensorCoreVectorizationPasses(OpPassManager &pm) {
+    // 1. Pack subgroup-level tiles into hardware MMA shapes (e.g. 16x16x16)
+    // pm.addNestedPass<func::FuncOp>(createNovaGPUPackToIntrinsicsPass());
+    
+    // 2. Vectorize using generic vectorization
+    pm.addNestedPass<func::FuncOp>(createNovaGPUGenericVectorizationPass());
+    
+    // 3. Distribute MMA vectors across threads (SIMD-to-SIMT)
+    // pm.addNestedPass<func::FuncOp>(createNovaGPUVectorDistributePass());
+    
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+  }
+
   // CORE LOGIC
   void addNovaGPUOptimizedPipeline(OpPassManager &pm,
                                    StringRef cudaArch)
@@ -281,6 +309,18 @@ namespace mlir::nova
     pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
+    // Step 7.8: Vectorization (Dual-Path)
+    //
+    // For matmuls on f16/i8, uses Tensor Core (MMA) path.
+    // Otherwise falls back to Generic (CUDA Core) vectorization.
+    // -------------------------------------------------------------------------
+    if (arch.starts_with("sm_") && arch.substr(3).compare("80") >= 0) {
+      addNovaGPUTensorCoreVectorizationPasses(pm);
+    } else {
+      addNovaGPUVectorizationPasses(pm);
+    }
+
+    // -------------------------------------------------------------------------
     // Step 8: GPU-aware bufferization (tensor → memref)
     //
     // Uses NovaGPUComprehensiveBufferizePass which has a GPU-aware copy
@@ -292,6 +332,13 @@ namespace mlir::nova
     // -------------------------------------------------------------------------
     addNovaGPUBufferizePasses(pm);
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertBufferizationToMemRefPass());
+
+    // -------------------------------------------------------------------------
+    // Step 8.1: Vectorize Memref Copies
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaGPUVectorizeMemrefCopyPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
     // Step 8.5: Eliminate degenerate single-iteration foralls
@@ -500,6 +547,12 @@ namespace mlir::nova
     registerNovaGPULowerMemorySpacePass();
     registerNovaGPUFillCopyForwardingPass();
     registerNovaGPUCoalesceWorkgroupBuffersPass();
+
+    // Vectorization
+    registerNovaGPUGenericVectorizationPass();
+    registerNovaGPUSubsetHoistingPass();
+    registerNovaGPUVectorizeMemrefCopyPass();
+    registerNovaGPUUnrollToIntrinsicsPass();
 
     // Register the full optimized pipeline as a named pipeline so it can be
     // invoked from mlir-opt with --nova-gpu-optimized-pipeline.

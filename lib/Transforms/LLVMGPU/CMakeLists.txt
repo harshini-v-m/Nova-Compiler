@@ -19,6 +19,7 @@ add_mlir_library(NovaLLVMGPUTransforms
   # Phase 2: LoweringConfig read/write utilities
   NovaGPULoweringConfigUtils.cpp
   # Phase 3: NVIDIA target description table
+  NovaGPUVectorization.cpp
   NVIDIATargetUtils.cpp
   # Phase 4: Kernel config heuristic
   NovaKernelConfig.cpp

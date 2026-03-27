@@ -559,7 +559,7 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
     int64_t innerTile = std::min(bestThreads * bestVS, innerSize);
 
     workgroupTiles[innerParallelDim] = innerTile;
-    threadTiles[innerParallelDim] = vectorSize;
+    threadTiles[innerParallelDim] = 1;
 
     // Outer parallel dims: distribute the remaining thread budget inward->outward
     // so that each block handles multiple rows/slices rather than a single one.
