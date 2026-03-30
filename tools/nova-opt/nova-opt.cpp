@@ -145,8 +145,10 @@ int main(int argc, char **argv) {
   mlir::nova::registerNovaFuseReductionIntoProducerPass();
   mlir::nova::registerNovaElementwiseOpFusionPass();
   mlir::nova::registerNovaCheckInsParallelFuse();
+  mlir::nova::registerNovaMultiConsumerFusion();
   mlir::nova::registerNovaLinalgHorizontalFusionPass();
   mlir::nova::registerNovaLinalgVerticalFusionPass();
+  mlir::nova::registerNovaRepositionStorePass();
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "Nova dialect optimizer\n", registry));
