@@ -16,17 +16,10 @@ using namespace mlir;
 namespace mlir {
 namespace nova {
 
-// static bool isMemorySpaceOne(Attribute memorySpace) {
-//   if (!memorySpace)
-//     return false;
-//   if (auto intAttr = llvm::dyn_cast<IntegerAttr>(memorySpace)) {
-//     return intAttr.getInt() == 1;
-//   }
-//   if (auto novaAttr = llvm::dyn_cast<nova::NovaDeviceAttr>(memorySpace)) {
-//     return novaAttr.getValue().getValue() == "1";
-//   }
-//   return false;
-// }
+static bool isInsideGpuRegion(Operation *op) {
+  return op->getParentOfType<gpu::GPUFuncOp>() ||
+         op->getParentOfType<gpu::LaunchOp>();
+}
 
 class ConvertAllocOp : public OpRewritePattern<memref::AllocOp> {
 public:
@@ -43,7 +36,7 @@ public:
     // memref.get_global (device global memory). Converting to alloca here
     // would create per-thread stack allocations that are catastrophic for
     // large workspace buffers (e.g. 1x1024x384xf32 = 1.5 MB per thread).
-    if (op->getParentOfType<gpu::GPUFuncOp>()) {
+    if (isInsideGpuRegion(op)) {
       rewriter.replaceOpWithNewOp<memref::AllocaOp>(
           op, type, op.getDynamicSizes(), op.getSymbolOperands());
       return success();
@@ -68,7 +61,7 @@ public:
       return failure();
 
     // Inside GPU kernels: erase deallocs (alloca has automatic lifetime).
-    if (op->getParentOfType<gpu::GPUFuncOp>()) {
+    if (isInsideGpuRegion(op)) {
       rewriter.eraseOp(op);
       return success();
     }
@@ -204,8 +197,8 @@ struct ConvertMemRefToGpuPass
     //             gpu.memcpy %gpu_buf, %host
     SmallVector<memref::StoreOp> storesToFix;
     module->walk([&](memref::StoreOp store) {
-      // Only fix stores on the host side (not inside gpu.func).
-      if (store->getParentOfType<gpu::GPUFuncOp>())
+      // Only fix stores on the host side (not inside gpu.func/gpu.launch).
+      if (isInsideGpuRegion(store))
         return;
       Value target = store.getMemref();
       if (target.getDefiningOp<gpu::AllocOp>())
@@ -255,8 +248,8 @@ struct ConvertMemRefToGpuPass
     //    remains in host memory — the GPU kernel cannot dereference host
     //    pointers via ld.global, causing CUDA_ERROR_ILLEGAL_ADDRESS.
     module->walk([&](memref::GetGlobalOp getGlobal) {
-      // Only handle host-side get_globals (not inside gpu.func).
-      if (getGlobal->getParentOfType<gpu::GPUFuncOp>())
+      // Only handle host-side get_globals (not inside gpu.func/gpu.launch).
+      if (isInsideGpuRegion(getGlobal))
         return;
 
       // Check if any user is a gpu.launch_func.

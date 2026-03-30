@@ -26,9 +26,7 @@
 #include "Compiler/Transforms/FuseMatmulBias.h"
 #include "Compiler/Transforms/Passes.h"
 
-namespace mlir::nova {
-void registerNovaLLVMGPUPasses();
-} // namespace mlir::nova
+// Redundant declarations removed as they are now in Passes.h
 
 #include "Compiler/Pipeline/Gpupipeline.h"
 #include "Compiler/Pipeline/Pipeline.h"

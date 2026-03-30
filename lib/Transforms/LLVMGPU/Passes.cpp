@@ -48,6 +48,10 @@
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
+#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
 #include "Compiler/Transforms/FixGpuLaunch.h"
@@ -392,24 +396,33 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(createNovaGPUInsertWorkgroupBarriersPass());
 
     // -------------------------------------------------------------------------
-    // Step 12: Outline gpu.launch bodies into gpu.module kernels
+    // Step 12: Host↔Device Memory Conversion and Vector Lowering
     //
-    // Must happen BEFORE the shared-mem conversion so that memref.global +
-    // memref.get_global for workgroup memory are created INSIDE the gpu.module
-    // (matching IREE's ConvertSharedMemAllocOp flow), not in the outer host
-    // module where finalize-memref-to-llvm cannot lower
-    // #gpu.address_space<workgroup> types.
+    // Run vector lowerings and finalize-memref-to-llvm on the host side
+    // so they can handle the logic inside @gpu.launch regions before
+    // they are outlined into @gpu.module kernels. This avoids
+    // PassManager restriction errors on @gpu.func.
+    // -------------------------------------------------------------------------
+    mlir::VectorTransferToSCFOptions xferOpts;
+    xferOpts.setTargetRank(0); // Scalarize all transfers for GPU
+    xferOpts.enableLowerTensors();
+    
+    pm.addNestedPass<func::FuncOp>(mlir::createConvertVectorToSCFPass(xferOpts));
+    pm.addNestedPass<func::FuncOp>(mlir::vector::createLowerVectorMultiReductionPass());
+    
+    pm.addPass(nova::createConvertMemRefToGpuPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+    // -------------------------------------------------------------------------
+    // Step 12.5: Outline gpu.launch bodies into gpu.module kernels
     // -------------------------------------------------------------------------
     pm.addPass(createGpuKernelOutliningPass());
     pm.addPass(mlir::nova::createRenameGpuKernelsPass());
     pm.addPass(createCanonicalizerPass());
 
     // -------------------------------------------------------------------------
-    // Step 12.5: Convert workgroup memref.alloc → memref.global + get_global
-    //
-    // Runs INSIDE the gpu.module so globals are scoped to the kernel and
-    // never appear in the outer host module.
-    // Ported from IREE's ConvertSharedMemAllocOp + DropSharedMemoryDeallocOp.
+    // Step 12.75: Convert workgroup memref.alloc → memref.global
     // -------------------------------------------------------------------------
     {
       auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
@@ -418,28 +431,8 @@ namespace mlir::nova
     }
 
     // -------------------------------------------------------------------------
-    // Step 12.75: Convert host-side cross-kernel allocations to GPU allocations
-    //
-    // Handles intermediate buffers (e.g. `%alloc = memref.alloc()`) on the
-    // host side that are passed into GPU kernels, converting them from the
-    // default memory space to `gpu.alloc` (which lowers to `cudaMalloc`).
-    // -------------------------------------------------------------------------
-    pm.addPass(nova::createConvertMemRefToGpuPass());
-    pm.addPass(createCanonicalizerPass());
-
-    // -------------------------------------------------------------------------
     // Step 13: Full CUDA/NVVM LLVM lowering
-    //
-    // Lowers gpu.module → PTX binary, then lowers host code → LLVM IR.
-    // Mirrors IREE's addLowerToLLVMGPUPasses (LLVMGPU/Passes.cpp).
     // -------------------------------------------------------------------------
-
-    // PERFORMANCE CRITICAL — 13.0: Attach NVVM target descriptor
-    // These flags directly control PTX code quality:
-    //   optLevel=3   → full LLVM O3 optimisations inside PTXAS
-    //   fastFlag     → allow fast-math reassociation in PTXAS
-    //   ftzFlag      → flush denormals to zero (halves operand precision cost)
-    //   features=+ptx76 → PTX 7.6 instruction set for Ampere (sm_86)
     GpuNVVMAttachTargetOptions nvvmTargetOptions;
     nvvmTargetOptions.triple = "nvptx64-nvidia-cuda";
     nvvmTargetOptions.chip = arch.str();
@@ -449,38 +442,31 @@ namespace mlir::nova
     nvvmTargetOptions.ftzFlag = true;
     pm.addPass(createGpuNVVMAttachTarget(nvvmTargetOptions));
 
-    // 13.1 — Outline GPU kernels and insert async tokens (required by
-    //         GpuModuleToBinaryPass).
     pm.addNestedPass<func::FuncOp>(createGpuAsyncRegionPass());
 
-    // 13.2 — Lower gpu.module contents to NVVM / LLVM.
-    //
-    // Pass ordering is critical:
-    //   1. expand-strided-metadata : decompose memref.subview while still
-    //      memref types (before gpu-to-nvvm changes pointer types).
-    //   2. lower-affine            : affine.apply → arith ops.
-    //   3. gpu.address_space lower : #gpu.address_space<private/workgroup/global>
-    //      → NVVM integer address spaces (5/3/1) before finalizeMemRefToLLVM
-    //      (which requires integer address spaces for LLVM type conversion).
-    //   4. scf-to-cf               : lower SCF control flow.
-    //   5. gpu-to-nvvm             : gpu.func signature + gpu ops → NVVM.
-    //   6. remaining dialect conversions (index, arith, math).
-    //   7. reconcile-unrealized-casts: erase conversion cast chains.
     {
       auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
       gpuPm.addPass(memref::createExpandStridedMetadataPass());
+      
       gpuPm.addNestedPass<gpu::GPUFuncOp>(createLowerAffinePass());
       gpuPm.addPass(createNovaGPULowerMemorySpacePass());
+      
+      // Full LLVM lowering inside the GPU module
       gpuPm.addPass(createSCFToControlFlowPass());
-      ConvertGpuOpsToNVVMOpsOptions nvvmOpts;
-      gpuPm.addPass(createConvertGpuOpsToNVVMOps(nvvmOpts));
       gpuPm.addPass(createConvertIndexToLLVMPass());
       gpuPm.addPass(createArithToLLVMConversionPass());
+      gpuPm.addPass(memref::createExpandStridedMetadataPass());
+      
+      gpuPm.addPass(mlir::createConvertVectorToLLVMPass());
+      
+      ConvertGpuOpsToNVVMOpsOptions nvvmOpts;
+      gpuPm.addPass(createConvertGpuOpsToNVVMOps(nvvmOpts));
       gpuPm.addPass(createConvertMathToLLVMPass());
+      gpuPm.addPass(createUBToLLVMConversionPass());
       gpuPm.addPass(createReconcileUnrealizedCastsPass());
+      
       // Promote __global_memory__ globals from device global (AS 0) to
-      // shared memory (AS 3). Must run after full LLVM lowering so we
-      // operate on opaque pointers and can insert addrspacecast cleanly.
+      // shared memory (AS 3). Must run after full LLVM lowering.
       gpuPm.addPass(createNovaGPUPromoteGlobalsToSharedPass());
     }
     pm.addPass(createCanonicalizerPass());
@@ -507,10 +493,13 @@ namespace mlir::nova
     pm.addPass(createCSEPass());
 
     // 13.5 — Lower remaining host dialects to LLVM.
-    pm.addPass(createSCFToControlFlowPass());
+    {
+      auto &funcPm = pm.nest<func::FuncOp>();
+      funcPm.addPass(createSCFToControlFlowPass());
+      funcPm.addPass(createArithToLLVMConversionPass());
+      funcPm.addPass(memref::createExpandStridedMetadataPass());
+    }
     pm.addPass(createConvertControlFlowToLLVMPass());
-    pm.addPass(createArithToLLVMConversionPass());
-    pm.addPass(memref::createExpandStridedMetadataPass());
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
     pm.addPass(createConvertFuncToLLVMPass());
     pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
