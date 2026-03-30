@@ -1306,7 +1306,7 @@ std::unique_ptr<Pass> createNovaToTosaLoweringPass() {
 // Register the pass
 void registerNovaToTosaLoweringPass() {
   PassRegistration<NovaToTosaLoweringPass>();
-}
+}   
 
 } // namespace nova
 } // namespace mlir

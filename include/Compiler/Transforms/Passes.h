@@ -33,11 +33,17 @@ void registerNovaElementwiseOpFusionPass();
 std::unique_ptr<Pass> createNovaCheckInsParallelFuse();
 void registerNovaCheckInsParallelFuse();
 
+std::unique_ptr<Pass> createNovaMultiConsumerFusion();
+void registerNovaMultiConsumerFusion();
+
 std::unique_ptr<Pass> createNovaLinalgHorizontalFusionPass();
 void registerNovaLinalgHorizontalFusionPass();
 
 std::unique_ptr<Pass> createNovaLinalgVerticalFusionPass();
 void registerNovaLinalgVerticalFusionPass();
+
+std::unique_ptr<Pass> createNovaRepositionStorePass();
+void registerNovaRepositionStorePass();
 
 
 }  // namespace nova

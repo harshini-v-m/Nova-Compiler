@@ -148,9 +148,10 @@ namespace mlir::nova
     // IREE performs the same fusion before its tile-and-fuse pipeline.
     // -------------------------------------------------------------------------
     // pm.addPass(createLinalgElementwiseOpFusionPass());
-    // pm.addNestedPass<mlir::func::FuncOp>(createNovaFuseReductionIntoProducerPass());
+    pm.addNestedPass<mlir::func::FuncOp>(createNovaFuseReductionIntoProducerPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaCheckInsParallelFuse());
+    pm.addNestedPass<mlir::func::FuncOp>(createNovaMultiConsumerFusion());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgHorizontalFusionPass());
     // pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgVerticalFusionPass());
 
@@ -319,7 +320,7 @@ namespace mlir::nova
     // degenerate foralls inside thread-mapped contexts cause the transform
     // interpreter to fail. Re-running normalize-loop-bounds eliminates them.
     // -------------------------------------------------------------------------
-       pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
+    pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
@@ -328,7 +329,7 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-   pm.addNestedPass<func::FuncOp>(createNovaGPUCoalesceWorkgroupBuffersPass());
+    pm.addNestedPass<func::FuncOp>(createNovaGPUCoalesceWorkgroupBuffersPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addPass(createCSEPass());
    
@@ -354,7 +355,8 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-
+    pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
+    
     // start of my Pass
     
 

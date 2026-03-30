@@ -42,8 +42,7 @@ struct FuseParallelGenericsWithSameInputs
     Block *block = genericOp->getBlock();
     linalg::GenericOp candidate = nullptr;
 
-    for (Operation &op :
-         llvm::make_range(std::next(genericOp->getIterator()), block->end())) {
+    for (Operation &op : llvm::make_range(std::next(genericOp->getIterator()), block->end())) {
       auto other = dyn_cast<linalg::GenericOp>(&op);
       if (!other || !other.isAllParallelLoops())
         continue;

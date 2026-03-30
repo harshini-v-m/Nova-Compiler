@@ -51,10 +51,14 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaElementwiseOpFusionPass.cpp
   # parallel fusion case with same inputs
   NovaCheckInsParallelFuse.cpp
+  # multi-consumer fusion case
+  NovaMultiConsumerFusion.cpp
   # horizontal fusion pass for reduction cases
   NovaLinalgFusion.cpp
   # vertical fusion pass for reduction producer and parallel consumer case
   NovaVerticalFusion.cpp
+  # repsositioning pass to move stores after fusion
+  NovaRepositionStore.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include
