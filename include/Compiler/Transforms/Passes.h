@@ -45,6 +45,10 @@ void registerNovaLinalgVerticalFusionPass();
 std::unique_ptr<Pass> createNovaRepositionStorePass();
 void registerNovaRepositionStorePass();
 
+std::unique_ptr<Pass> createNovaAccumulationFusionPass();
+std::unique_ptr<Pass> createNovaAccumulationFusionPass(llvm::StringRef cudaArch);
+void registerNovaAccumulationFusionPass();
+
 
 }  // namespace nova
 }  // namespace mlir

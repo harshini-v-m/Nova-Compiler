@@ -178,6 +178,8 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(
         createNovaGPUSelectLoweringStrategyPass(arch));
 
+    // pm.addNestedPass<func::FuncOp>(createNovaAccumulationFusionPass(arch));
+
     // -------------------------------------------------------------------------
     // Step 1: Tile and distribute to workgroups
     // -------------------------------------------------------------------------

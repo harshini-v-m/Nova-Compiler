@@ -1,44 +1,3 @@
-//===- NovaMultiConsumerFusion.cpp ----------------------------------------===//
-//
-// Fuses a parallel linalg.generic producer into each of its consumers,
-// even when the producer has multiple uses (multi-consumer rematerialization).
-//
-// Unlike the standard MLIR elementwise fusion pass which requires the producer
-// to have a single use, this pass rematerializes a parallel producer into
-// every consumer that uses it. This is safe because:
-//   1. The producer is all-parallel (no reduction) → pure computation on
-//      tensors with no side effects.
-//   2. linalg.generic on tensors is referentially transparent — recomputing
-//      the same value at multiple sites is always semantically correct.
-//   3. No other operations are affected: the producer remains in the IR until
-//      DCE removes it once all uses are fused, and interim uses of any other
-//      producer result continue to see the original SSA value unchanged.
-//
-// Algorithm (pattern fires on each CONSUMER):
-//   For each DPS input operand of the consumer that is the result of an
-//   all-parallel linalg.generic PRODUCER:
-//     - Guard: producer must be all-parallel (iterative stop condition —
-//       once the chain reaches a reduction, the guard prevents further
-//       producer-side fusion for that chain).
-//     - Guard: producer must not be a contraction op (matmul).
-//     - Guard: producer must not write directly to a dispatch output boundary.
-//     - Structural check: linalg::areElementwiseOpsFusable must pass.
-//     - Fuse via linalg::fuseElementwiseOps (inlines producer body into
-//       consumer, composes indexing maps, and merges block arguments).
-//     - Replace the consumer with the fused op's back-results.
-//   The greedy driver repeats until fixpoint; the original producer is erased
-//   by DCE once all its results have no remaining uses.
-//
-// tensor.empty / linalg.fill handling:
-//   Neither is a linalg.generic and neither is matched as a producer.
-//   After all fusion steps the unused producer output inits (typically
-//   tensor.empty or linalg.fill results) are removed by
-//   populateEraseUnusedOperandsAndResultsPatterns, then DCE erases the
-//   now-dead empty/fill ops.
-//
-// Pipeline position: Step -1, alongside other elementwise fusion passes.
-//===----------------------------------------------------------------------===//
-
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -48,11 +7,13 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "nova-fuse-parallels-with-multiple-consumers"
 
 using namespace mlir;
 using namespace mlir::linalg;
+using llvm::dbgs;
 
 namespace mlir::nova {
 
@@ -60,95 +21,285 @@ namespace mlir::nova {
 // Helpers
 //===----------------------------------------------------------------------===//
 
-// Returns true if any result of `op` flows directly into a
-// tensor.insert_slice / tensor.parallel_insert_slice, i.e. is written
-// to a dispatch-level output boundary.  Fusing through such a boundary
-// would reorder the write, potentially producing incorrect results.
-static bool hasDirectWriteResult(linalg::GenericOp op) {
-  return llvm::any_of(op->getResults(), [](Value result) {
-    return llvm::any_of(result.getUsers(), [](Operation *user) {
-      return isa<tensor::InsertSliceOp, tensor::ParallelInsertSliceOp>(user);
-    });
-  });
+static bool isAllParallel(linalg::GenericOp op) {
+  return llvm::all_of(op.getIteratorTypesArray(), linalg::isParallelIterator);
 }
 
 //===----------------------------------------------------------------------===//
-// FuseParallelGenericsWithMultipleConsumers
-//
-// Pattern fires on the CONSUMER.  For each input operand whose defining op
-// is an all-parallel linalg.generic PRODUCER, the pattern:
-//   1. Verifies all guards (parallel, non-contraction, no boundary write).
-//   2. Calls linalg::areElementwiseOpsFusable to check structural validity.
-//   3. Calls linalg::fuseElementwiseOps to inline the producer body.
-//   4. Replaces the consumer with the fused op.
-//
-// The producer is NOT erased here — it may still have other uses that will
-// be fused in later greedy iterations.  DCE removes it once fully dead.
-//
-// Iterative chain termination:
-//   After fusing P (parallel) into C, the resulting fused_PC may itself
-//   become a consumer of another parallel op.  The greedy driver keeps firing
-//   the pattern.  If C was a reduction, fused_PC has reduction iterators and
-//   the guard "producer must be all-parallel" stops the chain correctly.
+// Core fusion routine
 //===----------------------------------------------------------------------===//
+
+/// Fuse `producerOp` into `consumerOp`.
+///
+/// `producerResultIdx`  — which result of producerOp feeds the consumer.
+/// `consumerInputIdx`   — which DPS input of consumerOp receives that result.
+///
+/// This guarantees that multi-result producers (e.g. a fused add+relu op
+/// that yields both add and relu) are completely erased once every result
+/// has been taken over by a successive fusion step.
+
+static LogicalResult tryFuse(PatternRewriter &rewriter,
+                             linalg::GenericOp producerOp,
+                             unsigned producerResultIdx,
+                             linalg::GenericOp consumerOp,
+                             unsigned consumerInputIdx) {
+
+  unsigned numProdInputs  = producerOp.getNumDpsInputs();
+  unsigned numProdResults = producerOp->getNumResults();
+  unsigned numConsInputs  = consumerOp.getNumDpsInputs();
+  unsigned numConsInits   = consumerOp.getNumDpsInits();
+
+  auto producerMaps = producerOp.getIndexingMapsArray();
+  auto consumerMaps = consumerOp.getIndexingMapsArray();
+
+  // 1. Structural compatibility
+  AffineMap prodResultMap = producerMaps[numProdInputs + producerResultIdx];
+  AffineMap consInputMap  = consumerMaps[consumerInputIdx];
+
+  if (!prodResultMap.isProjectedPermutation() ||
+      !consInputMap.isProjectedPermutation())
+    return failure();
+  if (producerOp.getNumLoops() != consumerOp.getNumLoops())
+    return failure();
+  if (prodResultMap != consInputMap)
+    return failure();
+
+  // 2. Decide which producer results the fused op must yield
+  // needsYield[i]         — true  iff producer result i must be re-exposed.
+  // prodResultToOut[i]    — index into newOutputs (valid iff needsYield[i]).
+  SmallVector<bool>     needsYield(numProdResults, false);
+  SmallVector<unsigned> prodResultToOut(numProdResults, ~0u);
+
+  OpOperand *specificUse = consumerOp.getDpsInputOperands()[consumerInputIdx];
+  Block &producerBlock   = producerOp.getRegion().front();
+  Block &consumerBlock   = consumerOp.getRegion().front();
+
+  for (unsigned i = 0; i < numProdResults; ++i) {
+    Value result = producerOp->getResult(i);
+
+    if (i == producerResultIdx) {
+      // Case A: any use other than the slot we are fusing away.
+      needsYield[i] = llvm::any_of(result.getUses(), [&](OpOperand &use) {
+        return &use != specificUse;
+      });
+      // Case B: producer's output block-arg is read inside its own body
+      // (in-place accumulation), so the init tensor must be threaded through.
+      if (!needsYield[i]) {
+        BlockArgument outArg = producerBlock.getArgument(numProdInputs + i);
+        for (Operation &bodyOp : producerBlock.without_terminator()) {
+          if (llvm::any_of(bodyOp.getOperands(),
+                           [outArg](Value v) { return v == outArg; })) {
+            needsYield[i] = true;
+            break;
+          }
+        }
+      }
+    } else {
+      // Every other producer result: yield whenever it has any use, since
+      // all those uses are external to this fusion step.
+      needsYield[i] = !result.use_empty();
+    }
+  }
+
+  // 3. Dominance guard
+  // The fused op is inserted just before consumerOp. Any op between
+  // producerOp and consumerOp that uses a producer result we are rerouting
+  // would then reference a value defined after it — a dominance violation.
+  if (producerOp->getBlock() == consumerOp->getBlock()) {
+    bool inWindow = false;
+    for (Operation &op : producerOp->getBlock()->getOperations()) {
+      if (&op == producerOp.getOperation()) { inWindow = true;  continue; }
+      if (&op == consumerOp.getOperation()) { inWindow = false; break;    }
+      if (!inWindow) continue;
+      for (Value operand : op.getOperands()) {
+        for (unsigned i = 0; i < numProdResults; ++i) {
+          if (needsYield[i] && operand == producerOp->getResult(i))
+            return failure();
+        }
+      }
+    }
+  }
+
+  // 4. Build the fused operand lists and indexing maps
+  SmallVector<Value>     newInputs, newOutputs;
+  SmallVector<AffineMap> newMaps;
+  SmallVector<Type>      newResultTypes;
+
+  // Producer inputs (all).
+  for (unsigned i = 0; i < numProdInputs; ++i) {
+    newInputs.push_back(producerOp.getDpsInputs()[i]);
+    newMaps.push_back(producerMaps[i]);
+  }
+  // Consumer inputs — skip the slot that receives the inlined result.
+  for (unsigned i = 0; i < numConsInputs; ++i) {
+    if (i == consumerInputIdx) continue;
+    newInputs.push_back(consumerOp.getDpsInputs()[i]);
+    newMaps.push_back(consumerMaps[i]);
+  }
+
+  // Producer outputs — one entry per result that needs yielding, in order.
+  // Record each one's position in newOutputs for block-arg mapping below.
+  for (unsigned i = 0; i < numProdResults; ++i) {
+    if (!needsYield[i]) continue;
+    prodResultToOut[i] = newOutputs.size();
+    newOutputs.push_back(producerOp.getDpsInits()[i]);
+    newMaps.push_back(producerMaps[numProdInputs + i]);
+    newResultTypes.push_back(producerOp->getResult(i).getType());
+  }
+
+  // Consumer outputs (all), appended after producer outputs.
+  unsigned consOutBase = newOutputs.size();
+  for (unsigned i = 0; i < numConsInits; ++i) {
+    newOutputs.push_back(consumerOp.getDpsInits()[i]);
+    newMaps.push_back(consumerMaps[numConsInputs + i]);
+    newResultTypes.push_back(consumerOp->getResultTypes()[i]);
+  }
+
+  // 5. Create the fused GenericOp with an inline body builder
+  // Block-arg layout (mirrors newInputs / newOutputs order):
+  //   args[0 .. numProdInputs-1]                         producer inputs
+  //   args[numProdInputs .. newInputs.size()-1]          consumer non-fused inputs
+  //   args[newInputs.size() + prodResultToOut[i]]        producer output (per yielded result)
+  //   args[newInputs.size() + consOutBase + j]           consumer output j
+  rewriter.setInsertionPoint(consumerOp);
+
+  auto fusedOp = rewriter.create<linalg::GenericOp>(
+      consumerOp.getLoc(),
+      TypeRange(newResultTypes),
+      newInputs, newOutputs,
+      newMaps,
+      consumerOp.getIteratorTypesArray(),
+      /*doc=*/"", /*libraryCall=*/"",
+      [&](OpBuilder &b, Location fusedLoc, ValueRange args) {
+        IRMapping mapping;
+
+        // Map producer input block args.
+        for (unsigned i = 0; i < numProdInputs; ++i)
+          mapping.map(producerBlock.getArgument(i), args[i]);
+
+        // Map consumer non-fused input block args.
+        {
+          unsigned slot = numProdInputs;
+          for (unsigned i = 0; i < numConsInputs; ++i) {
+            if (i == consumerInputIdx) continue;
+            mapping.map(consumerBlock.getArgument(i), args[slot++]);
+          }
+        }
+
+        // Map producer output block args for results being yielded.
+        unsigned outArgBase = newInputs.size();
+        for (unsigned i = 0; i < numProdResults; ++i) {
+          if (!needsYield[i]) continue;
+          mapping.map(producerBlock.getArgument(numProdInputs + i),
+                      args[outArgBase + prodResultToOut[i]]);
+        }
+
+        // Map consumer output block args.
+        for (unsigned i = 0; i < numConsInits; ++i)
+          mapping.map(consumerBlock.getArgument(numConsInputs + i),
+                      args[outArgBase + consOutBase + i]);
+
+        // Inline the producer body.
+        for (Operation &op : producerBlock.without_terminator())
+          b.clone(op, mapping);
+
+        // Collect all producer computed values via the producer yield.
+        auto prodYield = cast<linalg::YieldOp>(producerBlock.getTerminator());
+        SmallVector<Value> prodComputed(numProdResults);
+        for (unsigned i = 0; i < numProdResults; ++i)
+          prodComputed[i] = mapping.lookupOrDefault(prodYield.getOperand(i));
+
+        // Expose the inlined result as the consumer's block arg for that slot.
+        mapping.map(consumerBlock.getArgument(consumerInputIdx),
+                    prodComputed[producerResultIdx]);
+
+        // Inline the consumer body.
+        for (Operation &op : consumerBlock.without_terminator())
+          b.clone(op, mapping);
+
+        // Build the fused yield:
+        //   [producer yielded values, in result-index order]
+        //   [consumer yield values]
+        SmallVector<Value> yieldVals;
+        for (unsigned i = 0; i < numProdResults; ++i) {
+          if (!needsYield[i]) continue;
+          yieldVals.push_back(prodComputed[i]);
+        }
+        auto consYield = cast<linalg::YieldOp>(consumerBlock.getTerminator());
+        for (Value v : consYield.getOperands())
+          yieldVals.push_back(mapping.lookupOrDefault(v));
+        b.create<linalg::YieldOp>(fusedLoc, yieldVals);
+      });
+
+  // 6. Replace uses of all original results
+  // Producer results that were yielded → corresponding fused results.
+  unsigned fusedResIdx = 0;
+  for (unsigned i = 0; i < numProdResults; ++i) {
+    if (!needsYield[i]) continue;
+    rewriter.replaceAllUsesWith(producerOp->getResult(i),
+                                fusedOp->getResult(fusedResIdx++));
+  }
+  // Consumer results → fused results (always).
+  for (unsigned i = 0; i < numConsInits; ++i)
+    rewriter.replaceAllUsesWith(consumerOp->getResult(i),
+                                fusedOp->getResult(fusedResIdx++));
+
+  // 7. Erase original ops
+  rewriter.eraseOp(consumerOp);
+  // Erase the producer only when every result is now dead.
+  if (llvm::all_of(producerOp->getResults(),
+                   [](Value r) { return r.use_empty(); }))
+    rewriter.eraseOp(producerOp);
+
+  return success();
+}
+
+// Rewrite pattern
+
+/// Matches any linalg.generic consumer whose DPS inputs include a result from
+/// an all-parallel linalg.generic producer, then calls tryFuse.
+///
+/// The greedy driver re-applies the pattern until a fixed point, naturally
+/// chaining fusions:
+///
+///   P (parallel) → C1 (parallel) → C2 (parallel) → C3 (reduction)
+///
+///   Round 1: fuse P into C1 → fused1
+///            fused1 yields: every P result that is still used, plus C1 result.
+///   Round 2: fuse fused1 into C2 → fused2
+///            fused2 yields: every fused1 result still in use, plus C2 result.
+///            fused1 is erased because all its results are now covered.
+///   Round 3: fuse fused2 into C3 → fused3 (reduction)
+///            fused3 yields: every fused2 result still in use, plus C3 result.
+///            fused2 is erased.
+///   Round 4: fused3 has reductions → isAllParallel() fails → stop.
 struct FuseParallelGenericsWithMultipleConsumers
     : public OpRewritePattern<linalg::GenericOp> {
   using OpRewritePattern<linalg::GenericOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(linalg::GenericOp consumerOp,
                                 PatternRewriter &rewriter) const override {
-    // Skip contraction ops (matmul, batch-matmul, etc.) as consumers — their
-    // tiling strategies are handled separately and premature fusion can destroy
-    // the contraction structure that later passes rely on.
-    if (linalg::isaContractionOpInterface(consumerOp))
+    // Skip contraction
+    if (mlir::linalg::isaContractionOpInterface(consumerOp))
       return failure();
 
-    for (OpOperand *opOperand : consumerOp.getDpsInputOperands()) {
-      // The operand must come from a linalg.generic producer.
-      auto producerOp =
-          opOperand->get().getDefiningOp<linalg::GenericOp>();
-      if (!producerOp)
+    for (auto [inputIdx, input] :
+         llvm::enumerate(consumerOp.getDpsInputs())) {
+
+      auto producerOp = input.getDefiningOp<linalg::GenericOp>();
+      if (!producerOp || !isAllParallel(producerOp) || producerOp == consumerOp)
         continue;
 
-      // ── Iterative stop condition ───────────────────────────────────────────
-      // Only rematerialize producers that are fully parallel.  Once a chain
-      // reaches a reduction the guard fires and fusion stops at that boundary.
-      if (!producerOp.isAllParallelLoops())
-        continue;
+      // Identify which result of producerOp feeds this input slot.
+      unsigned producerResultIdx = ~0u;
+      for (auto [rIdx, result] : llvm::enumerate(producerOp->getResults())) {
+        if (result == input) { producerResultIdx = rIdx; break; }
+      }
+      if (producerResultIdx == ~0u) continue;
 
-      // Skip contraction producers — their operand layout must be preserved.
-      if (linalg::isaContractionOpInterface(producerOp))
-        continue;
-
-      // Do not fuse producers whose result flows into an output boundary; that
-      // would move a write and corrupt dispatch-level memory management.
-      if (hasDirectWriteResult(producerOp))
-        continue;
-
-      // Structural pre-condition: the operand's indexing map must be a
-      // permutation and the producer's loops must be covered by the consumer's
-      // loops.  Skipping this check causes an assertion inside fuseElementwiseOps.
-      if (!linalg::areElementwiseOpsFusable(opOperand))
-        continue;
-
-      // ── Fuse producer body into this consumer use ──────────────────────────
-      // fuseElementwiseOps:
-      //   - Composes the producer's and consumer's indexing maps.
-      //   - Merges block arguments (producer ins, consumer ins, shared output).
-      //   - Produces a new GenericOp at the consumer's position.
-      //   - Does NOT erase the producer (other uses remain intact).
-      FailureOr<linalg::ElementwiseOpFusionResult> result =
-          linalg::fuseElementwiseOps(rewriter, opOperand);
-      if (failed(result))
-        continue;
-
-      // The fused op's results are ordered [producer_extra_results..., consumer_results].
-      // Replace only the consumer's results; extra producer results are handled
-      // by the remaining uses of the original producer.
-      auto replacements =
-          result->fusedOp->getResults().take_back(consumerOp.getNumResults());
-      rewriter.replaceOp(consumerOp, replacements);
-      return success();
+      if (succeeded(tryFuse(rewriter, producerOp, producerResultIdx,
+                            consumerOp, (unsigned)inputIdx)))
+        return success();
     }
     return failure();
   }
@@ -170,33 +321,21 @@ struct NovaMultiConsumerFusion
 
   StringRef getArgument()    const final { return "nova-multi-consumer-fusion"; }
   StringRef getDescription() const final {
-    return "Fuse parallel linalg.generic producers into each of their consumers "
-           "(multi-consumer rematerialization). Safe because parallel generics "
-           "on tensors are side-effect-free and referentially transparent.";
+    return "Fuse parallel linalg.generic producers into each of their consumers.";
   }
 
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
-    RewritePatternSet patterns(funcOp.getContext());
+    MLIRContext *ctx = funcOp.getContext();
 
-    // Core multi-consumer fusion pattern.
-    patterns.add<FuseParallelGenericsWithMultipleConsumers>(
-        funcOp.getContext());
+    RewritePatternSet patterns(ctx);
+    patterns.add<FuseParallelGenericsWithMultipleConsumers>(ctx);
 
-    // After fusing a producer into all its consumers the original producer
-    // may have unused output operands (e.g. the tensor.empty / linalg.fill
-    // that seeded its output).  This pattern strips those dead operands and
-    // results from the IR before DCE removes the now-empty ops.
-    linalg::populateEraseUnusedOperandsAndResultsPatterns(patterns);
-
-    // Top-down traversal ensures producers are visited before consumers,
-    // which gives the greedy driver the best chance of fusing the full chain
-    // in a single pass rather than requiring multiple fixpoint iterations.
     GreedyRewriteConfig config;
     config.setUseTopDownTraversal();
 
     if (failed(applyPatternsGreedily(funcOp, std::move(patterns), config)))
-      return signalPassFailure();
+      signalPassFailure();
   }
 };
 

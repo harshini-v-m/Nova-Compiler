@@ -57,6 +57,7 @@ add_mlir_library(NovaLLVMGPUTransforms
   NovaLinalgFusion.cpp
   # vertical fusion pass for reduction producer and parallel consumer case
   NovaVerticalFusion.cpp
+  NovaAccumulationFusion.cpp
   # repsositioning pass to move stores after fusion
   NovaRepositionStore.cpp
 
