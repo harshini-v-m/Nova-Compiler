@@ -173,10 +173,38 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
         .getResult();
   }
 
-  // No memory space → default (global memory for cross-kernel buffers).
-  // These are managed by buffer-deallocation-pipeline.
-  return memref::AllocOp::create(builder, loc, memRefType, dynamicSizes)
-      .getResult();
+  // No memory space → default to PRIVATE (thread-local).
+  // After NovaGPUInferMemorySpacePass, every alloc_tensor is tagged.
+  // Untagged allocations here are bufferizer-created temporaries (iter_arg
+  // copies, scf.if staging) which are thread-local by construction.
+  // Matches IREE's gpuRequireMemSpaceAllocationFn default behavior.
+  {
+    auto allocType =
+        MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
+                        AffineMap(), privateSpace);
+
+    // Check if we are inside a kernel (scf.forall).
+    bool insideKernel = false;
+    Operation *insertionParent = builder.getInsertionBlock()->getParentOp();
+    while (insertionParent) {
+      if (isa<scf::ForallOp>(insertionParent)) {
+        insideKernel = true;
+        break;
+      }
+      insertionParent = insertionParent->getParentOp();
+    }
+
+    if (insideKernel) {
+      return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
+          .getResult();
+    }
+
+    // At function scope (outside all foralls) — emit plain alloc without
+    // address space. This becomes a host-side buffer passed to kernels,
+    // later converted to gpu.alloc by ConvertMemRefToGpu.
+    return memref::AllocOp::create(builder, loc, memRefType, dynamicSizes)
+        .getResult();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +274,47 @@ static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
         }
       }
     }
+
+    // Fix shape mismatches between source and destination.
+    //
+    // gpuRequireMemSpaceAllocationFn converts dynamic private alloc_tensors
+    // (e.g. tensor<4x?xf32>) to static allocas (memref<4x4xf32>) because
+    // NVPTX cannot do dynamic stack allocation.  When OneShotBufferize
+    // lowers tensor.insert_slice, it calls this copy function with:
+    //   from = static alloca (4x4)
+    //   to   = dynamic subview of workgroup buffer (4x?)
+    //
+    // convert-linalg-to-loops resolves the dimension conflict by preferring
+    // the static size (4), causing out-of-bounds writes that overwrite
+    // zero-padding in the destination tile.
+    //
+    // Fix: subview the static source to match the destination's dynamic shape.
+    auto fromType = cast<MemRefType>(from.getType());
+    auto toType = cast<MemRefType>(to.getType());
+    if (fromType.getRank() == toType.getRank() && fromType.getRank() > 0) {
+      bool needsSubview = false;
+      int rank = fromType.getRank();
+      SmallVector<OpFoldResult> offsets(rank, builder.getIndexAttr(0));
+      SmallVector<OpFoldResult> strides(rank, builder.getIndexAttr(1));
+      SmallVector<OpFoldResult> sizes;
+      for (int i = 0; i < rank; ++i) {
+        if (!fromType.isDynamicDim(i) && toType.isDynamicDim(i)) {
+          // Source is static, dest is dynamic → use dest's dynamic size
+          sizes.push_back(
+              builder.create<memref::DimOp>(loc, to, i).getResult());
+          needsSubview = true;
+        } else if (!fromType.isDynamicDim(i)) {
+          sizes.push_back(builder.getIndexAttr(fromType.getDimSize(i)));
+        } else {
+          sizes.push_back(
+              builder.create<memref::DimOp>(loc, from, i).getResult());
+        }
+      }
+      if (needsSubview)
+        from = builder.create<memref::SubViewOp>(loc, from, offsets, sizes,
+                                                 strides);
+    }
+
     linalg::CopyOp::create(builder, loc, from, to);
   } else {
     memref::CopyOp::create(builder, loc, from, to);

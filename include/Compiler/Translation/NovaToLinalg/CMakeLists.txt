@@ -4,6 +4,7 @@ add_mlir_library(MLIRNovaToLinalgTransforms
   NovaToLinalg.cpp
   TNovaToLinalg.cpp
   NovaToLinalg.h
+  NovaToLinalgGeneric.cpp
 
   DEPENDS
   MLIRLinalgDialect

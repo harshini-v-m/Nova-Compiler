@@ -46,8 +46,6 @@
 #include "Compiler/Transforms/VectorOpt.h"
 
 //lowering passes
-#include "Compiler/Translation/NovaToArith/NovaToArith.h"
-#include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 
 // header of this file
@@ -67,11 +65,9 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
   // Lower Nova dialect to standard dialects 
 //pm.addNestedPass<func::FuncOp>(ceateNovaToLinalg());  
   pm.addPass(createCanonicalizerPass()); 
-  pm.addPass(createNovaToArithLoweringPass());
-  pm.addPass(createNovaToTosaLoweringPass());
-  pm.addNestedPass<func::FuncOp>(createNovaElementwiseToLinalgPass());
-  pm.addNestedPass<func::FuncOp>(createNovaToLinalgPass());
-  
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgGenericLoweringPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgNamedPass());
+
   pm.addPass(createCanonicalizerPass());
 //  pm.addPass(mlir::createTensorBufferizePass());  
   pm.addPass(mlir::createReconcileUnrealizedCastsPass());

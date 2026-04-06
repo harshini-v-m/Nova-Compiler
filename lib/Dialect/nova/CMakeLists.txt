@@ -5,9 +5,6 @@ add_mlir_dialect_library(MLIRNova
   NovaCanonicalizations.cpp
   Broadcast.cpp
 
-  ADDITIONAL_HEADER_DIRS
-  ${PROJECT_SOURCE_DIR}/include/Compiler/Dialect/nova
-
   DEPENDS
   MLIRNovaOpsIncGen
 

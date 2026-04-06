@@ -3,9 +3,6 @@ add_mlir_library(NovaPipelines
   Gpupipeline.cpp 
      
 
-  ADDITIONAL_HEADER_DIRS
-  ${PROJECT_SOURCE_DIR}/include/Compiler
-
   DEPENDS
   MLIRNovaOpsIncGen
 
@@ -25,9 +22,7 @@ add_mlir_library(NovaPipelines
    
 
   
-  MLIRNovaToArithTransforms
   MLIRNovaToLinalgTransforms
-  MLIRNovaToTosaTransforms
   MLIRNovaToGpu
 
   MLIRSCFToControlFlow

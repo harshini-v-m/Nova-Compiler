@@ -58,10 +58,8 @@
 #include "mlir/Dialect/SparseTensor/Transforms/Passes.h"
 
 // lowering passes
-#include "Compiler/Translation/NovaToArith/NovaToArith.h"
 #include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
-#include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/PatternMatch.h"
 
@@ -79,13 +77,13 @@ namespace {
 void createNovaGPUPipelines(mlir::OpPassManager &pm) {
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
-  pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
-  pm.addNestedPass<mlir::func::FuncOp>(
-      mlir::nova::createNovaElementwiseToLinalgPass());
-  pm.addNestedPass<mlir::func::FuncOp>(
+
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgGenericLoweringPass());
+    pm.addNestedPass<mlir::func::FuncOp>(
       mlir::nova::createNovaFusionKernelEmitterPass());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToGpuPass());
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgNamedPass());
+
 
             // 2. TOSA TO LINALG (Named and regular)
             pm.addNestedPass<mlir::func::FuncOp>(mlir::tosa::createTosaToLinalgNamed());

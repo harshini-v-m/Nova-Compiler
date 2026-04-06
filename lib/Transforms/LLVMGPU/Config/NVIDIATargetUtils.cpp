@@ -37,39 +37,58 @@ static constexpr int32_t kF32  = 2;
 //===----------------------------------------------------------------------===//
 
 // WMMA (Volta+): 16×16×16, f16 inputs → f32 accumulator
-static const NVMMAIntrinsicInfo kWmmaF32_16x16x16 = {
-    NVMMAIntrinsicValues::WMMA_F32_16x16x16,
-    /*mSize=*/16, /*nSize=*/16, /*kSize=*/16,
-    /*warpSize=*/32,
-    /*lhsKind=*/kF16, /*rhsKind=*/kF16, /*accKind=*/kF32};
-
-// WMMA (Volta+): 16×16×16, f16 inputs → f16 accumulator
-static const NVMMAIntrinsicInfo kWmmaF16_16x16x16 = {
-    NVMMAIntrinsicValues::WMMA_F16_16x16x16,
-    /*mSize=*/16, /*nSize=*/16, /*kSize=*/16,
-    /*warpSize=*/32,
-    /*lhsKind=*/kF16, /*rhsKind=*/kF16, /*accKind=*/kF16};
-
-// mma.sync (Ampere+): 16×8×16, f16 inputs → f32 accumulator
-static const NVMMAIntrinsicInfo kMmaSyncF16_16x8x16 = {
-    NVMMAIntrinsicValues::MMA_SYNC_F16_16x8x16,
-    /*mSize=*/16, /*nSize=*/8, /*kSize=*/16,
-    /*warpSize=*/32,
-    /*lhsKind=*/kF16, /*rhsKind=*/kF16, /*accKind=*/kF32};
-
-// mma.sync (Ampere+): 16×8×16, bf16 inputs → f32 accumulator
 static const NVMMAIntrinsicInfo kMmaSyncBf16_16x8x16 = {
     NVMMAIntrinsicValues::MMA_SYNC_BF16_16x8x16,
     /*mSize=*/16, /*nSize=*/8, /*kSize=*/16,
     /*warpSize=*/32,
-    /*lhsKind=*/kBF16, /*rhsKind=*/kBF16, /*accKind=*/kF32};
+    /*lhsKind=*/kBF16, /*rhsKind=*/kBF16, /*accKind=*/kF32,
+    /*distribution=*/{/*threadsM=*/8, /*threadsN=*/4,
+                      /*elemsPerThreadM=*/2, /*elemsPerThreadN=*/2}
+};
 
-// mma.sync (Ampere+): 16×8×8, f32 inputs (TF32 truncation in HW) → f32 accumulator
+static const NVMMAIntrinsicInfo kMmaSyncF16_16x8x16 = {
+    NVMMAIntrinsicValues::MMA_SYNC_F16_16x8x16,
+    /*mSize=*/16, /*nSize=*/8, /*kSize=*/16,
+    /*warpSize=*/32,
+    /*lhsKind=*/kF16, /*rhsKind=*/kF16, /*accKind=*/kF32,
+    /*distribution=*/{/*threadsM=*/8, /*threadsN=*/4,   // same shape
+                      /*elemsPerThreadM=*/2, /*elemsPerThreadN=*/2}
+};
+
 static const NVMMAIntrinsicInfo kMmaSyncTf32_16x8x8 = {
     NVMMAIntrinsicValues::MMA_SYNC_TF32_16x8x8,
     /*mSize=*/16, /*nSize=*/8, /*kSize=*/8,
     /*warpSize=*/32,
-    /*lhsKind=*/kF32, /*rhsKind=*/kF32, /*accKind=*/kF32};
+    /*lhsKind=*/kF32, /*rhsKind=*/kF32, /*accKind=*/kF32,
+    /*distribution=*/{/*threadsM=*/8, /*threadsN=*/4,   // M/N same as bf16
+                      /*elemsPerThreadM=*/2, /*elemsPerThreadN=*/2}
+};
+
+static const NVMMAIntrinsicInfo kWmmaF32_16x16x16 = {
+    NVMMAIntrinsicValues::WMMA_F32_16x16x16,
+    /*mSize=*/16, /*nSize=*/16, /*kSize=*/16,
+    /*warpSize=*/32,
+    /*lhsKind=*/kF16, /*rhsKind=*/kF16, /*accKind=*/kF32,
+    /*distribution=*/{/*threadsM=*/2, /*threadsN=*/16,
+                      /*elemsPerThreadM=*/8, /*elemsPerThreadN=*/1}
+};
+
+static const NVMMAIntrinsicInfo kWmmaF16_16x16x16 = {
+    NVMMAIntrinsicValues::WMMA_F16_16x16x16,
+    /*mSize=*/16, /*nSize=*/16, /*kSize=*/16,
+    /*warpSize=*/32,
+    /*lhsKind=*/kF16, /*rhsKind=*/kF16, /*accKind=*/kF16,
+    /*distribution=*/{/*threadsM=*/2, /*threadsN=*/16, 
+                      /*elemsPerThreadM=*/8, /*elemsPerThreadN=*/1}
+};
+
+std::optional<DistributionLayout> 
+NVMMAIntrinsicInfo::getDistributionMappingKind() const {
+    // Check if distribution was set (non-zero threads)
+    if (distribution.threadsM == 0 || distribution.threadsN == 0)
+        return std::nullopt;  // ← this is what causes the skip in your filter
+    return distribution;
+}
 
 //===----------------------------------------------------------------------===//
 // SM architecture capability table
@@ -91,11 +110,12 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
         return val;
     }
     return llvm::StringSwitch<int>(smArch)
-        .Case("volta",   70)
-        .Case("turing",  75)
-        .Case("ampere",  80)
-        .Case("ada",     89)
-        .Case("hopper",  90)
+        .Case("volta",     70)
+        .Case("turing",    75)
+        .Case("ampere",    80)
+        .Case("ada",       89)
+        .Case("hopper",    90)
+        .Case("blackwell", 100)
         .Default(-1);
   };
 
@@ -109,32 +129,62 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
   info.maxThreadsPerWorkgroup   = 1024;
 
   // ALGORITHM STEP: Select capabilities by SM generation (newest-first).
-  if (sm >= 90) {
-    // Hopper (H100 SXM, H100 PCIe, etc.)
+  if (sm >= 100) {
+    // Blackwell (B100 / B200 / RTX 5090 etc.)
+    // sm_100 is the first Blackwell compute arch; consumer parts use sm_120.
+    // Blackwell adds new UMMA (block-scaled, asynchronous) intrinsics that are
+    // not yet modelled here. For now we expose the same mma.sync set as Hopper
+    // so the compiler can generate functional (not peak-performance) code.
+    // TODO: add UMMA / wgmma.mma_async intrinsics when Nova adds sm_100 support.
+    info.archName = "sm_100";
+    info.smCount  = 132; // B100 SXM5 has 132 SMs (same die count as H100 SXM)
+    info.maxWorkgroupMemBytes = 228 * 1024; // same as Hopper shared-mem limit
+    info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
+                          kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
+                          kWmmaF32_16x16x16, kWmmaF16_16x16x16};
+  } else if (sm >= 90) {
+    // Hopper (H100 SXM5 = 132 SMs, H100 PCIe = 114 SMs, H800 = 132 SMs)
+    // 228 KB shared mem is achievable with dynamic smem carve-out.
     info.archName = "sm_90";
-    info.smCount  = 132; // H100 SXM has 132 SMs
+    info.smCount  = 132; // H100 SXM5
     info.maxWorkgroupMemBytes = 228 * 1024;
     info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
                           kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 89) {
-    // Ada Lovelace (RTX 4090, L40, L4, etc.)
+    // Ada Lovelace (RTX 4090 = 128 SMs, L40S = 142 SMs, L4 = 58 SMs)
+    // smCount=128 targets RTX 4090 as the reference device.
     info.archName = "sm_89";
-    info.smCount  = 128; // RTX 4090 has 128 SMs
-    info.maxWorkgroupMemBytes = 100 * 1024;
+    info.smCount  = 128;
+    info.maxWorkgroupMemBytes = 48 * 1024;
+    info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
+                          kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
+                          kWmmaF32_16x16x16, kWmmaF16_16x16x16};
+  } else if (sm >= 87) {
+    // Ampere GA10B — Jetson AGX Orin / Orin NX (16 SMs, 64 KB shared mem)
+    // sm_87 is the embedded Ampere variant; shares mma.sync intrinsics with
+    // sm_86 but has far fewer SMs and a smaller shared-mem limit per block.
+    info.archName = "sm_87";
+    info.smCount  = 16; // Jetson AGX Orin has 16 SMs
+    info.maxWorkgroupMemBytes = 48 * 1024;
     info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
                           kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 86) {
-    // Ampere GA106 / GA107 (RTX 3060 has 28 SMs, RTX 3090 has 84 SMs)
+    // Ampere GA106/GA107/GA104 desktop & professional:
+    //   RTX 3060 = 28 SMs, RTX 3070 = 46 SMs, RTX 3080 = 68 SMs,
+    //   RTX 3090 = 82 SMs, A10 = 72 SMs, A30 = 56 SMs.
+    // We use 46 SMs as a middle-ground representative; the adjustSeedsForTarget
+    // CU-fill pass will tune tiles for the actual SM count at runtime if a more
+    // accurate count is supplied by the user.
     info.archName = "sm_86";
-    info.smCount  = 28; // Targeting RTX 3060 as the reference device
-    info.maxWorkgroupMemBytes = 100 * 1024;
-    info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
-                          kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
-                          kWmmaF32_16x16x16, kWmmaF16_16x16x16};
+    info.smCount  = 46;
+    info.maxWorkgroupMemBytes = 48 * 1024;
+    info.mmaIntrinsics = {kMmaSyncTf32_16x8x8};
   } else if (sm >= 80) {
-    // Ampere GA100 (A100 SXM has 108 SMs; 164 KB max shared mem)
+    // Ampere GA100 (A100 SXM4/SXM5 = 108 SMs, A100 PCIe = 108 SMs,
+    //               A30 = 56 SMs — use 108 as canonical data-centre value).
+    // 164 KB shared mem is the maximum with dynamic smem carve-out.
     info.archName = "sm_80";
     info.smCount  = 108;
     info.maxWorkgroupMemBytes = 164 * 1024;
@@ -142,24 +192,26 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
                           kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 75) {
-    // Turing (T4, RTX 20xx series)
+    // Turing (RTX 2080 Ti = 68 SMs, T4 = 40 SMs, RTX 2080 = 46 SMs)
+    // Use 68 SMs (RTX 2080 Ti) as the reference; Turing has WMMA but NOT the
+    // mma.sync instructions introduced with Ampere.
     info.archName = "sm_75";
-    info.smCount  = 72; // RTX 2080 Ti has 68 SMs; use 72 as a round generic
+    info.smCount  = 68;
     info.maxWorkgroupMemBytes = 64 * 1024;
-    // Turing has WMMA but not the mma.sync Ampere instructions.
     info.mmaIntrinsics = {kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 70) {
-    // Volta (V100 SXM2 has 80 SMs, 96 KB max shared mem)
+    // Volta (V100 SXM2 = 80 SMs, V100 PCIe = 80 SMs, 96 KB shared mem)
+    // Only WMMA_F32 is available; WMMA_F16 accumulation requires Turing+.
     info.archName = "sm_70";
     info.smCount  = 80;
     info.maxWorkgroupMemBytes = 96 * 1024;
     info.mmaIntrinsics = {kWmmaF32_16x16x16};
   } else {
-    // Pre-Volta: no Tensor Core / MMA intrinsics, SIMT-only path.
+    // Pre-Volta (Pascal and older): no Tensor Core / MMA intrinsics.
+    // KernelConfig falls back to a SIMT tiling path for these devices.
     info.archName = "sm_60";
     info.smCount  = 60;
     info.maxWorkgroupMemBytes = 48 * 1024;
-    // mmaIntrinsics stays empty → KernelConfig falls back to SIMT tiling.
   }
   return info;
 }

@@ -16,9 +16,14 @@ void registerNovaElementwiseToLinalgPass();
 void populateNovaToLinalgPatternsTemplate(RewritePatternSet &patterns);
 
 // From NovaToLinalg.cpp — structural Nova ops (matmul, gather, etc.) → linalg
-std::unique_ptr<Pass> createNovaToLinalgPass();
-void registerNovaToLinalgPass();
+std::unique_ptr<Pass> createNovaToLinalgNamedPass();
+void registerNovaToLinalgNamedPass();
 void populateNovaToLinalgPatterns(RewritePatternSet &patterns);
+
+// From NovaToLinalgGeneric.cpp — complex elementwise ops (layernorm, softmax) → linalg
+std::unique_ptr<Pass> createNovaToLinalgGenericLoweringPass();
+void registerNovaToLinalgGenericLoweringPass();
+void populateNovaToLinalgGenericConversionPatterns(RewritePatternSet &patterns);
 
 } // namespace nova
 } // namespace mlir

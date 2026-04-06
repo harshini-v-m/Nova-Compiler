@@ -1,63 +1,84 @@
 add_mlir_library(NovaLLVMGPUTransforms
+  # Top-level pipeline
   Passes.cpp
-  NovaGPUTileAndFuseUtils.cpp
-  NovaGPUTileDispatchUsingForall.cpp
-  NovaGPUPadOperands.cpp
-  NovaGPUPromoteMatmulOperands.cpp
-  SCFScalarizeAccumulator.cpp
-  NovaWarpShuffleReduction.cpp
-  LoopSplit.cpp
-  NovaScfLoopUnroll.cpp
-  NovaScfLoopVectorize.cpp
-  NovaGPUApplyTilingLevelReduction.cpp
-  # GAP 2: Erase fusion barriers before bufferization
-  NovaGPUEraseFusionBarriers.cpp
-  # GAP 3: Infer GPU memory spaces before bufferization
-  NovaGPUInferMemorySpace.cpp
-  # GAP 3: Comprehensive GPU-aware bufferize pass (mirrors IREEComprehensiveBufferizePass)
-  NovaGPUBufferize.cpp
-  # Pre-bufferize: eliminate tensor.empty ops (mirrors IREE's EliminateEmptyTensorsPass)
-  NovaEliminateEmptyTensors.cpp
-  # Config propagation (mirrors IREE's ConfigTrackingCanonicalizerPass)
-  NovaConfigTrackingCanonicalizer.cpp
-  # Phase 2: LoweringConfig read/write utilities
-  NovaGPULoweringConfigUtils.cpp
-  # Phase 3: NVIDIA target description table
-  NVIDIATargetUtils.cpp
-  # Phase 4: Kernel config heuristic
-  NovaKernelConfig.cpp
-  # Phase 5: Strategy pass
-  NovaGPUSelectLoweringStrategy.cpp
-  # Phase 6: Fuse and hoist parallel loops (mirrors IREE GPUFuseAndHoistParallelLoops)
-  NovaGPUFuseAndHoistParallelLoops.cpp
-  # Phase 6.5: Greedily distribute orphaned ops to threads (mirrors IREE GPUGreedilyDistributeToThreads)
-  NovaGPUGreedilyDistributeToThreads.cpp
-  # Lower nova.barrier_region → two nova.value_barrier ops (mirrors IREE LowerBarrierRegion)
-  NovaGPULowerBarrierRegion.cpp
-  # Normalize scf.forall bounds to lb=0, step=1 (mirrors IREE NormalizeLoopBounds)
-  NovaNormalizeLoopBounds.cpp
-  # Convert workgroup memref.alloc → memref.global + drop deallocs (mirrors IREE)
-  NovaConvertSharedMemAllocs.cpp
-  # Convert scf.forall → gpu.launch with dynamic block dims (replaces transform script)
-  NovaGPUMapForallToGPU.cpp
 
-  NovaGPUFillCopyForwarding.cpp
-  # Step 8.2: Coalesce workgroup allocs with non-overlapping live ranges.
-  NovaGPUCoalesceWorkgroupBuffers.cpp
+  # ── Config ────────────────────────────────────────────────────────────────
+  # NVIDIA target description table
+  Config/NVIDIATargetUtils.cpp
+  # LoweringConfig read/write utilities
+  Config/NovaGPULoweringConfigUtils.cpp
+  # Kernel config heuristics
+  Config/NovaKernelConfig.cpp
+  # Strategy selection pass
+  Config/NovaGPUSelectLoweringStrategy.cpp
+  # Config-propagating canonicalizer
+  Config/NovaConfigTrackingCanonicalizer.cpp
 
-  # rematerialization pass
-  NovaFuseReductionIntoProducer.cpp
-  # custom element-wise fusion pass to prevent matmul fusion
-  NovaElementwiseOpFusionPass.cpp
-  # parallel fusion case with same inputs
-  NovaCheckInsParallelFuse.cpp
-  # horizontal fusion pass for reduction cases
-  NovaLinalgFusion.cpp
-  # vertical fusion pass for reduction producer and parallel consumer case
-  NovaVerticalFusion.cpp
+  # ── Tiling ────────────────────────────────────────────────────────────────
+  # Tile-and-fuse shared utilities
+  Tiling/NovaGPUTileAndFuseUtils.cpp
+  # Workgroup tiling via scf.forall
+  Tiling/NovaGPUTileDispatchUsingForall.cpp
+  # Reduction (K-dim) tiling inside forall
+  Tiling/NovaGPUApplyTilingLevelReduction.cpp
+  # Pad linalg operands to tile-size multiples
+  Tiling/NovaGPUPadOperands.cpp
+  # Promote matmul A/B operands to shared memory
+  Tiling/NovaGPUPromoteMatmulOperands.cpp
 
-  ADDITIONAL_HEADER_DIRS
-  ${PROJECT_SOURCE_DIR}/include
+  # ── Fusion ────────────────────────────────────────────────────────────────
+  # Fuse and hoist parallel scf.forall loops
+  Fusion/NovaGPUFuseAndHoistParallelLoops.cpp
+  # Distribute orphaned parallel ops to GPU threads
+  Fusion/NovaGPUGreedilyDistributeToThreads.cpp
+  # Rematerialization / reduction-into-producer fusion
+  Fusion/NovaFuseReductionIntoProducer.cpp
+  # Element-wise fusion (prevents unwanted matmul fusion)
+  Fusion/NovaElementwiseOpFusionPass.cpp
+  # Parallel fusion for ops with identical inputs
+  Fusion/NovaCheckInsParallelFuse.cpp
+  # Horizontal linalg fusion for reduction cases
+  Fusion/NovaLinalgFusion.cpp
+  # Vertical fusion: reduction producer + parallel consumer
+  Fusion/NovaVerticalFusion.cpp
+
+  Fusion/NovaMultiConsumerFusion.cpp
+
+  # ── Memory ────────────────────────────────────────────────────────────────
+  # GPU-aware comprehensive bufferization
+  Memory/NovaGPUBufferize.cpp
+  # Infer shared vs. private memory spaces
+  Memory/NovaGPUInferMemorySpace.cpp
+  # Convert workgroup alloc → memref.global (shared mem)
+  Memory/NovaConvertSharedMemAllocs.cpp
+  # Coalesce workgroup allocs with non-overlapping live ranges
+  Memory/NovaGPUCoalesceWorkgroupBuffers.cpp
+  # Forward fill/copy operations
+  Memory/NovaGPUFillCopyForwarding.cpp
+  # Eliminate tensor.empty ops pre-bufferization
+  Memory/NovaEliminateEmptyTensors.cpp
+  Memory/NovaRepositionStore.cpp
+  # ── Loops ─────────────────────────────────────────────────────────────────
+  # Unroll scf loops
+  Loops/NovaScfLoopUnroll.cpp
+  # Vectorize scf loops
+  Loops/NovaScfLoopVectorize.cpp
+  # Loop splitting transformation
+  Loops/LoopSplit.cpp
+  # Scalarize accumulator across SCF loops
+  Loops/SCFScalarizeAccumulator.cpp
+  # Normalize scf.forall bounds to lb=0, step=1
+  Loops/NovaNormalizeLoopBounds.cpp
+  # Warp-level shuffle reduction
+  Loops/NovaWarpShuffleReduction.cpp
+
+  # ── Lowering ──────────────────────────────────────────────────────────────
+  # Convert scf.forall → gpu.launch with dynamic block dims
+  Lowering/NovaGPUMapForallToGPU.cpp
+  # Lower nova.barrier_region → two nova.value_barrier ops
+  Lowering/NovaGPULowerBarrierRegion.cpp
+  # Erase nova.fusion_barrier ops
+  Lowering/NovaGPUEraseFusionBarriers.cpp
 
   DEPENDS
   MLIRNovaOpsIncGen
@@ -98,6 +119,12 @@ add_mlir_library(NovaLLVMGPUTransforms
   # IREE Dependencies (Using existing Nova linkage/vendored paths if available, otherwise adapting)
   # For now, assuming we implement simplified versions or link against IREE libraries if setup.
   # Given previous context, we likely reimplement simplified passes.
+)
+
+target_include_directories(NovaLLVMGPUTransforms
+  PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 add_compile_definitions(NOVA_SOURCE_DIR="${PROJECT_SOURCE_DIR}")

@@ -351,6 +351,20 @@ struct NovaTileAndDistributePass
                          << producerOp->getName() << "\n");
               return std::nullopt;
             }
+            // Producers that have their own lowering_config are scheduled to be
+            // tiled independently in Phase 1b.  Fusing them here would
+            // recompute the same tensor once per root forall (e.g., the
+            // embedding gather op feeding LN-mean, LN-var, LN-normalize, and
+            // the residual-add — 7× redundant scatter-reads from global memory).
+            // Let Phase 1b tile these producers into their own foralls; roots
+            // will read from the materialized result via extract_slice.
+            if (getLoweringConfig(producerOp)) {
+              LLVM_DEBUG(llvm::dbgs()
+                         << "[nova-tile-dispatch] Fusion BLOCKED (has own "
+                            "lowering_config): "
+                         << producerOp->getName() << "\n");
+              return std::nullopt;
+            }
             // Don't fuse producers that have reduction iterator types.
             // Reductions (e.g. LayerNorm mean/variance, softmax sum) need
             // to see ALL elements along the reduction dimension. When fused
@@ -368,6 +382,70 @@ struct NovaTileAndDistributePass
                 }
               }
             }
+            // Don't fuse a producer that has outside users (would create a
+            // shared_out in the forall) if its slice doesn't depend on ALL of
+            // the forall's induction variables. Such a producer is independent
+            // of some tiled dimension — every tile of that dimension would
+            // recompute the same result AND write it to the same shared_out
+            // slot (benign race, but O(N-tiles) redundant work).
+            //
+            // Example: layernorm output (8×1024×384) fused into a
+            // (batch=1, tokens=128, N=64) matmul forall. The extract_slice
+            // uses IVs arg51 (batch), arg52 (tokens) but NOT arg53 (N), so
+            // all 24 N-tiles compute identical layernorms. Block fusion so the
+            // layernorm gets its own (batch, tokens) kernel (Phase 1a-3).
+            if (yieldReplacementsFor.contains(producerOp)) {
+              auto parentForall =
+                  sliceOp->getParentOfType<scf::ForallOp>();
+              if (parentForall) {
+                auto ivs = parentForall.getInductionVars();
+                if (ivs.size() > 1) {
+                  // BFS backward from each offset/size value to see if all
+                  // forall IVs are reachable. This handles multi-level chains
+                  // like affine.apply(affine.apply(iv, stride), offset) or
+                  // arith.addi(arith.muli(iv, c), base) that the old one-level
+                  // expansion would miss, causing unnecessary fusion blocks.
+                  SmallPtrSet<Value, 32> visited;
+                  SmallVector<Value> worklist;
+                  auto enqueue = [&](Value v) {
+                    if (visited.insert(v).second)
+                      worklist.push_back(v);
+                  };
+                  for (auto ofr : sliceOp.getMixedOffsets())
+                    if (auto val = dyn_cast<Value>(ofr))
+                      enqueue(val);
+                  for (auto ofr : sliceOp.getMixedSizes())
+                    if (auto val = dyn_cast<Value>(ofr))
+                      enqueue(val);
+                  while (!worklist.empty()) {
+                    Value v = worklist.pop_back_val();
+                    // Stop at block arguments (IVs are block args of forall).
+                    if (isa<BlockArgument>(v))
+                      continue;
+                    if (auto *defOp = v.getDefiningOp()) {
+                      // Don't cross forall boundaries or region ops.
+                      if (defOp->getParentRegion() !=
+                          sliceOp->getParentRegion())
+                        continue;
+                      for (Value operand : defOp->getOperands())
+                        enqueue(operand);
+                    }
+                  }
+                  bool allIVsUsed = llvm::all_of(
+                      ivs, [&](Value iv) {
+                        return visited.contains(iv);
+                      });
+                  if (!allIVsUsed) {
+                    LLVM_DEBUG(llvm::dbgs()
+                               << "[nova-tile-dispatch] Fusion BLOCKED "
+                               << "(outside users + slice omits forall IV): "
+                               << producerOp->getName() << "\n");
+                    return std::nullopt;
+                  }
+                }
+              }
+            }
+
             LLVM_DEBUG(llvm::dbgs()
                        << "[nova-tile-dispatch] Fusion ALLOWED: "
                        << producerOp->getName() << "\n");
@@ -725,10 +803,24 @@ struct NovaTileAndDistributePass
         if (op->getNumResults() == 0)
           continue;
 
-        // Only wrap ops that produce tensor results.
-        auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-        if (!resultType)
+        // Collect ranked-tensor result types. For multi-output ops (e.g. a
+        // horizontally-fused linalg.generic with N outputs) we must wire ALL
+        // results through the forall — one shared_out and one
+        // parallel_insert_slice per result. Skip the op if any result is not
+        // a ranked tensor (no sensible forall wrapping possible).
+        SmallVector<RankedTensorType> resultTypes;
+        for (Value res : op->getResults()) {
+          auto rt = dyn_cast<RankedTensorType>(res.getType());
+          if (!rt) {
+            resultTypes.clear();
+            break;
+          }
+          resultTypes.push_back(rt);
+        }
+        if (resultTypes.empty())
           continue;
+
+        RankedTensorType resultType = resultTypes[0];
 
         // Warn if a large op is being serialized to a single workgroup.
         // This usually indicates a bug in SelectLoweringStrategy (op should
@@ -757,12 +849,15 @@ struct NovaTileAndDistributePass
         Location loc = op->getLoc();
         rewriter.setInsertionPoint(op);
 
-        // Create tensor.empty as the shared_out for the forall.
-        SmallVector<OpFoldResult> emptySizes;
-        for (int64_t dim = 0; dim < resultType.getRank(); ++dim)
-          emptySizes.push_back(rewriter.getIndexAttr(resultType.getDimSize(dim)));
-        Value emptyTensor = tensor::EmptyOp::create(
-            rewriter, loc, emptySizes, resultType.getElementType());
+        // Create one tensor.empty per result as shared_out for the forall.
+        SmallVector<Value> emptyTensors;
+        for (RankedTensorType rt : resultTypes) {
+          SmallVector<OpFoldResult> emptySizes;
+          for (int64_t dim = 0; dim < rt.getRank(); ++dim)
+            emptySizes.push_back(rewriter.getIndexAttr(rt.getDimSize(dim)));
+          emptyTensors.push_back(tensor::EmptyOp::create(
+              rewriter, loc, emptySizes, rt.getElementType()));
+        }
 
         SmallVector<OpFoldResult> lbs = {rewriter.getIndexAttr(0)};
         SmallVector<OpFoldResult> ubs = {rewriter.getIndexAttr(1)};
@@ -771,32 +866,36 @@ struct NovaTileAndDistributePass
             &getContext(), gpu::MappingId::DimX)};
 
         auto forallOp = scf::ForallOp::create(
-            rewriter, loc, lbs, ubs, steps, ValueRange{emptyTensor},
+            rewriter, loc, lbs, ubs, steps, ValueRange{emptyTensors},
             ArrayAttr::get(&getContext(), blockMapping));
 
         Block *body = forallOp.getBody();
         op->moveBefore(body, body->without_terminator().end());
 
-        // Create parallel_insert_slice in the terminator.
+        // Create one parallel_insert_slice per result in the terminator.
         rewriter.setInsertionPointToEnd(forallOp.getTerminator().getBody());
-        int64_t rank = resultType.getRank();
-        SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
-        SmallVector<OpFoldResult> sizes;
-        for (int64_t dim = 0; dim < rank; ++dim)
-          sizes.push_back(rewriter.getIndexAttr(resultType.getDimSize(dim)));
-        SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+        for (unsigned i = 0; i < resultTypes.size(); ++i) {
+          RankedTensorType rt = resultTypes[i];
+          int64_t rank = rt.getRank();
+          SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
+          SmallVector<OpFoldResult> sizes;
+          for (int64_t dim = 0; dim < rank; ++dim)
+            sizes.push_back(rewriter.getIndexAttr(rt.getDimSize(dim)));
+          SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+          tensor::ParallelInsertSliceOp::create(
+              rewriter, loc, op->getResult(i),
+              forallOp.getRegionIterArgs()[i],
+              offsets, sizes, strides);
+        }
 
-        Value resultVal = op->getResult(0);
-        tensor::ParallelInsertSliceOp::create(
-            rewriter, loc, resultVal,
-            forallOp.getRegionIterArgs()[0],
-            offsets, sizes, strides);
-
-        // Replace uses outside the forall.
-        rewriter.replaceUsesWithIf(
-            resultVal, forallOp.getResult(0), [&](OpOperand &use) {
-              return !forallOp->isProperAncestor(use.getOwner());
-            });
+        // Replace uses of each result outside the forall.
+        for (unsigned i = 0; i < resultTypes.size(); ++i) {
+          Value resultVal = op->getResult(i);
+          rewriter.replaceUsesWithIf(
+              resultVal, forallOp.getResult(i), [&](OpOperand &use) {
+                return !forallOp->isProperAncestor(use.getOwner());
+              });
+        }
       }
     }
 

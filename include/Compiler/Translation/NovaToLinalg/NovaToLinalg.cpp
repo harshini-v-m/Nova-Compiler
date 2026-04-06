@@ -24,9 +24,484 @@ using namespace mlir::bufferization;
 
 namespace mlir {
 namespace nova {
+//HELPER FUNCTIONS
+static Value broadcastToShape(OpBuilder &b, Location loc,
+                               Value input, ArrayRef<int64_t> targetShape) {
+  auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
+  if (!inputType)
+    return input;
+
+  ArrayRef<int64_t> inputShape = inputType.getShape();
+  int64_t inputRank  = static_cast<int64_t>(inputShape.size());
+  int64_t targetRank = static_cast<int64_t>(targetShape.size());
+
+  if (inputRank == targetRank &&
+      std::equal(inputShape.begin(), inputShape.end(), targetShape.begin()))
+    return input;
+
+  int64_t rankDiff = targetRank - inputRank;
+  SmallVector<AffineExpr> inputExprs;
+
+  if (inputRank < targetRank) {
+    // Rank mismatch: align input dims to the trailing dims of the target.
+    // e.g. input rank=1, target rank=3 → input[0] maps to d2
+    for (int64_t i = 0; i < inputRank; ++i)
+      inputExprs.push_back(b.getAffineDimExpr(rankDiff + i));
+  } else {
+    // Same rank, shape mismatch: size-1 dims use constant-0 (broadcast),
+    // all other dims pass through as identity.
+    // e.g. tensor<1x10xf32> → tensor<16x10xf32>: d0 → 0, d1 → d1
+    for (int64_t i = 0; i < targetRank; ++i) {
+      if (inputShape[i] == 1 && targetShape[i] != 1)
+        inputExprs.push_back(b.getAffineConstantExpr(0));
+      else
+        inputExprs.push_back(b.getAffineDimExpr(i));
+    }
+  }
+
+  auto inputMap  = AffineMap::get(targetRank, 0, inputExprs, b.getContext());
+  auto outputMap = AffineMap::getMultiDimIdentityMap(targetRank, b.getContext());
+
+  Value initTensor = b.create<tensor::EmptyOp>(
+      loc, targetShape, inputType.getElementType());
+
+  SmallVector<utils::IteratorType> iters(targetRank,
+                                         utils::IteratorType::parallel);
+
+  return b.create<linalg::GenericOp>(
+             loc, TypeRange{initTensor.getType()},
+             input, initTensor,
+             SmallVector<AffineMap>{inputMap, outputMap}, iters,
+             [](OpBuilder &b, Location loc, ValueRange args) {
+               b.create<linalg::YieldOp>(loc, args[0]);
+             })
+           .getResult(0);
+}
 
 // Conversion Patterns
+//Arithmetic ops
+//ADD OP - > LINALG.ADD
+struct NovaAddOpLowering : public OpConversionPattern<nova::AddOp> {
+  using OpConversionPattern<nova::AddOp>::OpConversionPattern;
 
+  LogicalResult
+  matchAndRewrite(nova::AddOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+
+    Location loc = op.getLoc();
+    Value input = adaptor.getLhs();
+    Value other = adaptor.getRhs();
+    input = broadcastToShape(rewriter, loc, input, resultType.getShape());
+    other = broadcastToShape(rewriter, loc, other, resultType.getShape());
+
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+
+    // Identity maps for linalg.add
+    auto ResOp = rewriter.create<linalg::AddOp>(
+        loc, TypeRange{resultType},ValueRange{input, other},ValueRange{emptyTensor});
+
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//SUB OP - > LINALG.SUB
+struct NovaSubOpLowering : public OpConversionPattern<nova::SubOp> {
+  using OpConversionPattern<nova::SubOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::SubOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getLhs();
+    Value other = adaptor.getRhs();
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+    input = broadcastToShape(rewriter, loc, input, resultType.getShape());
+    other = broadcastToShape(rewriter, loc, other, resultType.getShape());   
+    // Identity maps for linalg.sub
+    auto ResOp = rewriter.create<linalg::SubOp>(
+        loc, TypeRange{resultType},ValueRange{input, other},ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//MUL OP - > LINALG.MUL
+struct NovaMulOpLowering : public OpConversionPattern<nova::MulOp> {
+  using OpConversionPattern<nova::MulOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::MulOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getLhs();
+    Value other = adaptor.getRhs();
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+        
+    // Identity maps for linalg.mul
+    auto ResOp = rewriter.create<linalg::MulOp>(
+        loc, TypeRange{resultType},ValueRange{input, other},ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//DIV OP - > LINALG.DIV
+struct NovaDivOpLowering : public OpConversionPattern<nova::DivOp> {
+  using OpConversionPattern<nova::DivOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::DivOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getLhs();
+    Value other = adaptor.getRhs();
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+        
+    // Identity maps for linalg.div
+    auto ResOp = rewriter.create<linalg::DivOp>(
+        loc, TypeRange{resultType},ValueRange{input, other},ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//MIN OP - > LINALG.MIN
+struct NovaMinOpLowering : public OpConversionPattern<nova::MinOp> {
+  using OpConversionPattern<nova::MinOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::MinOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getLhs();
+    Value other = adaptor.getRhs();
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+        
+    // Identity maps for linalg.min
+    auto ResOp = rewriter.create<linalg::MinOp>(
+        loc, TypeRange{resultType},ValueRange{input, other},ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//MAX OP - > LINALG.MAX
+struct NovaMaxOpLowering : public OpConversionPattern<nova::MaxOp> {
+  using OpConversionPattern<nova::MaxOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::MaxOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getLhs();
+    Value other = adaptor.getRhs();
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+        
+    // Identity maps for linalg.max
+    auto ResOp = rewriter.create<linalg::MaxOp>(
+        loc, TypeRange{resultType},ValueRange{input, other},ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//POW OP - > LINALG.POW
+struct NovaPowOpLowering : public OpConversionPattern<nova::PowOp> {
+  using OpConversionPattern<nova::PowOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::PowOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getLhs();
+    Value other = adaptor.getRhs();
+
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+
+    Type elemType = resultType.getElementType();
+
+    if (isa<FloatType>(elemType)) {
+      // Float path: use linalg.powf named op
+      auto ResOp = rewriter.create<linalg::PowFOp>(
+          loc, TypeRange{resultType}, ValueRange{input, other},
+          ValueRange{emptyTensor});
+      rewriter.replaceOp(op, ResOp.getResults());
+    } else {
+      // Integer path: lower to linalg.generic with math.ipowi
+      int64_t rank = resultType.getRank();
+      SmallVector<AffineMap> indexingMaps(
+          3, AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext()));
+      SmallVector<utils::IteratorType> iteratorTypes(
+          rank, utils::IteratorType::parallel);
+
+      auto ResOp = rewriter.create<linalg::GenericOp>(
+          loc, TypeRange{resultType}, ValueRange{input, other},
+          ValueRange{emptyTensor}, indexingMaps, iteratorTypes,
+          [&](OpBuilder &b, Location loc, ValueRange args) {
+            Value result = b.create<math::IPowIOp>(loc, args[0], args[1]);
+            b.create<linalg::YieldOp>(loc, result);
+          });
+      rewriter.replaceOp(op, ResOp.getResults());
+    }
+    return success();
+  }
+};
+
+//ABS OP - > LINALG.ABS
+struct NovaAbsOpLowering : public OpConversionPattern<nova::AbsOp> {
+  using OpConversionPattern<nova::AbsOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::AbsOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getInput();
+
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+
+    // Identity maps for linalg.abs
+    auto ResOp = rewriter.create<linalg::AbsOp>(
+        loc, TypeRange{resultType}, ValueRange{input}, ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//EXP OP - > LINALG.EXP
+struct NovaExpOpLowering : public OpConversionPattern<nova::ExpOp> {
+  using OpConversionPattern<nova::ExpOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::ExpOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getInput();
+
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+
+    // Identity maps for linalg.abs
+    auto ResOp = rewriter.create<linalg::ExpOp>(
+        loc, TypeRange{resultType}, ValueRange{input}, ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//LOG OP - > LINALG.LOG
+struct NovaLogOpLowering : public OpConversionPattern<nova::LogOp> {
+  using OpConversionPattern<nova::LogOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::LogOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getInput();
+
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+
+    // Identity maps for linalg.abs
+    auto ResOp = rewriter.create<linalg::LogOp>(
+        loc, TypeRange{resultType}, ValueRange{input}, ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//NEG OP - > LINALG.NEGF (ONLY FOR FLOATS, INTS LOWERED TO MUL WITH -1)
+struct NovaNegOpLowering : public OpConversionPattern<nova::NegOp> {
+  using OpConversionPattern<nova::NegOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(nova::NegOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getInput();
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+    Type elemType = resultType.getElementType();
+    if (isa<FloatType>(elemType)) {
+      // Float path: use linalg.negf named op
+      auto ResOp = rewriter.create<linalg::NegFOp>(
+          loc, TypeRange{resultType}, ValueRange{input}, ValueRange{emptyTensor});
+      rewriter.replaceOp(op, ResOp.getResults());
+    } else {
+      // Integer path: lower to linalg.generic with multiplication by -1
+      auto negOne = rewriter.create<arith::ConstantOp>(
+          loc, resultType.getElementType(),
+          rewriter.getIntegerAttr(resultType.getElementType(), -1));
+      auto ResOp = rewriter.create<linalg::MulOp>(
+          loc, TypeRange{resultType}, ValueRange{input, negOne},
+          ValueRange{emptyTensor});
+      rewriter.replaceOp(op, ResOp.getResults());
+    }
+    return success();
+  }
+};
+
+//RECIPROCAL OP - > LINALG.RECRIPROCAL 
+struct NovaReciprocalOpLowering : public OpConversionPattern<nova::ReciprocalOp> {
+  using OpConversionPattern<nova::ReciprocalOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(nova::ReciprocalOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getInput();
+
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+
+    // Identity maps for linalg.reciprocal
+    auto ResOp = rewriter.create<linalg::ReciprocalOp>(
+        loc, TypeRange{resultType}, ValueRange{input}, ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//SQRT OP - > LINALG.SQRT
+struct NovaSqrtOpLowering : public OpConversionPattern<nova::SqrtOp> {
+  using OpConversionPattern<nova::SqrtOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(nova::SqrtOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)
+      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getInput();
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+    // Identity maps for linalg.sqrt
+    auto ResOp = rewriter.create<linalg::SqrtOp>(
+        loc, TypeRange{resultType}, ValueRange{input}, ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//SQUARE OP - > LINALG.SQUARE
+struct NovaSquareOpLowering : public OpConversionPattern<nova::SquareOp> {
+  using OpConversionPattern<nova::SquareOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(nova::SquareOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getInput();
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+    // Identity maps for linalg.square
+    auto ResOp = rewriter.create<linalg::SquareOp>(
+        loc, TypeRange{resultType}, ValueRange{input}, ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//TANH OP - > LINALG.TANH
+struct NovaTanhOpLowering : public OpConversionPattern<nova::TanhOp> {
+  using OpConversionPattern<nova::TanhOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(nova::TanhOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getInput();
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+    // Identity maps for linalg.tanh
+    auto ResOp = rewriter.create<linalg::TanhOp>(
+        loc, TypeRange{resultType}, ValueRange{input}, ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//RSQRT OP - > LINALG.RSQRT
+struct NovaRsqrtOpLowering : public OpConversionPattern<nova::RsqrtOp> {
+  using OpConversionPattern<nova::RsqrtOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(nova::RsqrtOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType)      return failure();
+    Location loc = op.getLoc();
+    Value input = adaptor.getInput();
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+    // Identity maps for linalg.rsqrt
+    auto ResOp = rewriter.create<linalg::RsqrtOp>(
+        loc, TypeRange{resultType}, ValueRange{input}, ValueRange{emptyTensor});
+    rewriter.replaceOp(op, ResOp.getResults());
+    return success();
+  }
+};
+
+//BROADCAST_IN_DIM OP - > LINALG.BROADCAST
 struct NovaBroadcastInDimOpLowering
     : public OpConversionPattern<nova::BroadcastInDimOp> {
   using OpConversionPattern<nova::BroadcastInDimOp>::OpConversionPattern;
@@ -34,7 +509,6 @@ struct NovaBroadcastInDimOpLowering
   LogicalResult
   matchAndRewrite(nova::BroadcastInDimOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-
     Value input = adaptor.getOperand();
 
     auto resultType = llvm::dyn_cast<RankedTensorType>(op.getType());
@@ -42,13 +516,11 @@ struct NovaBroadcastInDimOpLowering
       return rewriter.notifyMatchFailure(op,
                                          "expected ranked tensor result type");
     }
-
     auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
     if (!inputType) {
       return rewriter.notifyMatchFailure(op,
                                          "expected ranked tensor input type");
     }
-
     auto loc = op.getLoc();
     auto dimsAttr = op.getBroadcastDimensions();
 
@@ -98,7 +570,8 @@ struct NovaBroadcastInDimOpLowering
     return success();
   }
 };
-// Helper function to broadcast a tensor to a target shape
+
+// Helper function to broadcast for matmul
 static Value broadcastTensor(ConversionPatternRewriter &rewriter, Location loc,
                              Value input, ArrayRef<int64_t> targetShape) {
   auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
@@ -209,6 +682,7 @@ static Value broadcastTensor(ConversionPatternRewriter &rewriter, Location loc,
 
   return genericOp.getResult(0);
 }
+
 struct NovaMatmulOpLowering : public OpConversionPattern<nova::MatmulOp> {
   using OpConversionPattern<nova::MatmulOp>::OpConversionPattern;
 
@@ -386,121 +860,37 @@ struct NovaMatmulOpLowering : public OpConversionPattern<nova::MatmulOp> {
     return success();
   }
 };
-struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
-  using OpConversionPattern<nova::GatherOp>::OpConversionPattern;
+
+// RELU OP - > LINALG.MAX with 0
+struct NovaReluOpLowering : public OpConversionPattern<mlir::nova::ReluOp> {
+  using OpConversionPattern<mlir::nova::ReluOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(nova::GatherOp op, OpAdaptor adaptor,
+  matchAndRewrite(mlir::nova::ReluOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto resultType = cast<RankedTensorType>(op.getType());
-    auto loc = op.getLoc();
+    Location loc = op.getLoc();
     Value input = adaptor.getInput();
-    Value indices = adaptor.getIndices();
-
-    // Create empty output tensor
-    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
-        loc, resultType.getShape(), resultType.getElementType());
-
-    auto indicesType = cast<RankedTensorType>(indices.getType());
-    int64_t indicesRank = indicesType.getRank();
-    int64_t resRank = resultType.getRank();
-    int64_t axis = op.getAxis();
     auto inputType = cast<RankedTensorType>(input.getType());
-    int64_t inputRank = inputType.getRank();
+    Type elementType = inputType.getElementType();
 
-    if (axis < 0)
-      axis += inputRank;
+    // Create zero constant tensor with the same shape as input
+    Attribute zeroAttr;
 
-    int64_t batchDims = 0;
-    int64_t maxBatchDims = std::min<int64_t>(axis, indicesRank);
-    for (int64_t i = 0; i < maxBatchDims; ++i) {
-      bool inputDyn = inputType.getDimSize(i) == ShapedType::kDynamic;
-      bool indexDyn = indicesType.getDimSize(i) == ShapedType::kDynamic;
-      if (!inputDyn && !indexDyn && inputType.getDimSize(i) != indicesType.getDimSize(i)) {
-        break;
-      }
-      batchDims++;
+    if (auto floatType = dyn_cast<FloatType>(elementType)) {
+      APFloat zeroVal = APFloat::getZero(floatType.getFloatSemantics());
+      zeroAttr = rewriter.getFloatAttr(floatType, zeroVal);
+    } else if (auto intType = dyn_cast<IntegerType>(elementType)) {
+      zeroAttr = rewriter.getIntegerAttr(intType, 0);
+    } else {
+      return failure();
     }
+    DenseElementsAttr zeroTensor = DenseElementsAttr::get(inputType, zeroAttr);
+    Value zero =
+        rewriter.create<mlir::nova::ConstantOp>(loc, inputType, zeroTensor);
+    Value result =
+        rewriter.create<mlir::nova::MaxOp>(loc, inputType, input, zero);
 
-    // Map for indices: first batchDims map to loops [0, batchDims).
-    // Remaining indices map to loops [axis, axis + indicesRank - batchDims).
-    SmallVector<AffineExpr> indicesExprs;
-    for (int i = 0; i < batchDims; ++i) {
-      indicesExprs.push_back(rewriter.getAffineDimExpr(i));
-    }
-    for (int i = 0; i < indicesRank - batchDims; ++i) {
-      indicesExprs.push_back(rewriter.getAffineDimExpr(axis + i));
-    }
-    auto indicesMap =
-        AffineMap::get(resRank, 0, indicesExprs, rewriter.getContext());
-
-    // Constant map for input: makes the data dependency on `input` explicit
-    // so tiling passes can see it (the actual read is via tensor.extract).
-    SmallVector<AffineExpr> inputConstExprs;
-    for (int64_t i = 0; i < inputRank; ++i)
-      inputConstExprs.push_back(rewriter.getAffineConstantExpr(0));
-    auto inputMap =
-        AffineMap::get(resRank, 0, inputConstExprs, rewriter.getContext());
-
-    // Map for output is identity
-    auto outMap = rewriter.getMultiDimIdentityMap(resRank);
-
-    SmallVector<AffineMap> indexingMaps;
-    indexingMaps.push_back(indicesMap);
-    indexingMaps.push_back(inputMap);
-    indexingMaps.push_back(outMap);
-
-    SmallVector<utils::IteratorType> iteratorTypes(
-        resRank, utils::IteratorType::parallel);
-
-    Type indicesElemType = indicesType.getElementType();
-
-    // Pass both indices and input as inputs; input is needed to make the
-    // dependency visible to tiling passes (the block arg is unused).
-    SmallVector<Value> inputs = {indices, input};
-
-    auto genericOp = rewriter.create<linalg::GenericOp>(
-        loc, TypeRange{resultType}, inputs, emptyTensor, indexingMaps,
-        iteratorTypes, [&](OpBuilder &b, Location l, ValueRange args) {
-          Value indexVal = args[0]; // from indices
-          // args[1] is the dummy input element (unused)
-          if (llvm::isa<FloatType>(indicesElemType)) {
-            indexVal = b.create<arith::FPToSIOp>(l, b.getI32Type(), indexVal);
-          } else if (auto intType =
-                         llvm::dyn_cast<IntegerType>(indicesElemType)) {
-            // Widen narrow integer indices (e.g. i16) to i32 before
-            // IndexCastOp. MLIR's i16 is signless — IndexCastOp may
-            // sign-extend, mapping values > 32767 to negative indices.
-            // Use zero-extension (ExtUIOp) to preserve the unsigned
-            // range 0..65535, which covers vocab sizes up to 65536.
-            if (intType.getWidth() < 32) {
-              indexVal =
-                  b.create<arith::ExtUIOp>(l, b.getI32Type(), indexVal);
-            }
-          }
-
-          Value classIdx =
-              b.create<arith::IndexCastOp>(l, b.getIndexType(), indexVal);
-
-          SmallVector<Value> extractionIndices;
-          // Before axis
-          for (int64_t i = 0; i < axis; ++i) {
-            extractionIndices.push_back(b.create<linalg::IndexOp>(l, i));
-          }
-          // At axis
-          extractionIndices.push_back(classIdx);
-          // After axis
-          for (int64_t i = axis + 1; i < inputRank; ++i) {
-            extractionIndices.push_back(
-                b.create<linalg::IndexOp>(l, i + indicesRank - batchDims - 1));
-          }
-
-          Value extracted =
-              b.create<tensor::ExtractOp>(l, input, extractionIndices);
-          b.create<linalg::YieldOp>(l, extracted);
-        });
-
-    rewriter.replaceOp(op, genericOp.getResults());
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -829,6 +1219,7 @@ struct NovaToDeviceOpLowering : public OpConversionPattern<nova::ToDeviceOp> {
     return success();
   }
 };
+
 struct NovaRandomOpLowering : public OpConversionPattern<nova::Rndm2DOp> {
   using OpConversionPattern<nova::Rndm2DOp>::OpConversionPattern;
   LogicalResult
@@ -855,6 +1246,7 @@ struct NovaRandomOpLowering : public OpConversionPattern<nova::Rndm2DOp> {
     return success();
   }
 };
+
 //----------------------------------------------------------------
 //                          Argmin
 //----------------------------------------------------------------
@@ -875,6 +1267,7 @@ static TypedAttr createInitialValueForReduceOp(Operation *op, Type elementTy,
 inline SmallVector<utils::IteratorType> getNParallelLoopsAttrs(unsigned n) {
   return SmallVector<utils::IteratorType>(n, utils::IteratorType::parallel);
 }
+
 class ArgMinConverter : public OpRewritePattern<nova::ArgMinOp> {
 public:
   using OpRewritePattern<nova::ArgMinOp>::OpRewritePattern;
@@ -1260,6 +1653,7 @@ static Value createReduceCombiner(OpBuilder &b, Location loc,
   case nova::ReductionKind::ANY:
     return b.create<arith::OrIOp>(loc, lhs, rhs).getResult();
   }
+  return nullptr;
 }
 
 // Linalg.generic based lowering for keepdims=true
@@ -1547,6 +1941,7 @@ lowerFullReduceMeanToSCF(nova::ReduceOp op, PatternRewriter &rewriter,
   rewriter.replaceOp(op, result);
   return success();
 }
+
 class ReduceOpConverter : public OpRewritePattern<nova::ReduceOp> {
 public:
   using OpRewritePattern<nova::ReduceOp>::OpRewritePattern;
@@ -1579,12 +1974,12 @@ public:
 
     // Full-reduction MEAN → scf.forall (GPU block) + nested scf.for loops.
     // All other kinds and all partial reductions go through linalg.generic.
-    // bool isFullReduction = (static_cast<int64_t>(axes.size()) == rank);
-    // if (kind == nova::ReductionKind::MEAN && isFullReduction &&
-    //     isa<FloatType>(elemType)) {
-    //   return lowerFullReduceMeanToSCF(op, rewriter, loc, input, inputType,
-    //                                   resultType, elemType, rank, axes);
-    // }
+    bool isFullReduction = (static_cast<int64_t>(axes.size()) == rank);
+    if (kind == nova::ReductionKind::MEAN && isFullReduction &&
+        isa<FloatType>(elemType)) {
+      return lowerFullReduceMeanToSCF(op, rewriter, loc, input, inputType,
+                                      resultType, elemType, rank, axes);
+    }
 
     // Use linalg.generic path for everything else (partial reductions,
     // other reduction kinds, non-float MEAN, …).
@@ -1827,6 +2222,7 @@ struct AdamOpConverter : public OpConversionPattern<::mlir::nova::AdamOp> {
     return success();
   }
 };
+
 struct ReshapeOpConverter : public OpConversionPattern<nova::ReshapeOp> {
   using OpConversionPattern<nova::ReshapeOp>::OpConversionPattern;
 
@@ -1854,143 +2250,42 @@ struct ReshapeOpConverter : public OpConversionPattern<nova::ReshapeOp> {
   }
 };
 
-struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
-  using OpConversionPattern<nova::LinearOp>::OpConversionPattern;
+struct NovaConstantToArithConstPattern
+    : public OpConversionPattern<nova::ConstantOp> {
+  using OpConversionPattern<nova::ConstantOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(nova::LinearOp op, OpAdaptor adaptor,
+  matchAndRewrite(nova::ConstantOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto operands = adaptor.getOperands();
-    if (operands.size() != 3) {
-      return rewriter.notifyMatchFailure(op, "expected exactly 3 operands");
-    }
+    ElementsAttr valueAttr = op.getValue();
+    DenseElementsAttr value = dyn_cast<DenseElementsAttr>(valueAttr);
 
-    Value input = operands[0];
-    Value weight = operands[1];
-    Value bias = operands[2];
-
-    auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
-    auto weightType = llvm::dyn_cast<RankedTensorType>(weight.getType());
-    auto biasType = llvm::dyn_cast<RankedTensorType>(bias.getType());
-
-    auto resultType = llvm::dyn_cast<RankedTensorType>(op.getType());
-    if (!inputType || !weightType || !biasType || !resultType) {
-      return rewriter.notifyMatchFailure(op, "expected ranked tensor types");
-    }
-
-    auto loc = op.getLoc();
-    auto elementType = resultType.getElementType();
-    int64_t inputRank = inputType.getRank();
-
-    // 1. Initialize output with Bias
-    SmallVector<Value> dynDims;
-    for (int i = 0; i < inputRank; ++i) {
-      if (resultType.isDynamicDim(i)) {
-        // Find dim dynamically. We could just use tensor::DimOp if input has
-        // dynamic dims matching result.
-        dynDims.push_back(rewriter.create<tensor::DimOp>(loc, input, i));
-      }
-    }
-
-    Value empty = rewriter.create<tensor::EmptyOp>(loc, resultType.getShape(),
-                                                   elementType, dynDims);
-
-    // Map for Bias to Broadcast: bias is 1D -> (C)
-    // Result is [A, B, ..., C]
-    // Instead of hardcoding 1 dimension:
-    SmallVector<AffineExpr> biasExprs;
-    if (biasType.getRank() == 1) {
-        biasExprs.push_back(rewriter.getAffineDimExpr(inputRank - 1));
-    } else if (biasType.getRank() == 2) {
-    // For [1, C] shape
-    biasExprs.push_back(rewriter.getAffineConstantExpr(0)); 
-    biasExprs.push_back(rewriter.getAffineDimExpr(inputRank - 1));
-    }
-
-    AffineMap biasMap =
-        AffineMap::get(inputRank, 0, biasExprs, rewriter.getContext());
-    AffineMap resultMap = rewriter.getMultiDimIdentityMap(inputRank);
-
-    SmallVector<utils::IteratorType> broadcastIters(
-        inputRank, utils::IteratorType::parallel);
-
-    auto broadcastBias = rewriter.create<linalg::GenericOp>(
-        loc, empty.getType(), bias, empty,
-        ArrayRef<AffineMap>{biasMap, resultMap}, broadcastIters,
-        [&](OpBuilder &b, Location loc, ValueRange args) {
-          b.create<linalg::YieldOp>(loc, args[0]);
-        });
-
-    Value initTensor = broadcastBias.getResult(0);
-
-    // 2. Fused Matmul+Bias
-    // Iterators: [parallel..., parallel, reduction]
-    SmallVector<utils::IteratorType> matmulIters(inputRank,
-                                                 utils::IteratorType::parallel);
-    matmulIters.push_back(utils::IteratorType::reduction);
-
-    int numLoops = inputRank + 1;
-
-    // Input Map: D, A, B -> [d0, d1, d3] (where d3 is B, the reduction dim)
-    SmallVector<AffineExpr> inputExprs;
-    for (int i = 0; i < inputRank - 1; ++i) {
-      inputExprs.push_back(
-          rewriter.getAffineDimExpr(i)); // Parallel dims of LHS
-    }
-    inputExprs.push_back(
-        rewriter.getAffineDimExpr(inputRank)); // Reduction dim K
-    AffineMap inputMap =
-        AffineMap::get(numLoops, 0, inputExprs, rewriter.getContext());
-
-    // Weight Map: B, C -> [d3, d2] (where d3 is reduction dim K, d2 is C, the
-    // last parallel dim)
-    SmallVector<AffineExpr> weightExprs;
-    weightExprs.push_back(rewriter.getAffineDimExpr(inputRank));     // B (K)
-    weightExprs.push_back(rewriter.getAffineDimExpr(inputRank - 1)); // C (N)
-    AffineMap weightMap =
-        AffineMap::get(numLoops, 0, weightExprs, rewriter.getContext());
-
-    // Output Map: D, A, C -> [d0, d1, d2]
-    SmallVector<AffineExpr> outputExprs;
-    for (int i = 0; i < inputRank; ++i) {
-      outputExprs.push_back(rewriter.getAffineDimExpr(i)); // Parallel dims
-    }
-    AffineMap outputMap =
-        AffineMap::get(numLoops, 0, outputExprs, rewriter.getContext());
-
-    auto genericMatmul = rewriter.create<linalg::GenericOp>(
-        loc, resultType, ValueRange{input, weight}, initTensor,
-        ArrayRef<AffineMap>{inputMap, weightMap, outputMap}, matmulIters,
-        [&](OpBuilder &b, Location loc, ValueRange args) {
-          Value inVal = args[0];
-          Value wtVal = args[1];
-          Value outVal = args[2];
-          Value prod;
-          if (isa<FloatType>(elementType))
-            prod = b.create<arith::MulFOp>(loc, inVal, wtVal);
-          else
-            prod = b.create<arith::MulIOp>(loc, inVal, wtVal);
-
-          Value sum;
-          if (isa<FloatType>(elementType))
-            sum = b.create<arith::AddFOp>(loc, outVal, prod);
-          else
-            sum = b.create<arith::AddIOp>(loc, outVal, prod);
-
-          b.create<linalg::YieldOp>(loc, sum);
-        });
-
-    rewriter.replaceOp(op, genericMatmul.getResult(0));
+    auto outputType = cast<RankedTensorType>(op.getOutput().getType());
+    auto hostOutputType = RankedTensorType::get(outputType.getShape(),
+                                                outputType.getElementType());
+    auto hostValue = value.reshape(hostOutputType);
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, hostOutputType,
+                                                   hostValue);
     return success();
   }
 };
 
 void populateNovaToLinalgPatterns(RewritePatternSet &patterns) {
-  patterns.add<NovaMatmulOpLowering, NovaBroadcastInDimOpLowering,
-               NovaTransposeOpLowering, NovaToDeviceOpLowering,
-               NovaScatterAddOpLowering, NovaGatherOpLowering,
-               NovaRandomOpLowering, ArgMinConverter, ArgMaxConverter,
-               ReduceOpConverter, AdamOpConverter, ReshapeOpConverter>(
+  patterns.add<
+  NovaAbsOpLowering,NovaAddOpLowering,
+  AdamOpConverter,ArgMaxConverter,
+  ArgMinConverter,NovaBroadcastInDimOpLowering,NovaConstantToArithConstPattern,
+  NovaDivOpLowering,NovaExpOpLowering,
+  NovaLogOpLowering,NovaMatmulOpLowering,
+  NovaMaxOpLowering,NovaMinOpLowering,
+  NovaMulOpLowering,NovaNegOpLowering,
+  NovaPowOpLowering,NovaRandomOpLowering,
+  NovaReciprocalOpLowering,ReduceOpConverter,
+  NovaReluOpLowering,ReshapeOpConverter,
+  NovaScatterAddOpLowering,NovaSqrtOpLowering,
+  NovaSquareOpLowering,NovaSubOpLowering,
+  NovaTanhOpLowering,NovaToDeviceOpLowering,
+  NovaTransposeOpLowering>(
       patterns.getContext());
 }
 
@@ -2010,7 +2305,7 @@ struct NovaToLinalgPass
                 bufferization::BufferizationDialect, gpu::GPUDialect>();
   }
 
-  StringRef getArgument() const final { return "convert-nova-to-linalg"; }
+  StringRef getArgument() const final { return "convert-nova-to-linalg-named"; }
 
   StringRef getDescription() const final {
     return "Lower Nova structural ops (matmul, gather, transpose, etc.) to "
@@ -2029,13 +2324,39 @@ struct NovaToLinalgPass
     target.addLegalDialect<math::MathDialect>();
     target.addLegalDialect<mlir::memref::MemRefDialect>();
     target.addLegalDialect<mlir::bufferization::BufferizationDialect>();
+    target.addIllegalDialect<mlir::nova::NovaDialect>();
 
     // Only the structural ops this file has patterns for are illegal.
-    target.addIllegalOp<nova::MatmulOp, nova::BroadcastInDimOp, nova::TransposeOp,
-                      nova::ToDeviceOp, nova::ScatterAddOp, nova::GatherOp,
-                      nova::Rndm2DOp, nova::ReshapeOp, nova::ArgMinOp,
-                      nova::ArgmaxOp, nova::ReduceOp, nova::AdamOp,
-                      nova::LinearOp>();
+    target.addIllegalOp<nova::AbsOp>();
+    target.addIllegalOp<nova::AddOp>();
+    target.addIllegalOp<nova::AdamOp>();
+    target.addIllegalOp<nova::ArgmaxOp>();
+    target.addIllegalOp<nova::ArgMinOp>();
+    target.addIllegalOp<nova::BroadcastInDimOp>();
+    target.addIllegalOp<nova::ConstantOp>();
+    target.addIllegalOp<nova::DivOp>();
+    target.addIllegalOp<nova::ExpOp>();
+    target.addIllegalOp<nova::LogOp>();
+    target.addIllegalOp<nova::MatmulOp>();
+    target.addIllegalOp<nova::MaxOp>();
+    target.addIllegalOp<nova::MinOp>();
+    target.addIllegalOp<nova::MulOp>();
+    target.addIllegalOp<nova::NegOp>();
+    target.addIllegalOp<nova::PowOp>();
+    target.addIllegalOp<nova::ReciprocalOp>();
+    target.addIllegalOp<nova::ReduceOp>();
+    target.addIllegalOp<nova::ReluOp>();
+    target.addIllegalOp<nova::ReshapeOp>();
+    target.addIllegalOp<nova::RsqrtOp>();
+    target.addIllegalOp<nova::Rndm2DOp>();
+    target.addIllegalOp<nova::ScatterAddOp>();
+    target.addIllegalOp<nova::SqrtOp>();
+    target.addIllegalOp<nova::SquareOp>();
+    target.addIllegalOp<nova::SubOp>();
+    target.addIllegalOp<nova::TanhOp>();
+    target.addIllegalOp<nova::ToDeviceOp>();
+    target.addIllegalOp<nova::TransposeOp>();
+
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 
     RewritePatternSet patterns(context);
@@ -2047,9 +2368,9 @@ struct NovaToLinalgPass
   }
 };
 
-void registerNovaToLinalgPass() { PassRegistration<NovaToLinalgPass>(); }
+void registerNovaToLinalgNamedPass() { PassRegistration<NovaToLinalgPass>(); }
 
-std::unique_ptr<Pass> createNovaToLinalgPass() {
+std::unique_ptr<Pass> createNovaToLinalgNamedPass() {
   return std::make_unique<NovaToLinalgPass>();
 }
 

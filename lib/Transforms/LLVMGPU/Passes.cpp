@@ -30,9 +30,7 @@
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 // Nova frontend translation passes
-#include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
 #include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
-#include "Compiler/Translation/NovaToArith/NovaToArith.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 // TOSA conversion passes
 #include "mlir/Conversion/TosaToLinalg/TosaToLinalg.h"
@@ -124,10 +122,8 @@ namespace mlir::nova
     // making every tensor<..., #nova.device<"N">> into a plain tensor<...>.
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
     pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::nova::createNovaToArithLoweringPass());
-    pm.addPass(mlir::nova::createNovaToTosaLoweringPass());
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaElementwiseToLinalgPass());
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgGenericLoweringPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgNamedPass());
 
     pm.addNestedPass<mlir::func::FuncOp>(mlir::tosa::createTosaToLinalgNamed());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::tosa::createTosaToLinalg());
@@ -152,6 +148,7 @@ namespace mlir::nova
     pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaCheckInsParallelFuse());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgHorizontalFusionPass());
+     pm.addNestedPass<mlir::func::FuncOp>(createNovaMultiConsumerFusion());
     // pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgVerticalFusionPass());
 
     pm.addPass(mlir::createCanonicalizerPass());
@@ -381,7 +378,8 @@ namespace mlir::nova
     // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopUnrollPass(4));
     // pm.addPass(createCanonicalizerPass());
     // pm.addPass(createCSEPass());
-
+     
+     pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
 
     // // end of my pass
 
@@ -483,8 +481,7 @@ namespace mlir::nova
       gpuPm.addPass(createConvertVectorToLLVMPass());
       // Promote __global_memory__ globals from device global (AS 0) to
       // shared memory (AS 3). Must run after full LLVM lowering so we
-      // operate on opaque pointers and can insert addrspacecast cleanly.
-      gpuPm.addPass(createNovaGPUPromoteGlobalsToSharedPass());
+      // operate on opaque pointers and can insert addrspacecast cleanly
     }
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());

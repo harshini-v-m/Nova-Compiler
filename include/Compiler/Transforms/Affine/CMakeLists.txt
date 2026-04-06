@@ -5,9 +5,6 @@ add_mlir_dialect_library(MLIRAffineTransformPasses
   ${PROJECT_SOURCE_DIR}/lib/Transforms/Affine/DependencyAnalysisTestPass.cpp
   ${PROJECT_SOURCE_DIR}/lib/Transforms/Affine/MemoryAccessAnalysis.cpp
 
-  ADDITIONAL_HEADER_DIRS
-    ${PROJECT_SOURCE_DIR}/include/Compiler/Transforms/Affine
-
   LINK_LIBS PUBLIC
     MLIRAffineDialect
     MLIRAffineUtils

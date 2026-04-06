@@ -29,10 +29,8 @@
 #include "Compiler/Pipeline/Gpupipeline.h"
 #include "Compiler/Pipeline/Pipeline.h"
 #include "Compiler/Transforms/Affine/DependencyAnalysisTestPass.h"
-#include "Compiler/Translation/NovaToArith/NovaToArith.h"
 #include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
-#include "Compiler/Translation/NovaToTosa/NovaToTosa.h"
 
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
@@ -122,10 +120,8 @@ int main(int argc, char **argv) {
   mlir::nova::registerNovaLLVMGPUPasses();
   mlir::nova::registerAffinePasses();
 
-  mlir::nova::registerNovaToArithLoweringPass();
-  mlir::nova::registerNovaToTosaLoweringPass();
-  mlir::nova::registerNovaElementwiseToLinalgPass();
-  mlir::nova::registerNovaToLinalgPass();
+  mlir::nova::registerNovaToLinalgGenericLoweringPass();
+  mlir::nova::registerNovaToLinalgNamedPass();
   mlir::nova::registerNovaFusionKernelEmitterPass();
   mlir::registerDependencyAnalysisTestPass();
 

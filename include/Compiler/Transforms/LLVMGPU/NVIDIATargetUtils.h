@@ -31,6 +31,15 @@ enum class NVMMAIntrinsicValues : int32_t {
 //===----------------------------------------------------------------------===//
 // Per-intrinsic shape info
 //===----------------------------------------------------------------------===//
+struct DistributionLayout {
+    // How many threads along M and N dimensions
+    int64_t threadsM;
+    int64_t threadsN;
+    // How many elements each thread owns along M and N
+    int64_t elemsPerThreadM;
+    int64_t elemsPerThreadN;
+    bool is_set() const { return threadsM != 0 && threadsN != 0; } 
+};
 
 /// One MMA intrinsic available on a given SM.
 struct NVMMAIntrinsicInfo {
@@ -41,8 +50,20 @@ struct NVMMAIntrinsicInfo {
   int32_t warpSize;     // Always 32 for NVIDIA
   // Input / accumulator element kinds: 0=f16, 1=bf16, 2=f32, 3=tf32
   int32_t lhsKind;
-  int32_t rhsKind;
+  int32_t rhsKind; 
   int32_t accKind;
+  DistributionLayout distribution;
+
+  std::optional<DistributionLayout> getDistributionMappingKind() const;
+
+  /// Returns the (M, N, K) tile shape of this intrinsic.
+  std::tuple<int64_t, int64_t, int64_t> getMNKShape() const {
+    return {mSize, nSize, kSize};
+  }
+  /// Returns the (LHS, RHS, ACC) element kind codes: 0=f16, 1=bf16, 2=f32.
+  std::tuple<int32_t, int32_t, int32_t> getABCElementKinds() const {
+    return {lhsKind, rhsKind, accKind};
+  }
 };
 
 //===----------------------------------------------------------------------===//

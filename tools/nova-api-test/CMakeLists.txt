@@ -12,9 +12,7 @@ target_link_libraries(nova-api-test PRIVATE
   MLIRNova
   MLIRAffineTransformPasses
   
-  MLIRNovaToArithTransforms
   MLIRNovaToLinalgTransforms
-  MLIRNovaToTosaTransforms
   
   # Dependencies ordered by usage: NovaPipelines depends on CompilerTransforms
   NovaPipelines

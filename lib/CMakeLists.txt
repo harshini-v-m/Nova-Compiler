@@ -14,9 +14,7 @@ install(
         NovaPipelines
         MLIRAffineTransformPasses
         AffineTransforms
-        MLIRNovaToArithTransforms
         MLIRNovaToLinalgTransforms
-        MLIRNovaToTosaTransforms
         NovaLLVMGPUTransforms
         NovaCompilerAPI
         #NovaRuntimeCore
