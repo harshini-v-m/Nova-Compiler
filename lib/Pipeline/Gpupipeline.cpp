@@ -96,9 +96,12 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
             pm.addPass(mlir::createCanonicalizerPass());
 
 
-            // 4. LINALG OPT to linalg generalize pass
-            pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgGeneralizeNamedOpsPass());
+            // 4. LINALG OPT — fuse bias into matmul outs BEFORE generalizing named ops.
+            // FuseMatmulBias matches linalg::MatmulOp / BatchMatmulOp (named ops).
+            // Running it after LinalgGeneralizeNamedOps converts them to linalg.generic
+            // and the pass would silently match nothing.
             pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createFuseMatmulBiasPass());
+            pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgGeneralizeNamedOpsPass());
             pm.addPass(mlir::createCanonicalizerPass());
             pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgFoldUnitExtentDimsPass());
 

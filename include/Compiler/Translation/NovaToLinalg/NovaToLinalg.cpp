@@ -24,7 +24,11 @@ using namespace mlir::bufferization;
 
 namespace mlir {
 namespace nova {
+  
 //HELPER FUNCTIONS
+inline SmallVector<utils::IteratorType> getNParallelLoopsAttrs(unsigned n) {
+  return SmallVector<utils::IteratorType>(n, utils::IteratorType::parallel);
+}
 static Value broadcastToShape(OpBuilder &b, Location loc,
                                Value input, ArrayRef<int64_t> targetShape) {
   auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
@@ -80,35 +84,158 @@ static Value broadcastToShape(OpBuilder &b, Location loc,
 
 // Conversion Patterns
 //Arithmetic ops
-//ADD OP - > LINALG.ADD
-struct NovaAddOpLowering : public OpConversionPattern<nova::AddOp> {
-  using OpConversionPattern<nova::AddOp>::OpConversionPattern;
+//ADD OP - > LINALG.GENERIC
+struct NovaOpToStdScalarOp {
+  template <typename OpTy>
+  // kind of main function
+  static Value mapOp(OpTy op, Type resultType, ArrayRef<Value> args,
+                     OpBuilder *builder) {
+    return mapOpImpl(op, resultType, args, builder);
+  }
+
+  // default function to return null ptr if the operation didn't match
+private:
+  template <typename OpTy>
+  static Value mapOpImpl(OpTy op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    return nullptr;
+  }
+  // add operation
+  static Value mapOpImpl(nova::AddOp op, Type resultType, ArrayRef<Value> args,
+                         OpBuilder *builder) {
+    if (isa<FloatType>(resultType))
+      return builder->create<arith::AddFOp>(op.getLoc(), args[0], args[1]);
+    if (isa<IntegerType>(resultType))
+      return builder->create<arith::AddIOp>(op.getLoc(), args[0], args[1]);
+    return nullptr;
+  }};
+
+//SUB OP - > LINALG.GENERIC
+template <typename NovaOpTy>
+class NovaToLinalgElementwiseConverter : public OpConversionPattern<NovaOpTy> {
+public:
+  using OpConversionPattern<NovaOpTy>::OpConversionPattern; // creates a
+                                                            // constructor
+  using OpAdaptor = typename NovaOpTy::Adaptor; // for getting data type
+                                                // dynamically using adaptor
 
   LogicalResult
-  matchAndRewrite(nova::AddOp op, OpAdaptor adaptor,
+  matchAndRewrite(NovaOpTy op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+    auto operands = adaptor.getOperands();
+    if (operands.empty())
+      return rewriter.notifyMatchFailure(
+          op, "expected operands for linalg lowering operations");
+    // checking if operand is ranked tensortype
+    auto resultType = dyn_cast<RankedTensorType>(op.getType());
     if (!resultType)
-      return failure();
+      return rewriter.notifyMatchFailure(op, "expected ranked tensor result");
+    // each element type
+    auto resultDataType = resultType.getElementType();
+    
+    // Check for in_place attribute for DPS (Destination-Passing Style)
+    bool isInPlace = op->template hasAttrOfType<BoolAttr>("in_place") &&
+                     op->template getAttrOfType<BoolAttr>("in_place").getValue();
 
-    Location loc = op.getLoc();
-    Value input = adaptor.getLhs();
-    Value other = adaptor.getRhs();
-    input = broadcastToShape(rewriter, loc, input, resultType.getShape());
-    other = broadcastToShape(rewriter, loc, other, resultType.getShape());
+    SmallVector<Value> insOperands;
+    Value out;
+    if (isInPlace && operands.size() == 2) {
+      insOperands = {operands[1]}; // rhs is the explicit input (the new gradient values)
+      out = operands[0];           // lhs is the destination (the persistent parameter buffer)
+    } else {
+      insOperands = operands;
+      out = rewriter.create<tensor::EmptyOp>(
+          op.getLoc(), resultType.getShape(), resultDataType);
+    }
 
-    // Create empty output tensor
-    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
-        loc, resultType.getShape(), resultType.getElementType());
+    // Prepare affine maps
+    int64_t rank = resultType.getRank();
+    SmallVector<AffineMap> maps;
+    for (Value v : insOperands) {
+      auto vType = cast<RankedTensorType>(v.getType());
+      auto vShape = vType.getShape();
+      auto vRank = vType.getRank();
+      SmallVector<AffineExpr> exprs;
+      // Standard broadcasting: align right
+      for (int64_t i = 0; i < vRank; ++i) {
+        if (vShape[i] == 1) {
+          exprs.push_back(rewriter.getAffineConstantExpr(0));
+        } else {
+          exprs.push_back(rewriter.getAffineDimExpr(i + (rank - vRank)));
+        }
+      }
+      maps.push_back(AffineMap::get(rank, 0, exprs, rewriter.getContext()));
+    }
+    // Output map
+    maps.push_back(rewriter.getMultiDimIdentityMap(rank));
 
-    // Identity maps for linalg.add
-    auto ResOp = rewriter.create<linalg::AddOp>(
-        loc, TypeRange{resultType},ValueRange{input, other},ValueRange{emptyTensor});
+    // Create Linalg generic
+    auto linalgOp = rewriter.create<linalg::GenericOp>(
+        op.getLoc(), out.getType(), insOperands, out, maps,
+        getNParallelLoopsAttrs(rank),
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Type elemType = getElementTypeOrSelf(out);
+          SmallVector<Value> argVec(args.begin(), args.end());
+          // call our custom lowering functions
+          Value inner = NovaOpToStdScalarOp::mapOp(op, elemType, argVec, &b);
+          if (!inner)
+            return; // op failed to map
+          b.create<linalg::YieldOp>(loc, inner);
+        });
 
-    rewriter.replaceOp(op, ResOp.getResults());
+    rewriter.replaceOp(op, linalgOp->getResults());
     return success();
   }
 };
+// struct NovaAddOpLowering : public OpConversionPattern<nova::AddOp> {
+//   using OpConversionPattern<nova::AddOp>::OpConversionPattern;
+
+//   LogicalResult
+//   matchAndRewrite(nova::AddOp op, OpAdaptor adaptor,
+//                   ConversionPatternRewriter &rewriter) const override {
+//     RankedTensorType resultType = dyn_cast<RankedTensorType>(op.getType());
+//     if (!resultType)
+//       return failure();
+
+//     Location loc = op.getLoc();
+//     Value input = adaptor.getLhs();
+//     Value other = adaptor.getRhs();
+//     input = broadcastToShape(rewriter, loc, input, resultType.getShape());
+//     other = broadcastToShape(rewriter, loc, other, resultType.getShape());
+
+//     // Create empty output tensor
+//     Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+//         loc, resultType.getShape(), resultType.getElementType());
+
+//     int64_t rank = resultType.getRank();
+//     AffineMap identityMap =
+//         AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+//     SmallVector<AffineMap> indexingMaps = {identityMap, identityMap,
+//                                            identityMap};
+//     SmallVector<utils::IteratorType> iteratorTypes(rank,
+//                                                    utils::IteratorType::parallel);
+
+//     auto genericOp = rewriter.create<linalg::GenericOp>(
+//         loc, TypeRange{resultType},
+//         ValueRange{input, other}, ValueRange{emptyTensor},
+//         indexingMaps, iteratorTypes,
+//         [](OpBuilder &b, Location loc, ValueRange args) {
+//           //check if int lower to arith addiop
+//           if (isa<IntegerType>(args[0].getType())) {
+//             Value result =
+//                 b.create<arith::AddIOp>(loc, args[0], args[1]);
+//             b.create<linalg::YieldOp>(loc, result);
+//             return;
+//           }
+//           Value result =
+//               b.create<arith::AddFOp>(loc, args[0], args[1]);
+//           b.create<linalg::YieldOp>(loc, result);
+//         });
+
+//     rewriter.replaceOp(op, genericOp.getResults());
+//     return success();
+//   }
+// };
 
 //SUB OP - > LINALG.SUB
 struct NovaSubOpLowering : public OpConversionPattern<nova::SubOp> {
@@ -1264,9 +1391,6 @@ static TypedAttr createInitialValueForReduceOp(Operation *op, Type elementTy,
   return {};
 }
 
-inline SmallVector<utils::IteratorType> getNParallelLoopsAttrs(unsigned n) {
-  return SmallVector<utils::IteratorType>(n, utils::IteratorType::parallel);
-}
 
 class ArgMinConverter : public OpRewritePattern<nova::ArgMinOp> {
 public:
@@ -2272,7 +2396,8 @@ struct NovaConstantToArithConstPattern
 
 void populateNovaToLinalgPatterns(RewritePatternSet &patterns) {
   patterns.add<
-  NovaAbsOpLowering,NovaAddOpLowering,
+  NovaAbsOpLowering,
+  NovaToLinalgElementwiseConverter<nova::AddOp>,
   AdamOpConverter,ArgMaxConverter,
   ArgMinConverter,NovaBroadcastInDimOpLowering,NovaConstantToArithConstPattern,
   NovaDivOpLowering,NovaExpOpLowering,

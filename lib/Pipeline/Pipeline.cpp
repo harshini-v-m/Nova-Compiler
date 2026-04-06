@@ -96,6 +96,11 @@ void mlir::nova::createNovaPipelines(OpPassManager &pm) {
   //pm.addPass(mlir::transform::createInterpreterPass(interpOptions));
 //  pm.addPass(createCanonicalizerPass());
 
+  // FUSE BIAS INTO MATMUL OUTS — must run before generalization.
+  // Matches linalg::MatmulOp / BatchMatmulOp (named ops); after
+  // LinalgGeneralizeNamedOps they become linalg.generic and won't match.
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createFuseMatmulBiasPass());
+
   // GENERALIZE NAMED OPS (after tiling, for vectorization)
   pm.addNestedPass<mlir::func::FuncOp>(
                 mlir::createLinalgGeneralizeNamedOpsPass());

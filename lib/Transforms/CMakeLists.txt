@@ -21,6 +21,7 @@ add_mlir_library(CompilerTransforms
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRLinalgDialect
+  MLIRTensorDialect
   MLIRGPUDialect
 )
 add_subdirectory(Affine)

@@ -145,11 +145,14 @@ namespace mlir::nova
     // -------------------------------------------------------------------------
     // pm.addPass(createLinalgElementwiseOpFusionPass());
     // pm.addNestedPass<mlir::func::FuncOp>(createNovaFuseReductionIntoProducerPass());
+    pm.addNestedPass<mlir::func::FuncOp>(createFuseMatmulBiasPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaCheckInsParallelFuse());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgHorizontalFusionPass());
      pm.addNestedPass<mlir::func::FuncOp>(createNovaMultiConsumerFusion());
     // pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgVerticalFusionPass());
+
+    
 
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(createCSEPass());
