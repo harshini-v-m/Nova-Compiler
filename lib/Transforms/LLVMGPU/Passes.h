@@ -190,6 +190,66 @@ void registerNovaRepositionStorePass();
 
 std::unique_ptr<Pass> createNovaMultiConsumerFusion();
 void registerNovaMultiConsumerFusion();
+
+// ---------------------------------------------------------------------------
+// Vectorization Passes  (Batch 1: declarations; wired into pipeline in Batch 2+)
+// ---------------------------------------------------------------------------
+
+/// Repacks linalg.generic contraction ops whose lowering_config carries a
+/// non-zero mma_kind into inner tile shapes matching the MMA intrinsic
+/// (e.g. {16,16,16} for WMMA_F32, {16,8,16} for MMA_SYNC_F16).
+/// Must run BEFORE GenericVectorization (still linalg form).
+std::unique_ptr<Pass> createNovaGPUPackToIntrinsicsPass();
+void registerNovaGPUPackToIntrinsicsPass();
+
+/// Vectorizes linalg operations: matmul-shaped ops → vector.contract,
+/// others → vector.multi_reduction / vector.transfer.
+/// Also lowers multi_reduction → inner-reduction → vector.contract.
+std::unique_ptr<Pass> createNovaGPUGenericVectorizationPass();
+void registerNovaGPUGenericVectorizationPass();
+
+/// Hoists vector.transfer_read/write out of sequential loops (subset hoisting).
+std::unique_ptr<Pass> createNovaGPUSubsetHoistingPass();
+void registerNovaGPUSubsetHoistingPass();
+
+/// Distributes warp-level vector ops across threads (SIMD-to-SIMT).
+/// Lowers vector.contract → outer-product chains.
+/// Must run AFTER UnrollToIntrinsics.
+std::unique_ptr<Pass> createNovaGPUVectorDistributePass();
+void registerNovaGPUVectorDistributePass();
+
+/// Vectorizes memref.copy ops targeting shared memory (128-bit LDS.128).
+std::unique_ptr<Pass> createNovaGPUVectorizeMemrefCopyPass();
+void registerNovaGPUVectorizeMemrefCopyPass();
+
+/// Unrolls vector.contract to the native MMA shape from lowering_config.
+/// Must run AFTER GenericVectorization, BEFORE VectorDistribute.
+std::unique_ptr<Pass> createNovaGPUUnrollToIntrinsicsPass();
+void registerNovaGPUUnrollToIntrinsicsPass();
+
+/// Lowers linalg.pack / linalg.unpack to tensor ops before bufferization.
+/// linalg.pack/unpack have no BufferizableOpInterface so must be lowered
+/// BEFORE OneShotBufferize.
+std::unique_ptr<Pass> createNovaGPULowerPackOpsPass();
+void registerNovaGPULowerPackOpsPass();
+
+/// Aggressive transfer hoisting, sinking and folding patterns.
+std::unique_ptr<Pass> createNovaGPUOptimizeVectorTransferPass();
+void registerNovaGPUOptimizeVectorTransferPass();
+
+/// Drops unit dimensions from vector types.
+std::unique_ptr<Pass> createNovaGPUDropVectorUnitDimsPass();
+void registerNovaGPUDropVectorUnitDimsPass();
+
+/// Hoists vector.extract_slice / vector.insert_slice out of loops.
+std::unique_ptr<Pass> createNovaGPUHoistVectorExtractInsertSlicePass();
+void registerNovaGPUHoistVectorExtractInsertSlicePass();
+
+/// Normalizes strided-memref indices for WMMA load/store ops before NVVM legalization.
+/// No-op for the nvgpu.mma.sync (Ampere native) path.
+std::unique_ptr<Pass> createNovaGPUCastTypeToFitMMAPass();
+void registerNovaGPUCastTypeToFitMMAPass();
+
 } // namespace nova
 } // namespace mlir
 

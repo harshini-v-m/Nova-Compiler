@@ -78,7 +78,57 @@ static Value reduce_to_shape_nova(OpBuilder &builder, Location loc, Value grad, 
 //===--------------------------------------------------------------------------------------------===//
 // Arithmetic forward and backward operations: add, sub, mul, div, matmul
 //===--------------------------------------------------------------------------------------------===//
-
+// nova.cast → linalg.generic using arith element-wise casts (no TOSA dependency).
+struct NovaCastOpLowering : public OpConversionPattern<mlir::nova::CastOp> {
+  using OpConversionPattern<mlir::nova::CastOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(mlir::nova::CastOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value src      = adaptor.getInput();
+    auto srcType   = cast<RankedTensorType>(src.getType());
+    auto dstType   = cast<RankedTensorType>(op.getType());
+    if (srcType == dstType) {
+      rewriter.replaceOp(op, src);
+      return success();
+    }
+    auto srcElem = srcType.getElementType();
+    auto dstElem = dstType.getElementType();
+    int64_t rank = dstType.getRank();
+    MLIRContext *ctx = rewriter.getContext();
+    auto identMap = AffineMap::getMultiDimIdentityMap(rank, ctx);
+    SmallVector<utils::IteratorType> iters(rank, utils::IteratorType::parallel);
+    Value outEmpty = rewriter.create<tensor::EmptyOp>(loc, dstType.getShape(), dstElem);
+    auto generic = rewriter.create<linalg::GenericOp>(
+        loc, dstType, /*inputs=*/src, /*outputs=*/outEmpty,
+        SmallVector<AffineMap>{identMap, identMap}, iters,
+        [&](OpBuilder &b, Location nl, ValueRange args) {
+          Value val = args[0];
+          Value castVal;
+          if (isa<FloatType>(srcElem) && isa<FloatType>(dstElem)) {
+            unsigned srcW = cast<FloatType>(srcElem).getWidth();
+            unsigned dstW = cast<FloatType>(dstElem).getWidth();
+            castVal = srcW < dstW ? b.create<arith::ExtFOp>(nl, dstElem, val).getResult()
+                                  : b.create<arith::TruncFOp>(nl, dstElem, val).getResult();
+          } else if (isa<IntegerType>(srcElem) && isa<FloatType>(dstElem)) {
+            castVal = b.create<arith::SIToFPOp>(nl, dstElem, val).getResult();
+          } else if (isa<FloatType>(srcElem) && isa<IntegerType>(dstElem)) {
+            castVal = b.create<arith::FPToSIOp>(nl, dstElem, val).getResult();
+          } else {
+            unsigned srcW = cast<IntegerType>(srcElem).getWidth();
+            unsigned dstW = cast<IntegerType>(dstElem).getWidth();
+            if (srcW < dstW)
+              castVal = b.create<arith::ExtSIOp>(nl, dstElem, val).getResult();
+            else if (srcW > dstW)
+              castVal = b.create<arith::TruncIOp>(nl, dstElem, val).getResult();
+            else
+              castVal = val;
+          }
+          b.create<linalg::YieldOp>(nl, castVal);
+        });
+    rewriter.replaceOp(op, generic.getResult(0));
+    return success();
+  }
+};
 // struct NovaAddBackwardPattern : public OpConversionPattern<mlir::nova::AddBackwardOp> {
 //   using OpConversionPattern<mlir::nova::AddBackwardOp>::OpConversionPattern;
 //   LogicalResult matchAndRewrite(mlir::nova::AddBackwardOp op, OpAdaptor adaptor,
@@ -1321,11 +1371,11 @@ struct NovaSoftmaxForwardPattern : public OpConversionPattern<mlir::nova::Softma
     auto elemType   = inputType.getElementType();
     int64_t rank    = inputType.getRank();
     MLIRContext *ctx = rewriter.getContext();
-
-    int64_t dim = op.getDimension().has_value()
-                      ? static_cast<int64_t>(op.getDimension().value()) : -1;
+int64_t dim = op.getDimension().has_value()  
+              ? static_cast<int64_t>(op.getDimension().value())   
+              : static_cast<int64_t>(-1);
+    if (dim > rank) dim = rank - 1;
     if (dim < 0) dim += rank;
-
     if (inputType.getElementType() != resultType.getElementType()) {
       input     = rewriter.create<mlir::tosa::CastOp>(loc, resultType, input);
       inputType = resultType;
@@ -2701,6 +2751,7 @@ struct NovaToLinalgGenericLoweringPass : public PassWrapper<NovaToLinalgGenericL
     target.addIllegalOp<nova::Exp2Op>();
     target.addIllegalOp<nova::Log2Op>();
     target.addIllegalOp<nova::Log10Op>();
+    target.addIllegalOp<nova::CastOp>();
 
     target.addIllegalOp<nova::SinOp>();
     target.addIllegalOp<nova::CosOp>();
@@ -2754,7 +2805,7 @@ void populateNovaToLinalgGenericConversionPatterns(RewritePatternSet &patterns) 
       NovaSinhLoweringPattern, NovaCoshLoweringPattern, NovaAsinhLoweringPattern, 
       NovaAcoshLoweringPattern, NovaAtanhLoweringPattern,
       NovaNotLoweringPattern , NovaAndLoweringPattern, NovaOrLoweringPattern, 
-      NovaXorLoweringPattern, NovaSignLoweringPattern, NovaCompareLoweringPattern
+      NovaXorLoweringPattern, NovaSignLoweringPattern, NovaCompareLoweringPattern,NovaCastOpLowering
       >(patterns.getContext());
 }
 
