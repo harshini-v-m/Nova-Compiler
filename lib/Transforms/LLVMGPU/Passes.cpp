@@ -696,6 +696,98 @@ namespace mlir::nova
                                                  std::move(foldPatterns));
             }
 
+            // Step 2b: Decompose insert_strided_slice + transfer_write chains.
+            //
+            // UnrollToIntrinsics produces:
+            //   %v0 = contract(...) : vector<16x8>  // MMA tile [0,0]
+            //   %v1 = contract(...) : vector<16x8>  // MMA tile [0,8]
+            //   %a  = insert_strided_slice %v0, %init {offsets=[0,0]}
+            //   %b  = insert_strided_slice %v1, %a   {offsets=[0,8]}
+            //   ...
+            //   transfer_write %final, memref[base0, base1] : vector<32x16>
+            //
+            // ConvertVectorToGPU cannot handle insert_strided_slice in the
+            // forward slice from contracts. We decompose into individual writes:
+            //   transfer_write %v0, memref[base0+0,  base1+0]  : vector<16x8>
+            //   transfer_write %v1, memref[base0+0,  base1+8]  : vector<16x8>
+            //   ...
+            {
+              struct FoldInsertStridedSliceIntoTransferWrite
+                  : public OpRewritePattern<vector::TransferWriteOp> {
+                using OpRewritePattern::OpRewritePattern;
+                LogicalResult matchAndRewrite(
+                    vector::TransferWriteOp writeOp,
+                    PatternRewriter &rewriter) const override {
+                  // Only handle 2D writes to memref.
+                  auto writeType = writeOp.getVectorType();
+                  if (writeType.getRank() != 2) return failure();
+                  if (!isa<MemRefType>(writeOp.getBase().getType()))
+                    return failure();
+                  if (writeOp.getMask() || writeOp.hasOutOfBoundsDim())
+                    return failure();
+                  // Must have identity permutation map.
+                  if (!writeOp.getPermutationMap().isIdentity())
+                    return failure();
+
+                  // Trace back through the chain of insert_strided_slice ops
+                  // to collect all individual tile values and their offsets.
+                  struct TileInfo {
+                    Value value;       // the vector<16x8> being inserted
+                    SmallVector<int64_t, 2> offsets;
+                  };
+                  SmallVector<TileInfo> tiles;
+                  Value current = writeOp.getVector();
+                  bool foundChain = false;
+                  while (auto insertOp =
+                             current.getDefiningOp<vector::InsertStridedSliceOp>()) {
+                    foundChain = true;
+                    auto strides =
+                        insertOp.getStrides().getAsValueRange<IntegerAttr>();
+                    if (!llvm::all_of(strides,
+                                      [](const APInt &v) { return v.isOne(); }))
+                      return failure();
+                    SmallVector<int64_t, 2> offsets;
+                    for (auto attr :
+                         insertOp.getOffsets().getAsValueRange<IntegerAttr>())
+                      offsets.push_back(attr.getSExtValue());
+                    if (offsets.size() != 2) return failure();
+                    tiles.push_back({insertOp.getValueToStore(), offsets});
+                    current = insertOp.getDest();
+                  }
+                  if (!foundChain) return failure();
+
+                  // Emit individual transfer_write ops for each tile.
+                  Location loc = writeOp.getLoc();
+                  SmallVector<Value> baseIndices =
+                      llvm::to_vector(writeOp.getIndices());
+                  for (auto &tile : tiles) {
+                    SmallVector<Value> newIndices =
+                        llvm::to_vector(baseIndices);
+                    for (size_t i = 0; i < tile.offsets.size(); ++i) {
+                      if (tile.offsets[i] != 0) {
+                        Value off = rewriter.create<arith::ConstantIndexOp>(
+                            loc, tile.offsets[i]);
+                        newIndices[i] = rewriter.create<arith::AddIOp>(
+                            loc, newIndices[i], off);
+                      }
+                    }
+                    auto tileType = cast<VectorType>(tile.value.getType());
+                    SmallVector<bool> inBounds(tileType.getRank(), true);
+                    rewriter.create<vector::TransferWriteOp>(
+                        loc, tile.value, writeOp.getBase(), newIndices,
+                        inBounds);
+                  }
+                  rewriter.eraseOp(writeOp);
+                  return success();
+                }
+              };
+              RewritePatternSet writeFoldPatterns(&getContext());
+              writeFoldPatterns.add<FoldInsertStridedSliceIntoTransferWrite>(
+                  &getContext());
+              (void)applyPatternsAndFoldGreedily(funcOp,
+                                                  std::move(writeFoldPatterns));
+            }
+
             // Step 3: Prepare transfers → nvgpu fragment form.
             {
               RewritePatternSet patterns(&getContext());
