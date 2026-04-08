@@ -127,24 +127,45 @@ static void promoteOperandToShared(OpBuilder &builder,
   unsigned numLoops = copyOp.getNumLoops();
   SmallVector<int64_t> threadTiles(numLoops, 1); // placeholder (non-zero)
 
-  // Compute thread count and CTA block size from the parent contraction's
-  // lowering_config.
-  //   targetThreads = warps_per_block × warp_size  (drives forall trip count)
-  //   blockDim      = same value (total threads per CTA)
+  // Compute the contraction's thread count from its lowering_config.
+  // For MMA configs (threadTiles=0), derive from subgroup tiles instead:
+  //   totalThreads = numWarps × warpSize, where
+  //   numWarps = product of (wgTile / subgroupTile) for non-zero dims.
   // blockDim is stored in the copy's config so NovaGPUApplyTilingLevelReduction
-  // can pass it to deriveThreadTileSizes, which uses it to clamp perThread to a
+  // can pass it to deriveThreadTileSizes, which clamps perThread to a
   // multiple of maxVec — ensuring the innermost tile is exactly 4 f32 (16 B),
   // one cp.async.16 instruction per row.
   int64_t targetThreads = 0;
   int64_t blockDim = 0;
   DictionaryAttr parentConfig = getLoweringConfig(op);
   if (parentConfig) {
-    auto wgSubTiles = getLoweringConfigTileSizes(parentConfig, kWgSubgroupKey);
-    targetThreads = 1;
-    for (int64_t s : wgSubTiles)
-      if (s > 0) targetThreads *= s;
-    targetThreads *= 32; // warp size
-    blockDim = targetThreads; // blockDim == warps × warp_size
+    auto wgTiles = getLoweringConfigTileSizes(parentConfig, kWorkgroupKey);
+    auto thTiles = getLoweringConfigTileSizes(parentConfig, kThreadKey);
+    auto sgTiles = getLoweringConfigTileSizes(parentConfig, kSubgroupKey);
+
+    // Detect MMA config: all thread tiles are 0, subgroup tiles are non-zero.
+    bool isMMA = !thTiles.empty() &&
+                 llvm::all_of(thTiles, [](int64_t t) { return t == 0; }) &&
+                 !sgTiles.empty() &&
+                 llvm::any_of(sgTiles, [](int64_t t) { return t > 0; });
+
+    if (isMMA && wgTiles.size() == sgTiles.size()) {
+      // MMA path: total threads = numWarps × warpSize (32 for NVIDIA).
+      int64_t numWarps = 1;
+      for (size_t i = 0; i < wgTiles.size(); ++i) {
+        if (sgTiles[i] > 0 && wgTiles[i] > 0)
+          numWarps *= (wgTiles[i] / sgTiles[i]);
+      }
+      targetThreads = numWarps * 32;
+    } else if (wgTiles.size() == thTiles.size()) {
+      // SIMT path: threads = product of (wgTile / threadTile) for non-zero dims.
+      targetThreads = 1;
+      for (size_t i = 0; i < wgTiles.size(); ++i) {
+        if (thTiles[i] > 0 && wgTiles[i] > 0)
+          targetThreads *= (wgTiles[i] / thTiles[i]);
+      }
+    }
+    blockDim = targetThreads; // blockDim == total threads per CTA
   }
 
   SmallVector<int64_t> zeros(numLoops, 0);

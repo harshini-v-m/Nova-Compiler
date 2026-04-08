@@ -474,6 +474,60 @@ namespace mlir::nova
         return std::make_unique<FixMmaSyncTF32Pass>();
       }());
 
+      // Diagnostic: verify MMA conversion produced nvgpu.mma.sync ops.
+      // Logs a warning when vector.contract ops survive ConvertVectorToGPU
+      // unconverted — indicates a matching failure in PrepareVectorToMMA or
+      // ConvertVectorToGPU that needs debugging.
+      gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() {
+        struct VerifyMMAConversionPass
+            : public PassWrapper<VerifyMMAConversionPass,
+                                 OperationPass<gpu::GPUFuncOp>> {
+          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VerifyMMAConversionPass)
+          void runOnOperation() override {
+            int mmaCount = 0, contractCount = 0;
+            getOperation().walk([&](Operation *op) {
+              if (isa<nvgpu::MmaSyncOp>(op)) mmaCount++;
+              if (auto contractOp = dyn_cast<vector::ContractionOp>(op)) {
+                contractCount++;
+                // Dump the first few unconverted contracts for debugging.
+                if (contractCount <= 3) {
+                  llvm::errs() << "[nova-mma-verify] unconverted contract #"
+                               << contractCount << ":\n";
+                  llvm::errs() << "  LHS type: " << contractOp.getLhs().getType() << "\n";
+                  llvm::errs() << "  RHS type: " << contractOp.getRhs().getType() << "\n";
+                  llvm::errs() << "  ACC type: " << contractOp.getAcc().getType() << "\n";
+                  llvm::errs() << "  indexing_maps: ";
+                  for (auto map : contractOp.getIndexingMapsArray())
+                    llvm::errs() << map << " ";
+                  llvm::errs() << "\n";
+                  // Show what defines LHS
+                  if (auto defOp = contractOp.getLhs().getDefiningOp())
+                    llvm::errs() << "  LHS def: " << defOp->getName() << "\n";
+                }
+              }
+            });
+            if (contractCount > 0 && mmaCount == 0)
+              llvm::errs() << "[nova-mma-verify] WARNING: " << contractCount
+                           << " vector.contract ops remain unconverted in "
+                           << getOperation().getName()
+                           << " — ConvertVectorToGPU did not match.\n";
+            else if (contractCount > 0 && mmaCount > 0)
+              llvm::errs() << "[nova-mma-verify] PARTIAL: " << mmaCount
+                           << " mma.sync + " << contractCount
+                           << " unconverted contracts in "
+                           << getOperation().getName() << "\n";
+            else if (mmaCount > 0)
+              llvm::errs() << "[nova-mma-verify] OK: " << mmaCount
+                           << " nvgpu.mma.sync ops in "
+                           << getOperation().getName() << "\n";
+          }
+          StringRef getArgument() const override {
+            return "nova-verify-mma-conversion";
+          }
+        };
+        return std::make_unique<VerifyMMAConversionPass>();
+      }());
+
       gpuHwPm.addPass(createCanonicalizerPass());
       gpuHwPm.addPass(createCSEPass());
     }

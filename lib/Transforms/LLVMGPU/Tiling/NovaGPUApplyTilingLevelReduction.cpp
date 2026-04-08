@@ -170,6 +170,47 @@ getTileSizes(RewriterBase &rewriter, TilingInterface tilingOp,
   if ((int64_t)tiles.size() > numLoops)
     return SmallVector<OpFoldResult>(numLoops, zero);
 
+  // Thread level: when the op is inside a warp-mapped forall (subgroup-tiled),
+  // zero out contraction dims for MMA ops.  The vectorization + vector unrolling
+  // pipeline handles per-warp subdivision to native MMA tile sizes.  Creating
+  // a thread forall for contraction dims inside a warp forall would produce
+  // incorrect GPU mapping (one thread per 16×8 tile instead of 32-thread
+  // warp-cooperative mma.sync).
+  //
+  // Non-contraction dims and non-MMA ops keep their thread tiles unchanged.
+  if (tilingLevel == NovaTilingLevel::Thread) {
+    // Check if this op is nested inside a warp-mapped scf.forall.
+    bool insideWarpForall = false;
+    if (auto forall = op->getParentOfType<scf::ForallOp>()) {
+      if (auto mapping = forall.getMappingAttr()) {
+        for (auto attr : mapping.getValue()) {
+          if (isa<gpu::GPUWarpMappingAttr>(attr)) {
+            insideWarpForall = true;
+            break;
+          }
+        }
+      }
+    }
+    if (insideWarpForall) {
+      int32_t mmaKind = getMmaKindRaw(config);
+      if (mmaKind != 0) {
+        // MMA contraction inside warp forall: zero out all tiles so no
+        // thread forall is created. The matmul stays at warp granularity.
+        auto subgroupTiles = getLoweringConfigTileSizes(config, kSubgroupKey);
+        for (int i = 0; i < (int)tiles.size() &&
+                        i < (int)subgroupTiles.size(); ++i) {
+          if (subgroupTiles[i] > 0)
+            tiles[i] = 0;
+        }
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[nova-tiling] zeroed MMA contraction thread tiles "
+                      "(inside warp forall): [";
+                   for (int64_t t : tiles) llvm::dbgs() << t << " ";
+                   llvm::dbgs() << "]\n");
+      }
+    }
+  }
+
   // Derived-thread config: recompute thread tiles from the op's actual
   // (K-tiled) loop ranges and the stored target_threads count.  This ensures
   // the copy forall trip count matches the matmul forall trip count, enabling
