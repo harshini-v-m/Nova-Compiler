@@ -17,21 +17,11 @@
 //       * #gpu.address_space<workgroup>  → memref.alloc   (shared SRAM),
 //         hoisted above any enclosing scf.for to avoid per-iteration
 //         reallocation of statically-partitioned shared memory.
-//       * #gpu.address_space<workgroup>  → memref.alloc   (shared SRAM),
-//         hoisted above any enclosing scf.for to avoid per-iteration
-//         reallocation of statically-partitioned shared memory.
 //       * #gpu.address_space<private>   → memref.alloca  (per-thread register)
 //         BUT only when the insertion point is inside an scf.forall kernel;
 //         at function scope, falls back to memref.alloc (global memory).
 //       * no memory space specified     → memref.alloc   (default/global)
 //     - GPU-aware copy function:
-//       * inside scf.forall → linalg.copy (expands to load/store loops,
-//         avoids host-only @memrefCopy symbol inside gpu.func)
-//       * outside scf.forall → memref.copy (host runtime path)
-//     - Barriers are NOT inserted during bufferization (gpu.barrier has
-//       "unknown side effects" that break OneShotBufferize analysis).
-//       They are inserted post-bufferization by
-//       NovaGPUInsertWorkgroupBarriersPass.
 //       * inside scf.forall → linalg.copy (expands to load/store loops,
 //         avoids host-only @memrefCopy symbol inside gpu.func)
 //       * outside scf.forall → memref.copy (host runtime path)
@@ -56,7 +46,6 @@
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
@@ -95,30 +84,6 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
   // inside the gpu.launch / scf.forall kernel boundary.
   if (memSpace && cast<gpu::AddressSpaceAttr>(memSpace).getValue() ==
                       gpu::GPUDialect::getWorkgroupAddressSpace()) {
-    // Guard: workgroup (shared) memory is only valid inside a GPU kernel.
-    // If the bufferizer is inserting at function scope (outside every
-    // scf.forall), the alloc_tensor was defined at function level due to CSE
-    // hoisting. Allocating memref<..., 3> at host scope and passing it as a
-    // kernel argument is wrong — __shared__ has no host-visible address.
-    // Fall back to plain global memory so the pipeline doesn't produce
-    // illegal PTX. The real fix is to sink the alloc_tensor into the
-    // block-forall scope before bufferization (see NovaGPUSinkAllocTensors).
-    bool insideKernel = false;
-    Operation *check = builder.getInsertionBlock()->getParentOp();
-    while (check) {
-      if (isa<scf::ForallOp>(check)) {
-        insideKernel = true;
-        break;
-      }
-      check = check->getParentOp();
-    }
-    if (!insideKernel) {
-      auto globalType = MemRefType::get(memRefType.getShape(),
-                                        memRefType.getElementType());
-      return memref::AllocOp::create(builder, loc, globalType, dynamicSizes)
-          .getResult();
-    }
-
     auto allocType =
         MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
                         AffineMap(), wkgpSpace);
@@ -208,10 +173,38 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
         .getResult();
   }
 
-  // No memory space → default (global memory for cross-kernel buffers).
-  // These are managed by buffer-deallocation-pipeline.
-  return memref::AllocOp::create(builder, loc, memRefType, dynamicSizes)
-      .getResult();
+  // No memory space → default to PRIVATE (thread-local).
+  // After NovaGPUInferMemorySpacePass, every alloc_tensor is tagged.
+  // Untagged allocations here are bufferizer-created temporaries (iter_arg
+  // copies, scf.if staging) which are thread-local by construction.
+  // Matches IREE's gpuRequireMemSpaceAllocationFn default behavior.
+  {
+    auto allocType =
+        MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
+                        AffineMap(), privateSpace);
+
+    // Check if we are inside a kernel (scf.forall).
+    bool insideKernel = false;
+    Operation *insertionParent = builder.getInsertionBlock()->getParentOp();
+    while (insertionParent) {
+      if (isa<scf::ForallOp>(insertionParent)) {
+        insideKernel = true;
+        break;
+      }
+      insertionParent = insertionParent->getParentOp();
+    }
+
+    if (insideKernel) {
+      return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
+          .getResult();
+    }
+
+    // At function scope (outside all foralls) — emit plain alloc without
+    // address space. This becomes a host-side buffer passed to kernels,
+    // later converted to gpu.alloc by ConvertMemRefToGpu.
+    return memref::AllocOp::create(builder, loc, memRefType, dynamicSizes)
+        .getResult();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -260,29 +253,22 @@ static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
       if (memRefType.getRank() == 0) {
         // Scalar (rank-0) copy: hoist the load outside the forall if `from`
         // is defined outside the kernel, then store inside.
-        // Scalar (rank-0) copy: hoist the load outside the forall if `from`
-        // is defined outside the kernel, then store inside.
         bool isDefinedOutside = true;
         if (Operation *defOp = from.getDefiningOp()) {
-          if (parent->isAncestor(defOp))
-            isDefinedOutside = false;
           if (parent->isAncestor(defOp))
             isDefinedOutside = false;
         } else if (auto arg = llvm::dyn_cast<BlockArgument>(from)) {
           if (parent->isAncestor(arg.getOwner()->getParentOp()))
             isDefinedOutside = false;
-          if (parent->isAncestor(arg.getOwner()->getParentOp()))
-            isDefinedOutside = false;
         }
 
         if (isDefinedOutside) {
-          // Load the current value of `from` at the current insertion point
-          // (inside the forall body, AFTER any preceding accumulation). Do
-          // NOT hoist the load before the forall: `from` is a GPU-side
-          // accumulator that gets updated within this forall block (e.g. by
-          // a preceding atomic-add reduction), so hoisting the load would
-          // capture the pre-reduction zero instead of the computed sum.
-          Value scalarInit = builder.create<memref::LoadOp>(loc, from);
+          Value scalarInit;
+          {
+            OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPoint(parent);
+            scalarInit = builder.create<memref::LoadOp>(loc, from);
+          }
           builder.create<memref::StoreOp>(loc, scalarInit, to);
           return success();
         }
@@ -450,19 +436,6 @@ static bool hasNonAtomicWorkgroupStores(Operation *op) {
         found = true;
     });
   }
-  // vector.transfer_write / vector.store to workgroup memory.
-  if (!found) {
-    op->walk([&](vector::TransferWriteOp writeOp) {
-      if (auto mt = dyn_cast<MemRefType>(writeOp.getBase().getType()))
-        if (isWorkgroupMemref(mt)) found = true;
-    });
-  }
-  if (!found) {
-    op->walk([&](vector::StoreOp storeOp) {
-      if (isWorkgroupMemref(cast<MemRefType>(storeOp.getBase().getType())))
-        found = true;
-    });
-  }
   return found;
 }
 
@@ -495,19 +468,6 @@ static bool hasWorkgroupLoads(Operation *op) {
   if (!found) {
     op->walk([&](memref::CopyOp copyOp) {
       if (isWorkgroupMemref(cast<MemRefType>(copyOp.getSource().getType())))
-        found = true;
-    });
-  }
-  // vector.transfer_read / vector.load from workgroup memory.
-  if (!found) {
-    op->walk([&](vector::TransferReadOp readOp) {
-      if (auto mt = dyn_cast<MemRefType>(readOp.getBase().getType()))
-        if (isWorkgroupMemref(mt)) found = true;
-    });
-  }
-  if (!found) {
-    op->walk([&](vector::LoadOp loadOp) {
-      if (isWorkgroupMemref(cast<MemRefType>(loadOp.getBase().getType())))
         found = true;
     });
   }
@@ -587,30 +547,10 @@ struct NovaGPUInsertWorkgroupBarriersPass
           seenNonAtomicStore = true;
       }
 
-      // Recurse into scf.for bodies ONLY when loop bounds are compile-time
-      // constants (uniform across all threads).
-      //
-      // Dynamic bounds (e.g. affine.min of a thread-id-derived value) mean
-      // different threads execute different iteration counts.  Placing a
-      // barrier inside such a loop — even a tail barrier before scf.yield —
-      // causes a deadlock because some threads exit earlier than others and
-      // never reach the barrier.  Treat the entire scf.for as an opaque
-      // unit: hasWorkgroupStores/Loads already recurse into it for
-      // write→read transition detection at the enclosing scope.
-      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-        auto isConstIdx = [](Value v) -> bool {
-          if (auto cst = v.getDefiningOp<arith::ConstantOp>())
-            return isa<IntegerAttr>(cst.getValue());
-          if (v.getDefiningOp<arith::ConstantIndexOp>())
-            return true;
-          return false;
-        };
-        bool uniformBounds = isConstIdx(forOp.getLowerBound()) &&
-                             isConstIdx(forOp.getUpperBound()) &&
-                             isConstIdx(forOp.getStep());
-        if (uniformBounds)
-          insertBarriersInBlock(builder, forOp.getBody());
-      }
+      // Recurse into scf.for bodies to handle write→read transitions across
+      // ops within a single loop iteration.
+      if (auto forOp = dyn_cast<scf::ForOp>(op))
+        insertBarriersInBlock(builder, forOp.getBody());
     }
 
     // Tail barrier: protect the next loop iteration from reading shared memory

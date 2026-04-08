@@ -57,9 +57,6 @@
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
 #include "mlir/Target/LLVM/NVVM/Target.h"
-#include "mlir/Dialect/Linalg/Transforms/SubsetInsertionOpInterfaceImpl.h"
-#include "mlir/Dialect/Tensor/Transforms/SubsetInsertionOpInterfaceImpl.h"
-#include "mlir/Dialect/Vector/Transforms/SubsetOpInterfaceImpl.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -262,11 +259,6 @@ void NovaCompilerAPI::registerAllDialects(DialectRegistry &registry) {
   mlir::cf::registerBufferDeallocationOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferDeallocationOpInterfaceExternalModels(registry);
   mlir::gpu::registerBufferDeallocationOpInterfaceExternalModels(registry);
-
-  // Register SubsetInsertionOpInterface external models
-  mlir::linalg::registerSubsetOpInterfaceExternalModels(registry);
-  mlir::tensor::registerSubsetOpInterfaceExternalModels(registry);
-  mlir::vector::registerSubsetOpInterfaceExternalModels(registry);
 
   mlir::vector::registerConvertVectorToLLVMInterface(registry);
   mlir::arith::registerConvertArithToLLVMInterface(registry);

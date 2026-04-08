@@ -247,22 +247,11 @@ struct NovaGPULowerMemorySpacePass
     replacer.addReplacement([&](MemRefType type) -> std::optional<Type> {
       auto space =
           dyn_cast_if_present<gpu::AddressSpaceAttr>(type.getMemorySpace());
-      if (!space)
+      if (!space || space.getValue() != gpu::AddressSpace::Private)
         return std::nullopt;
-
-      unsigned as = 0;
-      if (space.getValue() == gpu::AddressSpace::Private)
-        as = 0;
-      else if (space.getValue() == gpu::AddressSpace::Workgroup)
-        as = 3;
-      else if (space.getValue() == gpu::AddressSpace::Global)
-        as = 1;
-      else
-        return std::nullopt;
-
       return MemRefType::get(type.getShape(), type.getElementType(),
                              type.getLayout(),
-                             IntegerAttr::get(IntegerType::get(ctx, 64), as));
+                             IntegerAttr::get(IntegerType::get(ctx, 64), 0));
     });
 
     replacer.recursivelyReplaceElementsIn(op, /*replaceAttrs=*/true,

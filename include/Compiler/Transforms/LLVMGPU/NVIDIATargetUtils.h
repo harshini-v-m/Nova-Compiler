@@ -26,7 +26,6 @@ enum class NVMMAIntrinsicValues : int32_t {
   MMA_SYNC_F16_16x8x16  = 3,
   MMA_SYNC_BF16_16x8x16 = 4,
   MMA_SYNC_TF32_16x8x8  = 5,
-  WMMA_TF32_16x16x8  = 6,  // Volta/Turing WMMA TF32 variant (LLVMGPUfrnd)
 };
 
 //===----------------------------------------------------------------------===//

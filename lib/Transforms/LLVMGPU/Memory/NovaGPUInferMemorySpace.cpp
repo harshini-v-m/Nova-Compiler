@@ -147,12 +147,6 @@ static void splitMixedUserAllocTensors(func::FuncOp funcOp) {
 //===----------------------------------------------------------------------===//
 
 static bool isDefinitelyShared(bufferization::AllocTensorOp alloc) {
-  // An allocation can only be in workgroup (shared) memory if it is
-  // defined inside a block-mapped forall (the workgroup scope).
-  // If it's outside (at the host/func level), it must be private or global.
-  if (!isInsideWorkgroupForall(alloc))
-    return false;
-
   bool hasThreadForallUser = false;
   for (Operation *user : alloc->getUsers()) {
     if (!isThreadForallInsideBlockForall(user))
@@ -208,7 +202,7 @@ struct NovaGPUInferMemorySpacePass
         alloc.setMemorySpaceAttr(workgroupSpace);
         LLVM_DEBUG(llvm::dbgs()
                    << "[" DEBUG_TYPE "]  workgroup (thread-forall user)\n");
-      } else if (isInsideWorkgroupForall(alloc)) {
+      } else {
         alloc.setMemorySpaceAttr(privateSpace);
         LLVM_DEBUG(llvm::dbgs()
                    << "[" DEBUG_TYPE "]  private (default)\n");
