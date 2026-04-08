@@ -250,6 +250,21 @@ void registerNovaGPUHoistVectorExtractInsertSlicePass();
 std::unique_ptr<Pass> createNovaGPUCastTypeToFitMMAPass();
 void registerNovaGPUCastTypeToFitMMAPass();
 
+// ---------------------------------------------------------------------------
+// Warp-Level Vector Distribution Passes
+// ---------------------------------------------------------------------------
+
+/// Wraps each vector.contract in gpu.warp_execute_on_lane_0 (step 1 of warp
+/// distribution). Must run BEFORE ConvertVectorToGPU so warp regions exist.
+std::unique_ptr<Pass> createNovaGPUVectorWrapPass();
+void registerNovaGPUVectorWrapPass();
+
+/// Lowers gpu.warp_execute_on_lane_0 regions: inlines MMA regions (all 32
+/// lanes must reach mma.sync), lowers others to scf.if + alloca + barrier.
+/// Must run inside gpuPm AFTER ConvertVectorToGPU(useNvGpu=true).
+std::unique_ptr<Pass> createNovaGPUWarpToSCFPass();
+void registerNovaGPUWarpToSCFPass();
+
 } // namespace nova
 } // namespace mlir
 

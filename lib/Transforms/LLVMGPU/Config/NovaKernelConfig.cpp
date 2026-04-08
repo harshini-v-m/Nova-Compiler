@@ -1180,10 +1180,20 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
  reductionTiles[contractionDims->k.back()] = sched.wgK;
 
 
- // [Fix5] threadTile = one MMA instruction shape.
- // The lowering backend derives per-warp multi-tile ownership from subgroupTile.
- threadTiles[contractionDims->m.back()] = sched.intrinsic.mSize;
- threadTiles[contractionDims->n.back()] = sched.intrinsic.nSize;
+ // [Fix5] threadTile = 0 for MMA contraction dims.
+ //
+ // mma.sync is a warp-cooperative instruction: all 32 lanes must execute it
+ // together. Setting threadTile = mSize/nSize would create a per-thread
+ // scf.forall that assigns one full 16×8 tile to a single thread — which is
+ // architecturally incorrect (the hardware expects per-lane fragments, not
+ // per-thread full tiles).
+ //
+ // With threadTile = 0, the thread tiling pass creates no thread forall for
+ // the matmul. The op stays at subgroup (warp) granularity. After
+ // vectorization, ConvertVectorToGPU handles the intra-warp lane distribution
+ // automatically via nvgpu.mma.sync's implicit per-lane fragment semantics.
+ threadTiles[contractionDims->m.back()] = 0;
+ threadTiles[contractionDims->n.back()] = 0;
 
 
  // subgroupTile = intrinsic × mnTileCount encodes how many MMA tiles each

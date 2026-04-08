@@ -162,12 +162,32 @@ static void promoteOperandToShared(OpBuilder &builder,
   SmallVector<int64_t> threadTiles(numLoops, 1); // placeholder (non-zero)
 
   // Compute the contraction's thread count from its lowering_config.
+  // For MMA configs (threadTiles=0), derive from subgroup tiles instead:
+  //   totalThreads = numWarps × warpSize, where
+  //   numWarps = product of (wgTile / subgroupTile) for non-zero dims.
   int64_t targetThreads = 0;
   DictionaryAttr parentConfig = getLoweringConfig(op);
   if (parentConfig) {
     auto wgTiles = getLoweringConfigTileSizes(parentConfig, kWorkgroupKey);
     auto thTiles = getLoweringConfigTileSizes(parentConfig, kThreadKey);
-    if (wgTiles.size() == thTiles.size()) {
+    auto sgTiles = getLoweringConfigTileSizes(parentConfig, kSubgroupKey);
+
+    // Detect MMA config: all thread tiles are 0, subgroup tiles are non-zero.
+    bool isMMA = !thTiles.empty() &&
+                 llvm::all_of(thTiles, [](int64_t t) { return t == 0; }) &&
+                 !sgTiles.empty() &&
+                 llvm::any_of(sgTiles, [](int64_t t) { return t > 0; });
+
+    if (isMMA && wgTiles.size() == sgTiles.size()) {
+      // MMA path: total threads = numWarps × warpSize (32 for NVIDIA).
+      int64_t numWarps = 1;
+      for (size_t i = 0; i < wgTiles.size(); ++i) {
+        if (sgTiles[i] > 0 && wgTiles[i] > 0)
+          numWarps *= (wgTiles[i] / sgTiles[i]);
+      }
+      targetThreads = numWarps * 32;
+    } else if (wgTiles.size() == thTiles.size()) {
+      // SIMT path: threads = product of (wgTile / threadTile) for non-zero dims.
       targetThreads = 1;
       for (size_t i = 0; i < wgTiles.size(); ++i) {
         if (thTiles[i] > 0 && wgTiles[i] > 0)
