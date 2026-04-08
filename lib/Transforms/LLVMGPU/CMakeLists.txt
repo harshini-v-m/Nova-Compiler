@@ -80,6 +80,15 @@ add_mlir_library(NovaLLVMGPUTransforms
   # Erase nova.fusion_barrier ops
   Lowering/NovaGPUEraseFusionBarriers.cpp
 
+  # ── Vectorization ──────────────────────────────────────────────────────────
+  # Normalize MMA load/store memref indices for NVVM legalization
+  Vectorization/NovaGPUCastTypeToFitMMA.cpp
+  # OptimizeVectorTransfer, DropVectorUnitDims, HoistVectorExtractInsertSlice
+  Vectorization/NovaGPUVectorCleanup.cpp
+  # GenericVectorization, SubsetHoisting, VectorDistribute, UnrollToIntrinsics,
+  # VectorizeMemrefCopy, PackToIntrinsics, LowerPackOps (Batch 2)
+  Vectorization/NovaGPUVectorization.cpp
+
   DEPENDS
   MLIRNovaOpsIncGen
 
@@ -115,6 +124,10 @@ add_mlir_library(NovaLLVMGPUTransforms
   MLIRLinalgTransformOps
   MLIRSCFToControlFlow
   MLIRAffineToStandard
+  MLIRVectorToSCF
+  MLIRVectorToGPU
+  MLIRNVGPUDialect
+  MLIRNVGPUToNVVM
   
   # IREE Dependencies (Using existing Nova linkage/vendored paths if available, otherwise adapting)
   # For now, assuming we implement simplified versions or link against IREE libraries if setup.
