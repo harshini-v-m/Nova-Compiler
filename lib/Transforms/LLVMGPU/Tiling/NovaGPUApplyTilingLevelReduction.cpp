@@ -468,6 +468,16 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
           return std::nullopt;
       }
 
+      // Subgroup level: do NOT fuse ops with derived_thread config into the
+      // warp forall.  These are workgroup-level cooperative copies that must
+      // remain at block scope so all threads cooperatively load the full tile.
+      if (tilingLevel == NovaTilingLevel::Subgroup) {
+        if (auto ownerConfig = getLoweringConfig(owner)) {
+          if (isDerivedThreadConfig(ownerConfig))
+            return std::nullopt;
+        }
+      }
+
       // Yield replacement: needed for ops with post-root users, but NOT
       // at reduction level (would yield large tensors).
       bool yieldProducerReplacement = false;

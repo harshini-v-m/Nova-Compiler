@@ -56,6 +56,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
+#include "mlir/Analysis/SliceAnalysis.h"
+#include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 
 #define DEBUG_TYPE "nova-gpu-hoist-slice"
 
@@ -64,6 +66,50 @@ using namespace mlir;
 namespace mlir::nova {
 
 namespace {
+
+//===----------------------------------------------------------------------===//
+// §0  MMA accumulator iter_arg detection
+//
+// Identifies scf.for iter_args that serve as MMA tensor-core accumulators.
+// These must NOT be hoisted (Steps 4/5): hoisting converts the iter_arg from
+// tensor to vector, which breaks the extract_strided_slice → transfer_read
+// fold chain that Stage 35 (ConvertVectorToGPU) needs.
+//
+// Detection: iter_arg → transfer_read → ... → vector.contract(mma_kind > 0).
+//===----------------------------------------------------------------------===//
+
+static llvm::DenseSet<int64_t>
+collectMMAAccumulatorIterArgs(scf::ForOp forOp) {
+  llvm::DenseSet<int64_t> mmaIterArgs;
+  for (auto [idx, iterArg] : llvm::enumerate(forOp.getRegionIterArgs())) {
+    for (Operation *user : iterArg.getUsers()) {
+      auto readOp = dyn_cast<vector::TransferReadOp>(user);
+      if (!readOp)
+        continue;
+      // Walk forward from the transfer_read to find a vector.contract.
+      SetVector<Operation *> forwardSlice;
+      getForwardSlice(readOp.getOperation(), &forwardSlice);
+      for (Operation *op : forwardSlice) {
+        auto contractOp = dyn_cast<vector::ContractionOp>(op);
+        if (!contractOp)
+          continue;
+        // Check mma_kind on the contract or any ancestor op.
+        Operation *cur = contractOp.getOperation();
+        while (cur) {
+          if (auto cfg = getLoweringConfig(cur)) {
+            if (getMmaKindRaw(cfg) != 0) {
+              mmaIterArgs.insert(idx);
+              goto next_iter_arg;
+            }
+          }
+          cur = cur->getParentOp();
+        }
+      }
+    }
+    next_iter_arg:;
+  }
+  return mmaIterArgs;
+}
 
 //===----------------------------------------------------------------------===//
 // §1  Helper — earliest insertion point inside a block
@@ -152,7 +198,14 @@ static bool canBeHoisted(LoopLikeOpInterface loopLike,
 static LoopLikeOpInterface
 hoistSubsetAtIterArg(RewriterBase &rewriter,
                      LoopLikeOpInterface loopLike,
-                     int64_t idx) {
+                     int64_t idx,
+                     const llvm::DenseSet<int64_t> &skipIndices = {}) {
+  // MMA accumulator iter_args must stay inside the K-loop so that
+  // Stage 35 FoldExtractStridedSlice(transfer_read) can fire post-bufferization.
+  if (skipIndices.contains(idx))
+    return loopLike;
+
+
   // The value yielded at position `idx` must come from an insert_slice-like op.
   auto insertion = loopLike.getYieldedValues()[idx]
                        .getDefiningOp<SubsetInsertionOpInterface>();
@@ -229,11 +282,13 @@ hoistSubsetAtIterArg(RewriterBase &rewriter,
 }
 
 /// Top-level driver: try hoisting for every iter_arg of the loop.
-static void hoistSubsetWithLoopInvariantTensor(RewriterBase &rewriter,
-                                               LoopLikeOpInterface loopLike) {
+/// Iter_arg indices in \p skipIndices are left untouched.
+static void hoistSubsetWithLoopInvariantTensor(
+    RewriterBase &rewriter, LoopLikeOpInterface loopLike,
+    const llvm::DenseSet<int64_t> &skipIndices = {}) {
   for (int64_t i = 0;
        i < static_cast<int64_t>(loopLike.getRegionIterArgs().size()); ++i)
-    loopLike = hoistSubsetAtIterArg(rewriter, loopLike, i);
+    loopLike = hoistSubsetAtIterArg(rewriter, loopLike, i, skipIndices);
 }
 
 //===----------------------------------------------------------------------===//
@@ -591,8 +646,25 @@ struct NovaGPUHoistVectorExtractInsertSlicePass
     // Handles the standard case: extract_slice and insert_slice both use
     // the same loop iter_arg as their tensor. Works for both tensor and
     // vector slice ops via SubsetOpInterface.
+    //
+    // GUARD: Skip loops whose iter_args serve as MMA tensor-core
+    // accumulators.  Hoisting would convert the tensor iter_arg to a
+    // vector iter_arg, and UnrollToIntrinsics (Stage 19) would then
+    // produce extract_strided_slice(block_arg) that ConvertVectorToGPU
+    // cannot trace.  By keeping the tensor iter_arg, bufferization
+    // yields transfer_read(memref) inside the loop, and Stage 35's
+    // FoldExtractStridedSlice(transfer_read) can fold correctly.
     // ------------------------------------------------------------------
     funcOp.walk([&](scf::ForOp forOp) {
+      llvm::DenseSet<int64_t> mmaIterArgs =
+          collectMMAAccumulatorIterArgs(forOp);
+      if (!mmaIterArgs.empty()) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[nova-hoist-slice] skipping hoistLoopInvariantSubsets "
+                   << "for loop with " << mmaIterArgs.size()
+                   << " MMA accumulator iter_arg(s)\n");
+        return;
+      }
       hoistLoopInvariantSubsets(rewriter, forOp);
     });
 
@@ -607,9 +679,13 @@ struct NovaGPUHoistVectorExtractInsertSlicePass
     //
     // Works for both tensor.insert_slice and vector.insert_strided_slice
     // because both implement SubsetInsertionOpInterface.
+    //
+    // Passes the MMA skip-set so accumulator iter_args are not hoisted.
     // ------------------------------------------------------------------
     funcOp.walk([&](scf::ForOp forOp) {
-      hoistSubsetWithLoopInvariantTensor(rewriter, forOp);
+      llvm::DenseSet<int64_t> mmaIterArgs =
+          collectMMAAccumulatorIterArgs(forOp);
+      hoistSubsetWithLoopInvariantTensor(rewriter, forOp, mmaIterArgs);
     });
 
     LLVM_DEBUG(llvm::dbgs()
