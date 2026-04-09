@@ -27,53 +27,6 @@ namespace nova {
 inline SmallVector<utils::IteratorType> getNParallelLoopsAttrs(unsigned n) {
   return SmallVector<utils::IteratorType>(n, utils::IteratorType::parallel);
 }
-static Value reduce_to_shape_nova(OpBuilder &builder, Location loc, Value grad, Value target) {
-  auto grad_type = llvm::dyn_cast<mlir::RankedTensorType>(grad.getType());
-  auto target_type = llvm::dyn_cast<mlir::RankedTensorType>(target.getType());
-  if (!grad_type || !target_type)
-    return grad;
-
-  auto grad_shape = grad_type.getShape();
-  auto target_shape = target_type.getShape();
-
-  if (grad_shape == target_shape)
-    return grad;
-
-  int64_t grad_rank = grad_type.getRank();
-  int64_t target_rank = target_type.getRank();
-
-  llvm::SmallVector<int64_t, 4> reduce_dims;
-  for (int64_t i = 0; i < grad_rank; ++i) {
-    int64_t grad_dim = grad_shape[grad_rank - 1 - i];
-    int64_t target_dim = (i < target_rank) ? target_shape[target_rank - 1 - i] : 1;
-    if (grad_dim != target_dim)
-        reduce_dims.push_back(grad_rank - 1 - i);
-  }
-
-  if (reduce_dims.empty() && grad_rank == target_rank)
-    return grad;
-  std::sort(reduce_dims.begin(), reduce_dims.end());
-
-  llvm::SmallVector<int64_t, 4> intermediate_shape;
-  for (int64_t i = 0; i < grad_rank; ++i) {
-    bool is_reduced = false;
-    for (auto d : reduce_dims)
-    if (d == i)
-        is_reduced = true;
-    if (!is_reduced)
-        intermediate_shape.push_back(grad_shape[i]);
-  }
-  if (intermediate_shape.empty()) {
-    intermediate_shape.push_back(1);
-  }
-  auto intermediate_type = mlir::RankedTensorType::get(intermediate_shape, grad_type.getElementType());
-  auto reduced = builder.create<mlir::nova::ReduceOp> (
-                  loc, mlir::nova::ReductionKind::SUM, grad, 
-                  intermediate_type, false,
-                  reduce_dims, false);
-
-  return builder.create<mlir::nova::ReshapeOp>(loc, target_type, reduced.getResult()).getResult();
-}
 
 //===--------------------------------------------------------------------------------------------===//
 // Arithmetic forward and backward operations: add, sub, mul, div, matmul
@@ -844,7 +797,6 @@ struct NovaSceForwardLowering : public OpConversionPattern<mlir::nova::SceOp> {
     for (int64_t i = 0; i < rank; ++i)
       if (i != lastDim) statsShape.push_back(logitsType.getDimSize(i));
     auto statsType = RankedTensorType::get(statsShape, elemType);
-    auto batchType = RankedTensorType::get(statsShape, elemType);
     int64_t batchRank = static_cast<int64_t>(statsShape.size());
 
     Value negInf = rewriter.create<arith::ConstantOp>(
@@ -854,8 +806,6 @@ struct NovaSceForwardLowering : public OpConversionPattern<mlir::nova::SceOp> {
         loc, rewriter.getZeroAttr(elemType));
     Value epsVal = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getFloatAttr(elemType, 1.0e-7f));
-    Value fOne   = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getFloatAttr(elemType, 1.0f));
 
     Value maxEmpty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
     Value maxInit  = rewriter.create<linalg::FillOp>(loc, negInf, maxEmpty).result();

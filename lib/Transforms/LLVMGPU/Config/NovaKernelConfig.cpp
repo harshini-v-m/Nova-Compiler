@@ -1124,110 +1124,136 @@ tryPickMMASchedule(linalg::LinalgOp op,
 // [Fix5] threadTile = intrinsic size (one MMA slot per thread);
 //         subgroupTile = intrinsic * mnTileCount encodes multi-tile ownership.
 //===----------------------------------------------------------------------===//
-
-
 static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
-                                    const NVIDIATargetInfo &target,
-                                    const MatmulDims &dims,
-                                    int numLoops,
-                                    bool doCPromotion,
-                                    bool promotePrologueOperands,
-                                    const FusedOpMemoryInfo &fusedInfo) {
- Type lhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(0)->get());
- Type rhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(1)->get());
- Type accType = getElementTypeOrSelf(matmul.getDpsInitOperand(0)->get());
+                                     const NVIDIATargetInfo &target,
+                                     const MatmulDims &dims,
+                                     int numLoops,
+                                     bool doCPromotion,
+                                     bool promotePrologueOperands,
+                                     const FusedOpMemoryInfo &fusedInfo) {
+  Type lhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(0)->get());
+  Type rhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(1)->get());
+  Type accType = getElementTypeOrSelf(matmul.getDpsInitOperand(0)->get());
 
+  int32_t lhsKind = typeToElementKind(lhsType);
+  int32_t rhsKind = typeToElementKind(rhsType);
+  int32_t accKind = typeToElementKind(accType);
+  if (lhsKind < 0 || rhsKind < 0 || accKind < 0)
+    return failure();
 
- int32_t lhsKind = typeToElementKind(lhsType);
- int32_t rhsKind = typeToElementKind(rhsType);
- int32_t accKind = typeToElementKind(accType);
- if (lhsKind < 0 || rhsKind < 0 || accKind < 0)
-   return failure();
+  auto maybeSchedule = tryPickMMASchedule(matmul, target, dims,
+                                          lhsKind, rhsKind, accKind,
+                                          doCPromotion, fusedInfo);
+  if (!maybeSchedule)
+    return failure();
 
+  const GPUMMASchedule &sched = *maybeSchedule;
+  auto contractionDims = mlir::linalg::inferContractionDims(matmul);
 
- auto maybeSchedule = tryPickMMASchedule(matmul, target, dims,
-                                         lhsKind, rhsKind, accKind,
-                                         doCPromotion, fusedInfo);
- if (!maybeSchedule)
-   return failure();
+  SmallVector<int64_t> workgroupTiles(numLoops, 0);
+  SmallVector<int64_t> reductionTiles(numLoops, 0);
+  SmallVector<int64_t> threadTiles(numLoops, 0);
+  SmallVector<int64_t> subgroupTiles(numLoops, 0);
+  // Per-workgroup subgroup counts (warps within ONE workgroup tile).
+  // Read by NovaGPUConfigureTensorLayouts to build correct per-warp layouts.
+  // Separate from subgroupTiles (global = numWorkgroups × warpsPerWG).
+  SmallVector<int64_t> wgSubgroupTiles(numLoops, 0);
 
+  // ── Batch and leading M/N/K dims: tile by 1 ──────────────────────────────
+  for (int64_t b : contractionDims->batch) {
+    workgroupTiles[b]   = 1;
+    threadTiles[b]      = 1;
+    subgroupTiles[b]    = 1;
+    wgSubgroupTiles[b]  = 1;
+  }
+  for (int64_t m : llvm::drop_end(contractionDims->m)) {
+    workgroupTiles[m]   = 1;
+    threadTiles[m]      = 1;
+    subgroupTiles[m]    = 1;
+    wgSubgroupTiles[m]  = 1;
+  }
+  for (int64_t n : llvm::drop_end(contractionDims->n)) {
+    workgroupTiles[n]   = 1;
+    threadTiles[n]      = 1;
+    subgroupTiles[n]    = 1;
+    wgSubgroupTiles[n]  = 1;
+  }
+  for (int64_t k : llvm::drop_end(contractionDims->k))
+    reductionTiles[k] = 1;
 
- const GPUMMASchedule &sched = *maybeSchedule;
- auto contractionDims = mlir::linalg::inferContractionDims(matmul);
+  // ── Innermost M, N, K dims ───────────────────────────────────────────────
+  int mDim = contractionDims->m.back();
+  int nDim = contractionDims->n.back();
+  int kDim = contractionDims->k.back();
 
+  workgroupTiles[mDim] = sched.wgM;
+  workgroupTiles[nDim] = sched.wgN;
+  reductionTiles[kDim] = sched.wgK;
 
- SmallVector<int64_t> workgroupTiles(numLoops, 0);
- SmallVector<int64_t> reductionTiles(numLoops, 0);
- SmallVector<int64_t> threadTiles(numLoops, 0);
- SmallVector<int64_t> subgroupTiles(numLoops, 0);
+  // threadTile = one MMA instruction shape (one MMA per thread slot).
+  threadTiles[mDim] = sched.intrinsic.mSize;
+  threadTiles[nDim] = sched.intrinsic.nSize;
 
+  // ── Global subgroup counts ("subgroup" field) ────────────────────────────
+  // = numWorkgroups × subgroupCountPerWG.
+  // Used as VectorDistribute global IDs / global tensor offset computation.
+  SmallVector<int64_t> loopRanges = matmul.getStaticLoopRanges();
 
- for (int64_t b : contractionDims->batch) {
-   workgroupTiles[b] = 1; threadTiles[b] = 1; subgroupTiles[b] = 1;
- }
- for (int64_t m : llvm::drop_end(contractionDims->m)) {
-   workgroupTiles[m] = 1; threadTiles[m] = 1; subgroupTiles[m] = 1;
- }
- for (int64_t n : llvm::drop_end(contractionDims->n)) {
-   workgroupTiles[n] = 1; threadTiles[n] = 1; subgroupTiles[n] = 1;
- }
- for (int64_t k : llvm::drop_end(contractionDims->k))
-   reductionTiles[k] = 1;
+  int64_t numWgM = llvm::divideCeil(loopRanges[mDim], sched.wgM);
+  int64_t numWgN = llvm::divideCeil(loopRanges[nDim], sched.wgN);
 
+  subgroupTiles[mDim] = numWgM * sched.subgroupCount;
+  subgroupTiles[nDim] = numWgN * 1;
+  subgroupTiles[kDim] = 0; // K not distributed across subgroups
 
- workgroupTiles[contractionDims->m.back()] = sched.wgM;
- workgroupTiles[contractionDims->n.back()] = sched.wgN;
- reductionTiles[contractionDims->k.back()] = sched.wgK;
+  for (int64_t b : contractionDims->batch)
+    subgroupTiles[b] = llvm::divideCeil(loopRanges[b], workgroupTiles[b]);
 
+  // ── Per-workgroup subgroup counts ("wg_subgroup" field) ──────────────────
+  // = subgroupCountPerWG only (within one workgroup tile).
+  // NovaGPUConfigureTensorLayouts uses this to compute per-warp
+  // batch_counts / sg_counts correctly from the wg-level tile bounds.
+  wgSubgroupTiles[mDim] = sched.subgroupCount; // warps tiling M within WG
+  wgSubgroupTiles[nDim] = 1;                   // N not split across warps
+  wgSubgroupTiles[kDim] = 0;                   // K not subgroup-distributed
 
- // [Fix5] threadTile = one MMA instruction shape.
- // The lowering backend derives per-warp multi-tile ownership from subgroupTile.
- threadTiles[contractionDims->m.back()] = sched.intrinsic.mSize;
- threadTiles[contractionDims->n.back()] = sched.intrinsic.nSize;
+  for (int64_t b : contractionDims->batch)
+    wgSubgroupTiles[b] = 1; // one subgroup per batch dim within WG
 
+  // ── Promoted operands ────────────────────────────────────────────────────
+  SmallVector<int64_t> promotedOps = {0, 1};
+  if (doCPromotion || promotePrologueOperands)
+    promotedOps.push_back(2);
 
- // subgroupTile = intrinsic × mnTileCount encodes how many MMA tiles each
- // subgroup (warp) owns. The backend pipelines these for register-level ILP.
- subgroupTiles[contractionDims->m.back()] =
-     sched.intrinsic.mSize * sched.mnTileCountPerSubgroup;
- subgroupTiles[contractionDims->n.back()] =
-     sched.intrinsic.nSize * sched.mnTileCountPerSubgroup;
+  // ── Padding ──────────────────────────────────────────────────────────────
+  SmallVector<int64_t> padding =
+      computePaddingSizes(matmul, workgroupTiles, reductionTiles);
 
+  // ── Write config ─────────────────────────────────────────────────────────
+  MLIRContext *ctx = matmul.getContext();
+  setMatmulLoweringConfigAttrs(matmul.getOperation(), ctx,
+                               workgroupTiles, reductionTiles,
+                               threadTiles, subgroupTiles,
+                               static_cast<int32_t>(sched.intrinsic.intrinsic),
+                               promotedOps, padding,
+                               wgSubgroupTiles);
 
- SmallVector<int64_t> padding =
-     computePaddingSizes(matmul, workgroupTiles, reductionTiles);
-
-
- // [Fix1] Build promoted operand list.
- // Always promote A and B (operands 0 and 1) into shared memory.
- // Also promote C (operand 2 / init) when C promotion is needed due to:
- //   - live accumulator buffer (doCPromotion / matmul_accumulate), OR
- //   - prologue ops that feed non-matmul data into the kernel.
- SmallVector<int64_t> promotedOps = {0, 1};
- if (doCPromotion || promotePrologueOperands)
-   promotedOps.push_back(2);
-
-
- MLIRContext *ctx = matmul.getContext();
- setMatmulLoweringConfigAttrs(matmul.getOperation(), ctx,
-                              workgroupTiles, reductionTiles,
-                              threadTiles, subgroupTiles,
-                              static_cast<int32_t>(sched.intrinsic.intrinsic),
-                              promotedOps, padding);
-
-
- LLVM_DEBUG(llvm::dbgs()
-            << "[nova-kernel-config] MMA config: wgM=" << sched.wgM
-            << " wgN=" << sched.wgN << " wgK=" << sched.wgK
-            << " subgroups=" << sched.subgroupCount
-            << " mnTile=" << sched.mnTileCountPerSubgroup
-            << " doCPromo=" << doCPromotion
-            << " promoProlog=" << promotePrologueOperands
-            << " fusedOpOverhead="
-            << fusedInfo.extraSmemBytes(sched.wgM, sched.wgK) << "\n");
- return success();
+  LLVM_DEBUG(llvm::dbgs()
+             << "[nova-kernel-config] MMA config:"
+             << " wgM=" << sched.wgM
+             << " wgN=" << sched.wgN
+             << " wgK=" << sched.wgK
+             << " subgroupCount=" << sched.subgroupCount
+             << " mnTilePerSubgroup=" << sched.mnTileCountPerSubgroup
+             << " globalSgM=" << subgroupTiles[mDim]
+             << " globalSgN=" << subgroupTiles[nDim]
+             << " wgSgM=" << wgSubgroupTiles[mDim]
+             << " doCPromo=" << doCPromotion
+             << " promoProlog=" << promotePrologueOperands
+             << " fusedOverhead="
+             << fusedInfo.extraSmemBytes(sched.wgM, sched.wgK) << "\n");
+  return success();
 }
-
 
 //===----------------------------------------------------------------------===//
 // setSimtConfig — SIMT fallback, fused-op-aware [Fix6]

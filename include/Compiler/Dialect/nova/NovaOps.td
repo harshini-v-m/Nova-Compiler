@@ -75,6 +75,10 @@ def Nova_NVMMAIntrinsicKind : I32EnumAttr<"NVMMAIntrinsic",
   I32EnumAttrCase<"MMA_SYNC_F16_16x8x16", 3, "mma_sync_f16_16x8x16">,
   // Ampere mma.sync: C(16x8) += A(16x16) * B(16x8), bf16 inputs, f32 acc.
   I32EnumAttrCase<"MMA_SYNC_BF16_16x8x16", 4, "mma_sync_bf16_16x8x16">,
+  // Ampere mma.sync: C(16x8) += A(16x8) * B(8x8), tf32 inputs, f32 acc.
+  I32EnumAttrCase<"MMA_SYNC_TF32_16x8x8", 5, "mma_sync_tf32_16x8x8">,
+  // Volta/Turing WMMA: C(16x16) += A(16x8) * B(8x16), tf32 inputs, f32 acc.
+  I32EnumAttrCase<"WMMA_TF32_16x16x8", 6, "wmma_tf32_16x16x8">,
 ]> {
   let cppNamespace = "::mlir::nova";
 }

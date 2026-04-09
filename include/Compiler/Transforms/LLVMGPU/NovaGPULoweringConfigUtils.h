@@ -34,6 +34,7 @@ constexpr llvm::StringLiteral kWorkgroupKey     = "workgroup";
 constexpr llvm::StringLiteral kReductionKey     = "reduction";
 constexpr llvm::StringLiteral kThreadKey        = "thread";
 constexpr llvm::StringLiteral kSubgroupKey      = "subgroup";
+constexpr llvm::StringLiteral kWgSubgroupKey    = "wg_subgroup";
 constexpr llvm::StringLiteral kMmaKindKey       = "mma_kind";
 constexpr llvm::StringLiteral kPromotedOpsKey   = "promoted_operands";
 constexpr llvm::StringLiteral kPaddingKey       = "padding";
@@ -62,6 +63,16 @@ SmallVector<int64_t> getLoweringConfigTileSizes(DictionaryAttr config,
 /// Reads the mma_kind integer from a LoweringConfig dict.
 /// Returns 0 (NVMMAIntrinsic::NONE) if the key is absent.
 int32_t getMmaKindRaw(DictionaryAttr config);
+
+/// Returns the MMA intrinsic shape {M, N, K} for the given intrinsic enum
+/// value. Returns {16, 16, 16} (WMMA default) if unrecognised.
+SmallVector<int64_t, 3> getMMAShape(int32_t mmaKindRaw);
+
+/// Convenience wrapper for getLoweringConfigTileSizes.
+SmallVector<int64_t> getConfigField(DictionaryAttr config, llvm::StringRef levelKey);
+
+/// Convenience wrapper for getPromotedOperandList.
+SmallVector<int64_t> getPromotedOperands(DictionaryAttr config);
 
 /// Append a tiling level array to an in-progress attrs list.
 void setLoweringConfigTileSizes(MLIRContext *ctx,
@@ -124,6 +135,12 @@ void setLoweringConfig(Operation *op, DictionaryAttr configDict);
 
 /// Build and attach a LoweringConfig from components.
 /// Convenience wrapper around the above two functions.
+/// wgSubgroupTiles (optional) encodes the per-workgroup subgroup counts
+/// (i.e. how many warps tile each dim within ONE workgroup tile).
+/// Stored as "wg_subgroup" in the config dict and read by
+/// NovaGPUConfigureTensorLayouts to compute correct per-warp layouts.
+/// Separate from "subgroup" which holds the global counts
+/// (numWorkgroups × subgroupsPerWG) used for global address computation.
 void setMatmulLoweringConfigAttrs(Operation *op,
                                   MLIRContext *ctx,
                                   ArrayRef<int64_t> workgroupTiles,
@@ -132,7 +149,8 @@ void setMatmulLoweringConfigAttrs(Operation *op,
                                   ArrayRef<int64_t> subgroupTiles,
                                   int32_t mmaKindValue,
                                   ArrayRef<int64_t> promotedOperands,
-                                  ArrayRef<int64_t> paddingSizes = {});
+                                  ArrayRef<int64_t> paddingSizes = {},
+                                  ArrayRef<int64_t> wgSubgroupTiles = {});
 
 /// Remove the lowering_config attribute from an op.
 /// Used to strip configs from non-root ops after they fuse into a root's

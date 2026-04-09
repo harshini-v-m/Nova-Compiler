@@ -77,34 +77,6 @@ struct NovaGPUDropVectorUnitDimsPass
     return "Drop unit dimensions from vector operations.";
   }
 };
-
-//===----------------------------------------------------------------------===//
-// NovaGPUHoistVectorExtractInsertSlicePass
-//===----------------------------------------------------------------------===//
-
-struct NovaGPUHoistVectorExtractInsertSlicePass
-    : public PassWrapper<NovaGPUHoistVectorExtractInsertSlicePass, OperationPass<func::FuncOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUHoistVectorExtractInsertSlicePass)
-
-  void runOnOperation() override {
-    func::FuncOp funcOp = getOperation();
-    
-    // Hoist redundant vector.extract_slice / vector.insert_slice out of loops.
-    // This enables wider vectorization across kernel code.
-    // Ported from IREE's HoistVectorExtractInsertSlice.
-    linalg::hoistRedundantVectorTransfers(funcOp);
-    
-    // Note: Standard MLIR doesn't have a single "hoist slice" pattern outside
-    // of linalg's generic hoisting. However, we can apply additional 
-    // subset-hoisting logic here if needed.
-  }
-
-  StringRef getArgument() const override { return "nova-gpu-hoist-slice"; }
-  StringRef getDescription() const override {
-    return "Hoist vector.extract_slice and vector.insert_slice out of loops.";
-  }
-};
-
 } // namespace
 
 namespace mlir::nova {
@@ -123,11 +95,5 @@ void registerNovaGPUDropVectorUnitDimsPass() {
   PassRegistration<NovaGPUDropVectorUnitDimsPass>();
 }
 
-std::unique_ptr<Pass> createNovaGPUHoistVectorExtractInsertSlicePass() {
-  return std::make_unique<NovaGPUHoistVectorExtractInsertSlicePass>();
-}
-void registerNovaGPUHoistVectorExtractInsertSlicePass() {
-  PassRegistration<NovaGPUHoistVectorExtractInsertSlicePass>();
-}
 
 } // namespace mlir::nova

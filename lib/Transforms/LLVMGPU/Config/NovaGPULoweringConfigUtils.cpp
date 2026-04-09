@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
+#include "Compiler/Transforms/LLVMGPU/NVIDIATargetUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 
@@ -50,6 +51,35 @@ int32_t getMmaKindRaw(DictionaryAttr config) {
   if (!intAttr)
     return 0;
   return static_cast<int32_t>(intAttr.getInt());
+}
+
+SmallVector<int64_t, 3> getMMAShape(int32_t mmaKindRaw) {
+  switch (static_cast<NVMMAIntrinsicValues>(mmaKindRaw)) {
+  case NVMMAIntrinsicValues::MMA_SYNC_F16_16x8x16:
+  case NVMMAIntrinsicValues::MMA_SYNC_BF16_16x8x16:
+    return {16, 8, 16};
+  case NVMMAIntrinsicValues::MMA_SYNC_TF32_16x8x8:
+    return {16, 8, 8};
+  case NVMMAIntrinsicValues::WMMA_TF32_16x16x8:
+    return {16, 16, 8};
+  case NVMMAIntrinsicValues::WMMA_F32_16x16x16:
+  case NVMMAIntrinsicValues::WMMA_F16_16x16x16:
+    return {16, 16, 16};
+  case NVMMAIntrinsicValues::NONE:
+  default:
+    // Default fallback for NVIDIA Tensor Cores if no specific kind matched.
+    return {16, 16, 16};
+  }
+}
+
+SmallVector<int64_t> getConfigField(DictionaryAttr config,
+                                    llvm::StringRef levelKey) {
+  return getLoweringConfigTileSizes(config, levelKey);
+}
+
+SmallVector<int64_t> getPromotedOperands(DictionaryAttr config) {
+  auto optList = getPromotedOperandList(config);
+  return optList.has_value() ? *optList : SmallVector<int64_t>{};
 }
 
 std::optional<SmallVector<int64_t>>
@@ -249,12 +279,15 @@ void setMatmulLoweringConfigAttrs(Operation *op,
                                   ArrayRef<int64_t> subgroupTiles,
                                   int32_t mmaKindValue,
                                   ArrayRef<int64_t> promotedOperands,
-                                  ArrayRef<int64_t> paddingSizes) {
+                                  ArrayRef<int64_t> paddingSizes,
+                                  ArrayRef<int64_t> wgSubgroupTiles) {
   SmallVector<NamedAttribute> attrs;
   setLoweringConfigTileSizes(ctx, attrs, kWorkgroupKey, workgroupTiles);
   setLoweringConfigTileSizes(ctx, attrs, kReductionKey, reductionTiles);
   setLoweringConfigTileSizes(ctx, attrs, kThreadKey, threadTiles);
   setLoweringConfigTileSizes(ctx, attrs, kSubgroupKey, subgroupTiles);
+  if (!wgSubgroupTiles.empty())
+    setLoweringConfigTileSizes(ctx, attrs, kWgSubgroupKey, wgSubgroupTiles);
   setMmaKindRaw(ctx, attrs, mmaKindValue);
   appendPromotedOperandsList(ctx, attrs, promotedOperands);
   if (!paddingSizes.empty())

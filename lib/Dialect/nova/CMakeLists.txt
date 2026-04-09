@@ -4,6 +4,7 @@ add_mlir_dialect_library(MLIRNova
   NovaOps.cpp
   NovaCanonicalizations.cpp
   Broadcast.cpp
+  NovaVectorLayoutAttr.cpp
 
   DEPENDS
   MLIRNovaOpsIncGen

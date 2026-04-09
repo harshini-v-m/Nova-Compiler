@@ -191,32 +191,21 @@ void registerNovaRepositionStorePass();
 std::unique_ptr<Pass> createNovaMultiConsumerFusion();
 void registerNovaMultiConsumerFusion();
 
+// Computes per-operand thread distribution layouts for MMA contraction ops
+// and attaches them as nova.layout_0/1/2 attributes on the linalg op.
+// MUST run after thread tiling (Step 5) and before vectorization (Step 8).
+std::unique_ptr<Pass> createNovaGPUConfigureTensorLayoutsPass();
+void registerNovaGPUConfigureTensorLayoutsPass();
+
 // ---------------------------------------------------------------------------
 // Vectorization Passes  (Batch 1: declarations; wired into pipeline in Batch 2+)
 // ---------------------------------------------------------------------------
 
-/// Repacks linalg.generic contraction ops whose lowering_config carries a
-/// non-zero mma_kind into inner tile shapes matching the MMA intrinsic
-/// (e.g. {16,16,16} for WMMA_F32, {16,8,16} for MMA_SYNC_F16).
-/// Must run BEFORE GenericVectorization (still linalg form).
-std::unique_ptr<Pass> createNovaGPUPackToIntrinsicsPass();
-void registerNovaGPUPackToIntrinsicsPass();
-
-/// Vectorizes linalg operations: matmul-shaped ops → vector.contract,
-/// others → vector.multi_reduction / vector.transfer.
-/// Also lowers multi_reduction → inner-reduction → vector.contract.
-std::unique_ptr<Pass> createNovaGPUGenericVectorizationPass();
-void registerNovaGPUGenericVectorizationPass();
-
-/// Hoists vector.transfer_read/write out of sequential loops (subset hoisting).
-std::unique_ptr<Pass> createNovaGPUSubsetHoistingPass();
-void registerNovaGPUSubsetHoistingPass();
-
-/// Distributes warp-level vector ops across threads (SIMD-to-SIMT).
-/// Lowers vector.contract → outer-product chains.
-/// Must run AFTER UnrollToIntrinsics.
-std::unique_ptr<Pass> createNovaGPUVectorDistributePass();
-void registerNovaGPUVectorDistributePass();
+/// Vectorizes linalg ops to vector.contract / vector.transfer_*.
+/// MMA ops: vectorize + transfer nova.layout_* onto vector.contract.
+/// Static ops: plain vectorize. Dynamic ops: masked vectorize via ValueBounds.
+std::unique_ptr<Pass> createNovaGenericVectorizationPass();
+void registerNovaGenericVectorizationPass();
 
 /// Vectorizes memref.copy ops targeting shared memory (128-bit LDS.128).
 std::unique_ptr<Pass> createNovaGPUVectorizeMemrefCopyPass();
@@ -249,6 +238,18 @@ void registerNovaGPUHoistVectorExtractInsertSlicePass();
 /// No-op for the nvgpu.mma.sync (Ampere native) path.
 std::unique_ptr<Pass> createNovaGPUCastTypeToFitMMAPass();
 void registerNovaGPUCastTypeToFitMMAPass();
+
+std::unique_ptr<Pass> createNovaGPUVectorAllocPass();
+void registerNovaGPUVectorAllocPass();
+
+/// Combines multiple nova.value_barrier ops in the same block into a single
+/// one, reducing the number of gpu.barrier instructions emitted after
+/// bufferization. Same-semantics barriers (all-vector write OR all-tensor read)
+/// are merged; write and read barriers are never merged together.
+/// Must run AFTER GPUVectorAllocPass (which produces the barriers) and
+/// BEFORE bufferization (barriers are on tensor/vector types, not memrefs).
+std::unique_ptr<Pass> createNovaGPUCombineValueSemanticBarriersPass();
+void registerNovaGPUCombineValueSemanticBarriersPass();
 
 } // namespace nova
 } // namespace mlir

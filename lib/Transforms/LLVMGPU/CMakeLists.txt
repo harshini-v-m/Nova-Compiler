@@ -13,6 +13,8 @@ add_mlir_library(NovaLLVMGPUTransforms
   Config/NovaGPUSelectLoweringStrategy.cpp
   # Config-propagating canonicalizer
   Config/NovaConfigTrackingCanonicalizer.cpp
+  # Configure MMA tensor layouts
+  Config/NovaGPUConfigureTensorLayouts.cpp
 
   # ── Tiling ────────────────────────────────────────────────────────────────
   # Tile-and-fuse shared utilities
@@ -85,9 +87,17 @@ add_mlir_library(NovaLLVMGPUTransforms
   Vectorization/NovaGPUCastTypeToFitMMA.cpp
   # OptimizeVectorTransfer, DropVectorUnitDims, HoistVectorExtractInsertSlice
   Vectorization/NovaGPUVectorCleanup.cpp
-  # GenericVectorization, SubsetHoisting, VectorDistribute, UnrollToIntrinsics,
-  # VectorizeMemrefCopy, PackToIntrinsics, LowerPackOps (Batch 2)
+  # linalg → vector.contract / vector.transfer (SIMD vectorization)
+  Vectorization/NovaGPUGenericVectorization.cpp
+  
+  Vectorization/NovaGPUHoistExtractInsert.cpp
+  # Vector size inference for dynamic shapes (ValueBounds UB analysis)
+  Vectorization/NovaVectorSizeUtils.cpp
+  # VectorizeMemrefCopy, UnrollToIntrinsics, LowerPackOps
   Vectorization/NovaGPUVectorization.cpp
+  
+  Vectorization/NovaGPUVectorAlloc.cpp
+  Vectorization/NovaGPUCombineValueSemanticBarriers.cpp
 
   DEPENDS
   MLIRNovaOpsIncGen
@@ -118,6 +128,7 @@ add_mlir_library(NovaLLVMGPUTransforms
   MLIRTosaDialect
   MLIROpenMPDialect
   MLIRAnalysis
+  MLIRValueBoundsOpInterface
   MLIRTensorTransforms
   MLIRTransformDialect
   MLIRTransformDialectTransforms
