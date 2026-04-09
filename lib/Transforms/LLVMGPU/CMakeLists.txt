@@ -88,6 +88,8 @@ add_mlir_library(NovaLLVMGPUTransforms
   # GenericVectorization, SubsetHoisting, VectorDistribute, UnrollToIntrinsics,
   # VectorizeMemrefCopy, PackToIntrinsics, LowerPackOps (Batch 2)
   Vectorization/NovaGPUVectorization.cpp
+  
+  Vectorization/NovaGPUHoistExtractInsert.cpp
 
   DEPENDS
   MLIRNovaOpsIncGen

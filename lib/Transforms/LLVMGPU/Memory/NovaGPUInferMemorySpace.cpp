@@ -50,6 +50,13 @@ static bool hasThreadMapping(scf::ForallOp forall) {
   });
 }
 
+static bool hasWarpMapping(scf::ForallOp forall) {
+  if (!forall.getMapping().has_value()) return false;
+  return llvm::any_of(*forall.getMapping(), [](Attribute a) {
+    return isa<gpu::GPUWarpMappingAttr>(a);
+  });
+}
+
 static bool hasBlockMapping(scf::ForallOp forall) {
   if (!forall.getMapping().has_value()) return false;
   return llvm::any_of(*forall.getMapping(), [](Attribute a) {
@@ -83,7 +90,14 @@ static bool isInsideWorkgroupForall(Operation *op) {
 
 static bool isThreadForallInsideBlockForall(Operation *op) {
   auto forallOp = dyn_cast<scf::ForallOp>(op);
-  if (!forallOp || !hasThreadMapping(forallOp))
+  if (!forallOp)
+    return false;
+  // Thread-mapped OR warp-mapped foralls inside a block forall need workgroup
+  // (shared) memory for their promoted operand buffers.  Warp-mapped foralls
+  // are created by subgroup tiling for the MMA (tensor core) path — the
+  // promoted A/B copies must be in shared memory so all warps can read them
+  // after a barrier.
+  if (!hasThreadMapping(forallOp) && !hasWarpMapping(forallOp))
     return false;
   return isInsideWorkgroupForall(forallOp);
 }

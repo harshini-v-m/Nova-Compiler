@@ -372,8 +372,8 @@ namespace mlir::nova
     //
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUGenericVectorizationPass());
-    pm.addNestedPass<func::FuncOp>(createNovaGPUOptimizeVectorTransferPass());
     pm.addNestedPass<func::FuncOp>(createNovaGPUHoistVectorExtractInsertSlicePass());
+    // pm.addNestedPass<func::FuncOp>(createNovaGPUHoistVectorExtractInsertSlicePass());
     pm.addNestedPass<func::FuncOp>(createNovaGPUDropVectorUnitDimsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
