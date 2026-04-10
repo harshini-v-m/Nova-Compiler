@@ -1251,6 +1251,13 @@ static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
                                   int numLoops,
                                   const NVIDIATargetInfo &target,
                                   const FusedOpMemoryInfo &fusedInfo) {
+ // Matvec (M=1 or N=1) should use the reduction pipeline, not SIMT
+ // contraction tiling.  Returning failure here lets the caller fall through
+ // to setDefaultConfig, which handles 1D accumulation via
+ // vector.multi_reduction → FMA that ConvertVectorToLLVM lowers correctly.
+ if (dims.M == 1 || dims.N == 1)
+   return failure();
+
  // Phase 1: find the best-aligned tile from the table.
  const SimtTilePair *chosen = nullptr;
  for (const auto &entry : kSimtTable) {
@@ -1380,8 +1387,10 @@ LogicalResult setContractConfig(linalg::LinalgOp op,
 
  MatmulDims dims = inferMatmulDims(op);
  if (!dims.valid())          return failure();
+ // Matvec (M=1 or N=1): skip both contraction and SIMT paths.
+ // Returning failure lets the caller fall through to setDefaultConfig
+ // (the reduction pipeline), which handles 1D accumulation correctly.
  if (dims.M == 1 || dims.N == 1) return failure();
-
 
  // Send very skinny matmuls to the vector reduction pipeline.
  FailureOr<mlir::linalg::ContractionDimensions> contractionDims =
