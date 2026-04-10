@@ -90,6 +90,7 @@ namespace mlir::nova
     // ── Step -1: Pre-tiling elementwise fusion ─────────────────────────────
     pm.addNestedPass<mlir::func::FuncOp>(createFuseMatmulBiasPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
+    pm.addNestedPass<func::FuncOp>(createFuseMatmulBiasPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaCheckInsParallelFuse());
     pm.addNestedPass<mlir::func::FuncOp>(
         createNovaLinalgHorizontalFusionPass());
@@ -168,14 +169,13 @@ namespace mlir::nova
 
     // ── Step 6: Normalize loop bounds ──────────────────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+ 
 
     // ── Step 6.6: Distribute orphaned ops ──────────────────────────────────
     pm.addNestedPass<func::FuncOp>(
         createNovaGPUGreedilyDistributeToThreadsPass());
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
 
     // ── Step 6.75: Lower barrier regions ───────────────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaGPULowerBarrierRegionPass());
@@ -252,28 +252,46 @@ namespace mlir::nova
 
     // ── Step 9: scf.forall → gpu.launch ────────────────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaGPUMapForallToGPUPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
 
     // ── Step 10: Lower linalg → scf loops ──────────────────────────────────
     pm.addPass(createConvertLinalgToLoopsPass());
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
 
-    // ── Scalar accumulator + warp shuffle reduction ─────────────────────────
+    pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
+
+    // ── Step 10.5: Stride-32 parallelization for single-thread reductions ──
+    // Rewrites scf.for reduction loops inside single-thread gpu.launch ops
+    // to use 32 threads with stride-32 access: lb=tid.x, step=32.
+    // Must run BEFORE SCFScalarize (which creates atomic_rmw from stores)
+    // and BEFORE WarpShuffle (which converts atomic_rmw to shfl.sync.bfly).
+    pm.addNestedPass<func::FuncOp>(createNovaStrideReductionPass());
+
     pm.addNestedPass<func::FuncOp>(
         mlir::nova::createSCFScalarizeAccumulatorPass());
+    pm.addPass(createCanonicalizerPass());
+
+    // ── Step 10.8: Loop split + vectorize (both reduction and non-reduction) ─
+    // LoopSplit splits loops at condition boundaries (helps non-reduction
+    // vectorization). The vectorizer then handles BOTH modes:
+    //   Mode A: non-reduction loops (step=1, no iter_args) → vector.load/store
+    //   Mode B: reduction loops (iter_args) → vector.load + vector.reduction
+    // Must run BEFORE WarpShuffle because the vectorized reduction emits
+    // vector.reduction → scalar, which feeds into the atomic_rmw that
+    // WarpShuffle matches.
+    pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
+    pm.addPass(createCanonicalizerPass());
+
+    pm.addNestedPass<func::FuncOp>(
+        mlir::nova::createNovaScfLoopVectorizePass(4));
+    pm.addPass(createCanonicalizerPass());
+
+    // ── Warp butterfly shuffle reduction ────────────────────────────────────
+    // Replaces double-atomic reduction patterns with register-based shuffle
+    // + thread-0 write. Also matches values from vector::ReductionOp.
     pm.addNestedPass<func::FuncOp>(
         mlir::nova::createNovaWarpShuffleReductionPass());
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
-
-    // // ── Loop optimizations ──────────────────────────────────────────────────
-    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
-    // pm.addPass(createCanonicalizerPass());
-
-    // ── Reposition stores ───────────────────────────────────────────────────
-    pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
 
     // ── Step 11: Insert workgroup barriers ──────────────────────────────────
     pm.addNestedPass<func::FuncOp>(
@@ -689,7 +707,6 @@ namespace mlir::nova
       gpuPm.addPass(createReconcileUnrealizedCastsPass());
     }
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
 
     GpuModuleToBinaryPassOptions binaryOptions;
     binaryOptions.toolkitPath = "/usr/local/cuda-13.0";
@@ -707,11 +724,18 @@ namespace mlir::nova
     pm.addPass(createArithToLLVMConversionPass());
     pm.addPass(memref::createExpandStridedMetadataPass());
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+    // 13.5b — Patch host-side loads/stores from GPU device pointers produced
+    // by mgpuMemAlloc.  SCFScalarizeAccumulator emits a host memref.load from
+    // a scratch buffer that ConvertMemRefToGpuPass later promotes to device
+    // memory.  Without this pass the load becomes a bare host dereference of
+    // a CUDA device pointer → SIGSEGV.  This pass replaces each such load with
+    // a synchronous cudaMemcpy(DeviceToHost) and each such store with a
+    // synchronous cudaMemcpy(HostToDevice).
+    pm.addPass(mlir::nova::createFixHostGpuMemoryPass());
     pm.addPass(createConvertFuncToLLVMPass());
     pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
     pm.addPass(createReconcileUnrealizedCastsPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
   }
 
   void registerNovaLLVMGPUPasses()
@@ -744,6 +768,7 @@ namespace mlir::nova
     registerNovaGPUCombineValueSemanticBarriersPass();
     registerNovaGPUVectorDistributePass();
     registerNovaGPUUnrollToIntrinsicsPass();
+    registerNovaStrideReductionPass();
 
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
       return mlir::nova::createNovaScfLoopUnrollPass();
