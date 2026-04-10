@@ -158,6 +158,14 @@ void tileToThreads(RewriterBase &rewriter,
       [&](tensor::ExtractSliceOp candidateSliceOp, OpResult originalProducer,
           bool isDestinationOperand)
       -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+    // Guard 2: refuse to fuse scf.for / scf.forall producers into this
+    // thread-level forall.  fusing a K-loop or a workgroup-promotion forall
+    // would pull its entire body inside one thread's tile, turning a
+    // workgroup-scoped copy into per-thread work and breaking the
+    // nova.promote_to_workgroup semantic.
+    Operation *defOp = originalProducer.getOwner();
+    if (isa<scf::ForOp, scf::ForallOp>(defOp))
+      return std::nullopt; // refuse fusion
     return scf::SCFTileAndFuseOptions::ControlFnResult{
         /*yieldProducerReplacement=*/false};
   };
@@ -201,6 +209,13 @@ void processRegion(RewriterBase &rewriter, Region *region) {
       // Tile linalg ops to threads.
       if (auto tilableOp = dyn_cast<TilingInterface>(op)) {
         if (isa<linalg::LinalgOp>(op)) {
+          // Guard 1: never thread-tile workgroup-promotion copies.
+          // linalg.copy ops tagged nova.promote_to_workgroup are intended to
+          // run at workgroup scope (later lowered to nvgpu.device_async_copy).
+          // Tiling them to threads would break that semantic — each thread
+          // would copy its own slice instead of cooperating on one tile.
+          if (op->hasAttr("nova.promote_to_workgroup"))
+            continue;
           tileToThreads(rewriter, tilableOp);
           continue;
         }

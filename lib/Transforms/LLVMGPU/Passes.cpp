@@ -154,10 +154,6 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    // ── Step 6.5: Fuse and hoist parallel loops ─────────────────────────────
-    pm.addNestedPass<func::FuncOp>(
-        createNovaGPUFuseAndHoistParallelLoopsPass());
-
     // ── Step 6.6: Distribute orphaned ops ──────────────────────────────────
     pm.addNestedPass<func::FuncOp>(
         createNovaGPUGreedilyDistributeToThreadsPass());
@@ -188,13 +184,7 @@ namespace mlir::nova
     //   SIMT path (mma_kind == NONE): linalg.generic → vector.transfer + arith
     // OptimizeVectorTransfer: fold redundant transfer_read/write pairs.
     // DropVectorUnitDims: vector<1x16xf32> → vector<16xf32> for MMA matching.
-    //
-    // NOTE: CastTypeToFitMMA removed from here — it is a no-op for the
-    // nvgpu.mma.sync path (sm_80+). It remains at 38b inside gpuPm where
-    // it handles the WMMA path (sm_70–sm_75) post-outlining.
     pm.addNestedPass<func::FuncOp>(createNovaGenericVectorizationPass());
-    // pm.addNestedPass<func::FuncOp>(createNovaGPUOptimizeVectorTransferPass());
-    // pm.addNestedPass<func::FuncOp>(createNovaGPUDropVectorUnitDimsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
@@ -224,87 +214,64 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    // ── Stage 19: Unroll vector.contract to MMA intrinsic shapes ───────────
-    // Reads mma_kind from lowering_config. Unrolls to:
-    //   MMA_SYNC_TF32_16x8x8  → 16×8×8 fragments
-    //   MMA_SYNC_F16_16x8x16  → 16×8×16 fragments
-    //   WMMA_F32_16x16x16     → 16×16×16 fragments
-    // The extract_strided_slice ops produced here are hoisted/folded by
-    // Stage 19.5 (HoistVectorExtractInsertSlice) and then by
-    // // FoldExtractStridedSliceFromTransferRead in GpuHardwareMappingPass.
-    // pm.addNestedPass<func::FuncOp>(createNovaGPUUnrollToIntrinsicsPass());
-    // pm.addPass(createCanonicalizerPass());
-    // pm.addPass(createCSEPass());
-
-    // ── Stage 19.5: Hoist vector/tensor extract+insert slice pairs ──────────
-    // Hoists loop-invariant extract_slice / insert_slice (both tensor and
-    // vector dialects) out of scf.for loops and folds identity no-op slices.
-    // 6-step pipeline:
-    //   1. Move extracts to earliest valid position (improves LICM coverage).
-    //   2. hoistRedundantVectorTransfers — transfer_read/write pairs.
-    //   3. moveLoopInvariantCode        — standard MLIR LICM.
-    //   4. hoistLoopInvariantSubsets    — extract+insert sharing iter_arg.
-    //   5. hoistSubsetWithLoopInvariantTensor — insert into loop-invariant dest.
-    //   6. Cleanup: CastLike{Extract,Insert}SliceFolder + Vector{Extract,Insert}
-    //      StridedFolder + scf/vector canonicalization patterns.
-    
-
-
-    // ── Stage 21: Host-side vector scalarization [BEFORE bufferization] ────
-    // targetRank=0 scalarizes all host-side vector ops.
-    // Device-side vector.contract ops survive inside gpu.launch bodies and
-    // are lowered by GpuHardwareMappingPass + ConvertVectorToGPU post-outlining.
-    {
-      auto &funcPm = pm.nest<func::FuncOp>();
-      VectorTransferToSCFOptions opts;
-      opts.setTargetRank(0);
-      funcPm.addPass(createConvertVectorToSCFPass(opts));
-      funcPm.addPass(createCanonicalizerPass());
-      funcPm.addPass(createCSEPass());
-    }
-
     // ── Step 8: GPU-aware bufferization (tensor → memref) ──────────────────
     addNovaGPUBufferizePasses(pm);
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::createConvertBufferizationToMemRefPass());
 
+    pm.addNestedPass<func::FuncOp>(createNovaGPUVectorDistributePass());
+    // Canonicalizer folds 42 dead constants + 6 divui/muli/thread_id ops
+    // produced by the thread-offset arithmetic unrolling.
+    // CSE then deduplicates 5 more offset expressions shared across K-batch
+    // iterations.  Both are measured non-empty on the MMA path.
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
     // ── Stage 23: Vectorize shared memory copies [AFTER bufferization] ──────
     // Vectorizes linalg.copy on shared memory buffers → wide vector loads
     // targeting 128-bit LDS.128 instructions on sm_80+.
     pm.addNestedPass<func::FuncOp>(createNovaGPUVectorizeMemrefCopyPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+    // No cleanup needed: VectorizeMemrefCopy introduces clean transfer ops and
+    // leaves no dead constants or redundant expressions on the MMA path.
 
     // ── Step 8.5: Eliminate degenerate single-iteration foralls ────────────
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
+    // Canonicalizer folds 4 affine.apply ops whose results became constant
+    // after single-iteration forall inlining.  CSE produces no savings here.
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
 
     // ── Fill-copy forwarding and buffer coalescing ──────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaGPUFillCopyForwardingPass());
-    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
     pm.addNestedPass<func::FuncOp>(
         createNovaGPUCoalesceWorkgroupBuffersPass());
-    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    // Single Canon+CSE shared between FillCopy and Coalesce.
+    // Neither pass introduces constants or redundant subexpressions on the MMA
+    // path, so one cleanup round is sufficient for both.
+    pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
-
 
     // ── Step 9: scf.forall → gpu.launch ────────────────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaGPUMapForallToGPUPass());
+    // MapForallToGPU introduces 47 index constants and 23 divui/remui ops for
+    // block/thread coordinate extraction.  Canonicalizer + CSE together remove
+    // 83 redundant ops (the largest cleanup in the post-distribute pipeline).
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
     // ── Step 10: Lower linalg → scf loops ──────────────────────────────────
     pm.addPass(createConvertLinalgToLoopsPass());
+    // CSE removes 1 affine.apply and 1 memref.subview that become duplicates
+    // after loop lowering.  Canonicalizer is also useful here for any remaining
+    // affine index ops.
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
     // ── Scalar accumulator + warp shuffle reduction ─────────────────────────
     pm.addNestedPass<func::FuncOp>(
         mlir::nova::createSCFScalarizeAccumulatorPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+    // SCFScalarize and WarpShuffleReduction produce no dead constants or
+    // redundant subexpressions on the MMA path (measured zero-delta).
+    // One shared Canon+CSE after both passes is sufficient.
     pm.addNestedPass<func::FuncOp>(
         mlir::nova::createNovaWarpShuffleReductionPass());
     pm.addPass(createCanonicalizerPass());
@@ -614,6 +581,7 @@ namespace mlir::nova
     registerNovaGPUConfigureTensorLayoutsPass();
     registerNovaGPUVectorAllocPass();
     registerNovaGPUCombineValueSemanticBarriersPass();
+    registerNovaGPUVectorDistributePass();
 
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
       return mlir::nova::createNovaScfLoopUnrollPass();

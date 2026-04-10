@@ -174,15 +174,20 @@ getHardwareLayout(int32_t mmaKind, int operandIdx) {
   // PTX: mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32
   //   A  [M=16, K=8]:  16 threads on M (1 elem each), 2 threads on K (4 elem each)
   //                    → 4 registers/thread, 32 threads × 4 = 128 = 16×8 ✓
-  //   B  [K=8,  N=8]:  4 threads on K (2 elem each), 8 threads on N (1 elem each)
-  //                    → 2 registers/thread, 32 threads × 2 = 64 = 8×8 ✓
-  //   C  [M=16, N=8]:  8 threads on M (2 elem each), 4 threads on N (2 elem each)
-  //                    → 4 registers/thread, 32 threads × 4 = 128 = 16×8 ✓
+  //   B  [K=8,  N=8]:  2 threads on K (4 elem each), 8 threads on N (1 elem each)
+  //                    → 4 registers/thread, 32 threads × 4 = 128 = 8×8×2 ✓
+  //                    K layout MUST match A: thread=2, elem=4 (PTX ISA §9.7.13.4)
+  //   C  [M=16, N=8]:  16 threads on M (1 elem each), 8 threads on N (1 elem each)
+  //                    → 1 register/thread, 32 threads × 1 = 32 scalars visible to
+  //                    vector.contract. The hardware packs 2x2 blocks per thread in
+  //                    physical registers — that repack is done by UnrollToIntrinsics,
+  //                    not here. ACC elem_counts MUST match LHS M-elem and RHS N-elem
+  //                    so that vector.contract map verification passes.
   case NVMMAIntrinsicValues::MMA_SYNC_TF32_16x8x8:
     switch (operandIdx) {
     case 0: return OperandHWLayout{{1, 16, 1, 1}, {1, 2, 4, 16}}; // LHS: M={t=16,e=1}, K={t=2,e=4}
-    case 1: return OperandHWLayout{{1, 4,  2, 1}, {1, 8, 1,  4}}; // RHS: K={t=4,e=2}, N={t=8,e=1}
-    case 2: return OperandHWLayout{{1, 8,  2, 1}, {1, 4, 2,  8}}; // ACC: M={t=8,e=2}, N={t=4,e=2}
+    case 1: return OperandHWLayout{{1, 2,  4, 1}, {1, 8, 1,  4}}; // RHS: K={t=2,e=4}, N={t=8,e=1}
+    case 2: return OperandHWLayout{{1, 16, 1, 1}, {1, 8, 1,  4}}; // ACC: M={t=16,e=1}, N={t=8,e=1}
     }
     break;
 
@@ -249,24 +254,35 @@ computeOperandLayout(MLIRContext *ctx,
 
   if (perWgSgCounts.empty() || (int)perWgSgCounts.size() != rank) {
     // Fallback for configs that predate the wg_subgroup field.
-    // Approximate subgroupCount = wgM / mmaM  (assumes mnTileCount = 1).
+    // Approximate subgroupCounts from wg tile sizes / MMA tile sizes.
     perWgSgCounts.assign(rank, 1);
     SmallVector<int64_t> wgField = getConfigField(config, kWorkgroupKey);
     auto contractionDimsFB = linalg::inferContractionDims(op);
-    if (succeeded(contractionDimsFB) && !contractionDimsFB->m.empty() &&
-        !wgField.empty()) {
-      int mDimFB = contractionDimsFB->m.back();
-      if (mDimFB < (int)wgField.size() && wgField[mDimFB] > 0)
-        perWgSgCounts[mDimFB] =
-            llvm::divideCeil(wgField[mDimFB], mmaShape[0]);
+    if (succeeded(contractionDimsFB) && !wgField.empty()) {
+      // M dimension
+      if (!contractionDimsFB->m.empty()) {
+        int mDimFB = contractionDimsFB->m.back();
+        if (mDimFB < (int)wgField.size() && wgField[mDimFB] > 0)
+          perWgSgCounts[mDimFB] =
+              llvm::divideCeil(wgField[mDimFB], mmaShape[0]);
+      }
+      // N dimension — must also be estimated or all warps alias on N
+      if (!contractionDimsFB->n.empty()) {
+        int nDimFB = contractionDimsFB->n.back();
+        if (nDimFB < (int)wgField.size() && wgField[nDimFB] > 0)
+          perWgSgCounts[nDimFB] =
+              llvm::divideCeil(wgField[nDimFB], mmaShape[1]);
+      }
     }
   }
   // Zero means "not distributed across subgroups" — normalise to 1.
   for (auto &v : perWgSgCounts)
     if (v == 0) v = 1;
 
-  // ── 3. Subgroup strides (row-major from per-WG counts) ───────────────────
-  SmallVector<int64_t> sgStrides = computeStrides(perWgSgCounts);
+  // ── 3. Subgroup strides — deferred until after projection (see step 10) ──
+  // Computing strides on the full iteration-space counts and then projecting
+  // gives wrong stride values when the operand map permutes dimensions (e.g.
+  // RHS map swaps K and N).  We compute strides on the projected counts instead.
 
   // ── 4. Reconstruct workgroup-level bounds from config ────────────────────
   // tiledBounds reflects the warp-level op (after thread tiling).
@@ -353,19 +369,23 @@ computeOperandLayout(MLIRContext *ctx,
 
   // ── 10. Project all full-rank arrays through the operand's indexing map ──
   // Drops iteration dims that don't appear in this operand (e.g. N from LHS).
+  // Strides are computed AFTER projection so that row-major ordering is based
+  // on the operand's physical axis order, not the iteration-space order.
   AffineMap operandMap = op.getIndexingMapsArray()[operandIdx];
 
   SmallVector<int64_t> projSgCounts,    projBatchCounts,  projOuterCounts;
   SmallVector<int64_t> projThreadCounts,projElemCounts;
-  SmallVector<int64_t> projSgStrides,   projThreadStrides;
 
-  projectThroughMap(operandMap, perWgSgCounts,  projSgCounts,     1);
-  projectThroughMap(operandMap, batchCounts,    projBatchCounts,  1);
-  projectThroughMap(operandMap, outerCounts,    projOuterCounts,  1);
-  projectThroughMap(operandMap, threadCounts,   projThreadCounts, 1);
-  projectThroughMap(operandMap, elemCounts,     projElemCounts,   1);
-  projectThroughMap(operandMap, sgStrides,      projSgStrides,    0);
-  projectThroughMap(operandMap, threadStrides,  projThreadStrides,0);
+  projectThroughMap(operandMap, perWgSgCounts, projSgCounts,     1);
+  projectThroughMap(operandMap, batchCounts,   projBatchCounts,  1);
+  projectThroughMap(operandMap, outerCounts,   projOuterCounts,  1);
+  projectThroughMap(operandMap, threadCounts,  projThreadCounts, 1);
+  projectThroughMap(operandMap, elemCounts,    projElemCounts,   1);
+
+  // Compute strides on the projected counts so stride values respect the
+  // operand's physical axis ordering after any map permutation.
+  SmallVector<int64_t> projSgStrides     = computeStrides(projSgCounts);
+  SmallVector<int64_t> projThreadStrides = computeStrides(projThreadCounts);
 
   // ── 11. Shared memory flag ────────────────────────────────────────────────
   bool sharedMem = llvm::is_contained(getPromotedOperands(config),

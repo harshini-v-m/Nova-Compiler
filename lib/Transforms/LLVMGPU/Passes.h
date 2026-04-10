@@ -242,14 +242,11 @@ void registerNovaGPUCastTypeToFitMMAPass();
 std::unique_ptr<Pass> createNovaGPUVectorAllocPass();
 void registerNovaGPUVectorAllocPass();
 
-/// Combines multiple nova.value_barrier ops in the same block into a single
-/// one, reducing the number of gpu.barrier instructions emitted after
-/// bufferization. Same-semantics barriers (all-vector write OR all-tensor read)
-/// are merged; write and read barriers are never merged together.
-/// Must run AFTER GPUVectorAllocPass (which produces the barriers) and
-/// BEFORE bufferization (barriers are on tensor/vector types, not memrefs).
 std::unique_ptr<Pass> createNovaGPUCombineValueSemanticBarriersPass();
 void registerNovaGPUCombineValueSemanticBarriersPass();
+
+std::unique_ptr<Pass> createNovaGPUVectorDistributePass();
+void registerNovaGPUVectorDistributePass();
 
 } // namespace nova
 } // namespace mlir

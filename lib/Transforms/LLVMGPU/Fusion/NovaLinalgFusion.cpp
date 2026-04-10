@@ -66,6 +66,79 @@ namespace nova {
 /// memory traffic, so we cap the group size to keep the fused kernel lean.
 static constexpr unsigned kMaxFusionGroupSize = 4;
 
+/// Returns true if `a` and `b` are both produced by linalg.fill with the same
+/// scalar constant and the same result type, or are the exact same SSA value.
+static bool sameConstantFill(Value a, Value b) {
+  if (a == b)
+    return true;
+  auto fillA = a.getDefiningOp<linalg::FillOp>();
+  auto fillB = b.getDefiningOp<linalg::FillOp>();
+  if (!fillA || !fillB)
+    return false;
+  auto cstA = fillA.getInputs()[0].getDefiningOp<arith::ConstantOp>();
+  auto cstB = fillB.getInputs()[0].getDefiningOp<arith::ConstantOp>();
+  if (!cstA || !cstB)
+    return false;
+  return cstA.getValue() == cstB.getValue() && a.getType() == b.getType();
+}
+
+/// Returns true if the two linalg.generic bodies are structurally identical.
+/// Block arguments at the same index are treated as equivalent; op results
+/// are tracked pairwise through the body. This detects duplicate reduction
+/// accumulators that compute the same expression over the same input args.
+static bool bodiesStructurallyEqual(Block *bodyA, Block *bodyB) {
+  if (bodyA->getNumArguments() != bodyB->getNumArguments())
+    return false;
+
+  // Build an equivalence map: bodyA value → corresponding bodyB value.
+  llvm::DenseMap<Value, Value> equiv;
+  for (auto [argA, argB] :
+       llvm::zip(bodyA->getArguments(), bodyB->getArguments()))
+    equiv[argA] = argB;
+
+  auto opsA = bodyA->without_terminator();
+  auto opsB = bodyB->without_terminator();
+  auto itA = opsA.begin(), endA = opsA.end();
+  auto itB = opsB.begin(), endB = opsB.end();
+
+  for (; itA != endA && itB != endB; ++itA, ++itB) {
+    Operation &opA = *itA, &opB = *itB;
+    if (opA.getName() != opB.getName())
+      return false;
+    if (opA.getAttrDictionary() != opB.getAttrDictionary())
+      return false;
+    if (opA.getNumOperands() != opB.getNumOperands())
+      return false;
+    if (opA.getNumResults() != opB.getNumResults())
+      return false;
+
+    for (auto [ovA, ovB] : llvm::zip(opA.getOperands(), opB.getOperands())) {
+      auto it = equiv.find(ovA);
+      if (it == equiv.end() || it->second != ovB)
+        return false;
+    }
+
+    for (auto [resA, resB] : llvm::zip(opA.getResults(), opB.getResults()))
+      equiv[resA] = resB;
+  }
+
+  if (itA != endA || itB != endB)
+    return false;
+
+  // Verify the terminator (linalg.yield) operands.
+  Operation *termA = bodyA->getTerminator(), *termB = bodyB->getTerminator();
+  if (termA->getNumOperands() != termB->getNumOperands())
+    return false;
+  for (auto [tvA, tvB] :
+       llvm::zip(termA->getOperands(), termB->getOperands())) {
+    auto it = equiv.find(tvA);
+    if (it == equiv.end() || it->second != tvB)
+      return false;
+  }
+
+  return true;
+}
+
 struct NovaLinalgHorizontalFusionPass
     : public PassWrapper<NovaLinalgHorizontalFusionPass,
                          OperationPass<func::FuncOp>> {
@@ -87,8 +160,10 @@ struct NovaLinalgHorizontalFusionPass
 
   void runOnOperation() override {
     func::FuncOp func = getOperation();
-    for (auto &block : func.getBlocks())
-      fuseGenericsInBlock(block);
+    for (auto &block : func.getBlocks()) {
+    while (deduplicateIdenticalGenerics(block)) { /*repeat*/ }
+    fuseGenericsInBlock(block);
+  }
   }
 
 private:
@@ -134,6 +209,72 @@ private:
           worklist.push_back(defOp);
     }
     return false;
+  }
+
+  /// Returns true if `a` and `b` are completely equivalent linalg.generic
+  /// reduction ops: same inputs (by SSA value and map), same output maps,
+  /// same init fill constants, and structurally identical bodies.
+  bool genericsIdentical(GenericOp a, GenericOp b) {
+    if (a.getNumDpsInputs() != b.getNumDpsInputs())
+      return false;
+    if (a.getNumDpsInits() != b.getNumDpsInits())
+      return false;
+    if (a.getIndexingMapsArray() != b.getIndexingMapsArray())
+      return false;
+
+    for (auto [ia, ib] : llvm::zip(a.getDpsInputs(), b.getDpsInputs()))
+      if (ia != ib)
+        return false;
+
+    for (auto [oa, ob] : llvm::zip(a.getDpsInits(), b.getDpsInits()))
+      if (!sameConstantFill(oa, ob))
+        return false;
+
+    return bodiesStructurallyEqual(a.getBody(), b.getBody());
+  }
+
+  /// Scans \p block for pairs of identical linalg.generic reduction ops and
+  /// replaces every duplicate with the first (canonical) occurrence, erasing
+  /// the redundant op.  This prevents horizontal fusion from forwarding
+  /// identical accumulators as separate outputs of a multi-result generic.
+
+  bool deduplicateIdenticalGenerics(Block &block) {
+    SmallVector<GenericOp> candidates;
+    for (auto &op : block) {
+      auto gop = dyn_cast<GenericOp>(op);
+      if (!gop)
+        continue;
+      if (mlir::linalg::isaContractionOpInterface(cast<LinalgOp>(op)))
+        continue;
+      bool hasReduction =
+          llvm::any_of(gop.getIteratorTypesArray(), [](utils::IteratorType t) {
+            return t == utils::IteratorType::reduction;
+          });
+      if (!hasReduction)
+        continue;
+      candidates.push_back(gop);
+    }
+
+    llvm::DenseSet<Operation *> toErase;
+    for (unsigned i = 0; i < candidates.size(); ++i) {
+      if (toErase.count(candidates[i]))
+        continue;
+      for (unsigned j = i + 1; j < candidates.size(); ++j) {
+        if (toErase.count(candidates[j]))
+          continue;
+        if (!genericsIdentical(candidates[i], candidates[j]))
+          continue;
+        for (auto [ri, rj] :
+             llvm::zip(candidates[i].getResults(), candidates[j].getResults()))
+          rj.replaceAllUsesWith(ri);
+        toErase.insert(candidates[j]);
+      }
+    }
+
+    for (Operation *op : toErase)
+      op->erase();
+
+    return !toErase.empty();
   }
 
   void fuseGenericsInBlock(Block &block) {
