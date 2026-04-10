@@ -179,6 +179,14 @@ void registerNovaGPULowerMemorySpacePass();
 std::unique_ptr<Pass> createNovaWarpShuffleReductionPass();
 void registerNovaWarpShuffleReductionPass();
 
+// Lowers vector.reduction / vector.multi_reduction ops inside gpu.launch bodies
+// to warp butterfly shuffle reductions (all-reduce via XOR butterfly + thread-0
+// write). Currently a no-op stub — the Nova vectorizer does not yet emit
+// vector.reduction; this pass is the extensibility hook for that future work.
+// Shared utilities (buildShuffleReductionTree, emitTypedShuffleXOR, etc.) live
+// in NovaVectorReduction.cpp and are also used by NovaWarpShuffleReduction.
+
+
 std::unique_ptr<Pass> createNovaGPUFillCopyForwardingPass();
 void registerNovaGPUFillCopyForwardingPass();
 
@@ -265,6 +273,8 @@ void registerNovaGPUVectorWrapPass();
 std::unique_ptr<Pass> createNovaGPUWarpToSCFPass();
 void registerNovaGPUWarpToSCFPass();
 
+std::unique_ptr<Pass> createNovaStrideReductionPass();
+void registerNovaStrideReductionPass();
 } // namespace nova
 } // namespace mlir
 

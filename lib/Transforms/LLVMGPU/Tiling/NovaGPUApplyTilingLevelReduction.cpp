@@ -21,6 +21,7 @@
 #include "NovaGPUTileAndFuseUtils.h"
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -267,6 +268,87 @@ getTileSizes(RewriterBase &rewriter, TilingInterface tilingOp,
 //   6. Replace original uses with tiled results
 //===----------------------------------------------------------------------===//
 
+/// Fixes linalg.index uses inside tiled linalg.generic bodies for reduction
+/// dims tiled with PartialReductionOuterParallel at the Thread level.
+///
+/// Root cause: when the thread tiling pass tiles a reduction dim, it creates a
+/// scf.forall whose IV gives the tile-start offset. Formal operands are
+/// correctly sliced via tensor.extract_slice (offset embedded in the slice),
+/// but any tensor.extract on non-operand tensors inside the body still uses
+/// linalg.index i — which, after tiling, gives the tile-local index (0..T-1)
+/// rather than the global index (tile_start + 0..T-1).
+///
+/// Fix: for each tiled linalg.generic inside the forall, find every
+/// linalg.index i where dim i was tiled as a reduction, and replace its result
+/// with (forall_iv_for_dim_i + linalg.index i) everywhere it is used.
+static void fixupReductionTiledLinalgIndex(IRRewriter &rewriter,
+                                           linalg::LinalgOp originalOp,
+                                           scf::SCFTileAndFuseResult &result,
+                                           ArrayRef<OpFoldResult> tileSizes) {
+  // Find the enclosing scf.forall created by the tiling pass.
+  scf::ForallOp forallOp;
+  for (LoopLikeOpInterface loop : result.loops) {
+    if (auto fop = dyn_cast<scf::ForallOp>(loop.getOperation())) {
+      forallOp = fop;
+      break;
+    }
+  }
+  if (!forallOp)
+    return;
+
+  // Map each tiled reduction dimension to its forall induction variable.
+  // The forall IVs are created for non-zero tile dims in left-to-right order.
+  auto iterTypes = originalOp.getIteratorTypesArray();
+  SmallVector<std::pair<int, Value>> tiledReductionDimIVs;
+  {
+    SmallVector<Value> ivs = forallOp.getInductionVars();
+    int ivIdx = 0;
+    for (int i = 0;
+         i < (int)tileSizes.size() && ivIdx < (int)ivs.size(); ++i) {
+      if (!isZeroInteger(tileSizes[i])) {
+        if (i < (int)iterTypes.size() &&
+            linalg::isReductionIterator(iterTypes[i]))
+          tiledReductionDimIVs.push_back({i, ivs[ivIdx]});
+        ++ivIdx;
+      }
+    }
+  }
+  if (tiledReductionDimIVs.empty())
+    return;
+
+  // For each tiled linalg op, offset every linalg.index i (for a tiled
+  // reduction dim i) by the corresponding forall IV so callers of linalg.index
+  // that access non-operand tensors get the correct global position.
+  for (Operation *tiledOp : result.tiledAndFusedOps) {
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(tiledOp);
+    if (!linalgOp || linalgOp->getNumRegions() == 0)
+      continue;
+
+    SmallVector<std::pair<linalg::IndexOp, Value>> toFix;
+    linalgOp->getRegion(0).walk([&](linalg::IndexOp indexOp) {
+      for (auto [tiledDim, iv] : tiledReductionDimIVs) {
+        if ((int)indexOp.getDim() == tiledDim) {
+          toFix.push_back({indexOp, iv});
+          break;
+        }
+      }
+    });
+
+    for (auto [indexOp, iv] : toFix) {
+      rewriter.setInsertionPointAfter(indexOp);
+      Value localIdx = indexOp.getResult();
+      // globalIdx = tile start (forall IV) + tile-local offset (linalg.index).
+      Value globalIdx =
+          rewriter.create<arith::AddIOp>(indexOp.getLoc(), iv, localIdx);
+      // Replace all uses of localIdx with globalIdx except in the AddIOp
+      // itself, which reads localIdx as one of its operands.
+      localIdx.replaceUsesWithIf(globalIdx, [&](OpOperand &use) {
+        return use.getOwner() != globalIdx.getDefiningOp();
+      });
+    }
+  }
+}
+
 static LogicalResult
 applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
                            SmallVector<TilingInterface> &targetOps,
@@ -459,6 +541,20 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
           << "nova-gpu-apply-tiling-level: tiling failed at level "
           << static_cast<int>(tilingLevel) << ", skipping\n";
       continue;
+    }
+
+    // Fix tile-local linalg.index in tensor.extract for reduction dims tiled
+    // at the Thread level via PartialReductionOuterParallel.
+    //
+    // When tiling a reduction dim across threads, formal operands are correctly
+    // sliced (the tile-start offset is baked into tensor.extract_slice), but
+    // tensor.extract on non-operand tensors inside the linalg body still uses
+    // linalg.index i with a tile-local value (0..tile_size-1). Those callers
+    // need the global index (forall_iv + local), so we add the forall IV here.
+    if (tilingLevel == NovaTilingLevel::Thread) {
+      fixupReductionTiledLinalgIndex(
+          rewriter, cast<linalg::LinalgOp>(tilingOp.getOperation()), *result,
+          tileSizes);
     }
 
     // Replace original uses with tiled results.

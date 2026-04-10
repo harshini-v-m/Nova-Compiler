@@ -22,24 +22,137 @@
 //   - blockSizeY == blockSizeZ == 1
 //   - f32 element type
 //
+// Shuffle utilities (emitTypedShuffleXOR, buildReductionCombineOp,
+// buildShuffleReductionTree, buildReductionIdentity) are defined in
+// NovaVectorReduction.cpp and declared in NovaVectorReduction.h.
+// This file calls them via the mlir::nova:: namespace.
+//
 //===----------------------------------------------------------------------===//
+
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
+#include <limits>
 
 #define DEBUG_TYPE "nova-warp-shuffle-reduction"
 
 using namespace mlir;
 
 namespace {
+
+#include <optional>
+
+static std::optional<gpu::AllReduceOperation> mapToGPUAllReduce(arith::AtomicRMWKind kind) {
+  switch (kind) {
+    case arith::AtomicRMWKind::addf:
+    case arith::AtomicRMWKind::addi:   return gpu::AllReduceOperation::ADD;
+    case arith::AtomicRMWKind::mulf:
+    case arith::AtomicRMWKind::muli:   return gpu::AllReduceOperation::MUL;
+    case arith::AtomicRMWKind::maximumf: return gpu::AllReduceOperation::MAXIMUMF;
+    case arith::AtomicRMWKind::minimumf: return gpu::AllReduceOperation::MINIMUMF;
+    case arith::AtomicRMWKind::maxnumf:return gpu::AllReduceOperation::MAXNUMF;
+    case arith::AtomicRMWKind::minnumf:return gpu::AllReduceOperation::MINNUMF;
+    case arith::AtomicRMWKind::maxs:   return gpu::AllReduceOperation::MAXSI;
+    case arith::AtomicRMWKind::maxu:   return gpu::AllReduceOperation::MAXUI;
+    case arith::AtomicRMWKind::mins:   return gpu::AllReduceOperation::MINSI;
+    case arith::AtomicRMWKind::minu:   return gpu::AllReduceOperation::MINUI;
+    case arith::AtomicRMWKind::ori:    return gpu::AllReduceOperation::OR;
+    case arith::AtomicRMWKind::andi:   return gpu::AllReduceOperation::AND;
+    default: return std::nullopt;
+  }
+}
+
+static Value buildReductionIdentity(OpBuilder &builder, Location loc,
+                                    arith::AtomicRMWKind kind, Type elemTy) {
+  if (auto floatTy = dyn_cast<FloatType>(elemTy)) {
+    double val = 0.0;
+    switch (kind) {
+    case arith::AtomicRMWKind::mulf: val = 1.0; break;
+    case arith::AtomicRMWKind::maximumf:
+    case arith::AtomicRMWKind::maxnumf: val = -std::numeric_limits<double>::infinity(); break;
+    case arith::AtomicRMWKind::minimumf:
+    case arith::AtomicRMWKind::minnumf: val = std::numeric_limits<double>::infinity(); break;
+    default: val = 0.0; break;
+    }
+    return builder.create<arith::ConstantOp>(loc, builder.getFloatAttr(floatTy, val));
+  }
+  auto intTy = cast<IntegerType>(elemTy);
+  unsigned w = intTy.getWidth();
+  int64_t val = 0;
+  switch (kind) {
+  case arith::AtomicRMWKind::muli: val = 1; break;
+  case arith::AtomicRMWKind::andi:
+  case arith::AtomicRMWKind::minu: val = -1; break;
+  case arith::AtomicRMWKind::maxs: val = (w >= 64) ? std::numeric_limits<int64_t>::min() : -(int64_t(1) << (w - 1)); break;
+  case arith::AtomicRMWKind::mins: val = (w >= 64) ? std::numeric_limits<int64_t>::max() : (int64_t(1) << (w - 1)) - 1; break;
+  default: val = 0; break;
+  }
+  return builder.create<arith::ConstantOp>(loc, builder.getIntegerAttr(intTy, val));
+}
+
+/// Emits nested scf.for loops to fill `target` memref with `identity` value.
+static void emitZeroFillLoop(OpBuilder &builder, Location loc, Value target, Value identity) {
+  auto memTy = cast<MemRefType>(target.getType());
+  int64_t rank = memTy.getRank();
+
+  if (rank == 0) {
+    builder.create<memref::StoreOp>(loc, identity, target);
+    return;
+  }
+
+  SmallVector<Value> ivs;
+  SmallVector<scf::ForOp> forOps;
+
+  for (int i = 0; i < rank; ++i) {
+    Value lower = builder.create<arith::ConstantIndexOp>(loc, 0);
+    Value upper;
+    if (memTy.isDynamicDim(i)) {
+      upper = builder.create<memref::DimOp>(loc, target, i);
+    } else {
+      upper = builder.create<arith::ConstantIndexOp>(loc, memTy.getDimSize(i));
+    }
+    Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
+    auto forOp = builder.create<scf::ForOp>(loc, lower, upper, step);
+    ivs.push_back(forOp.getInductionVar());
+    builder.setInsertionPointToStart(forOp.getBody());
+    forOps.push_back(forOp);
+  }
+
+  builder.create<memref::StoreOp>(loc, identity, target, ivs);
+
+  if (!forOps.empty())
+    builder.setInsertionPointAfter(forOps[0]);
+}
+
+static Value buildReductionCombineOp(OpBuilder &builder, Location loc,
+                                     arith::AtomicRMWKind kind, Value lhs, Value rhs) {
+  switch (kind) {
+  case arith::AtomicRMWKind::addf: return builder.create<arith::AddFOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::mulf: return builder.create<arith::MulFOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::maximumf: return builder.create<arith::MaximumFOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::minimumf: return builder.create<arith::MinimumFOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::maxnumf: return builder.create<arith::MaxNumFOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::minnumf: return builder.create<arith::MinNumFOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::addi: return builder.create<arith::AddIOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::muli: return builder.create<arith::MulIOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::maxs: return builder.create<arith::MaxSIOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::maxu: return builder.create<arith::MaxUIOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::mins: return builder.create<arith::MinSIOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::minu: return builder.create<arith::MinUIOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::ori: return builder.create<arith::OrIOp>(loc, lhs, rhs);
+  case arith::AtomicRMWKind::andi: return builder.create<arith::AndIOp>(loc, lhs, rhs);
+  default: llvm_unreachable("unsupported reduction kind");
+  }
+}
 
 /// Holds a matched double-atomic triad inside a gpu.launch body.
 struct DoubleAtomicTriad {
@@ -66,6 +179,16 @@ static bool isExternalMemRef(Value mem, gpu::LaunchOp launchOp) {
   return defOp && !launchOp->isAncestor(defOp);
 }
 
+/// Like isExternalMemRef but also traces through memref.subview ops to
+/// find the root source. Used for stride-32 pattern where the atomic target
+/// is a subview of an external alloc.
+static bool isExternalMemRefThroughSubview(Value mem, gpu::LaunchOp launchOp) {
+  Value current = mem;
+  while (auto subview = current.getDefiningOp<memref::SubViewOp>())
+    current = subview.getSource();
+  return isExternalMemRef(current, launchOp);
+}
+
 /// Extract constant integer from a Value, or return std::nullopt.
 static std::optional<int64_t> getConstantIndex(Value v) {
   if (auto cst = v.getDefiningOp<arith::ConstantIndexOp>())
@@ -83,22 +206,87 @@ static bool isSingleBlockLaunch(gpu::LaunchOp launch) {
   return gx && gy && gz && *gx == 1 && *gy == 1 && *gz == 1;
 }
 
-/// Build the combining op for the butterfly reduction.
-static Value buildCombineOp(OpBuilder &builder, Location loc,
-                            arith::AtomicRMWKind kind, Value lhs, Value rhs) {
-  switch (kind) {
-  case arith::AtomicRMWKind::addf:
-    return builder.create<arith::AddFOp>(loc, lhs, rhs);
-  case arith::AtomicRMWKind::mulf:
-    return builder.create<arith::MulFOp>(loc, lhs, rhs);
-  case arith::AtomicRMWKind::maximumf:
-    return builder.create<arith::MaximumFOp>(loc, lhs, rhs);
-  case arith::AtomicRMWKind::minimumf:
-    return builder.create<arith::MinimumFOp>(loc, lhs, rhs);
-  default:
-    llvm_unreachable("unsupported reduction kind for warp shuffle");
-  }
+/// Check if grid=(1,1,1) AND block=(1,1,1) — exactly 1 thread total.
+static bool isSingleThreadLaunch(gpu::LaunchOp launch) {
+  auto gx = getConstantIndex(launch.getGridSizeX());
+  auto gy = getConstantIndex(launch.getGridSizeY());
+  auto gz = getConstantIndex(launch.getGridSizeZ());
+  auto bx = getConstantIndex(launch.getBlockSizeX());
+  auto by = getConstantIndex(launch.getBlockSizeY());
+  auto bz = getConstantIndex(launch.getBlockSizeZ());
+  return gx && gy && gz && bx && by && bz &&
+         *gx == 1 && *gy == 1 && *gz == 1 &&
+         *bx == 1 && *by == 1 && *bz == 1;
 }
+
+// buildIdentityValue → now buildReductionIdentity (NovaVectorReduction.h)
+
+/// Return the innermost gpu.LaunchOp ancestor of `op`, or null.
+static gpu::LaunchOp getEnclosingLaunch(Operation *op) {
+  Operation *cursor = op->getParentOp();
+  while (cursor) {
+    if (auto l = dyn_cast<gpu::LaunchOp>(cursor))
+      return l;
+    cursor = cursor->getParentOp();
+  }
+  return nullptr;
+}
+
+/// After eliminating a double-atomic triad, clean up the scratch memref that
+/// sourceLaunch no longer writes to:
+///   1. Erase any gpu.memset emitted by SCFScalarizeAccumulator for this scratch.
+///   2. Erase the single-thread init launch (if any) whose sole purpose was
+///      writing 0 into scratch before the now-eliminated multi-thread kernel.
+///
+/// Bails out silently if the scratch has any remaining non-trivial uses.
+static void tryCleanupScratch(Value scratchMemref, gpu::LaunchOp sourceLaunch) {
+  SmallVector<gpu::MemsetOp> memsets;
+  SmallVector<gpu::LaunchOp> initLaunches;
+
+  for (Operation *user : scratchMemref.getUsers()) {
+    // Uses inside sourceLaunch were eliminated by the triad erasure.
+    if (sourceLaunch->isAncestor(user))
+      continue;
+    // Deallocs free memory but don't read — not a reason to keep the scratch.
+    if (isa<memref::DeallocOp>(user))
+      continue;
+    // gpu.memset initializes the scratch — candidate for erasure.
+    if (auto m = dyn_cast<gpu::MemsetOp>(user)) {
+      memsets.push_back(m);
+      continue;
+    }
+    // If this user is inside a single-thread launch that only writes to scratch,
+    // it is the SCFScalarize init kernel — queue it for erasure.
+    gpu::LaunchOp enclosing = getEnclosingLaunch(user);
+    if (!enclosing || !isSingleThreadLaunch(enclosing))
+      return; // non-trivial use — bail out conservatively
+
+    bool onlyInitScratch = true;
+    enclosing.getBody().walk([&](Operation *op) {
+      if (isa<gpu::TerminatorOp>(op)) return;
+      if (auto s = dyn_cast<memref::StoreOp>(op)) {
+        if (s.getMemRef() != scratchMemref) onlyInitScratch = false;
+        return;
+      }
+      if (auto a = dyn_cast<memref::AtomicRMWOp>(op)) {
+        if (a.getMemref() != scratchMemref) onlyInitScratch = false;
+        return;
+      }
+      if (isa<arith::ConstantOp>(op)) return; // harmless inline constant
+      onlyInitScratch = false;
+    });
+
+    if (!onlyInitScratch)
+      return;
+    initLaunches.push_back(enclosing);
+  }
+
+  // All remaining uses are dead — safe to erase.
+  for (auto m : memsets) m->erase();
+  for (auto l : initLaunches) l->erase();
+}
+
+// buildCombineOp → now buildReductionCombineOp (NovaVectorReduction.h)
 
 /// Find all double-atomic triads in a gpu.launch body.
 ///
@@ -119,17 +307,19 @@ findTriads(gpu::LaunchOp launchOp) {
     auto atomicA = atomics[i];
     Value intermediate = atomicA.getMemref();
 
+    auto memType = cast<MemRefType>(intermediate.getType());
+
+    // Only support float types — integer atomic triads (e.g. scatter_add
+    // index accumulators) must not be warp-shuffled.
+    if (!isa<FloatType>(memType.getElementType()))
+      continue;
+
     // (A) must target an external scalar memref.
     if (!isExternalMemRef(intermediate, launchOp))
       continue;
 
-    auto memType = cast<MemRefType>(intermediate.getType());
     // Must be scalar (rank 0).
     if (memType.getRank() != 0)
-      continue;
-
-    // Only support float types for now.
-    if (!isa<FloatType>(memType.getElementType()))
       continue;
 
     // Look for a load from the same memref after this atomic.
@@ -217,7 +407,7 @@ static Value buildShuffleTree(OpBuilder &builder, Location loc,
         loc, acc, offsetVal, widthVal, gpu::ShuffleMode::XOR);
     Value shuffled = shuffleOp.getShuffleResult();
 
-    acc = buildCombineOp(builder, loc, kind, acc, shuffled);
+    acc = buildReductionCombineOp(builder, loc, kind, acc, shuffled);
   }
   return acc;
 }
@@ -293,6 +483,14 @@ static bool privatizeScratch(scf::ForOp forOp, Value sharedScratch,
   Value privateScratch = allocBuilder.create<memref::AllocaOp>(
       forOp.getLoc(), privateType);
 
+  // Initialize the private scratch with the identity value for the reduction
+  // (e.g., 0.0 for addf). Otherwise the first load from local memory/registers
+  // will contain garbage values, leading to NaN.
+  Value identity = buildReductionIdentity(allocBuilder, forOp.getLoc(),
+                                          triadKind, memType.getElementType());
+  allocBuilder.create<memref::StoreOp>(forOp.getLoc(), identity,
+                                        privateScratch, ValueRange{});
+
   // Replace all stores to shared scratch → stores to private scratch.
   for (auto storeOp : innerStores)
     storeOp.getMemrefMutable().assign(privateScratch);
@@ -307,7 +505,7 @@ static bool privatizeScratch(scf::ForOp forOp, Value sharedScratch,
     OpBuilder b(atomicOp);
     Location loc = atomicOp.getLoc();
     Value old = b.create<memref::LoadOp>(loc, privateScratch, ValueRange{});
-    Value combined = buildCombineOp(b, loc, triadKind,
+    Value combined = buildReductionCombineOp(b, loc, triadKind,
                                      atomicOp.getValue(), old);
     b.create<memref::StoreOp>(loc, combined, privateScratch, ValueRange{});
     // The atomic_rmw result might be used — replace with the old value.
@@ -322,8 +520,39 @@ static bool privatizeScratch(scf::ForOp forOp, Value sharedScratch,
   return true;
 }
 
+/// Helper to zero-initialize a shared memory memref once in a block.
+static void initializeSharedScratch(OpBuilder &builder, Location loc,
+                                    Value scratch, arith::AtomicRMWKind kind,
+                                    gpu::LaunchOp launch) {
+  // Use the entry block of the launch to insert the guard.
+  Block &entryBlock = launch.getBody().front();
+  OpBuilder init(&entryBlock.front());
+  Operation *scratchDef = scratch.getDefiningOp();
+  if (scratchDef && scratchDef->getBlock() == &entryBlock)
+    init.setInsertionPointAfter(scratchDef);
+
+  Location iloc = launch.getLoc();
+
+  Value tidX = init.create<gpu::ThreadIdOp>(iloc, gpu::Dimension::x);
+  Value tidY = init.create<gpu::ThreadIdOp>(iloc, gpu::Dimension::y);
+  Value tidZ = init.create<gpu::ThreadIdOp>(iloc, gpu::Dimension::z);
+  Value c0 = init.create<arith::ConstantIndexOp>(iloc, 0);
+  Value isT0X = init.create<arith::CmpIOp>(iloc, arith::CmpIPredicate::eq, tidX, c0);
+  Value isT0Y = init.create<arith::CmpIOp>(iloc, arith::CmpIPredicate::eq, tidY, c0);
+  Value isT0Z = init.create<arith::CmpIOp>(iloc, arith::CmpIPredicate::eq, tidZ, c0);
+  Value isThread0 = init.create<arith::AndIOp>(iloc, isT0X, isT0Y);
+  isThread0 = init.create<arith::AndIOp>(iloc, isThread0, isT0Z);
+
+  auto memTy = cast<MemRefType>(scratch.getType());
+  init.create<scf::IfOp>(iloc, isThread0, [&](OpBuilder &thenB, Location thenL) {
+    Value zero = buildReductionIdentity(thenB, thenL, kind, memTy.getElementType());
+    emitZeroFillLoop(thenB, thenL, scratch, zero);
+    thenB.create<scf::YieldOp>(thenL);
+  });
+  init.create<gpu::BarrierOp>(iloc);
+}
+
 /// Emit the thread-0-guarded write (barrier + tid==0 → load scratch → write
-/// output).  Used for nested triads and multi-warp triads.
 static void emitBarrierAndGuardedWrite(OpBuilder &builder, Location loc,
                                        const DoubleAtomicTriad &triad,
                                        bool singleBlock) {
@@ -361,7 +590,7 @@ struct NovaWarpShuffleReductionPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, arith::ArithDialect, scf::SCFDialect,
-                    memref::MemRefDialect>();
+                    memref::MemRefDialect, vector::VectorDialect>();
   }
 
   void runOnOperation() override {
@@ -433,6 +662,79 @@ struct NovaWarpShuffleReductionPass
       }
 
       auto triads = findTriads(launchOp);
+
+      // ── Single-atomic pattern (from NovaStrideReduction) ──
+      // After stride-32 + SCFScalarize, each thread has a per-thread partial
+      // in a scf.for result, written via atomic_rmw to an external memref.
+      // All 32 threads atomic-add their partials → N× overcounting.
+      // Replace with: shuffle tree to combine 32 partials, thread-0 writes.
+      //
+      // Match: atomic_rmw to external float memref whose value comes from
+      // a scf.for result. Skip constant-valued atomics (initializations).
+      if (triads.empty() && useShuffle) {
+        SmallVector<memref::AtomicRMWOp> strideAtomics;
+        launchOp.getBody().walk([&](memref::AtomicRMWOp atomicOp) {
+          // Use subview-tracing check — stride-32 targets are subviews
+          // of external allocs (e.g., subview of memref<8xf32>).
+          if (!isExternalMemRefThroughSubview(atomicOp.getMemref(), launchOp))
+            return;
+          auto memTy = cast<MemRefType>(atomicOp.getMemref().getType());
+          if (!isa<FloatType>(memTy.getElementType()))
+            return;
+          // Value must come from a scf.for (scalar reduction) or
+          // vector.reduction (vectorized reduction). Skip constants
+          // (initialization stores like 0.0 or -inf).
+          Value partialVal = atomicOp.getValue();
+          if (!partialVal.getDefiningOp<scf::ForOp>() &&
+              !partialVal.getDefiningOp<vector::ReductionOp>())
+            return;
+          strideAtomics.push_back(atomicOp);
+        });
+
+        for (auto atomicOp : strideAtomics) {
+          Location loc = atomicOp.getLoc();
+          OpBuilder builder(atomicOp);
+
+          // The atomic's value is the per-thread partial (scf.for result).
+          Value partial = atomicOp.getValue();
+
+          // Build 5-round butterfly shuffle to combine 32 partials.
+          Value result = buildShuffleTree(builder, loc, partial,
+                                          numThreads, atomicOp.getKind());
+
+          // Thread-0 guard: only thread 0 writes the final result.
+          Value tidX = builder.create<gpu::ThreadIdOp>(
+              loc, builder.getIndexType(), gpu::Dimension::x);
+          Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+          Value isThread0 = builder.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::eq, tidX, zero);
+
+          bool singleBlock = isSingleBlockLaunch(launchOp);
+          SmallVector<Value> indices(atomicOp.getIndices().begin(),
+                                     atomicOp.getIndices().end());
+          Value outputMem = atomicOp.getMemref();
+          auto kind = atomicOp.getKind();
+
+          builder.create<scf::IfOp>(
+              loc, isThread0,
+              [&](OpBuilder &thenBuilder, Location thenLoc) {
+                if (singleBlock) {
+                  thenBuilder.create<memref::StoreOp>(
+                      thenLoc, result, outputMem, indices);
+                } else {
+                  thenBuilder.create<memref::AtomicRMWOp>(
+                      thenLoc, kind, result, outputMem, indices);
+                }
+                thenBuilder.create<scf::YieldOp>(thenLoc);
+              });
+
+          atomicOp.erase();
+        }
+
+        if (!strideAtomics.empty())
+          continue;
+      }
+
       if (triads.empty())
         continue;
 
@@ -472,18 +774,18 @@ struct NovaWarpShuffleReductionPass
           auto outerFor = cast<scf::ForOp>(triad.outermostContainingLoop);
           OpBuilder builder(outerFor);
 
-          // Build a zero init for the new iter_arg.
+          // Build the identity init for the new iter_arg.
           auto elemTy = cast<MemRefType>(triad.scratchMemref.getType())
                             .getElementType();
-          Value zeroInit = builder.create<arith::ConstantOp>(
-              loc, builder.getFloatAttr(elemTy, 0.0));
+          Value identityInit = buildReductionIdentity(builder, loc, triad.kind,
+                                                  elemTy);
 
           // Rebuild the outermost scf.for with one additional iter_arg.
           // Clone the body and replace atomicA with register accumulation.
           auto newFor = builder.create<scf::ForOp>(
               loc, outerFor.getLowerBound(), outerFor.getUpperBound(),
               outerFor.getStep(),
-              /*iterArgs=*/ValueRange{zeroInit});
+              /*iterArgs=*/ValueRange{identityInit});
 
           // Map old induction var → new induction var.
           IRMapping mapping;
@@ -508,7 +810,7 @@ struct NovaWarpShuffleReductionPass
               // Replace atomic_rmw with register combine.
               Value partial = mapping.lookupOrDefault(triad.partialValue);
               Value combined =
-                  buildCombineOp(builder, loc, triad.kind, partial, newAcc);
+                  buildReductionCombineOp(builder, loc, triad.kind, partial, newAcc);
               newAcc = combined;
             } else {
               builder.clone(op, mapping);
@@ -564,6 +866,12 @@ struct NovaWarpShuffleReductionPass
           triad.atomicToOutput.erase();
           triad.loadFromScratch.erase();
           outerFor.erase();
+          tryCleanupScratch(triad.scratchMemref, launchOp);
+
+          // Ensure the output is zeroed if it's external (and not already zeroed by memset).
+          // SCFScalarizeAccumulator should handle global memrefs.
+          // For shared scratch, NovaStrideReduction/SCFScalarize might have missed it.
+          initializeSharedScratch(builder, loc, triad.scratchMemref, triad.kind, launchOp);
 
         } else if (triad.outermostContainingLoop && preReduced) {
           // ── Nested triad, pre-reduced: hoist to register, skip shuffle ──
@@ -581,12 +889,12 @@ struct NovaWarpShuffleReductionPass
 
           auto elemTy = cast<MemRefType>(triad.scratchMemref.getType())
                             .getElementType();
-          Value zeroInit = builder.create<arith::ConstantOp>(
-              loc, builder.getFloatAttr(elemTy, 0.0));
+          Value identityInit = buildReductionIdentity(builder, loc, triad.kind,
+                                                  elemTy);
 
           auto newFor = builder.create<scf::ForOp>(
               loc, outerFor.getLowerBound(), outerFor.getUpperBound(),
-              outerFor.getStep(), ValueRange{zeroInit});
+              outerFor.getStep(), ValueRange{identityInit});
 
           IRMapping mapping;
           mapping.map(outerFor.getInductionVar(),
@@ -602,8 +910,8 @@ struct NovaWarpShuffleReductionPass
           for (auto &op : outerFor.getBody()->without_terminator()) {
             if (&op == triad.atomicToScratch.getOperation()) {
               Value partial = mapping.lookupOrDefault(triad.partialValue);
-              newAcc = buildCombineOp(builder, loc, triad.kind,
-                                      partial, newAcc);
+              newAcc = buildReductionCombineOp(builder, loc, triad.kind,
+                                                    partial, newAcc);
             } else {
               builder.clone(op, mapping);
             }
@@ -649,6 +957,7 @@ struct NovaWarpShuffleReductionPass
           triad.atomicToOutput.erase();
           triad.loadFromScratch.erase();
           outerFor.erase();
+          tryCleanupScratch(triad.scratchMemref, launchOp);
 
         } else if (triad.outermostContainingLoop) {
           // ── Nested triad, multi-warp or other: barrier + thread-0 guard ──
@@ -702,6 +1011,7 @@ struct NovaWarpShuffleReductionPass
           triad.atomicToOutput.erase();
           triad.loadFromScratch.erase();
           triad.atomicToScratch.erase();
+          tryCleanupScratch(triad.scratchMemref, launchOp);
 
         } else if (useShuffle) {
           // ── Single-warp, same-block path: butterfly shuffle ──
@@ -739,6 +1049,7 @@ struct NovaWarpShuffleReductionPass
           triad.atomicToOutput.erase();
           triad.loadFromScratch.erase();
           triad.atomicToScratch.erase();
+          tryCleanupScratch(triad.scratchMemref, launchOp);
 
         } else {
           // ── Multi-warp, same-block path: barrier + tid==0 guard ──

@@ -7,6 +7,7 @@ add_mlir_library(MLIRNovaToGpu
   MLIRIR
   MLIRPass
   MLIRGPUDialect
+  MLIRNVGPUDialect
   MLIRArithDialect
   MLIRSCFDialect
   MLIRTensorDialect
