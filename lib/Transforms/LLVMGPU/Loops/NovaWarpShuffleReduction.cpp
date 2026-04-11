@@ -169,6 +169,39 @@ struct DoubleAtomicTriad {
   Operation *outermostContainingLoop = nullptr;
 };
 
+/// Trace `val` through the vectorize-introduced round-trip:
+///   memref.load %scratch  ←  vector.store (vector.insert %scalar []) %scratch
+/// Returns the original f32 scalar that was inserted, or `val` if the chain
+/// is not recognized.  Used to recover the true per-thread partial from the
+/// store-load idiom the vectorize pass leaves behind.
+static Value resolveScalarPartial(Value val) {
+  auto loadOp = val.getDefiningOp<memref::LoadOp>();
+  if (!loadOp)
+    return val;
+  Value scratch = loadOp.getMemRef();
+  Block *block = loadOp->getBlock();
+
+  // Find the latest vector::StoreOp to the same scratch that precedes the load.
+  vector::StoreOp latestVStore;
+  for (Operation *user : scratch.getUsers()) {
+    auto s = dyn_cast<vector::StoreOp>(user);
+    if (!s || s->getBlock() != block || !s->isBeforeInBlock(loadOp))
+      continue;
+    if (!latestVStore || latestVStore->isBeforeInBlock(s))
+      latestVStore = s;
+  }
+  if (!latestVStore)
+    return val;
+
+  // Stored value should be: vector.insert %scalar [] : f32 into vector<f32>
+  // (i.e. a scalar wrapped into a 0-d vector — the pattern the vectorize pass emits).
+  auto insertOp = latestVStore.getValueToStore().getDefiningOp<vector::InsertOp>();
+  if (!insertOp || !insertOp.getStaticPosition().empty())
+    return val;
+
+  return insertOp.getOperand(0); // the actual f32 per-thread partial (source operand)
+}
+
 /// Returns true if `mem` is defined outside the gpu.launch region.
 static bool isExternalMemRef(Value mem, gpu::LaunchOp launchOp) {
   Operation *defOp = mem.getDefiningOp();
@@ -663,30 +696,25 @@ struct NovaWarpShuffleReductionPass
 
       auto triads = findTriads(launchOp);
 
-      // ── Single-atomic pattern (from NovaStrideReduction) ──
-      // After stride-32 + SCFScalarize, each thread has a per-thread partial
-      // in a scf.for result, written via atomic_rmw to an external memref.
-      // All 32 threads atomic-add their partials → N× overcounting.
-      // Replace with: shuffle tree to combine 32 partials, thread-0 writes.
-      //
-      // Match: atomic_rmw to external float memref whose value comes from
-      // a scf.for result. Skip constant-valued atomics (initializations).
-      if (triads.empty() && useShuffle) {
+      // ── Single-atomic pattern (from tiling / NovaStrideReduction) ──
+      // Each thread has a per-thread partial written via atomic_rmw to an
+      // external memref — N threads atomic-add their partials → N× overcounting.
+      // Replace with: gpu.all_reduce to combine all partials, thread-0 writes.
+      // Works for any thread count (not restricted to powers-of-2 ≤ 32).
+      if (triads.empty()) {
         SmallVector<memref::AtomicRMWOp> strideAtomics;
         launchOp.getBody().walk([&](memref::AtomicRMWOp atomicOp) {
-          // Use subview-tracing check — stride-32 targets are subviews
-          // of external allocs (e.g., subview of memref<8xf32>).
           if (!isExternalMemRefThroughSubview(atomicOp.getMemref(), launchOp))
             return;
           auto memTy = cast<MemRefType>(atomicOp.getMemref().getType());
           if (!isa<FloatType>(memTy.getElementType()))
             return;
-          // Value must come from a scf.for (scalar reduction) or
-          // vector.reduction (vectorized reduction). Skip constants
-          // (initialization stores like 0.0 or -inf).
-          Value partialVal = atomicOp.getValue();
+          // Trace through the vectorize-introduced store-load round-trip:
+          //   memref.load ← vector.store ← vector.insert %scalar []
+          Value partialVal = resolveScalarPartial(atomicOp.getValue());
           if (!partialVal.getDefiningOp<scf::ForOp>() &&
-              !partialVal.getDefiningOp<vector::ReductionOp>())
+              !partialVal.getDefiningOp<vector::ReductionOp>() &&
+              !partialVal.getDefiningOp<vector::ExtractOp>())
             return;
           strideAtomics.push_back(atomicOp);
         });
@@ -695,12 +723,17 @@ struct NovaWarpShuffleReductionPass
           Location loc = atomicOp.getLoc();
           OpBuilder builder(atomicOp);
 
-          // The atomic's value is the per-thread partial (scf.for result).
-          Value partial = atomicOp.getValue();
+          // Recover the true per-thread partial (bypass store-load round-trip).
+          Value partial = resolveScalarPartial(atomicOp.getValue());
 
-          // Build 5-round butterfly shuffle to combine 32 partials.
-          Value result = buildShuffleTree(builder, loc, partial,
-                                          numThreads, atomicOp.getKind());
+          // Cross-thread reduction via gpu.all_reduce — simpler than a manual
+          // butterfly shuffle and works for any thread count.
+          auto gpuReduceKind = mapToGPUAllReduce(atomicOp.getKind());
+          auto reduceAttr = gpu::AllReduceOperationAttr::get(
+              builder.getContext(), *gpuReduceKind);
+          Value result = builder.create<gpu::AllReduceOp>(
+              loc, partial.getType(), partial, reduceAttr,
+              /*uniform=*/false);
 
           // Thread-0 guard: only thread 0 writes the final result.
           Value tidX = builder.create<gpu::ThreadIdOp>(
