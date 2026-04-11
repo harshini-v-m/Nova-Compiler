@@ -1834,31 +1834,32 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
     else parallelAxes.push_back(i);
   }
 
-  // logicalToLoop[logical_dim] = generic_loop_index
-  SmallVector<int64_t> logicalToLoop(rank);
-  for (size_t i = 0; i < parallelAxes.size(); ++i)
-    logicalToLoop[parallelAxes[i]] = i;
-  for (size_t i = 0; i < reductionAxes.size(); ++i)
-    logicalToLoop[reductionAxes[i]] = parallelAxes.size() + i;
-
+  // Use identity mapping: linalg loop dim i = input tensor dim i.
+  // This preserves the natural dimension order [B, T, D] so that the
+  // GPU tiling config (which is indexed by linalg loop dim) aligns
+  // correctly with the actual data dimensions.  The previous remapping
+  // that put parallel dims first caused setDefaultConfig to assign
+  // reduction tiles to the wrong dimensions.
   SmallVector<AffineExpr> inputExprs;
-  for (int64_t i = 0; i < rank; ++i) {
-    inputExprs.push_back(rewriter.getAffineDimExpr(logicalToLoop[i]));
-  }
+  for (int64_t i = 0; i < rank; ++i)
+    inputExprs.push_back(rewriter.getAffineDimExpr(i));
 
-  //  Only add DimExprs for parallel dims (results in rank N-K)
+  // Output map: only the parallel (non-reduced) dims, in their
+  // original order.
   SmallVector<AffineExpr> outputExprs;
   for (int64_t i = 0; i < rank; ++i) {
-    if (!axisSet.contains(i)) {
-      outputExprs.push_back(rewriter.getAffineDimExpr(logicalToLoop[i]));
-    }
+    if (!axisSet.contains(i))
+      outputExprs.push_back(rewriter.getAffineDimExpr(i));
   }
 
+  // Iterator types in natural order: reduction for axes, parallel otherwise.
   SmallVector<utils::IteratorType> iteratorTypes;
-  for (size_t i = 0; i < parallelAxes.size(); ++i)
-    iteratorTypes.push_back(utils::IteratorType::parallel);
-  for (size_t i = 0; i < reductionAxes.size(); ++i)
-    iteratorTypes.push_back(utils::IteratorType::reduction);
+  for (int64_t i = 0; i < rank; ++i) {
+    if (axisSet.contains(i))
+      iteratorTypes.push_back(utils::IteratorType::reduction);
+    else
+      iteratorTypes.push_back(utils::IteratorType::parallel);
+  }
 
   auto inputMap = AffineMap::get(rank, 0, inputExprs, rewriter.getContext());
   auto outputMap = AffineMap::get(rank, 0, outputExprs, rewriter.getContext());

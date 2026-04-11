@@ -14,6 +14,7 @@
 #include "Passes.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
 #include "Compiler/Transforms/Passes.h"
+#include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "Compiler/Transforms/GenerateDynamicWrapper.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -135,7 +136,7 @@ namespace mlir::nova
     // with no TypeConverter, so they cannot materialize device-encoded types to
     // plain tensor types. RemDevAttrPass rewrites all result types in-place,
     // making every tensor<..., #nova.device<"N">> into a plain tensor<...>.
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
+    // pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgGenericLoweringPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgNamedPass());
@@ -162,12 +163,12 @@ namespace mlir::nova
     // pm.addNestedPass<mlir::func::FuncOp>(createNovaFuseReductionIntoProducerPass());
     pm.addNestedPass<mlir::func::FuncOp>(createFuseMatmulBiasPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
+    pm.addNestedPass<func::FuncOp>(createFuseMatmulBiasPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaCheckInsParallelFuse());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgHorizontalFusionPass());
      pm.addNestedPass<mlir::func::FuncOp>(createNovaMultiConsumerFusion());
     // pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgVerticalFusionPass());
 
-    
 
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(createCSEPass());
@@ -198,7 +199,7 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(
         createNovaTileAndDistributeToWorkgroupsPass());
     pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
 
     // -------------------------------------------------------------------------
     // Step 2: Pad operands to static multiples of tile sizes
@@ -210,7 +211,7 @@ namespace mlir::nova
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUPadOperandsPass());
     pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
 
     // -------------------------------------------------------------------------
     // Step 3: Promote operands to shared memory   [BEFORE K-TILING]
@@ -229,7 +230,7 @@ namespace mlir::nova
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUPromoteMatmulOperandsPass());
     pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
 
     // -------------------------------------------------------------------------
     // Step 4: Tile reduction (K) dimension   [AFTER PROMOTION]
@@ -241,20 +242,35 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(
         createNovaGPUApplyTilingLevelReductionPass());
     pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
 
     // -------------------------------------------------------------------------
-    // Step 5: Tile thread-level M/N dimensions
+    // Step 5: Subgroup (warp) tiling — BEFORE thread tiling
+    //
+    // Splits the workgroup tile across warps via scf.forall + GPUWarpMappingAttr.
+    // For MMA configs: each warp gets a subgroupTile-sized slice (e.g. 32×16).
+    // For SIMT configs: subgroupTiles are all 0, pass is a no-op.
+    //
+    // Must run BEFORE thread tiling so thread foralls are nested inside warp
+    // foralls. The zero-tile logic in ApplyTilingLevelThread detects
+    // isInsideWarpForall && mmaKind!=0 and zeros out thread tiles, deferring
+    // intra-warp distribution to ConvertVectorToGPU(nvgpu).
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelSubgroupPass());
+    pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
+ 
+
+    // -------------------------------------------------------------------------
+    // Step 5b: Thread tiling — per-thread register tiles within each warp
+    //
+    // For MMA ops (threadTiles=[0,0]): no thread forall created — matmul stays
+    // at subgroup (warp) granularity for vectorization + ConvertVectorToGPU.
+    // For SIMT ops: normal per-thread tiling applies.
+    // For copies: derived thread tiles recomputed from targetThreads.
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelThreadPass());
     pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
     pm.addPass(createCSEPass());
-
-    // Step 6 (Subgroup tiling) is disabled — warp-level tiling is not yet
-    // tuned for all shapes.  Re-enable when subgroup config is stable.
-    //   pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelSubgroupPass());
-    //   pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-    //   pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
     // Step 6: Normalize forall loop bounds (lb=0, step=1)
@@ -262,8 +278,7 @@ namespace mlir::nova
     // (step==1) to compute flat trip counts for fusion matching.
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+ 
 
     // -------------------------------------------------------------------------
     // Step 6.5: Fuse and hoist parallel loops
@@ -283,7 +298,7 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(
         createNovaGPUGreedilyDistributeToThreadsPass());
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
 
     // -------------------------------------------------------------------------
     // Step 6.75: Lower barrier_region → two value_barrier ops
@@ -357,7 +372,6 @@ namespace mlir::nova
     //
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUGenericVectorizationPass());
-    pm.addNestedPass<func::FuncOp>(createNovaGPUOptimizeVectorTransferPass());
     pm.addNestedPass<func::FuncOp>(createNovaGPUHoistVectorExtractInsertSlicePass());
     pm.addNestedPass<func::FuncOp>(createNovaGPUDropVectorUnitDimsPass());
     pm.addPass(createCanonicalizerPass());
@@ -399,20 +413,23 @@ namespace mlir::nova
     }
 
     // -------------------------------------------------------------------------
-    // Stage 21: Host-Side Vector Scalarization  [BEFORE Bufferization]
+    // Stage 21: Host-Side Vector Transfer Lowering  [BEFORE Bufferization]
     //
-    // Lower all HOST-side vector operations to SCF/standard dialect BEFORE
-    // bufferization. This prevents host-side arith.divui (grid/block tiling
-    // math) from triggering the hardware-native vector-to-gpu legalizer.
+    // Lower rank>1 vector.transfer_read/write to loops of rank-1 transfers.
+    // This prevents host-side arith.divui (grid/block tiling math) from
+    // triggering the hardware-native vector-to-gpu legalizer.
     //
-    // targetRank=0 scalarizes all host-side vectors. This is safe because
-    // we target only func.func (host side). Device-side vector.contract ops
-    // survive and are lowered by GpuHardwareMappingPass post-outlining (Batch 4).
+    // IMPORTANT: targetRank=1 (NOT 0). targetRank=0 would scalarize ALL
+    // vector.transfer_read/write ops including those feeding MMA-configured
+    // vector.contract ops inside warp foralls. Scalarizing MMA transfers
+    // destroys the 2D vector shapes that ConvertVectorToGPU needs to match
+    // for nvgpu.mma.sync generation. Rank-1 transfers are handled later by
+    // ConvertVectorToLLVMPass inside the GPU module (Stage 38d2).
     // -------------------------------------------------------------------------
     {
       auto &funcPm = pm.nest<func::FuncOp>();
       VectorTransferToSCFOptions opts;
-      opts.setTargetRank(0);
+      opts.setTargetRank(1);
       funcPm.addPass(createConvertVectorToSCFPass(opts));
       funcPm.addPass(createCanonicalizerPass());
       funcPm.addPass(createCSEPass());
@@ -458,16 +475,15 @@ namespace mlir::nova
 
 
     pm.addNestedPass<func::FuncOp>(createNovaGPUFillCopyForwardingPass());
-    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
 
    pm.addNestedPass<func::FuncOp>(createNovaGPUCoalesceWorkgroupBuffersPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
    
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
 
     // -------------------------------------------------------------------------
     // Step 9: scf.forall → gpu.launch (C++ pass with dynamic block dims)
@@ -477,39 +493,57 @@ namespace mlir::nova
     // from the actual thread-mapped forall iteration bounds.
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUMapForallToGPUPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
 
     // -------------------------------------------------------------------------
     // Step 10: Lower remaining linalg → scf loops
     // -------------------------------------------------------------------------
     pm.addPass(createConvertLinalgToLoopsPass());
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
 
 
-    // start of my Pass
-    
+
+    pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
+
+    // -------------------------------------------------------------------------
+    // Step 10.5: Stride-32 parallelization for single-thread reductions
+    // Rewrites scf.for reduction loops inside single-thread gpu.launch ops
+    // to use 32 threads with stride-32 access: lb=tid.x, step=32.
+    // Must run BEFORE SCFScalarize (which creates atomic_rmw from stores)
+    // and BEFORE WarpShuffle (which converts atomic_rmw to shfl.sync.bfly).
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaStrideReductionPass());
 
     pm.addNestedPass<func::FuncOp>(
         mlir::nova::createSCFScalarizeAccumulatorPass());
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
 
-    // Warp butterfly shuffle: replace double-atomic reduction patterns
-    // (which over-count by N×) with register-based shuffle + thread-0 write.
-    pm.addNestedPass<func::FuncOp>(
-        mlir::nova::createNovaWarpShuffleReductionPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
 
+    // -------------------------------------------------------------------------
+    // Step 10.8: Loop split + vectorize (both reduction and non-reduction)
+    //
+    // LoopSplit splits loops at condition boundaries (helps non-reduction
+    // vectorization). The vectorizer then handles BOTH modes:
+    //   Mode A: non-reduction loops (step=1, no iter_args) → vector.load/store
+    //   Mode B: reduction loops (iter_args) → vector.load + vector.reduction
+    //
+    // Must run BEFORE WarpShuffle because the vectorized reduction emits
+    // vector.reduction → scalar, which feeds into the atomic_rmw that
+    // WarpShuffle matches.
+    // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
     pm.addPass(createCanonicalizerPass());
 
-    // pm.addNestedPass<func::FuncOp>(
-    //     mlir::nova::createNovaScfLoopVectorizePass(16));
-    // pm.addPass(createCanonicalizerPass());
-    // pm.addPass(createCSEPass());
+    pm.addNestedPass<func::FuncOp>(
+        mlir::nova::createNovaScfLoopVectorizePass(4));
+    pm.addPass(createCanonicalizerPass());
+
+    // Warp butterfly shuffle: replace double-atomic reduction patterns
+    // (which over-count by N×) with register-based shuffle + thread-0 write.
+    // Now also matches values from vector::ReductionOp (vectorized reductions).
+    pm.addNestedPass<func::FuncOp>(
+        mlir::nova::createNovaWarpShuffleReductionPass());
+    pm.addPass(createCanonicalizerPass());
 
     // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopUnrollPass(4));
     // pm.addPass(createCanonicalizerPass());
@@ -678,6 +712,98 @@ namespace mlir::nova
                                                  std::move(foldPatterns));
             }
 
+            // Step 2b: Decompose insert_strided_slice + transfer_write chains.
+            //
+            // UnrollToIntrinsics produces:
+            //   %v0 = contract(...) : vector<16x8>  // MMA tile [0,0]
+            //   %v1 = contract(...) : vector<16x8>  // MMA tile [0,8]
+            //   %a  = insert_strided_slice %v0, %init {offsets=[0,0]}
+            //   %b  = insert_strided_slice %v1, %a   {offsets=[0,8]}
+            //   ...
+            //   transfer_write %final, memref[base0, base1] : vector<32x16>
+            //
+            // ConvertVectorToGPU cannot handle insert_strided_slice in the
+            // forward slice from contracts. We decompose into individual writes:
+            //   transfer_write %v0, memref[base0+0,  base1+0]  : vector<16x8>
+            //   transfer_write %v1, memref[base0+0,  base1+8]  : vector<16x8>
+            //   ...
+            {
+              struct FoldInsertStridedSliceIntoTransferWrite
+                  : public OpRewritePattern<vector::TransferWriteOp> {
+                using OpRewritePattern::OpRewritePattern;
+                LogicalResult matchAndRewrite(
+                    vector::TransferWriteOp writeOp,
+                    PatternRewriter &rewriter) const override {
+                  // Only handle 2D writes to memref.
+                  auto writeType = writeOp.getVectorType();
+                  if (writeType.getRank() != 2) return failure();
+                  if (!isa<MemRefType>(writeOp.getBase().getType()))
+                    return failure();
+                  if (writeOp.getMask() || writeOp.hasOutOfBoundsDim())
+                    return failure();
+                  // Must have identity permutation map.
+                  if (!writeOp.getPermutationMap().isIdentity())
+                    return failure();
+
+                  // Trace back through the chain of insert_strided_slice ops
+                  // to collect all individual tile values and their offsets.
+                  struct TileInfo {
+                    Value value;       // the vector<16x8> being inserted
+                    SmallVector<int64_t, 2> offsets;
+                  };
+                  SmallVector<TileInfo> tiles;
+                  Value current = writeOp.getVector();
+                  bool foundChain = false;
+                  while (auto insertOp =
+                             current.getDefiningOp<vector::InsertStridedSliceOp>()) {
+                    foundChain = true;
+                    auto strides =
+                        insertOp.getStrides().getAsValueRange<IntegerAttr>();
+                    if (!llvm::all_of(strides,
+                                      [](const APInt &v) { return v.isOne(); }))
+                      return failure();
+                    SmallVector<int64_t, 2> offsets;
+                    for (auto attr :
+                         insertOp.getOffsets().getAsValueRange<IntegerAttr>())
+                      offsets.push_back(attr.getSExtValue());
+                    if (offsets.size() != 2) return failure();
+                    tiles.push_back({insertOp.getValueToStore(), offsets});
+                    current = insertOp.getDest();
+                  }
+                  if (!foundChain) return failure();
+
+                  // Emit individual transfer_write ops for each tile.
+                  Location loc = writeOp.getLoc();
+                  SmallVector<Value> baseIndices =
+                      llvm::to_vector(writeOp.getIndices());
+                  for (auto &tile : tiles) {
+                    SmallVector<Value> newIndices =
+                        llvm::to_vector(baseIndices);
+                    for (size_t i = 0; i < tile.offsets.size(); ++i) {
+                      if (tile.offsets[i] != 0) {
+                        Value off = rewriter.create<arith::ConstantIndexOp>(
+                            loc, tile.offsets[i]);
+                        newIndices[i] = rewriter.create<arith::AddIOp>(
+                            loc, newIndices[i], off);
+                      }
+                    }
+                    auto tileType = cast<VectorType>(tile.value.getType());
+                    SmallVector<bool> inBounds(tileType.getRank(), true);
+                    rewriter.create<vector::TransferWriteOp>(
+                        loc, tile.value, writeOp.getBase(), newIndices,
+                        inBounds);
+                  }
+                  rewriter.eraseOp(writeOp);
+                  return success();
+                }
+              };
+              RewritePatternSet writeFoldPatterns(&getContext());
+              writeFoldPatterns.add<FoldInsertStridedSliceIntoTransferWrite>(
+                  &getContext());
+              (void)applyPatternsAndFoldGreedily(funcOp,
+                                                  std::move(writeFoldPatterns));
+            }
+
             // Step 3: Prepare transfers → nvgpu fragment form.
             {
               RewritePatternSet patterns(&getContext());
@@ -694,9 +820,65 @@ namespace mlir::nova
         return std::make_unique<GpuHardwareMappingPass>();
       }());
 
+      // DEBUG: Dump full IR before ConvertVectorToGPU to diagnose unmatched contracts.
+      // gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
+      //   struct DumpBeforeVectorToGPUPass
+      //       : public PassWrapper<DumpBeforeVectorToGPUPass,
+      //                            OperationPass<gpu::GPUFuncOp>> {
+      //     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DumpBeforeVectorToGPUPass)
+      //     void runOnOperation() override {
+      //       auto funcOp = getOperation();
+      //       bool hasContracts = false;
+      //       funcOp.walk([&](vector::ContractionOp) { hasContracts = true; });
+      //       if (hasContracts) {
+      //         llvm::errs() << "\n===== IR BEFORE ConvertVectorToGPU =====\n";
+      //         funcOp.print(llvm::errs(), OpPrintingFlags().useLocalScope());
+      //         llvm::errs() << "\n===== END IR DUMP =====\n\n";
+      //       }
+      //     }
+      //     StringRef getArgument() const override {
+      //       return "nova-dump-before-vector-to-gpu";
+      //     }
+      //   };
+      //   return std::make_unique<DumpBeforeVectorToGPUPass>();
+      // }());
+
       // 35b. vector.contract → nvgpu.mma.sync.
       gpuHwPm.addNestedPass<gpu::GPUFuncOp>(
           createConvertVectorToGPUPass(/*useNvGpu=*/true));
+
+      // 35b2. Clean up dead ops left by ConvertVectorToGPU.
+      //
+      // ConvertVectorToGPU replaces the dataflow (transfer_read → contract →
+      // transfer_write) with (ldmatrix/scalar_load → mma.sync → vector.store)
+      // but does NOT erase the original transfer_read + contract ops. They
+      // become dead code. Without DCE, the subsequent LLVM lowering pass
+      // attempts to lower these dead full-tile contracts via scalar loops,
+      // causing compilation stalls on large matrices.
+      gpuHwPm.addPass(createCanonicalizerPass());
+      gpuHwPm.addPass(createCSEPass());
+
+      // DEBUG: Dump IR AFTER ConvertVectorToGPU
+      gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
+        struct DumpAfterVectorToGPUPass
+            : public PassWrapper<DumpAfterVectorToGPUPass,
+                                 OperationPass<gpu::GPUFuncOp>> {
+          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DumpAfterVectorToGPUPass)
+          void runOnOperation() override {
+            bool hasContracts = false;
+            getOperation().walk([&](vector::ContractionOp) { hasContracts = true; });
+            if (hasContracts) {
+              llvm::errs() << "\n===== IR AFTER ConvertVectorToGPU (unconverted contracts remain) =====\n";
+              getOperation().print(llvm::errs(), OpPrintingFlags().useLocalScope());
+              llvm::errs() << "\n===== END POST-CONVERT DUMP =====\n\n";
+            }
+          }
+          StringRef getArgument() const override {
+            return "nova-dump-after-vector-to-gpu";
+          }
+        };
+        return std::make_unique<DumpAfterVectorToGPUPass>();
+      }());
 
       // 35c. Fix missing tf32_enabled on f32 nvgpu.mma.sync ops.
       gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
@@ -720,8 +902,135 @@ namespace mlir::nova
         return std::make_unique<FixMmaSyncTF32Pass>();
       }());
 
+      // Diagnostic: verify MMA conversion produced nvgpu.mma.sync ops.
+      // Logs a warning when vector.contract ops survive ConvertVectorToGPU
+      // unconverted — indicates a matching failure in PrepareVectorToMMA or
+      // ConvertVectorToGPU that needs debugging.
+      gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() {
+        struct VerifyMMAConversionPass
+            : public PassWrapper<VerifyMMAConversionPass,
+                                 OperationPass<gpu::GPUFuncOp>> {
+          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VerifyMMAConversionPass)
+          void runOnOperation() override {
+            int mmaCount = 0, contractCount = 0;
+            bool hasMmaConfig = false;
+            getOperation().walk([&](Operation *op) {
+              if (isa<nvgpu::MmaSyncOp>(op)) mmaCount++;
+              if (auto contractOp = dyn_cast<vector::ContractionOp>(op)) {
+                contractCount++;
+                // Check if any ancestor carries mma_kind > 0 — that means
+                // this contract was SUPPOSED to be MMA but failed to convert.
+                Operation *cur = contractOp.getOperation();
+                while (cur) {
+                  if (auto cfg = getLoweringConfig(cur)) {
+                    if (getMmaKindRaw(cfg) != 0) {
+                      hasMmaConfig = true;
+                      break;
+                    }
+                  }
+                  cur = cur->getParentOp();
+                }
+                // Only dump details for contracts that were meant for MMA.
+                if (hasMmaConfig && contractCount <= 3) {
+                  llvm::errs() << "[nova-mma-verify] unconverted contract #"
+                               << contractCount << ":\n";
+                  llvm::errs() << "  LHS type: " << contractOp.getLhs().getType() << "\n";
+                  llvm::errs() << "  RHS type: " << contractOp.getRhs().getType() << "\n";
+                  llvm::errs() << "  ACC type: " << contractOp.getAcc().getType() << "\n";
+                  llvm::errs() << "  indexing_maps: ";
+                  for (auto map : contractOp.getIndexingMapsArray())
+                    llvm::errs() << map << " ";
+                  llvm::errs() << "\n";
+                  if (auto defOp = contractOp.getLhs().getDefiningOp())
+                    llvm::errs() << "  LHS def: " << defOp->getName() << "\n";
+                }
+              }
+            });
+            if (contractCount > 0 && mmaCount == 0 && hasMmaConfig)
+              llvm::errs() << "[nova-mma-verify] WARNING: " << contractCount
+                           << " vector.contract ops remain unconverted in "
+                           << getOperation().getName()
+                           << " — ConvertVectorToGPU did not match.\n";
+            else if (contractCount > 0 && mmaCount == 0 && !hasMmaConfig)
+              llvm::errs() << "[nova-mma-verify] SIMT: " << contractCount
+                           << " vector.contract op(s) in "
+                           << getOperation().getName()
+                           << " using SIMT (CUDA core FMA) path.\n";
+            else if (contractCount > 0 && mmaCount > 0)
+              llvm::errs() << "[nova-mma-verify] PARTIAL: " << mmaCount
+                           << " mma.sync + " << contractCount
+                           << " unconverted contracts in "
+                           << getOperation().getName() << "\n";
+            else if (mmaCount > 0)
+              llvm::errs() << "[nova-mma-verify] OK: " << mmaCount
+                           << " nvgpu.mma.sync ops in "
+                           << getOperation().getName() << "\n";
+          }
+          StringRef getArgument() const override {
+            return "nova-verify-mma-conversion";
+          }
+        };
+        return std::make_unique<VerifyMMAConversionPass>();
+      }());
+
       gpuHwPm.addPass(createCanonicalizerPass());
       gpuHwPm.addPass(createCSEPass());
+
+      // 35d. Scalarize MMA fragment vector stores.
+      //
+      // ConvertVectorToGPU generates vector.store of vector<2xf32> for MMA
+      // result fragments (VectorToGPU.cpp:935). The LLVM 21 NVPTX backend
+      // miscompiles these by packing two f32 into i64 and emitting:
+      //   mov.b64 %rd, {%r, %r}; st.global.b32 [addr], %rd  (INVALID PTX)
+      // Scalarizing to individual f32 memref.store ops avoids the backend bug.
+      gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
+        struct ScalarizeMMAFragmentStoresPass
+            : public PassWrapper<ScalarizeMMAFragmentStoresPass,
+                                 OperationPass<gpu::GPUFuncOp>> {
+          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+              ScalarizeMMAFragmentStoresPass)
+          void runOnOperation() override {
+            SmallVector<vector::StoreOp> toScalarize;
+            getOperation().walk([&](vector::StoreOp storeOp) {
+              auto vecType = storeOp.getVectorType();
+              if (vecType.getRank() == 1 && vecType.getDimSize(0) == 2 &&
+                  vecType.getElementType().isF32())
+                toScalarize.push_back(storeOp);
+            });
+            if (toScalarize.empty())
+              return;
+
+            OpBuilder builder(&getContext());
+            for (auto storeOp : toScalarize) {
+              builder.setInsertionPoint(storeOp);
+              Location loc = storeOp.getLoc();
+              Value vec = storeOp.getValueToStore();
+              Value base = storeOp.getBase();
+              SmallVector<Value> indices(storeOp.getIndices());
+
+              for (int64_t i = 0; i < 2; ++i) {
+                Value elem = builder.create<vector::ExtractOp>(
+                    loc, vec, ArrayRef<int64_t>{i});
+                SmallVector<Value> storeIndices(indices);
+                if (!storeIndices.empty()) {
+                  Value offset =
+                      builder.create<arith::ConstantIndexOp>(loc, i);
+                  storeIndices.back() = builder.create<arith::AddIOp>(
+                      loc, storeIndices.back(), offset);
+                }
+                builder.create<memref::StoreOp>(loc, elem, base,
+                                                storeIndices);
+              }
+              storeOp.erase();
+            }
+          }
+          StringRef getArgument() const override {
+            return "nova-scalarize-mma-fragment-stores";
+          }
+        };
+        return std::make_unique<ScalarizeMMAFragmentStoresPass>();
+      }());
+      gpuHwPm.addPass(createCanonicalizerPass());
     }
 
     // -------------------------------------------------------------------------
@@ -759,11 +1068,15 @@ namespace mlir::nova
     //   optLevel=3   → full LLVM O3 optimisations inside PTXAS
     //   fastFlag     → allow fast-math reassociation in PTXAS
     //   ftzFlag      → flush denormals to zero (halves operand precision cost)
-    //   features=+ptx76 → PTX 7.6 instruction set for Ampere (sm_86)
+    //   features=+ptx86 → PTX 8.6 (CUDA 13.0 / sm_86+).
+    //   PTX 8.1+ is required for kernel params > 4352 bytes (MMA kernels
+    //   pass large by-value accumulator vectors via param space).
+    //   PTX 7.6 was limited to 4352 bytes → CUDA_ERROR_INVALID_PTX.
+    //   LLVM 21 supports: ptx80, ptx86, ptx87, ptx88 (no ptx81-85).
     GpuNVVMAttachTargetOptions nvvmTargetOptions;
     nvvmTargetOptions.triple = "nvptx64-nvidia-cuda";
     nvvmTargetOptions.chip = arch.str();
-    nvvmTargetOptions.features = "+ptx76";
+    nvvmTargetOptions.features = "+ptx86";
     nvvmTargetOptions.optLevel = 3;
     nvvmTargetOptions.fastFlag = true;
     nvvmTargetOptions.ftzFlag = true;
@@ -829,11 +1142,9 @@ namespace mlir::nova
     // vector.contract (e.g. vector<4xf32>,vector<4x1xf32>→vector<1xf32> on
     // matvec SIMT path) must be lowered to LLVM scalar FMAs HERE, while
     // memrefs are still in their original form.
-    gpuPm.addNestedPass<gpu::GPUFuncOp>(createConvertVectorToLLVMPass());
-      // 38f. SCF → cf.br.
-      gpuPm.addPass(createSCFToControlFlowPass());
-      // 38g. nvgpu.mma.sync → nvvm.mma.sync  (Batch 4 — NVVM domain starts).
-      gpuPm.addPass(createConvertNVGPUToNVVMPass());
+      gpuPm.addPass(createSCFToControlFlowPass());                           // SCF first
+      gpuPm.addPass(createConvertNVGPUToNVVMPass());                         // nvgpu → nvvm FIRST
+      gpuPm.addNestedPass<gpu::GPUFuncOp>(createConvertVectorToLLVMPass());  // vector → LLVM AFTER nvgpu lowered
       // 38h. gpu.* → NVVM intrinsics.
       // NOTE: ConvertGpuOpsToNVVMOps MUST run before ConvertVectorToLLVMPass.
       //   ConvertGpuOpsToNVVMOps converts gpu.func → llvm.func, rewriting all
@@ -861,7 +1172,6 @@ namespace mlir::nova
       gpuPm.addPass(createReconcileUnrealizedCastsPass()); // catch chains
     }
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
 
     // 13.3 — Compile the gpu.module blobs to a PTX ISA binary embedded in IR.
     GpuModuleToBinaryPassOptions binaryOptions;
@@ -889,11 +1199,19 @@ namespace mlir::nova
     pm.addPass(createArithToLLVMConversionPass());
     pm.addPass(memref::createExpandStridedMetadataPass());
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+    // 13.5b — Patch host-side loads/stores from GPU device pointers produced
+    // by mgpuMemAlloc.  SCFScalarizeAccumulator emits a host memref.load from
+    // a scratch buffer that ConvertMemRefToGpuPass later promotes to device
+    // memory.  Without this pass the load becomes a bare host dereference of
+    // a CUDA device pointer → SIGSEGV.  This pass replaces each such load with
+    // a synchronous cudaMemcpy(DeviceToHost) and each such store with a
+    // synchronous cudaMemcpy(HostToDevice).
+    pm.addPass(mlir::nova::createFixHostGpuMemoryPass());
     pm.addPass(createConvertFuncToLLVMPass());
+    pm.addPass(createConvertVectorToLLVMPass()); 
     pm.addPass(mlir::nova::createGenerateDynamicWrapperPass());
     pm.addPass(createReconcileUnrealizedCastsPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+
   }
 
   // ---------------------------------------------------------------------------
@@ -925,6 +1243,7 @@ namespace mlir::nova
     registerNovaWarpShuffleReductionPass();
     registerNovaGPUFillCopyForwardingPass();
     registerNovaGPUCoalesceWorkgroupBuffersPass();
+    registerNovaStrideReductionPass();
 
     // Register the full optimized pipeline as a named pipeline so it can be
     // invoked from mlir-opt with --nova-gpu-optimized-pipeline.
@@ -992,6 +1311,9 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(
         bufferization::createEmptyTensorToAllocTensorPass());
     pm.addNestedPass<func::FuncOp>(createNovaGPUInferMemorySpacePass());
+    pm.addNestedPass<func::FuncOp>(
+        memref::createResolveShapedTypeResultDimsPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
 
     // GPU-aware comprehensive bufferize (module-level).
     // Erases nova.fusion_barrier, converts function boundaries with identity

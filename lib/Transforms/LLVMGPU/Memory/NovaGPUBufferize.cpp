@@ -208,10 +208,38 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
         .getResult();
   }
 
-  // No memory space → default (global memory for cross-kernel buffers).
-  // These are managed by buffer-deallocation-pipeline.
-  return memref::AllocOp::create(builder, loc, memRefType, dynamicSizes)
-      .getResult();
+  // No memory space → default to PRIVATE (thread-local).
+  // After NovaGPUInferMemorySpacePass, every alloc_tensor is tagged.
+  // Untagged allocations here are bufferizer-created temporaries (iter_arg
+  // copies, scf.if staging) which are thread-local by construction.
+  // Matches IREE's gpuRequireMemSpaceAllocationFn default behavior.
+  {
+    auto allocType =
+        MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
+                        AffineMap(), privateSpace);
+
+    // Check if we are inside a kernel (scf.forall).
+    bool insideKernel = false;
+    Operation *insertionParent = builder.getInsertionBlock()->getParentOp();
+    while (insertionParent) {
+      if (isa<scf::ForallOp>(insertionParent)) {
+        insideKernel = true;
+        break;
+      }
+      insertionParent = insertionParent->getParentOp();
+    }
+
+    if (insideKernel) {
+      return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
+          .getResult();
+    }
+
+    // At function scope (outside all foralls) — emit plain alloc without
+    // address space. This becomes a host-side buffer passed to kernels,
+    // later converted to gpu.alloc by ConvertMemRefToGpu.
+    return memref::AllocOp::create(builder, loc, memRefType, dynamicSizes)
+        .getResult();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +473,12 @@ static bool hasNonAtomicWorkgroupStores(Operation *op) {
       found = true;
   });
   if (!found) {
+    op->walk([&](vector::StoreOp storeOp) {
+      if (isWorkgroupMemref(cast<MemRefType>(storeOp.getBase().getType())))
+        found = true;
+    });
+  }
+  if (!found) {
     op->walk([&](memref::CopyOp copyOp) {
       if (isWorkgroupMemref(cast<MemRefType>(copyOp.getTarget().getType())))
         found = true;
@@ -487,6 +521,12 @@ static bool hasWorkgroupLoads(Operation *op) {
       found = true;
   });
   if (!found) {
+    op->walk([&](vector::LoadOp loadOp) {
+      if (isWorkgroupMemref(cast<MemRefType>(loadOp.getBase().getType())))
+        found = true;
+    });
+  }
+  if (!found) {
     op->walk([&](memref::AtomicRMWOp rmwOp) {
       if (isWorkgroupMemref(cast<MemRefType>(rmwOp.getMemref().getType())))
         found = true;
@@ -526,7 +566,7 @@ struct NovaGPUInsertWorkgroupBarriersPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect,
-                    NVVM::NVVMDialect>();
+                    NVVM::NVVMDialect, vector::VectorDialect>();
   }
 
   void runOnOperation() override {

@@ -179,6 +179,14 @@ void registerNovaGPULowerMemorySpacePass();
 std::unique_ptr<Pass> createNovaWarpShuffleReductionPass();
 void registerNovaWarpShuffleReductionPass();
 
+// Lowers vector.reduction / vector.multi_reduction ops inside gpu.launch bodies
+// to warp butterfly shuffle reductions (all-reduce via XOR butterfly + thread-0
+// write). Currently a no-op stub — the Nova vectorizer does not yet emit
+// vector.reduction; this pass is the extensibility hook for that future work.
+// Shared utilities (buildShuffleReductionTree, emitTypedShuffleXOR, etc.) live
+// in NovaVectorReduction.cpp and are also used by NovaWarpShuffleReduction.
+
+
 std::unique_ptr<Pass> createNovaGPUFillCopyForwardingPass();
 void registerNovaGPUFillCopyForwardingPass();
 
@@ -250,6 +258,23 @@ void registerNovaGPUHoistVectorExtractInsertSlicePass();
 std::unique_ptr<Pass> createNovaGPUCastTypeToFitMMAPass();
 void registerNovaGPUCastTypeToFitMMAPass();
 
+// ---------------------------------------------------------------------------
+// Warp-Level Vector Distribution Passes
+// ---------------------------------------------------------------------------
+
+/// Wraps each vector.contract in gpu.warp_execute_on_lane_0 (step 1 of warp
+/// distribution). Must run BEFORE ConvertVectorToGPU so warp regions exist.
+std::unique_ptr<Pass> createNovaGPUVectorWrapPass();
+void registerNovaGPUVectorWrapPass();
+
+/// Lowers gpu.warp_execute_on_lane_0 regions: inlines MMA regions (all 32
+/// lanes must reach mma.sync), lowers others to scf.if + alloca + barrier.
+/// Must run inside gpuPm AFTER ConvertVectorToGPU(useNvGpu=true).
+std::unique_ptr<Pass> createNovaGPUWarpToSCFPass();
+void registerNovaGPUWarpToSCFPass();
+
+std::unique_ptr<Pass> createNovaStrideReductionPass();
+void registerNovaStrideReductionPass();
 } // namespace nova
 } // namespace mlir
 

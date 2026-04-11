@@ -36,10 +36,117 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DenseSet.h"
+#include <limits>
 
 using namespace mlir;
 
 namespace {
+
+/// Extract constant integer value from a Value, or return std::nullopt.
+/// Mirrors the implementation in NovaWarpShuffleReduction.cpp.
+static std::optional<int64_t> getConstantIndex(Value v) {
+  if (auto cst = v.getDefiningOp<arith::ConstantIndexOp>())
+    return cst.value();
+  if (auto cst = v.getDefiningOp<arith::ConstantIntOp>())
+    return cst.value();
+  return std::nullopt;
+}
+
+/// Returns true if the launch has exactly 1 total thread:
+/// gridSize=(1,1,1) AND blockSize=(1,1,1). With a single thread there is
+/// zero contention, so atomic_rmw is unnecessary.
+static bool isSingleThreadLaunch(gpu::LaunchOp launch) {
+  auto gx = getConstantIndex(launch.getGridSizeX());
+  auto gy = getConstantIndex(launch.getGridSizeY());
+  auto gz = getConstantIndex(launch.getGridSizeZ());
+  auto bx = getConstantIndex(launch.getBlockSizeX());
+  auto by = getConstantIndex(launch.getBlockSizeY());
+  auto bz = getConstantIndex(launch.getBlockSizeZ());
+  return gx && gy && gz && bx && by && bz &&
+         *gx == 1 && *gy == 1 && *gz == 1 &&
+         *bx == 1 && *by == 1 && *bz == 1;
+}
+
+/// Returns true if `memref` has at least one use that is ordered AFTER
+/// `launchOp` in the same block (i.e., a subsequent op reads/writes it).
+/// If there are no post-launch uses the store inside the launch is dead.
+/// Conservative: returns true when the ordering cannot be determined.
+static bool hasPostLaunchUses(Value memref, gpu::LaunchOp launchOp) {
+  Block *launchBlock = launchOp->getBlock();
+  if (!launchBlock)
+    return true; // conservative
+
+  for (Operation *user : memref.getUsers()) {
+    // Skip uses inside this launchOp — they are the stores being considered.
+    if (launchOp->isAncestor(user))
+      continue;
+
+    // Deallocs free memory but don't read content — ignore them.
+    if (isa<memref::DeallocOp>(user))
+      continue;
+
+    // Walk up to find the top-level ancestor in launchBlock.
+    Operation *ancestor = user;
+    while (ancestor && ancestor->getBlock() != launchBlock)
+      ancestor = ancestor->getParentOp();
+
+    if (!ancestor)
+      return true; // conservative: different region
+
+    if (ancestor == launchOp.getOperation())
+      continue; // already handled above
+
+    // If ancestor is ordered after launchOp, this is a genuine post-launch use.
+    if (launchOp->isBeforeInBlock(ancestor))
+      return true;
+  }
+  return false;
+}
+
+/// Return the identity element for the given reduction kind and element type.
+///   addf/addi/ori -> 0    mulf -> 1.0    maximumf/maxnumf -> -inf
+///   minimumf/minnumf -> +inf   maxs -> INT_MIN   maxu -> 0
+///   mins -> INT_MAX   minu/andi -> all-ones
+static Value buildIdentityValue(OpBuilder &builder, Location loc,
+                                arith::AtomicRMWKind kind, Type elemTy) {
+  if (auto floatTy = dyn_cast<FloatType>(elemTy)) {
+    double val = 0.0;
+    switch (kind) {
+    case arith::AtomicRMWKind::mulf:
+      val = 1.0; break;
+    case arith::AtomicRMWKind::maximumf:
+    case arith::AtomicRMWKind::maxnumf:
+      val = -std::numeric_limits<double>::infinity(); break;
+    case arith::AtomicRMWKind::minimumf:
+    case arith::AtomicRMWKind::minnumf:
+      val = std::numeric_limits<double>::infinity(); break;
+    default:
+      val = 0.0; break;
+    }
+    return builder.create<arith::ConstantOp>(
+        loc, builder.getFloatAttr(floatTy, val));
+  }
+  auto intTy = cast<IntegerType>(elemTy);
+  unsigned w = intTy.getWidth();
+  int64_t val = 0;
+  switch (kind) {
+  case arith::AtomicRMWKind::muli:
+    val = 1; break;
+  case arith::AtomicRMWKind::andi:
+  case arith::AtomicRMWKind::minu:
+    val = -1; break; // all-ones: UINT_MAX in unsigned representation
+  case arith::AtomicRMWKind::maxs:
+    val = (w >= 64) ? std::numeric_limits<int64_t>::min()
+                    : -(int64_t(1) << (w - 1)); break;
+  case arith::AtomicRMWKind::mins:
+    val = (w >= 64) ? std::numeric_limits<int64_t>::max()
+                    : (int64_t(1) << (w - 1)) - 1; break;
+  default:
+    val = 0; break;
+  }
+  return builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(intTy, val));
+}
 
 // Checks whether `mem` is a memref defined outside `launchOp`.
 // Returns true when the defining op (or the block argument owner) is an
@@ -52,6 +159,16 @@ static bool isExternalMemRef(Value mem, gpu::LaunchOp launchOp) {
       defOp = arg.getOwner()->getParentOp();
   }
   return defOp && !launchOp->isAncestor(defOp);
+}
+
+/// Like isExternalMemRef but traces through memref.subview to the root.
+/// Used only for stride-32 launches where the accumulator is a subview
+/// of an external alloc.
+static bool isExternalMemRefThroughSubview(Value mem, gpu::LaunchOp launchOp) {
+  Value current = mem;
+  while (auto subview = current.getDefiningOp<memref::SubViewOp>())
+    current = subview.getSource();
+  return isExternalMemRef(current, launchOp);
 }
 
 // Checks whether a loop's store-to-load pattern is scalarisable:
@@ -94,6 +211,103 @@ static bool matchScalarizePattern(scf::ForOp forOp,
   outLoad  = loadOp;
   outStore = storeOp;
   return true;
+}
+
+/// Tries to fix the "captured-initial-value" store pattern that bufferization
+/// sometimes emits.  The bufferizer can generate:
+///
+///   [outside gpu.launch]:
+///     %captured = memref.load %scratchB[]   // captures the initial zero
+///   [inside gpu.launch]:
+///     %innerB  = memref.load %scratchB[]
+///     %X       = <per-thread computation or load from another scratch>
+///     %acc     = arith.addf %X, %innerB     // accumulates into scratchB
+///     memref.store %acc, %scratchB[]
+///     memref.store %captured, %target[]     // BUG: stores initial zero
+///
+/// Without the fix, Phase 2 converts the buggy store to
+///   atomic_rmw addf 0.0, %target[]          // no-op → target stays 0
+/// leading to incorrect results (e.g. mean cross-entropy = 0).
+///
+/// The fix replaces %captured with the true per-thread contribution:
+/// • If %X = memref.load %scratchA[], we find the last value written to
+///   %scratchA before that load (store or atomic_rmw) and use that value,
+///   so the atomic_rmw that Phase 2 emits sees the actual per-thread datum.
+/// • Otherwise %X itself is the contribution.
+///
+/// Returns the replacement Value, or a null Value when the pattern does not
+/// match (no false positives — the original behaviour is preserved).
+static Value tryFixCapturedValueStore(Value storeVal, gpu::LaunchOp launchOp) {
+  // storeVal must originate OUTSIDE the launch (a captured value).
+  Operation *storeValDef = storeVal.getDefiningOp();
+  if (!storeValDef || launchOp->isAncestor(storeValDef))
+    return {};
+
+  // It must be a memref.load of a buffer defined outside the launch.
+  auto capturedLoad = dyn_cast<memref::LoadOp>(storeValDef);
+  if (!capturedLoad)
+    return {};
+  Value scratchB = capturedLoad.getMemRef();
+
+  // Inside the launch, look for:
+  //   %innerB = memref.load %scratchB[]
+  //   %acc    = arith.addf %X, %innerB  (or arith.addf %innerB, %X)
+  //   memref.store %acc, %scratchB[]
+  Value contribution;
+  launchOp.walk([&](memref::LoadOp innerLoad) -> WalkResult {
+    if (contribution)
+      return WalkResult::interrupt();
+    if (innerLoad.getMemRef() != scratchB)
+      return WalkResult::advance();
+    // innerLoad reads from scratchB inside the launch.
+    for (Operation *user : innerLoad.getResult().getUsers()) {
+      auto addfOp = dyn_cast<arith::AddFOp>(user);
+      if (!addfOp)
+        continue;
+      // The other addf operand is the per-thread contribution candidate.
+      Value X = (addfOp.getLhs() == innerLoad.getResult()) ? addfOp.getRhs()
+                                                           : addfOp.getLhs();
+      // Confirm that the addf result is stored back into scratchB.
+      bool confirmed = false;
+      for (Operation *stUser : addfOp.getResult().getUsers()) {
+        auto accStore = dyn_cast<memref::StoreOp>(stUser);
+        if (accStore && accStore.getMemRef() == scratchB) {
+          confirmed = true;
+          break;
+        }
+      }
+      if (!confirmed)
+        continue;
+
+      // If X is itself a load from another scratch (scratchA), find the
+      // last value written to scratchA before X's load.  This avoids using
+      // a stale racy-load value and instead uses the actual stored datum
+      // (e.g. the per-row loss value fed into the C-step atomic for scratchA).
+      auto innerLoadA = X.getDefiningOp<memref::LoadOp>();
+      if (innerLoadA && launchOp->isAncestor(innerLoadA)) {
+        Value scratchA = innerLoadA.getMemRef();
+        Block *block = innerLoadA->getBlock();
+        Value lastWrite;
+        for (Operation &op : *block) {
+          if (&op == innerLoadA.getOperation())
+            break;
+          if (auto s = dyn_cast<memref::StoreOp>(&op)) {
+            if (s.getMemRef() == scratchA)
+              lastWrite = s.getValueToStore();
+          } else if (auto rmw = dyn_cast<memref::AtomicRMWOp>(&op)) {
+            if (rmw.getMemref() == scratchA)
+              lastWrite = rmw.getValue();
+          }
+        }
+        contribution = lastWrite ? lastWrite : X;
+      } else {
+        contribution = X;
+      }
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return contribution;
 }
 
 // PERFORMANCE CRITICAL — scf.for accumulator scalarization.
@@ -143,6 +357,13 @@ struct SCFScalarizeAccumulatorPass
   // For each float store outside a scf.for that targets an external (host)
   // memref, replace it with memref::AtomicRMWOp(addf) and prepend a
   // gpu.memset to zero-init the target buffer before the launch.
+  //
+  // Two optimizations applied before the default atomic path:
+  //   1. Dead-use elimination: if the target memref has no uses after the
+  //      launch, the store result is never consumed — erase it, skip memset.
+  //   2. Single-thread bypass: if grid=(1,1,1) and block=(1,1,1), there is
+  //      exactly 1 thread with zero contention — leave the plain store in
+  //      place, skip memset.
   void atomicizeCrossBlockStores(gpu::LaunchOp launchOp) {
     SmallVector<memref::StoreOp> toAtomicize;
     launchOp.walk([&](memref::StoreOp storeOp) {
@@ -159,6 +380,20 @@ struct SCFScalarizeAccumulatorPass
     if (toAtomicize.empty())
       return;
 
+    // Pre-compute single-thread status once — depends only on launchOp.
+    bool singleThread = isSingleThreadLaunch(launchOp);
+
+    // Pre-compute captured-value fixes for all stores BEFORE any erasures.
+    // tryFixCapturedValueStore confirms the pattern by checking existing
+    // users of arith.addf results; those users (accumulation stores) may be
+    // erased during the main loop, so we must snapshot the fixes first.
+    llvm::DenseMap<memref::StoreOp, Value> capturedFixes;
+    for (auto storeOp : toAtomicize) {
+      if (Value fixed =
+              tryFixCapturedValueStore(storeOp.getValueToStore(), launchOp))
+        capturedFixes[storeOp] = fixed;
+    }
+
     // Track memrefs already zeroed to avoid duplicate gpu.memset ops.
     llvm::DenseSet<Value> zeroed;
 
@@ -168,7 +403,43 @@ struct SCFScalarizeAccumulatorPass
       auto elemTy = cast<MemRefType>(targetMemref.getType()).getElementType();
       Location loc = storeOp.getLoc();
 
-      // Replace the store with an atomic add so all blocks accumulate safely.
+      // ----------------------------------------------------------------
+      // Check 1 (Bug 1): Dead-use elimination.
+      // The target memref has no consumers after this launch — the store
+      // result is never read. Erase the dead store; no memset needed.
+      // ----------------------------------------------------------------
+      if (!hasPostLaunchUses(targetMemref, launchOp)) {
+        storeOp.erase();
+        continue;
+      }
+
+      // ----------------------------------------------------------------
+      // Check 2 (Bug 2): Single-thread bypass.
+      // Exactly 1 thread => zero contention. The original memref.store is
+      // already correct. No memset needed (store overwrites the target).
+      // ----------------------------------------------------------------
+      if (singleThread) {
+        // Leave the memref.store untouched.
+        continue;
+      }
+
+      // ----------------------------------------------------------------
+      // Check 3 (Captured-initial-value fix):
+      // If storeValue was captured from outside the launch (e.g. a
+      // pre-launch host load of a zero-initialised scratch buffer), it
+      // carries the initial zero rather than the per-thread contribution.
+      // Use the pre-computed fix to substitute the actual per-thread datum
+      // so the atomic_rmw below accumulates meaningful data.
+      // ----------------------------------------------------------------
+      auto fixIt = capturedFixes.find(storeOp);
+      if (fixIt != capturedFixes.end())
+        storeValue = fixIt->second;
+
+      // ----------------------------------------------------------------
+      // Default path: atomicize (existing behavior).
+      // Replace the store with an atomic add so all blocks accumulate
+      // safely. Insert gpu.memset before the launch to zero-init.
+      // ----------------------------------------------------------------
       OpBuilder builder(storeOp);
       builder.create<memref::AtomicRMWOp>(
           loc, arith::AtomicRMWKind::addf, storeValue,
@@ -194,8 +465,15 @@ struct SCFScalarizeAccumulatorPass
 
     auto &bodyOps = forOp.getBody()->getOperations();
 
-    // Determine if the target memref is shared (cross-forall or cross-launch).
+    // Determine if the target memref is shared across threads.
     // Shared accumulators need a final atomic_rmw instead of a plain store.
+    //
+    // "Shared" means: multiple threads write to the same memref location.
+    // This happens in two cases:
+    //   (a) The memref is defined outside a forall/launch (cross-block sharing)
+    //   (b) The launch has multiple threads per block AND the memref indices
+    //       are loop-invariant (all threads in the block access the same slot)
+    //       — this is the stride-32 reduction pattern from NovaStrideReduction.
     bool isShared = false;
     if (auto forallOp = forOp->getParentOfType<scf::ForallOp>()) {
       Operation *defOp = storeOp.getMemRef().getDefiningOp();
@@ -211,6 +489,18 @@ struct SCFScalarizeAccumulatorPass
           defOp = arg.getOwner()->getParentOp();
       if (defOp && !launchOp->isAncestor(defOp))
         isShared = true;
+
+      // Case (b): stride-32 reduction (NovaStrideReduction).
+      // After the stride pass, blockSizeX=32 and all 32 threads stride
+      // through the SAME reduction loop, accumulating into the SAME
+      // memref location. Detect: blockSizeX=32 AND the scf.for lower
+      // bound is gpu.thread_id (signature of the stride rewrite).
+      if (!isShared) {
+        auto bx = getConstantIndex(launchOp.getBlockSizeX());
+        if (bx && *bx == 32 &&
+            forOp.getLowerBound().getDefiningOp<gpu::ThreadIdOp>())
+          isShared = true;
+      }
     }
 
     // Pick the atomic kind from the op that feeds the store (the actual
@@ -220,14 +510,37 @@ struct SCFScalarizeAccumulatorPass
     // atomic kind.
     arith::AtomicRMWKind atomicKind = arith::AtomicRMWKind::addf;
     if (Operation *storeValDef = storeOp.getValueToStore().getDefiningOp()) {
+      // Float reductions — NaN-returning variants
       if (isa<arith::AddFOp>(storeValDef))
         atomicKind = arith::AtomicRMWKind::addf;
       else if (isa<arith::MulFOp>(storeValDef))
         atomicKind = arith::AtomicRMWKind::mulf;
-      else if (isa<arith::MaxNumFOp>(storeValDef))
+      else if (isa<arith::MaximumFOp>(storeValDef))
         atomicKind = arith::AtomicRMWKind::maximumf;
-      else if (isa<arith::MinNumFOp>(storeValDef))
+      else if (isa<arith::MinimumFOp>(storeValDef))
         atomicKind = arith::AtomicRMWKind::minimumf;
+      // Float reductions — NaN-propagating variants
+      else if (isa<arith::MaxNumFOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::maxnumf;
+      else if (isa<arith::MinNumFOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::minnumf;
+      // Integer reductions
+      else if (isa<arith::AddIOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::addi;
+      else if (isa<arith::MulIOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::muli;
+      else if (isa<arith::MaxSIOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::maxs;
+      else if (isa<arith::MaxUIOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::maxu;
+      else if (isa<arith::MinSIOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::mins;
+      else if (isa<arith::MinUIOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::minu;
+      else if (isa<arith::OrIOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::ori;
+      else if (isa<arith::AndIOp>(storeValDef))
+        atomicKind = arith::AtomicRMWKind::andi;
     }
 
     // Look for an initialisation store immediately before the loop.
@@ -253,11 +566,8 @@ struct SCFScalarizeAccumulatorPass
     Value initVal;
 
     if (isShared) {
-      // For shared accumulators, choose the identity value for the operation.
       auto elemTy = cast<MemRefType>(storeOp.getMemRef().getType()).getElementType();
-      double identity = (atomicKind == arith::AtomicRMWKind::mulf) ? 1.0 : 0.0;
-      initVal = builder.create<arith::ConstantOp>(
-          loc, builder.getFloatAttr(elemTy, identity));
+      initVal = buildIdentityValue(builder, loc, atomicKind, elemTy);
     } else if (initStore) {
       initVal = initStore.getValueToStore();
     } else {

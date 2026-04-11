@@ -12,6 +12,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -44,12 +46,39 @@ struct Barrier0OpMemoryEffects
 };
 
 } // namespace
-// Helper to create shared memory reduction for max/sum
+// Warp-level reduction using butterfly shuffle (__shfl_xor_sync).
+// After reduction, ALL 32 threads hold the final reduced value.
+// Avoids gpu.all_reduce which doesn't lower correctly in the JIT pipeline.
+Value createWarpReduce(OpBuilder &rewriter, Location loc, Value val,
+                       gpu::AllReduceOperation op) {
+  Value width = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getI32IntegerAttr(32));
+
+  for (int mask = 16; mask >= 1; mask >>= 1) {
+    Value maskVal = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getI32IntegerAttr(mask));
+    auto shuffleOp = rewriter.create<gpu::ShuffleOp>(
+        loc, val, maskVal, width, gpu::ShuffleMode::XOR);
+    Value other = shuffleOp.getShuffleResult();
+
+    switch (op) {
+    case gpu::AllReduceOperation::ADD:
+      val = rewriter.create<arith::AddFOp>(loc, val, other);
+      break;
+    case gpu::AllReduceOperation::MAXIMUMF:
+      val = rewriter.create<arith::MaximumFOp>(loc, val, other);
+      break;
+    default:
+      llvm_unreachable("Unsupported reduction op for warp reduce");
+    }
+  }
+  return val; // All 32 threads hold the same reduced value
+}
+
+// Helper to create shared memory reduction for max/sum (used by other patterns)
 // Returns the reduced value for the block (only thread 0 has the valid result)
 Value createBlockReduce(OpBuilder &rewriter, Location loc, Value val,
                         gpu::AllReduceOperation op, int blockDim) {
-  // Use gpu.all_reduce for simplicity and efficiency within the block
-  // This generates the necessary shuffle/shared memory ops
   mlir::gpu::AllReduceOperationAttr opAttr =
       mlir::gpu::AllReduceOperationAttr::get(rewriter.getContext(), op);
   return rewriter
@@ -70,8 +99,6 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     auto targetsType = cast<RankedTensorType>(targets.getType());
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
 
-    // Generalized Shapes: logits [D1, D2, ..., Dn, C], targets [D1, D2, ...,
-    // Dn]
     auto logitsShape = logitsType.getShape();
     int64_t rank = logitsType.getRank();
     int64_t C = logitsShape[rank - 1];
@@ -81,20 +108,9 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
         N *= logitsShape[i];
     }
 
-    // 1. Allocate memory for the FINAL scalar loss
-    auto lossMemRefType = MemRefType::get({1}, resultType.getElementType(),
-                                          MemRefLayoutAttrInterface{},
-                                          rewriter.getI64IntegerAttr(1));
+    Type elemTy = resultType.getElementType();
 
-    Value lossMemRef =
-        rewriter
-            .create<gpu::AllocOp>(loc, lossMemRefType,
-                                  /*asyncDependencies=*/ValueRange{},
-                                  /*dynamicSizes=*/ValueRange{},
-                                  /*symbolOperands=*/ValueRange{})
-            .getMemref();
-
-    // 2. Prepare Inputs
+    // 1. Bufferize inputs
     auto logitsMemRefType =
         MemRefType::get(logitsType.getShape(), logitsType.getElementType());
     Value logitsMemRef =
@@ -108,20 +124,35 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
         rewriter.create<bufferization::ToBufferOp>(loc, targetsMemType, targets)
             .getResult();
 
-    // 3. Single-Block Execution Parameters
-    // We launch exactly one block to ensure total determinism across rows.
+    // 2. Allocate per-row loss array on device (avoids non-deterministic atomics)
+    auto rowLossMemRefType = MemRefType::get(
+        {N}, rewriter.getF32Type(), MemRefLayoutAttrInterface{},
+        rewriter.getI64IntegerAttr(1));
+    Value rowLossMemRef =
+        rewriter
+            .create<gpu::AllocOp>(loc, rowLossMemRefType,
+                                  /*asyncDependencies=*/ValueRange{},
+                                  /*dynamicSizes=*/ValueRange{},
+                                  /*symbolOperands=*/ValueRange{})
+            .getMemref();
+
+    // ====================================================================
+    // Kernel 1: N blocks x 32 threads (1 warp). Each block computes one
+    // row's cross-entropy loss using warp shuffle reduction (XOR butterfly
+    // via gpu.shuffle). Thread 0 stores the row loss to rowLossMemRef[bid].
+    // ====================================================================
+    constexpr int64_t blockDim = 32;
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value c256 = rewriter.create<arith::ConstantIndexOp>(loc, 256);
     Value cN = rewriter.create<arith::ConstantIndexOp>(loc, N);
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value cBlockDim = rewriter.create<arith::ConstantIndexOp>(loc, blockDim);
 
     auto launchOp =
-        rewriter.create<gpu::LaunchOp>(loc, c1, c1, c1, // Grid: 1, 1, 1
-                                       c256, c1, c1     // Block: 256, 1, 1
+        rewriter.create<gpu::LaunchOp>(loc, cN, c1, c1,       // Grid: N, 1, 1
+                                       cBlockDim, c1, c1      // Block: 32, 1, 1
         );
 
-    // 4. Kernel Body
     rewriter.setInsertionPointToStart(&launchOp.getBody().front());
+    Value bid = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x);
     Value tid = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
     Value bdim = rewriter.create<gpu::BlockDimOp>(loc, gpu::Dimension::x);
 
@@ -130,119 +161,162 @@ struct SceOpLowering : public OpRewritePattern<mlir::nova::SceOp> {
     Value neg_inf = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getF32FloatAttr(-std::numeric_limits<float>::infinity()));
     Value cC = rewriter.create<arith::ConstantIndexOp>(loc, C);
+    Value c0_k = rewriter.create<arith::ConstantIndexOp>(loc, 0);
 
-    // Row-wise total unnormalized loss accumulator
-    auto rowLoop = rewriter.create<scf::ForOp>(
-        loc, c0, cN, c1, ValueRange{zero_f32},
-        [&](OpBuilder &b, Location l, Value r, ValueRange args) {
-          Value runningLoss = args[0];
-
-          // Delinearize row index 'r' for multi-dim batch indexing
-          SmallVector<Value> rowIndices;
-          Value rem = r;
-          for (int i = rank - 2; i >= 0; --i) {
-            Value dSize = b.create<arith::ConstantIndexOp>(l, logitsShape[i]);
-            if (i > 0) {
-              rowIndices.push_back(b.create<arith::RemUIOp>(l, rem, dSize));
-              rem = b.create<arith::DivUIOp>(l, rem, dSize);
-            } else {
-              rowIndices.push_back(rem);
-            }
-          }
-          std::reverse(rowIndices.begin(), rowIndices.end());
-
-          // A. Load Target Class index
-          Value targetIdxVal =
-              b.create<memref::LoadOp>(l, targetsMemRef, rowIndices);
-          Value targetIdx = targetIdxVal;
-          if (!targetIdx.getType().isIndex())
-            targetIdx =
-                b.create<arith::IndexCastOp>(l, b.getIndexType(), targetIdxVal);
-
-          // B. Pass 1: Find Max (Parallel across threads in block)
-          auto maxLoop = b.create<scf::ForOp>(
-              l, tid, cC, bdim, ValueRange{neg_inf},
-              [&](OpBuilder &ib, Location il, Value c_idx, ValueRange iargs) {
-                SmallVector<Value> lIdx = rowIndices;
-                lIdx.push_back(c_idx);
-                Value val = ib.create<memref::LoadOp>(il, logitsMemRef, lIdx);
-                if (val.getType().isF16() || val.getType().isBF16())
-                  val = ib.create<arith::ExtFOp>(il, ib.getF32Type(), val);
-                Value newMax = ib.create<arith::MaximumFOp>(il, iargs[0], val);
-                ib.create<scf::YieldOp>(il, newMax);
-              });
-          Value rowMax =
-              createBlockReduce(b, l, maxLoop.getResult(0),
-                                gpu::AllReduceOperation::MAXIMUMF, 256);
-
-          // C. Pass 2: Find Sum(Exp) and Target Logit
-          auto sumLoop = b.create<scf::ForOp>(
-              l, tid, cC, bdim, ValueRange{zero_f32, zero_f32},
-              [&](OpBuilder &ib, Location il, Value c_idx, ValueRange iargs) {
-                SmallVector<Value> lIdx = rowIndices;
-                lIdx.push_back(c_idx);
-                Value val = ib.create<memref::LoadOp>(il, logitsMemRef, lIdx);
-                if (val.getType().isF16() || val.getType().isBF16())
-                  val = ib.create<arith::ExtFOp>(il, ib.getF32Type(), val);
-
-                Value diff = ib.create<arith::SubFOp>(il, val, rowMax);
-                Value expVal = ib.create<mlir::math::ExpOp>(il, diff);
-                Value newSum = ib.create<arith::AddFOp>(il, iargs[0], expVal);
-
-                Value isTarget = ib.create<arith::CmpIOp>(
-                    il, arith::CmpIPredicate::eq, c_idx, targetIdx);
-                Value zero =
-                    ib.create<arith::ConstantOp>(il, ib.getF32FloatAttr(0.0f));
-                Value valIfTarget =
-                    ib.create<arith::SelectOp>(il, isTarget, val, zero);
-                Value newTargetLogit =
-                    ib.create<arith::AddFOp>(il, iargs[1], valIfTarget);
-
-                ib.create<scf::YieldOp>(il, ValueRange{newSum, newTargetLogit});
-              });
-          Value rowSum = createBlockReduce(b, l, sumLoop.getResult(0),
-                                           gpu::AllReduceOperation::ADD, 256);
-          Value targetLogit = createBlockReduce(
-              b, l, sumLoop.getResult(1), gpu::AllReduceOperation::ADD, 256);
-
-          // D. Compute Row Loss
-          Value logSum = b.create<mlir::math::LogOp>(l, rowSum);
-          Value t2 = b.create<arith::SubFOp>(l, targetLogit, rowMax);
-          Value rowLoss = b.create<arith::SubFOp>(l, logSum, t2);
-
-          Value nextAccum = b.create<arith::AddFOp>(l, runningLoss, rowLoss);
-          b.create<scf::YieldOp>(l, nextAccum);
-        });
-
-    Value totalUnnormalizedLoss = rowLoop.getResult(0);
-
-    // 5. Final Normalization and Store (Thread 0)
-    Value isMaster =
-        rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, tid, c0);
-    scf::IfOp writeOp = rewriter.create<scf::IfOp>(loc, isMaster, false);
-    rewriter.setInsertionPointToStart(writeOp.thenBlock());
-
-    Value cN_f32 = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getF32FloatAttr(static_cast<float>(N)));
-    Value meanLoss =
-        rewriter.create<arith::DivFOp>(loc, totalUnnormalizedLoss, cN_f32);
-
-    Value finalResult = meanLoss;
-    Type outputElemTy = resultType.getElementType();
-    if (outputElemTy.isF16() || outputElemTy.isBF16()) {
-      finalResult =
-          rewriter.create<arith::TruncFOp>(loc, outputElemTy, meanLoss);
+    // Delinearize block index for multi-dim batch indexing
+    SmallVector<Value> rowIndices;
+    Value rem = bid;
+    for (int i = rank - 2; i >= 0; --i) {
+      Value dSize =
+          rewriter.create<arith::ConstantIndexOp>(loc, logitsShape[i]);
+      if (i > 0) {
+        rowIndices.push_back(rewriter.create<arith::RemUIOp>(loc, rem, dSize));
+        rem = rewriter.create<arith::DivUIOp>(loc, rem, dSize);
+      } else {
+        rowIndices.push_back(rem);
+      }
     }
-    rewriter.create<memref::StoreOp>(loc, finalResult, lossMemRef,
-                                     ValueRange{c0});
+    std::reverse(rowIndices.begin(), rowIndices.end());
 
-    rewriter.setInsertionPointAfter(writeOp);
+    // A. Load target class index
+    Value targetIdxVal =
+        rewriter.create<memref::LoadOp>(loc, targetsMemRef, rowIndices);
+    Value targetIdx = targetIdxVal;
+    if (!targetIdx.getType().isIndex())
+      targetIdx = rewriter.create<arith::IndexCastOp>(
+          loc, rewriter.getIndexType(), targetIdxVal);
+
+    // B. Parallel Pass 1: strided max over C classes
+    //    Each of 32 threads processes elements tid, tid+32, tid+64, ...
+    auto maxLoop = rewriter.create<scf::ForOp>(
+        loc, tid, cC, bdim, ValueRange{neg_inf},
+        [&](OpBuilder &ib, Location il, Value c_idx, ValueRange iargs) {
+          SmallVector<Value> lIdx = rowIndices;
+          lIdx.push_back(c_idx);
+          Value val = ib.create<memref::LoadOp>(il, logitsMemRef, lIdx);
+          if (val.getType().isF16() || val.getType().isBF16())
+            val = ib.create<arith::ExtFOp>(il, ib.getF32Type(), val);
+          Value newMax = ib.create<arith::MaximumFOp>(il, iargs[0], val);
+          ib.create<scf::YieldOp>(il, newMax);
+        });
+    Value threadMax = maxLoop.getResult(0);
+
+    // Warp shuffle reduction for max (XOR butterfly, all threads get result)
+    Value rowMax =
+        createWarpReduce(rewriter, loc, threadMax,
+                         gpu::AllReduceOperation::MAXIMUMF);
+
+    // C. Parallel Pass 2: strided sum(exp) and target logit extraction
+    auto sumLoop = rewriter.create<scf::ForOp>(
+        loc, tid, cC, bdim, ValueRange{zero_f32, zero_f32},
+        [&](OpBuilder &ib, Location il, Value c_idx, ValueRange iargs) {
+          SmallVector<Value> lIdx = rowIndices;
+          lIdx.push_back(c_idx);
+          Value val = ib.create<memref::LoadOp>(il, logitsMemRef, lIdx);
+          if (val.getType().isF16() || val.getType().isBF16())
+            val = ib.create<arith::ExtFOp>(il, ib.getF32Type(), val);
+
+          Value diff = ib.create<arith::SubFOp>(il, val, rowMax);
+          Value expVal = ib.create<mlir::math::ExpOp>(il, diff);
+          Value newSum = ib.create<arith::AddFOp>(il, iargs[0], expVal);
+
+          // Only the thread owning the target class picks up non-zero
+          Value isTarget = ib.create<arith::CmpIOp>(
+              il, arith::CmpIPredicate::eq, c_idx, targetIdx);
+          Value zero =
+              ib.create<arith::ConstantOp>(il, ib.getF32FloatAttr(0.0f));
+          Value valIfTarget =
+              ib.create<arith::SelectOp>(il, isTarget, val, zero);
+          Value newTargetLogit =
+              ib.create<arith::AddFOp>(il, iargs[1], valIfTarget);
+
+          ib.create<scf::YieldOp>(il, ValueRange{newSum, newTargetLogit});
+        });
+    Value threadSum = sumLoop.getResult(0);
+    Value threadTargetLogit = sumLoop.getResult(1);
+
+    // Warp shuffle reduction for sum and target logit
+    Value rowSum = createWarpReduce(rewriter, loc, threadSum,
+                                    gpu::AllReduceOperation::ADD);
+    Value targetLogit = createWarpReduce(rewriter, loc, threadTargetLogit,
+                                         gpu::AllReduceOperation::ADD);
+
+    // D. Compute row loss: log(sum_exp) - (target_logit - max)
+    Value logSum = rewriter.create<mlir::math::LogOp>(loc, rowSum);
+    Value t2 = rewriter.create<arith::SubFOp>(loc, targetLogit, rowMax);
+    Value rowLoss = rewriter.create<arith::SubFOp>(loc, logSum, t2);
+
+    // E. Thread 0 stores row loss (no atomics, deterministic)
+    Value isThread0 = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, tid, c0_k);
+    auto ifOp =
+        rewriter.create<scf::IfOp>(loc, isThread0, /*withElseRegion=*/false);
+    rewriter.setInsertionPointToStart(ifOp.thenBlock());
+
+    rewriter.create<memref::StoreOp>(loc, rowLoss, rowLossMemRef,
+                                     ValueRange{bid});
+
+    rewriter.setInsertionPointAfter(ifOp);
     rewriter.create<gpu::TerminatorOp>(loc);
     rewriter.setInsertionPointAfter(launchOp);
 
-    // 6. Result
-    auto scalarTensorType =
-        RankedTensorType::get({1}, resultType.getElementType());
+    // ====================================================================
+    // Kernel 2: 1 block x 1 thread. Sequentially sums the N row losses
+    // and divides by N. Deterministic — no atomics, no reduction races.
+    // ====================================================================
+    auto lossMemRefType = MemRefType::get({1}, elemTy,
+                                          MemRefLayoutAttrInterface{},
+                                          rewriter.getI64IntegerAttr(1));
+    Value lossMemRef =
+        rewriter
+            .create<gpu::AllocOp>(loc, lossMemRefType,
+                                  /*asyncDependencies=*/ValueRange{},
+                                  /*dynamicSizes=*/ValueRange{},
+                                  /*symbolOperands=*/ValueRange{})
+            .getMemref();
+
+    auto launchOp2 =
+        rewriter.create<gpu::LaunchOp>(loc, c1, c1, c1,   // Grid:  1,1,1
+                                       c1, c1, c1         // Block: 1,1,1
+        );
+
+    rewriter.setInsertionPointToStart(&launchOp2.getBody().front());
+
+    Value c0_k2 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1_k2 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value cN_k2 = rewriter.create<arith::ConstantIndexOp>(loc, N);
+    Value zero_f32_k2 =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getF32FloatAttr(0.0f));
+
+    auto sumRedLoop = rewriter.create<scf::ForOp>(
+        loc, c0_k2, cN_k2, c1_k2, ValueRange{zero_f32_k2},
+        [&](OpBuilder &ib, Location il, Value idx, ValueRange iargs) {
+          Value v = ib.create<memref::LoadOp>(il, rowLossMemRef,
+                                              ValueRange{idx});
+          Value acc = ib.create<arith::AddFOp>(il, iargs[0], v);
+          ib.create<scf::YieldOp>(il, acc);
+        });
+    Value totalLoss = sumRedLoop.getResult(0);
+
+    // Divide by N to get mean loss
+    Value cN_f32 = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getF32FloatAttr(static_cast<float>(N)));
+    Value meanLoss =
+        rewriter.create<arith::DivFOp>(loc, totalLoss, cN_f32);
+
+    // Store final scalar loss, casting if needed
+    Value storeLoss = meanLoss;
+    if (elemTy.isF16() || elemTy.isBF16())
+      storeLoss = rewriter.create<arith::TruncFOp>(loc, elemTy, meanLoss);
+
+    rewriter.create<memref::StoreOp>(loc, storeLoss, lossMemRef,
+                                     ValueRange{c0_k2});
+
+    rewriter.create<gpu::TerminatorOp>(loc);
+    rewriter.setInsertionPointAfter(launchOp2);
+
+    // 3. Result
+    auto scalarTensorType = RankedTensorType::get({1}, elemTy);
     Value lossTensor = rewriter.create<bufferization::ToTensorOp>(
         loc, scalarTensorType, lossMemRef, /*restrict=*/true,
         /*writable=*/true);
@@ -271,6 +345,27 @@ public:
     }
     Value input = op.getInput();
     auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
+    auto outputType = llvm::dyn_cast<RankedTensorType>(op.getOutput().getType());
+
+    if (!inputType || !outputType)
+      return failure();
+
+    // Only support reduction to scalar for now in this direct GPU mapper
+    // Partial reductions should fall back to NovaToLinalg
+    if (outputType.getRank() != 0) {
+       bool all_dims_reduced = true;
+       if (auto dimensionAttr = op.getDimension()) {
+         if (dimensionAttr->size() != inputType.getRank()) {
+            all_dims_reduced = false;
+         }
+       } else {
+          // If dimension is null, it's a full reduction to scalar (if output rank is 0).
+          // If output rank > 0 but dimension is null, it's weird, but technically full reduction leads to rank 0.
+          all_dims_reduced = (outputType.getRank() == 0);
+       }
+       if (!all_dims_reduced)
+         return failure();
+    }
 
     // 2. Map Reduction Kind to GPU Op attribute
     gpu::AllReduceOperation gpuOp;
@@ -305,7 +400,6 @@ public:
     // Result type is got from output type
     // and we are creating the memref for it
     // (eg: 0-D tensor -> 0-D memref)
-    auto outputType = cast<RankedTensorType>(op.getOutput().getType());
     auto memRefType = MemRefType::get(
         outputType.getShape(), inputType.getElementType(),
         MemRefLayoutAttrInterface{}, rewriter.getI64IntegerAttr(1));
@@ -866,6 +960,42 @@ struct ScatterAddOpGpuLowering : public OpRewritePattern<nova::ScatterAddOp> {
   }
 };
 
+// Check if a value is provably uninitialized, meaning a host-to-device
+// copy would just transfer garbage. In that case we can skip the copy
+// and only allocate device memory.
+static bool isUninitializedInput(Value input) {
+  Operation *defOp = input.getDefiningOp();
+  if (!defOp)
+    return false;
+
+  // tensor.empty produces uninitialized memory
+  if (isa<tensor::EmptyOp>(defOp))
+    return true;
+
+  // bufferization.to_tensor wrapping a block argument memref that has
+  // no stores — this is an output-only buffer from the JIT runtime
+  if (auto toTensor = dyn_cast<bufferization::ToTensorOp>(defOp)) {
+    Value memref = toTensor.getBuffer();
+    if (isa<BlockArgument>(memref)) {
+      bool hasStores = false;
+      for (auto &use : memref.getUses()) {
+        Operation *user = use.getOwner();
+        if (user == defOp)
+          continue;
+        if (isa<memref::DeallocOp>(user))
+          continue;
+        // Any other use means the memref may be written to or read
+        hasStores = true;
+        break;
+      }
+      if (!hasStores)
+        return true;
+    }
+  }
+
+  return false;
+}
+
 struct ToDeviceOpLowering : public OpRewritePattern<nova::ToDeviceOp> {
   using OpRewritePattern<nova::ToDeviceOp>::OpRewritePattern;
 
@@ -875,20 +1005,40 @@ struct ToDeviceOpLowering : public OpRewritePattern<nova::ToDeviceOp> {
     Value input = op.getInput();
     auto inputType = cast<RankedTensorType>(input.getType());
 
+    // GPU MemRef type with memory space 1 (device)
+    auto gpuMemRefType =
+        MemRefType::get(inputType.getShape(), inputType.getElementType(),
+                        MemRefLayoutAttrInterface{},
+                        rewriter.getI64IntegerAttr(1));
+
+    // Fast path: if the input is provably uninitialized (e.g. tensor.empty
+    // or an output-only block arg), skip the host alloc + copy entirely
+    // and just allocate device memory.
+    if (isUninitializedInput(input)) {
+      Value gpuMemRef =
+          rewriter
+              .create<gpu::AllocOp>(loc, gpuMemRefType,
+                                    /*asyncDeps=*/ValueRange{},
+                                    /*dynSizes=*/ValueRange{},
+                                    /*symbolOperands=*/ValueRange{})
+              .getMemref();
+
+      auto toTensor = rewriter.create<bufferization::ToTensorOp>(
+          loc, op.getType(), gpuMemRef);
+      toTensor.setRestrict(true);
+      rewriter.replaceOp(op, toTensor.getResult());
+      return success();
+    }
+
+    // Default path: full host-to-device copy
+
     // 1. Convert Input Tensor to Host MemRef
-    // We assume the input is on host (default memory space)
     auto hostMemRefType =
         MemRefType::get(inputType.getShape(), inputType.getElementType());
     Value hostMemRef =
         rewriter.create<bufferization::ToBufferOp>(loc, hostMemRefType, input);
 
-    // 2. Allocate GPU Memory (Device MemRef)
-    // We need a MemRef type with memory space 1 (GPU Global)
-    auto gpuMemRefType =
-        MemRefType::get(inputType.getShape(), inputType.getElementType(),
-                        MemRefLayoutAttrInterface{},
-                        rewriter.getI64IntegerAttr(1)); // Memory Space 1
-
+    // 2. Allocate GPU Memory
     Value gpuMemRef = rewriter
                           .create<gpu::AllocOp>(loc, gpuMemRefType,
                                                 /*asyncDeps=*/ValueRange{},
@@ -900,13 +1050,10 @@ struct ToDeviceOpLowering : public OpRewritePattern<nova::ToDeviceOp> {
     rewriter.create<gpu::MemcpyOp>(loc, TypeRange{}, ValueRange{}, gpuMemRef,
                                    hostMemRef);
 
-    // 4. Convert Device MemRef back to Tensor (for output)
-    // The output tensor type should match the op's result type
+    // 4. Convert Device MemRef back to Tensor
     bufferization::ToTensorOp toTensor =
         rewriter.create<bufferization::ToTensorOp>(loc, op.getType(),
                                                    gpuMemRef);
-
-    // Optional: Restrict aliasing if you know ownership occurs here
     toTensor.setRestrict(true);
 
     rewriter.replaceOp(op, toTensor.getResult());
@@ -927,7 +1074,8 @@ struct NovaToGpuPass
     registry.insert<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect,
                     memref::MemRefDialect, tensor::TensorDialect,
                     bufferization::BufferizationDialect, math::MathDialect,
-                    func::FuncDialect, NVVM::NVVMDialect>();
+                    func::FuncDialect, NVVM::NVVMDialect, nvgpu::NVGPUDialect,
+                    vector::VectorDialect>();
 
     // Register the side-effect interface for nvvm.barrier0.
     registry.addExtension(
@@ -945,7 +1093,7 @@ struct NovaToGpuPass
         arith::ArithDialect, gpu::GPUDialect, scf::SCFDialect,
         memref::MemRefDialect, func::FuncDialect, math::MathDialect,
         tensor::TensorDialect, bufferization::BufferizationDialect,
-        NVVM::NVVMDialect>();
+        NVVM::NVVMDialect, nvgpu::NVGPUDialect, vector::VectorDialect>();
     target.addLegalOp<gpu::BarrierOp>();
     target.addIllegalOp<nova::ToDeviceOp, nova::SceOp, nova::MatmulOp,
                         nova::GatherOp, nova::ScatterAddOp>();

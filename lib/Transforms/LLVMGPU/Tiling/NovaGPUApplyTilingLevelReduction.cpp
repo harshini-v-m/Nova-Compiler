@@ -21,6 +21,7 @@
 #include "NovaGPUTileAndFuseUtils.h"
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -166,6 +167,47 @@ getTileSizes(RewriterBase &rewriter, TilingInterface tilingOp,
   if ((int64_t)tiles.size() > numLoops)
     return SmallVector<OpFoldResult>(numLoops, zero);
 
+  // Thread level: when the op is inside a warp-mapped forall (subgroup-tiled),
+  // zero out contraction dims for MMA ops.  The vectorization + vector unrolling
+  // pipeline handles per-warp subdivision to native MMA tile sizes.  Creating
+  // a thread forall for contraction dims inside a warp forall would produce
+  // incorrect GPU mapping (one thread per 16×8 tile instead of 32-thread
+  // warp-cooperative mma.sync).
+  //
+  // Non-contraction dims and non-MMA ops keep their thread tiles unchanged.
+  if (tilingLevel == NovaTilingLevel::Thread) {
+    // Check if this op is nested inside a warp-mapped scf.forall.
+    bool insideWarpForall = false;
+    if (auto forall = op->getParentOfType<scf::ForallOp>()) {
+      if (auto mapping = forall.getMappingAttr()) {
+        for (auto attr : mapping.getValue()) {
+          if (isa<gpu::GPUWarpMappingAttr>(attr)) {
+            insideWarpForall = true;
+            break;
+          }
+        }
+      }
+    }
+    if (insideWarpForall) {
+      int32_t mmaKind = getMmaKindRaw(config);
+      if (mmaKind != 0) {
+        // MMA contraction inside warp forall: zero out all tiles so no
+        // thread forall is created. The matmul stays at warp granularity.
+        auto subgroupTiles = getLoweringConfigTileSizes(config, kSubgroupKey);
+        for (int i = 0; i < (int)tiles.size() &&
+                        i < (int)subgroupTiles.size(); ++i) {
+          if (subgroupTiles[i] > 0)
+            tiles[i] = 0;
+        }
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[nova-tiling] zeroed MMA contraction thread tiles "
+                      "(inside warp forall): [";
+                   for (int64_t t : tiles) llvm::dbgs() << t << " ";
+                   llvm::dbgs() << "]\n");
+      }
+    }
+  }
+
   // Derived-thread config: recompute thread tiles from the op's actual
   // (K-tiled) loop ranges and the stored target_threads count.  This ensures
   // the copy forall trip count matches the matmul forall trip count, enabling
@@ -225,6 +267,87 @@ getTileSizes(RewriterBase &rewriter, TilingInterface tilingOp,
 //   5. Tile and fuse
 //   6. Replace original uses with tiled results
 //===----------------------------------------------------------------------===//
+
+/// Fixes linalg.index uses inside tiled linalg.generic bodies for reduction
+/// dims tiled with PartialReductionOuterParallel at the Thread level.
+///
+/// Root cause: when the thread tiling pass tiles a reduction dim, it creates a
+/// scf.forall whose IV gives the tile-start offset. Formal operands are
+/// correctly sliced via tensor.extract_slice (offset embedded in the slice),
+/// but any tensor.extract on non-operand tensors inside the body still uses
+/// linalg.index i — which, after tiling, gives the tile-local index (0..T-1)
+/// rather than the global index (tile_start + 0..T-1).
+///
+/// Fix: for each tiled linalg.generic inside the forall, find every
+/// linalg.index i where dim i was tiled as a reduction, and replace its result
+/// with (forall_iv_for_dim_i + linalg.index i) everywhere it is used.
+static void fixupReductionTiledLinalgIndex(IRRewriter &rewriter,
+                                           linalg::LinalgOp originalOp,
+                                           scf::SCFTileAndFuseResult &result,
+                                           ArrayRef<OpFoldResult> tileSizes) {
+  // Find the enclosing scf.forall created by the tiling pass.
+  scf::ForallOp forallOp;
+  for (LoopLikeOpInterface loop : result.loops) {
+    if (auto fop = dyn_cast<scf::ForallOp>(loop.getOperation())) {
+      forallOp = fop;
+      break;
+    }
+  }
+  if (!forallOp)
+    return;
+
+  // Map each tiled reduction dimension to its forall induction variable.
+  // The forall IVs are created for non-zero tile dims in left-to-right order.
+  auto iterTypes = originalOp.getIteratorTypesArray();
+  SmallVector<std::pair<int, Value>> tiledReductionDimIVs;
+  {
+    SmallVector<Value> ivs = forallOp.getInductionVars();
+    int ivIdx = 0;
+    for (int i = 0;
+         i < (int)tileSizes.size() && ivIdx < (int)ivs.size(); ++i) {
+      if (!isZeroInteger(tileSizes[i])) {
+        if (i < (int)iterTypes.size() &&
+            linalg::isReductionIterator(iterTypes[i]))
+          tiledReductionDimIVs.push_back({i, ivs[ivIdx]});
+        ++ivIdx;
+      }
+    }
+  }
+  if (tiledReductionDimIVs.empty())
+    return;
+
+  // For each tiled linalg op, offset every linalg.index i (for a tiled
+  // reduction dim i) by the corresponding forall IV so callers of linalg.index
+  // that access non-operand tensors get the correct global position.
+  for (Operation *tiledOp : result.tiledAndFusedOps) {
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(tiledOp);
+    if (!linalgOp || linalgOp->getNumRegions() == 0)
+      continue;
+
+    SmallVector<std::pair<linalg::IndexOp, Value>> toFix;
+    linalgOp->getRegion(0).walk([&](linalg::IndexOp indexOp) {
+      for (auto [tiledDim, iv] : tiledReductionDimIVs) {
+        if ((int)indexOp.getDim() == tiledDim) {
+          toFix.push_back({indexOp, iv});
+          break;
+        }
+      }
+    });
+
+    for (auto [indexOp, iv] : toFix) {
+      rewriter.setInsertionPointAfter(indexOp);
+      Value localIdx = indexOp.getResult();
+      // globalIdx = tile start (forall IV) + tile-local offset (linalg.index).
+      Value globalIdx =
+          rewriter.create<arith::AddIOp>(indexOp.getLoc(), iv, localIdx);
+      // Replace all uses of localIdx with globalIdx except in the AddIOp
+      // itself, which reads localIdx as one of its operands.
+      localIdx.replaceUsesWithIf(globalIdx, [&](OpOperand &use) {
+        return use.getOwner() != globalIdx.getDefiningOp();
+      });
+    }
+  }
+}
 
 static LogicalResult
 applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
@@ -347,6 +470,16 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
           return std::nullopt;
       }
 
+      // Subgroup level: do NOT fuse ops with derived_thread config into the
+      // warp forall.  These are workgroup-level cooperative copies that must
+      // remain at block scope so all threads cooperatively load the full tile.
+      if (tilingLevel == NovaTilingLevel::Subgroup) {
+        if (auto ownerConfig = getLoweringConfig(owner)) {
+          if (isDerivedThreadConfig(ownerConfig))
+            return std::nullopt;
+        }
+      }
+
       // Yield replacement: needed for ops with post-root users, but NOT
       // at reduction level (would yield large tensors).
       bool yieldProducerReplacement = false;
@@ -408,6 +541,20 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
           << "nova-gpu-apply-tiling-level: tiling failed at level "
           << static_cast<int>(tilingLevel) << ", skipping\n";
       continue;
+    }
+
+    // Fix tile-local linalg.index in tensor.extract for reduction dims tiled
+    // at the Thread level via PartialReductionOuterParallel.
+    //
+    // When tiling a reduction dim across threads, formal operands are correctly
+    // sliced (the tile-start offset is baked into tensor.extract_slice), but
+    // tensor.extract on non-operand tensors inside the linalg body still uses
+    // linalg.index i with a tile-local value (0..tile_size-1). Those callers
+    // need the global index (forall_iv + local), so we add the forall IV here.
+    if (tilingLevel == NovaTilingLevel::Thread) {
+      fixupReductionTiledLinalgIndex(
+          rewriter, cast<linalg::LinalgOp>(tilingOp.getOperation()), *result,
+          tileSizes);
     }
 
     // Replace original uses with tiled results.

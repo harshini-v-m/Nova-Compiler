@@ -60,6 +60,15 @@ void tileToThreads(RewriterBase &rewriter,
   if (!linalgOp)
     return;
 
+  // Skip ops that are explicitly configured for MMA — these must remain
+  // warp-level vectors for the tensor-core unroller and ConvertVectorToGPU
+  // to work correctly. Creating a thread forall here would break the
+  // warp-cooperative mma.sync execution model.
+  if (auto config = nova::getLoweringConfig(linalgOp)) {
+    if (nova::getMmaKindRaw(config) != 0)
+      return;
+  }
+
   SmallVector<int64_t> loopRanges = linalgOp.getStaticLoopRanges();
   auto iterTypes = linalgOp.getIteratorTypesArray();
   int64_t numLoops = loopRanges.size();

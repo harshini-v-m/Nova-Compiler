@@ -71,6 +71,8 @@ add_mlir_library(NovaLLVMGPUTransforms
   Loops/NovaNormalizeLoopBounds.cpp
   # Warp-level shuffle reduction
   Loops/NovaWarpShuffleReduction.cpp
+  # Stride-32 parallelization for single-thread reductions
+  Loops/NovaStrideReduction.cpp
 
   # ── Lowering ──────────────────────────────────────────────────────────────
   # Convert scf.forall → gpu.launch with dynamic block dims
@@ -88,6 +90,8 @@ add_mlir_library(NovaLLVMGPUTransforms
   # GenericVectorization, SubsetHoisting, VectorDistribute, UnrollToIntrinsics,
   # VectorizeMemrefCopy, PackToIntrinsics, LowerPackOps (Batch 2)
   Vectorization/NovaGPUVectorization.cpp
+  
+  Vectorization/NovaGPUHoistExtractInsert.cpp
 
   DEPENDS
   MLIRNovaOpsIncGen
