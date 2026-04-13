@@ -399,6 +399,23 @@ namespace mlir::nova
     pm.addPass(createCSEPass());
 
     // -------------------------------------------------------------------------
+    // Stage 19b: Vector Distribution (warp-level → per-lane fragments)
+    //
+    // Distributes the warp-level vector.contract accumulator produced by
+    // UnrollToIntrinsics (e.g. vector<16x8x64xf32> = 8,192 f32 = 32KB) across
+    // the 32 warp lanes before GPU outlining.  Without this pass the entire
+    // accumulator is captured by GpuKernelOutliningPass as a by-value kernel
+    // parameter, exceeding the 4KB CUDA hardware parameter space limit and
+    // causing CUDA_ERROR_INVALID_PTX from register explosion (18,173 vregs).
+    //
+    // MUST run AFTER UnrollToIntrinsics (contracts are MMA-sized) and
+    // BEFORE bufferization (still tensor/vector form for clean warp outlining).
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaGPUVectorDistributePass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+    // -------------------------------------------------------------------------
     // Stage 20: Generalize Remaining Named Ops  (sm_80+ only, post-vectorize)
     //
     // For sm_80+: named contraction ops are already gone (vectorized in
@@ -461,6 +478,11 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
+    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaGPUReduceBankConflictsPass(cudaArch));
+    // pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+
+
+
     // -------------------------------------------------------------------------
     // Step 8.5: Eliminate degenerate single-iteration foralls
     //
@@ -502,6 +524,8 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
 
 
+    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaGPUApplySwizzlePass());
+    // pm.addPass(createCanonicalizerPass());
 
     pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
 
@@ -804,6 +828,112 @@ namespace mlir::nova
                                                   std::move(writeFoldPatterns));
             }
 
+            // Step 2.5: Lower extract_strided_slice(transfer_read) →
+            // direct smaller transfer_read.
+            //
+            // populatePrepareVectorToMMAPatterns (Step 3) requires that the
+            // MMA accumulator operand of every vector.contract comes DIRECTLY
+            // from a vector.transfer_read.  When the tile subgroup size is
+            // [1,32,16] the unroller produces 2×2 MMA tiles per warp, so
+            // the accumulator is loaded as vector<32x16xf32> and each
+            // vector<16x8xf32> fragment is extracted via
+            // vector.extract_strided_slice.  Step 3 cannot match this chain.
+            //
+            // This pass folds the extraction offset into the read indices:
+            //   %big  = transfer_read %mem[b, m, n]  : vector<32x16xf32>
+            //   %frag = extract_strided_slice %big {off=[dm,dn], sz=[16,8]}
+            // becomes:
+            //   %frag = transfer_read %mem[b, m+dm, n+dn] : vector<16x8xf32>
+            //
+            // This is exactly the read-side symmetric of the write-side
+            // FoldInsertStridedSliceIntoTransferWrite above.
+            {
+              struct SplitTransferReadExtract
+                  : public OpRewritePattern<vector::ExtractStridedSliceOp> {
+                using OpRewritePattern::OpRewritePattern;
+                LogicalResult matchAndRewrite(
+                    vector::ExtractStridedSliceOp extractOp,
+                    PatternRewriter &rewriter) const override {
+                  // Only handle 2-D extractions (MMA accumulator tiles).
+                  auto resultType =
+                      cast<VectorType>(extractOp.getType());
+                  if (resultType.getRank() != 2) return failure();
+
+                  // Source must be a transfer_read from a memref.
+                  auto readOp = extractOp.getVector()
+                                    .getDefiningOp<vector::TransferReadOp>();
+                  if (!readOp) return failure();
+                  if (!isa<MemRefType>(readOp.getBase().getType()))
+                    return failure();
+
+                  // Source vector must be 2-D.
+                  auto srcVecType = readOp.getVectorType();
+                  if (srcVecType.getRank() != 2) return failure();
+
+                  // No mask allowed.
+                  if (readOp.getMask()) return failure();
+
+                  // Strides of the extract must all be 1.
+                  auto strides =
+                      extractOp.getStrides().getAsValueRange<IntegerAttr>();
+                  if (!llvm::all_of(strides,
+                                    [](const APInt &v) { return v.isOne(); }))
+                    return failure();
+
+                  // Permutation map must be a "minor identity": the last
+                  // vecRank input dimensions mapped to output in order.
+                  // This guarantees that extract offsets [dm, dn] directly
+                  // correspond to the last two memref indices.
+                  AffineMap permMap = readOp.getPermutationMap();
+                  unsigned numMemDims =
+                      cast<MemRefType>(readOp.getBase().getType()).getRank();
+                  unsigned vecRank = srcVecType.getRank(); // 2
+                  if (permMap.getNumResults() != vecRank) return failure();
+                  unsigned dimBase = numMemDims - vecRank;
+                  for (unsigned i = 0; i < vecRank; ++i) {
+                    auto dim =
+                        dyn_cast<AffineDimExpr>(permMap.getResult(i));
+                    if (!dim || dim.getPosition() != dimBase + i)
+                      return failure();
+                  }
+
+                  // Gather extract offsets.
+                  SmallVector<int64_t, 2> offsets;
+                  for (auto attr :
+                       extractOp.getOffsets().getAsValueRange<IntegerAttr>())
+                    offsets.push_back(attr.getSExtValue());
+                  if ((unsigned)offsets.size() != vecRank) return failure();
+
+                  // Build adjusted indices for the new read.
+                  Location loc = extractOp.getLoc();
+                  SmallVector<Value> newIndices =
+                      llvm::to_vector(readOp.getIndices());
+                  for (unsigned i = 0; i < vecRank; ++i) {
+                    if (offsets[i] != 0) {
+                      Value cst = rewriter.create<arith::ConstantIndexOp>(
+                          loc, offsets[i]);
+                      newIndices[dimBase + i] = rewriter.create<arith::AddIOp>(
+                          loc, newIndices[dimBase + i], cst);
+                    }
+                  }
+
+                  // Emit the new smaller transfer_read.
+                  // The permutation map stays the same (same rank mapping,
+                  // just a smaller result vector type).
+                  SmallVector<bool> inBounds(resultType.getRank(), true);
+                  Value newRead = rewriter.create<vector::TransferReadOp>(
+                      loc, resultType, readOp.getBase(), newIndices,
+                      readOp.getPadding(), permMap, inBounds);
+                  rewriter.replaceOp(extractOp, newRead);
+                  return success();
+                }
+              };
+              RewritePatternSet readSplitPatterns(&getContext());
+              readSplitPatterns.add<SplitTransferReadExtract>(&getContext());
+              (void)applyPatternsAndFoldGreedily(
+                  funcOp, std::move(readSplitPatterns));
+            }
+
             // Step 3: Prepare transfers → nvgpu fragment form.
             {
               RewritePatternSet patterns(&getContext());
@@ -859,26 +989,26 @@ namespace mlir::nova
       gpuHwPm.addPass(createCSEPass());
 
       // DEBUG: Dump IR AFTER ConvertVectorToGPU
-      gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
-        struct DumpAfterVectorToGPUPass
-            : public PassWrapper<DumpAfterVectorToGPUPass,
-                                 OperationPass<gpu::GPUFuncOp>> {
-          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DumpAfterVectorToGPUPass)
-          void runOnOperation() override {
-            bool hasContracts = false;
-            getOperation().walk([&](vector::ContractionOp) { hasContracts = true; });
-            if (hasContracts) {
-              llvm::errs() << "\n===== IR AFTER ConvertVectorToGPU (unconverted contracts remain) =====\n";
-              getOperation().print(llvm::errs(), OpPrintingFlags().useLocalScope());
-              llvm::errs() << "\n===== END POST-CONVERT DUMP =====\n\n";
-            }
-          }
-          StringRef getArgument() const override {
-            return "nova-dump-after-vector-to-gpu";
-          }
-        };
-        return std::make_unique<DumpAfterVectorToGPUPass>();
-      }());
+      // gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
+      //   struct DumpAfterVectorToGPUPass
+      //       : public PassWrapper<DumpAfterVectorToGPUPass,
+      //                            OperationPass<gpu::GPUFuncOp>> {
+      //     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DumpAfterVectorToGPUPass)
+      //     void runOnOperation() override {
+      //       bool hasContracts = false;
+      //       getOperation().walk([&](vector::ContractionOp) { hasContracts = true; });
+      //       if (hasContracts) {
+      //         llvm::errs() << "\n===== IR AFTER ConvertVectorToGPU (unconverted contracts remain) =====\n";
+      //         getOperation().print(llvm::errs(), OpPrintingFlags().useLocalScope());
+      //         llvm::errs() << "\n===== END POST-CONVERT DUMP =====\n\n";
+      //       }
+      //     }
+      //     StringRef getArgument() const override {
+      //       return "nova-dump-after-vector-to-gpu";
+      //     }
+      //   };
+      //   return std::make_unique<DumpAfterVectorToGPUPass>();
+      // }());
 
       // 35c. Fix missing tf32_enabled on f32 nvgpu.mma.sync ops.
       gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {

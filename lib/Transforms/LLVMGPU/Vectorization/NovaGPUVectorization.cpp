@@ -198,12 +198,23 @@ struct NovaGPUGenericVectorizationPass
   // custom CUDA kernel and eliminating the precision mismatch.
   static bool tryVectorizeAsContraction(IRRewriter &rewriter,
                                         linalg::LinalgOp op) {
-    // Must have exactly 2 ins and 1 out, 3 loops [par, par, red].
+    // Accept 3-loop [par, par, red] for 2D matmul, or
+    //        4-loop [par(batch), par, par, red] for 3D batch_matmul with batch=1.
     auto iterTypes = op.getIteratorTypesArray();
-    if (iterTypes.size() != 3) return false;
-    if (iterTypes[0] != utils::IteratorType::parallel ||
-        iterTypes[1] != utils::IteratorType::parallel ||
-        iterTypes[2] != utils::IteratorType::reduction) return false;
+    bool isBatch = (iterTypes.size() == 4);
+    if (iterTypes.size() != 3 && iterTypes.size() != 4) return false;
+
+    if (isBatch) {
+      if (iterTypes[0] != utils::IteratorType::parallel ||
+          iterTypes[1] != utils::IteratorType::parallel ||
+          iterTypes[2] != utils::IteratorType::parallel ||
+          iterTypes[3] != utils::IteratorType::reduction) return false;
+    } else {
+      if (iterTypes[0] != utils::IteratorType::parallel ||
+          iterTypes[1] != utils::IteratorType::parallel ||
+          iterTypes[2] != utils::IteratorType::reduction) return false;
+    }
+
     if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1) return false;
     // For linalg.generic, verify the body is a matmul (mulf+addf).
     // Named ops (linalg.matmul, linalg.batch_matmul) are matmuls by definition.
@@ -217,17 +228,76 @@ struct NovaGPUGenericVectorizationPass
     auto cTy = dyn_cast<RankedTensorType>(outs[0].getType());
     if (!aTy || !bTy || !cTy) return false;
     if (!aTy.hasStaticShape() || !bTy.hasStaticShape() || !cTy.hasStaticShape()) return false;
-    if (aTy.getRank() != 2 || bTy.getRank() != 2 || cTy.getRank() != 2) return false;
 
-    // Verify indexing maps are exactly: [d0,d2], [d2,d1], [d0,d1].
-    auto maps = op.getIndexingMapsArray();
+    // In a 4-loop (batch) context the weight matrix B can be either:
+    //   • Fully batched:  A=[1,M,K], B=[1,K,N], C=[1,M,N]  (all rank-3, batch=1)
+    //   • Broadcast batch: A=[1,M,K], B=[K,N],   C=[1,M,N]  (B is rank-2, shared)
+    //
+    // The broadcast layout is by far the most common in transformer models
+    // (the weight matrix is not replicated per batch element).
+    // We handle both here so that linalg::vectorize() is not used as a fallback,
+    // which would lose the mma_kind config and produce SIMT contracts.
+    bool bIsBroadcast = isBatch && (bTy.getRank() == 2);
+
+    if (!isBatch) {
+      // Pure 2D path: all operands must be rank-2.
+      if (aTy.getRank() != 2 || bTy.getRank() != 2 || cTy.getRank() != 2)
+        return false;
+    } else {
+      // Batch path: A and C must be rank-3; B may be rank-2 (broadcast) or rank-3.
+      if (aTy.getRank() != 3 || cTy.getRank() != 3) return false;
+      if (!bIsBroadcast && bTy.getRank() != 3) return false;
+      // The batch dimension (shape[0]) of A and C must be 1 so the whole tile
+      // collapses into a single 2-D vector.contract that MMA can lower.
+      if (aTy.getShape()[0] != 1 || cTy.getShape()[0] != 1) return false;
+      // For fully-batched B (rank-3) the batch dim must also be 1.
+      if (!bIsBroadcast && bTy.getShape()[0] != 1) return false;
+    }
+
     MLIRContext *ctx = op.getContext();
-    auto expectedA = AffineMap::get(3, 0, {getAffineDimExpr(0, ctx), getAffineDimExpr(2, ctx)}, ctx);
-    auto expectedB = AffineMap::get(3, 0, {getAffineDimExpr(2, ctx), getAffineDimExpr(1, ctx)}, ctx);
-    auto expectedC = AffineMap::get(3, 0, {getAffineDimExpr(0, ctx), getAffineDimExpr(1, ctx)}, ctx);
+    auto maps = op.getIndexingMapsArray();
+
+    // Verify indexing maps.
+    //   2D: A=[d0,d2], B=[d2,d1], C=[d0,d1]                    (3 iter dims)
+    //   3D fully-batched: A=[d0,d1,d3], B=[d0,d3,d2], C=[d0,d1,d2]  (4 iter dims)
+    //   3D broadcast:     A=[d0,d1,d3], B=[d3,d2],   C=[d0,d1,d2]  (4 iter dims, B no batch)
+    AffineMap expectedA, expectedB, expectedC;
+    if (!isBatch) {
+      expectedA = AffineMap::get(3, 0,
+          {getAffineDimExpr(0, ctx), getAffineDimExpr(2, ctx)}, ctx);
+      expectedB = AffineMap::get(3, 0,
+          {getAffineDimExpr(2, ctx), getAffineDimExpr(1, ctx)}, ctx);
+      expectedC = AffineMap::get(3, 0,
+          {getAffineDimExpr(0, ctx), getAffineDimExpr(1, ctx)}, ctx);
+    } else if (bIsBroadcast) {
+      expectedA = AffineMap::get(4, 0,
+          {getAffineDimExpr(0, ctx), getAffineDimExpr(1, ctx), getAffineDimExpr(3, ctx)}, ctx);
+      // B has no batch dim: its map skips d0.
+      expectedB = AffineMap::get(4, 0,
+          {getAffineDimExpr(3, ctx), getAffineDimExpr(2, ctx)}, ctx);
+      expectedC = AffineMap::get(4, 0,
+          {getAffineDimExpr(0, ctx), getAffineDimExpr(1, ctx), getAffineDimExpr(2, ctx)}, ctx);
+    } else {
+      // Fully-batched B
+      expectedA = AffineMap::get(4, 0,
+          {getAffineDimExpr(0, ctx), getAffineDimExpr(1, ctx), getAffineDimExpr(3, ctx)}, ctx);
+      expectedB = AffineMap::get(4, 0,
+          {getAffineDimExpr(0, ctx), getAffineDimExpr(3, ctx), getAffineDimExpr(2, ctx)}, ctx);
+      expectedC = AffineMap::get(4, 0,
+          {getAffineDimExpr(0, ctx), getAffineDimExpr(1, ctx), getAffineDimExpr(2, ctx)}, ctx);
+    }
     if (maps[0] != expectedA || maps[1] != expectedB || maps[2] != expectedC) return false;
 
-    int64_t M = cTy.getShape()[0], N = cTy.getShape()[1], K = aTy.getShape()[1];
+    // Extract logical M, N, K from the appropriate shape dimensions.
+    int64_t M, N, K;
+    if (!isBatch) {
+      M = cTy.getShape()[0]; N = cTy.getShape()[1]; K = aTy.getShape()[1];
+    } else if (bIsBroadcast) {
+      M = cTy.getShape()[1]; N = cTy.getShape()[2]; K = aTy.getShape()[2];
+    } else {
+      M = cTy.getShape()[1]; N = cTy.getShape()[2]; K = aTy.getShape()[2];
+    }
+
     Type elemTy = cTy.getElementType();
     auto lhsVT = VectorType::get({M, K}, elemTy);
     auto rhsVT = VectorType::get({K, N}, elemTy);
@@ -236,19 +306,43 @@ struct NovaGPUGenericVectorizationPass
     Location loc = op.getLoc();
     rewriter.setInsertionPoint(op);
     Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(elemTy));
-    SmallVector<Value> zeroIdx = {rewriter.create<arith::ConstantIndexOp>(loc, 0),
-                                  rewriter.create<arith::ConstantIndexOp>(loc, 0)};
-    // in_bounds = [true, true] since shapes are static and we verified sizes match.
-    SmallVector<bool> inBounds2D = {true, true};
-    Value lhs = rewriter.create<vector::TransferReadOp>(loc, lhsVT, ins[0], zeroIdx,
-                                                        zero, inBounds2D);
-    Value rhs = rewriter.create<vector::TransferReadOp>(loc, rhsVT, ins[1], zeroIdx,
-                                                        zero, inBounds2D);
-    Value acc = rewriter.create<vector::TransferReadOp>(loc, accVT, outs[0], zeroIdx,
-                                                        zero, inBounds2D);
+    Value zeroI = rewriter.create<arith::ConstantIndexOp>(loc, 0);
 
-    // Build vector.contract with the same maps.
-    SmallVector<AffineMap> cMaps = {expectedA, expectedB, expectedC};
+    // in_bounds has one entry per *vector* dimension (always 2D here).
+    SmallVector<bool> inBoundsVec = {true, true};
+
+    Value lhs, rhs, acc;
+    if (!isBatch) {
+      SmallVector<Value> zeroIdx = {zeroI, zeroI};
+      // Implicit identity permutation map for same-rank 2D transfers.
+      lhs = rewriter.create<vector::TransferReadOp>(loc, lhsVT, ins[0],  zeroIdx, zero, inBoundsVec);
+      rhs = rewriter.create<vector::TransferReadOp>(loc, rhsVT, ins[1],  zeroIdx, zero, inBoundsVec);
+      acc = rewriter.create<vector::TransferReadOp>(loc, accVT, outs[0], zeroIdx, zero, inBoundsVec);
+    } else {
+      // A and C are rank-3 [1, M, K] / [1, M, N].  Use a projection map that
+      // drops the batch d0 (always 0), mapping src dims (d0,d1,d2) → (d1,d2).
+      SmallVector<Value> zeroIdx3 = {zeroI, zeroI, zeroI};
+      auto projAC = AffineMap::get(3, 0,
+          {getAffineDimExpr(1, ctx), getAffineDimExpr(2, ctx)}, ctx);
+      // Builder: (loc, vectorType, source, indices, padding, permutationMap, inBounds)
+      lhs = rewriter.create<vector::TransferReadOp>(loc, lhsVT, ins[0],  zeroIdx3, zero, projAC, inBoundsVec);
+      acc = rewriter.create<vector::TransferReadOp>(loc, accVT, outs[0], zeroIdx3, zero, projAC, inBoundsVec);
+
+      if (bIsBroadcast) {
+        // B is rank-2 [K, N] with no batch dim — use plain 2D transfer_read.
+        SmallVector<Value> zeroIdx2 = {zeroI, zeroI};
+        rhs = rewriter.create<vector::TransferReadOp>(loc, rhsVT, ins[1], zeroIdx2, zero, inBoundsVec);
+      } else {
+        // B is rank-3 [1, K, N] — same projection as A/C.
+        rhs = rewriter.create<vector::TransferReadOp>(loc, rhsVT, ins[1], zeroIdx3, zero, projAC, inBoundsVec);
+      }
+    }
+
+    // The vector.contract always uses 2-D maps regardless of source rank.
+    auto contractA = AffineMap::get(3, 0, {getAffineDimExpr(0, ctx), getAffineDimExpr(2, ctx)}, ctx);
+    auto contractB = AffineMap::get(3, 0, {getAffineDimExpr(2, ctx), getAffineDimExpr(1, ctx)}, ctx);
+    auto contractC = AffineMap::get(3, 0, {getAffineDimExpr(0, ctx), getAffineDimExpr(1, ctx)}, ctx);
+    SmallVector<AffineMap> cMaps = {contractA, contractB, contractC};
     SmallVector<Attribute> iterAttrs = {
         vector::IteratorTypeAttr::get(ctx, vector::IteratorType::parallel),
         vector::IteratorTypeAttr::get(ctx, vector::IteratorType::parallel),
@@ -266,13 +360,26 @@ struct NovaGPUGenericVectorizationPass
     if (auto cfg = getLoweringConfig(op.getOperation()))
       setLoweringConfig(contractOp, cfg);
 
-    // [RECTIFICATION] Also carry the config to the transfer_write to ensure 
-    // stability through bufferization/hoisting.
-    auto writeOp = rewriter.create<vector::TransferWriteOp>(loc, contractOp.getResult(), outs[0], zeroIdx,
-                                                             inBounds2D);
-    if (auto cfg = getLoweringConfig(op.getOperation()))
-      setLoweringConfig(writeOp, cfg);
-    rewriter.replaceOp(op, writeOp->getResult(0));
+    // Write the contraction result back, using the same projection for 3D.
+    Value writeResult;
+    if (isBatch) {
+      SmallVector<Value> zeroIdx3 = {zeroI, zeroI, zeroI};
+      auto projW = AffineMap::get(3, 0,
+          {getAffineDimExpr(1, ctx), getAffineDimExpr(2, ctx)}, ctx);
+      auto writeOp = rewriter.create<vector::TransferWriteOp>(
+          loc, contractOp.getResult(), outs[0], zeroIdx3, projW, inBoundsVec);
+      if (auto cfg = getLoweringConfig(op.getOperation()))
+        setLoweringConfig(writeOp, cfg);
+      writeResult = writeOp->getResult(0);
+    } else {
+      SmallVector<Value> zeroIdx = {zeroI, zeroI};
+      auto writeOp = rewriter.create<vector::TransferWriteOp>(
+          loc, contractOp.getResult(), outs[0], zeroIdx, inBoundsVec);
+      if (auto cfg = getLoweringConfig(op.getOperation()))
+        setLoweringConfig(writeOp, cfg);
+      writeResult = writeOp->getResult(0);
+    }
+    rewriter.replaceOp(op, writeResult);
     return true;
   }
 
@@ -680,63 +787,210 @@ struct NovaGPUVectorDistributePass
     }
 
     // -----------------------------------------------------------------------
-    // Step 2: Lower vector.contract → outer-product chains.
-    // After PackToIntrinsics + UnrollToIntrinsics, each lane sees a single
-    // MMA-sized vector.contract ({16,16,16} or {16,8,16}).  Lowering to
-    // outer-products decomposes this into a chain of vector.outerproduct ops
-    // that can be independently distributed across the 32 warp lanes.
-    // Then flatten transfer rank to 1 so warp distribution sees simple 1-D
-    // vectors (no 2-D tile shapes that confuse the warp op matcher).
+    // Step 1b: Fold extract(insert_strided_slice chain) + reduction chains.
     //
-    // SKIP when any linalg op in this function carries a non-NONE mma_kind:
-    // the contracts will be preserved for PrepareVectorToGPU + ConvertVectorToGPU
-    // in the gpuPm (post-outlining) which converts them directly to
-    // gpu.subgroup_mma_compute (TF32 mma.sync for FP32 matmuls on sm_80+).
-    // Lowering to outer-products here would lose the TF32 precision path.
+    // When a matmul tile is vectorized via linalg::vectorize() (rather than
+    // tryVectorizeAsContraction — e.g. because the op has a batch dim of 1),
+    // the K-loop is unrolled into:
+    //   %p0 = mulf(A_k0, B_k0) : vector<16x8x8xf32>
+    //   %v0 = insert_strided_slice %p0, %zero  {offsets=[0,0,0]}  → vector<16x8x64xf32>
+    //   %p1 = mulf(A_k8, B_k8) : vector<16x8x8xf32>
+    //   %v1 = insert_strided_slice %p1, %v0   {offsets=[0,0,8]}   → vector<16x8x64xf32>
+    //   ... (8 tiles total) ...
+    //   %slice = vector.extract %final[i, j]   → vector<64xf32>
+    //   %sum   = vector.reduction<add> %slice  → f32
+    //
+    // The 3D accumulator vector<16x8x64xf32> = 8,192 f32 = 32 KB stays alive
+    // through GPU outlining and becomes a by-value kernel parameter, triggering
+    // CUDA_ERROR_INVALID_PTX (parameter space overflow + register explosion).
+    //
+    // This pattern rewrites to:
+    //   %r0  = vector.extract %p0[i, j]          → vector<8xf32>
+    //   %s0  = vector.reduction<add> %r0, %init  → f32
+    //   %r1  = vector.extract %p1[i, j]          → vector<8xf32>
+    //   %s1  = vector.reduction<add> %r1, %s0    → f32
+    //   ... → %sum
+    //
+    // This eliminates the 3D accumulator entirely; each per-tile partial
+    // product (vector<16x8x8xf32> = 128 f32 = 512 bytes) is reduced and
+    // discarded immediately, keeping the working set at vector<16x8xf32>.
     // -----------------------------------------------------------------------
     {
-      // Always lower all vector.contract ops via the SIMT outer-product path.
-      //
-      // DESIGN NOTE — why we do NOT use the nvgpu.mma.sync (tensor core) path:
-      //
-      // nvgpu.mma.sync operates at the level of per-thread fragments.  For
-      // TF32 m16n8k8 each thread in a 32-thread warp holds only 4 A-elements,
-      // 2 B-elements and 4 C-elements.  Correct lowering therefore requires:
-      //   1. Warp-level vector.contract (16×8) distributed to per-thread
-      //      fragments via a warp-distribution pass.
-      //   2. Distributed contracts (vector<2x1>, vector<1x1>, vector<2x2>)
-      //      converted to nvgpu.mma.sync by ConvertVectorToGPU.
-      //
-      // Our current kernel structure assigns one thread per output tile (8
-      // threads each computing a full 16×8 accumulation), NOT 32 threads
-      // cooperating on a single warp tile.  Passing warp-level vectors
-      // (vector<16x8xf32>) directly to nvgpu.mma.sync is architecturally
-      // incorrect — the per-thread type mismatch causes PrepareVectorToMMA
-      // patterns to silently not match, leaving contracts un-lowered, which
-      // then fall through to a broken scalar-loop path that emits a 3-byte
-      // PTX binary (all zeros).
-      //
-      // Implementing proper warp-level tensor-core distribution requires a
-      // non-trivial redesign (assign 32-thread warps to 16×8 tiles, run
-      // warp distribution, emit per-thread fragments).  Until that redesign
-      // is complete, ALL contracts are routed through the outer-product path:
-      //   vector.contract → vector.outerproduct → llvm.fma
-      // This produces numerically correct results (FP32 precision) identical
-      // to the eager path and successfully compiles to valid PTX.
-      {
-        RewritePatternSet patterns(ctx);
-        vector::populateVectorContractLoweringPatterns(
-            patterns, vector::VectorContractLowering::OuterProduct);
-        vector::populateVectorTransferLoweringPatterns(patterns,
-                                                       /*maxTransferRank=*/1);
-        (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
-      }
+      struct FoldExtractInsertChainReduction
+          : OpRewritePattern<vector::ReductionOp> {
+        using OpRewritePattern::OpRewritePattern;
+
+        LogicalResult matchAndRewrite(vector::ReductionOp redOp,
+                                      PatternRewriter &rewriter) const override {
+          if (redOp.getKind() != vector::CombiningKind::ADD)
+            return failure();
+
+          // The vector being reduced must come from vector.extract [i, j, ...].
+          auto extractOp =
+              redOp.getVector().getDefiningOp<vector::ExtractOp>();
+          if (!extractOp)
+            return failure();
+
+          // All extract positions must be static (constant indices).
+          // getMixedPosition() returns SmallVector<OpFoldResult>; each entry
+          // is either an Attribute (static) or a Value (dynamic).
+          auto mixedPos = extractOp.getMixedPosition();
+          SmallVector<int64_t> iPos;
+          for (auto p : mixedPos) {
+            if (!isa<Attribute>(p))
+              return failure(); // dynamic index — can't fold statically
+            iPos.push_back(cast<IntegerAttr>(cast<Attribute>(p)).getInt());
+          }
+
+          // Walk the insert_strided_slice chain, collecting all tiles with
+          // their full offset vectors.  Tiles may vary in ALL dimensions —
+          // e.g. vector<32x16x64xf32> assembled from vector<16x8x8xf32> tiles
+          // at offsets [d0_off, d1_off, d2_off].
+          //
+          // For a given extract position iPos[0..N-2] (covering all dims
+          // except the last inner dim), only tiles where
+          //   offset[d] ≤ iPos[d] < offset[d] + tileDim[d]   (for d < rank-1)
+          // contribute.  The contributing local index inside that tile is
+          //   localPos[d] = iPos[d] - offset[d].
+          struct TileEntry {
+            SmallVector<int64_t> offsets;
+            Value tile;
+          };
+          SmallVector<TileEntry> allTiles;
+          Value cur = extractOp.getVector();
+          VectorType tileTy;
+          while (auto insertOp =
+                     cur.getDefiningOp<vector::InsertStridedSliceOp>()) {
+            // getOffsets() / getStrides() return ArrayAttr of IntegerAttr.
+            SmallVector<int64_t> offsets, strides;
+            for (auto a : insertOp.getOffsets().getAsRange<IntegerAttr>())
+              offsets.push_back(a.getInt());
+            for (auto a : insertOp.getStrides().getAsRange<IntegerAttr>())
+              strides.push_back(a.getInt());
+            // Require unit strides.
+            for (auto s : strides)
+              if (s != 1)
+                return failure();
+            Value tile = insertOp.getValueToStore();
+            auto tTy = dyn_cast<VectorType>(tile.getType());
+            if (!tTy)
+              return failure();
+            if (tileTy && tileTy != tTy)
+              return failure(); // all tiles must be the same shape
+            tileTy = tTy;
+            allTiles.push_back({offsets, tile});
+            cur = insertOp.getDest();
+          }
+          if (allTiles.size() < 2)
+            return failure();
+
+          // iPos covers the first (rank-1) dimensions of the tile.
+          if ((int64_t)iPos.size() != tileTy.getRank() - 1)
+            return failure();
+
+          // Filter to tiles that contain the extract position iPos in their
+          // first (rank-1) dimensions, and compute the local sub-index.
+          struct ContribEntry {
+            SmallVector<int64_t> localPos; // per-tile extract index (rank-1)
+          };
+          SmallVector<std::pair<ContribEntry, Value>> contribs;
+          for (auto &te : allTiles) {
+            bool inBounds = true;
+            SmallVector<int64_t> localPos;
+            for (size_t d = 0; d < iPos.size(); ++d) {
+              int64_t lo = te.offsets[d];
+              int64_t hi = lo + tileTy.getDimSize(d);
+              if (iPos[d] < lo || iPos[d] >= hi) {
+                inBounds = false;
+                break;
+              }
+              localPos.push_back(iPos[d] - lo);
+            }
+            if (inBounds)
+              contribs.push_back({{localPos}, te.tile});
+          }
+          if (contribs.empty())
+            return failure();
+
+          // No sort needed — vector.reduction<add> is commutative so
+          // accumulation order does not affect the result.
+
+          // Build: acc = init; for each contributing tile:
+          //   subVec = extract(tile, localPos)  → 1-D vector (inner K-sub dim)
+          //   acc    = reduce<add>(subVec, acc)
+          Location loc = redOp.getLoc();
+          Value acc = redOp.getAcc();
+          if (!acc)
+            acc = rewriter.create<arith::ConstantOp>(
+                loc, rewriter.getZeroAttr(redOp.getType()));
+
+          for (auto &[ce, tile] : contribs) {
+            Value subVec =
+                rewriter.create<vector::ExtractOp>(loc, tile, ce.localPos);
+            acc = rewriter.create<vector::ReductionOp>(
+                loc, vector::CombiningKind::ADD, subVec, acc);
+          }
+          rewriter.replaceOp(redOp, acc);
+          return success();
+        }
+      };
+
+      RewritePatternSet patterns(ctx);
+      patterns.add<FoldExtractInsertChainReduction>(ctx);
+      (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
     }
 
     // -----------------------------------------------------------------------
-    // Step 3: Flatten shape-cast chains introduced by outer-product lowering.
+    // Step 2 (MMA check): Detect whether this function targets tensor-core
+    // (mma.sync) intrinsics via a non-NONE mma_kind in lowering_config.
+    //
+    //   MMA path  (hasMMAContract == true):
+    //     Preserve vector.contract ops here.  They flow to PrepareVectorToGPU
+    //     + ConvertVectorToGPU in the GPU pass pipeline (post-GPU-outlining),
+    //     which wraps them per-thread in WarpExecuteOnLane0 and lowers to
+    //     gpu.subgroup_mma_compute → mma.sync PTX.
+    //
+    //   SIMT path (hasMMAContract == false):
+    //     Lower vector.contract → vector.outerproduct → llvm.fma.  This path
+    //     is numerically correct (FP32 FMA, single rounding) but MUST NOT be
+    //     used for large matmuls (e.g. 5120×5120): the outer-product chains
+    //     for K=5120 create enormous register pressure that causes GPU kernel
+    //     stalling regardless of whether PTX compilation succeeds.
     // -----------------------------------------------------------------------
-    {
+    bool hasMMAContract = false;
+    funcOp.walk([&](vector::ContractionOp contractOp) {
+      Operation *cur = contractOp.getOperation();
+      while (cur) {
+        if (auto cfg = getLoweringConfig(cur)) {
+          if (getMmaKindRaw(cfg) != 0) {
+            hasMMAContract = true;
+            return WalkResult::interrupt();
+          }
+        }
+        cur = cur->getParentOp();
+      }
+      return WalkResult::advance();
+    });
+
+    if (!hasMMAContract) {
+      // SIMT (CUDA-core) path: lower vector.contract → outer-product → llvm.fma.
+      // Safe for small tile sizes where the outerproduct chain fits in registers.
+      RewritePatternSet patterns(ctx);
+      vector::populateVectorContractLoweringPatterns(
+          patterns, vector::VectorContractLowering::OuterProduct);
+      vector::populateVectorTransferLoweringPatterns(patterns,
+                                                     /*maxTransferRank=*/1);
+      (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
+    }
+    // MMA path: vector.contract ops are preserved for ConvertVectorToGPU
+    // (mma.sync / tensor-core lowering in the GPU pass pipeline).
+
+    // -----------------------------------------------------------------------
+    // Step 3: Flatten shape-cast chains introduced by outer-product lowering.
+    // Skip on the MMA path — contracts must keep their 2-D tile shapes so
+    // ConvertVectorToGPU pattern matching succeeds.
+    // -----------------------------------------------------------------------
+    if (!hasMMAContract) {
       RewritePatternSet patterns(ctx);
       vector::populateVectorShapeCastLoweringPatterns(patterns);
       (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
@@ -812,6 +1066,59 @@ struct NovaGPUVectorDistributePass
         src.replaceUsesWithIf(warpOp.getResult(0), [&](OpOperand &use) {
           return use.getOwner() == rop.getOperation();
         });
+      }
+
+      // MMA path: also wrap vector.contract ops in WarpExecuteOnLane0 so
+      // ConvertVectorToGPU can distribute them to per-thread MMA fragments.
+      // Each contract (e.g. vector<16x8xf32>) is wrapped with a warp-level
+      // argument; the distribution pass below produces per-lane fragment
+      // vectors that ConvertVectorToGPU converts to gpu.subgroup_mma_compute.
+      if (hasMMAContract) {
+        SmallVector<vector::ContractionOp> contracts;
+        launchOp.walk([&](vector::ContractionOp cop) {
+          contracts.push_back(cop);
+        });
+        for (vector::ContractionOp cop : contracts) {
+          auto accTy = dyn_cast<VectorType>(cop.getAcc().getType());
+          if (!accTy) continue;
+
+          OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPoint(cop);
+
+          // Per-lane accumulator: each lane owns 1 element of the output tile.
+          int64_t laneElems = std::max<int64_t>(1,
+              accTy.getNumElements() / kWarpSize);
+          VectorType perLaneAccTy = VectorType::get({laneElems},
+                                                    accTy.getElementType());
+
+          // Wrap the full contraction (lhs, rhs, acc) in the warp op.
+          // The warp body yields the contraction result; distribution
+          // propagation patterns split it per lane.
+          SmallVector<Value>    warpArgs = {cop.getLhs(), cop.getRhs(),
+                                            cop.getAcc()};
+          SmallVector<Type>     warpArgTys = {cop.getLhs().getType(),
+                                              cop.getRhs().getType(),
+                                              cop.getAcc().getType()};
+          auto warpOp = builder.create<gpu::WarpExecuteOnLane0Op>(
+              loc, TypeRange{perLaneAccTy}, laneId, kWarpSize,
+              warpArgs, warpArgTys);
+
+          Block *warpBody = warpOp.getBody(0);
+          {
+            OpBuilder::InsertionGuard wg(builder);
+            builder.setInsertionPointToEnd(warpBody);
+            // Re-emit the contraction inside the warp body using the
+            // warp-body block arguments (which carry warp-level types).
+            Value innerResult = builder.create<vector::ContractionOp>(
+                loc, warpBody->getArgument(0),
+                warpBody->getArgument(1),
+                warpBody->getArgument(2),
+                cop.getIndexingMaps(), cop.getIteratorTypes());
+            builder.create<gpu::YieldOp>(loc, ValueRange{innerResult});
+          }
+          cop.getResult().replaceAllUsesWith(warpOp.getResult(0));
+          cop.erase();
+        }
       }
     });
 
