@@ -205,6 +205,12 @@ void registerNovaMultiConsumerFusion();
 std::unique_ptr<Pass> createNovaGPUConfigureTensorLayoutsPass();
 void registerNovaGPUConfigureTensorLayoutsPass();
 
+std::unique_ptr<Pass> createNovaGPUReduceBankConflictsPass(
+    StringRef arch = "sm_86");
+void registerNovaGPUReduceBankConflictsPass();
+std::unique_ptr<Pass> createNovaGPUApplySwizzlePass();
+void registerNovaGPUApplySwizzlePass();
+
 // ---------------------------------------------------------------------------
 // Vectorization Passes  (Batch 1: declarations; wired into pipeline in Batch 2+)
 // ---------------------------------------------------------------------------
