@@ -101,7 +101,6 @@ add_mlir_library(NovaLLVMGPUTransforms
   Vectorization/NovaGPUVectorAlloc.cpp
   Vectorization/NovaGPUCombineValueSemanticBarriers.cpp
   Vectorization/NovaGPUVectorDistribution.cpp
-  Vectorization/NovaGPUHoistExtractInsert.cpp
 
   DEPENDS
   MLIRNovaOpsIncGen
