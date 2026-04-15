@@ -84,22 +84,7 @@ static bool isFillProducer(Value operand) {
   return false;
 }
 
-/// Promote a single input operand to workgroup (shared) memory.
-///
-/// Inserts: alloc_tensor(workgroup) + linalg.copy(global → shared).
-/// The operand is replaced with the copy result (in workgroup space).
-///
-/// NO fusion_barrier or per-thread copy is inserted for inputs.  The copy
-/// is left as a plain producer so that:
-///   - K-reduction tiling (Step 4) fuses it into the K-loop, giving each
-///     iteration a [wgM × kStep]-sized shared tile instead of [wgM × K].
-///   - Thread tiling (Step 5) distributes the copy across threads for
-///     cooperative loading.
-///   - InsertWorkgroupBarriers (Step 11) adds gpu.barrier between the
-///     cooperative store and the matmul read after bufferization.
-///
-/// This matches IREE's input promotion strategy where the copy tiles
-/// naturally with the consumer — no opaque barrier to block tiling.
+
 static void promoteOperandToShared(OpBuilder &builder,
                                    Operation *op,
                                    unsigned inputIdx) {
@@ -132,52 +117,37 @@ static void promoteOperandToShared(OpBuilder &builder,
       return;
   }
 
-  // Phase 1: tensor.empty() + linalg.copy with thread-only lowering_config.
-  //
-  // The copy has NO workgroup or reduction tiles, so:
-  //   - K-tiling (Step 4) fuses it as a producer into the K-loop, naturally
-  //     shrinking the copy to [wgM × kStep] or [kStep × wgN].
-  //   - Thread tiling (Step 5) sees the non-zero thread tiles and creates a
-  //     separate cooperative-loading scf.forall for the copy. This makes the
-  //     tensor.empty() a shared_outs arg of the forall.
-  //   - InferMemorySpace (Step 8) detects the alloc_tensor is used as
-  //     shared_outs of a thread-mapped forall → tags as workgroup memory.
-  //
-  // This mirrors IREE's DerivedThreadConfigAttr approach.
   SmallVector<OpFoldResult> mixedSizes =
       tensor::getMixedSizes(builder, loc, operand);
   Value empty = tensor::EmptyOp::create(builder, loc, mixedSizes,
                                         tensorType.getElementType());
   auto copyOp = linalg::CopyOp::create(builder, loc, operand, empty);
 
-  // Attach a derived-thread lowering_config: placeholder thread tiles [1,..,1]
-  // plus a "derived_thread = true" marker and the contraction's target thread
-  // count.  At thread-tiling time (Step 5), the tiling pass detects the marker
-  // and recomputes tile sizes from the copy's actual (K-tiled) loop ranges so
-  // that trip_count == targetThreads.  This guarantees the copy forall and
-  // matmul forall have matching bounds, enabling FuseForalls (Step 6).
-  //
-  // Mirrors IREE's DerivedThreadConfigAttr pattern.
+
   unsigned numLoops = copyOp.getNumLoops();
   SmallVector<int64_t> threadTiles(numLoops, 1); // placeholder (non-zero)
 
-  // Compute the contraction's thread count from its lowering_config.
+  // Compute thread count and CTA block size from the parent contraction's
+  // lowering_config.
+  //   targetThreads = warps_per_block × warp_size  (drives forall trip count)
+  //   blockDim      = same value (total threads per CTA)
+  // blockDim is stored in the copy's config so NovaGPUApplyTilingLevelReduction
+  // can pass it to deriveThreadTileSizes, which uses it to clamp perThread to a
+  // multiple of maxVec — ensuring the innermost tile is exactly 4 f32 (16 B),
+  // one cp.async.16 instruction per row.
   int64_t targetThreads = 0;
+  int64_t blockDim = 0;
   DictionaryAttr parentConfig = getLoweringConfig(op);
   if (parentConfig) {
-    auto wgTiles = getLoweringConfigTileSizes(parentConfig, kWorkgroupKey);
-    auto thTiles = getLoweringConfigTileSizes(parentConfig, kThreadKey);
-    if (wgTiles.size() == thTiles.size()) {
-      targetThreads = 1;
-      for (size_t i = 0; i < wgTiles.size(); ++i) {
-        if (thTiles[i] > 0 && wgTiles[i] > 0)
-          targetThreads *= (wgTiles[i] / thTiles[i]);
-      }
-    }
+    auto wgSubTiles = getLoweringConfigTileSizes(parentConfig, kWgSubgroupKey);
+    targetThreads = 1;
+    for (int64_t s : wgSubTiles)
+      if (s > 0) targetThreads *= s;
+    targetThreads *= 32; // warp size
+    blockDim = targetThreads; // blockDim == warps × warp_size
   }
 
   SmallVector<int64_t> zeros(numLoops, 0);
-  // Build the base config with placeholder thread tiles.
   SmallVector<NamedAttribute> attrs;
   MLIRContext *ctx = builder.getContext();
   setLoweringConfigTileSizes(ctx, attrs, kWorkgroupKey, zeros);
@@ -186,13 +156,14 @@ static void promoteOperandToShared(OpBuilder &builder,
   setLoweringConfigTileSizes(ctx, attrs, kSubgroupKey, zeros);
   setMmaKindRaw(ctx, attrs, 0);
   appendPromotedOperandsList(ctx, attrs, {});
-  // Mark as derived-thread config with the target thread count.
   if (targetThreads > 0) {
     Builder b(ctx);
     attrs.emplace_back(StringAttr::get(ctx, kDerivedThreadKey),
                        b.getBoolAttr(true));
     attrs.emplace_back(StringAttr::get(ctx, kTargetThreadsKey),
                        b.getI64IntegerAttr(targetThreads));
+    attrs.emplace_back(StringAttr::get(ctx, kBlockDimKey),
+                       b.getI64IntegerAttr(blockDim));
   }
   setLoweringConfig(copyOp, DictionaryAttr::get(ctx, attrs));
 
@@ -302,16 +273,16 @@ struct NovaGPUPromoteMatmulOperandsPass
       unsigned numInputs = dpsOp.getNumDpsInputs();
 
       for (int64_t idx : *promotedOperands) {
-        unsigned i = static_cast<unsigned>(idx);
-        if (i < numInputs) {
-          // Input operand promotion: shared memory copy.
-          promoteOperandToShared(builder, op, i);
-        } else {
-          // Result promotion: index beyond inputs refers to DPS init result.
-          unsigned resultIdx = i - numInputs;
-          promoteResultToShared(builder, op, resultIdx);
-        }
-      }
+  unsigned i = static_cast<unsigned>(idx);
+  if (i < numInputs) {
+    promoteOperandToShared(builder, op, i);
+  } else {
+    unsigned resultIdx = i - numInputs;
+    if (linalg::isaContractionOpInterface(dyn_cast<linalg::LinalgOp>(op)))
+      continue;
+    promoteResultToShared(builder, op, resultIdx);
+  }
+}
 
       return WalkResult::advance();
     });

@@ -40,6 +40,10 @@ constexpr llvm::StringLiteral kPromotedOpsKey   = "promoted_operands";
 constexpr llvm::StringLiteral kPaddingKey       = "padding";
 constexpr llvm::StringLiteral kDerivedThreadKey = "derived_thread";
 constexpr llvm::StringLiteral kTargetThreadsKey = "target_threads";
+/// Total threads per CTA (product of wg_subgroup dims × warp size).
+/// Stored on promoted linalg.copy configs so deriveThreadTileSizes can clamp
+/// perThread to a cp.async-compatible granularity (multiple of maxVec).
+constexpr llvm::StringLiteral kBlockDimKey = "block_dim";
 /// Marker attribute placed on linalg.copy ops created by promoteOperandToShared.
 /// InferMemorySpace uses this to unconditionally classify the copy destination
 /// as workgroup memory, bypassing the isCrossThreadAccess heuristic which cannot
@@ -118,13 +122,23 @@ bool isDerivedThreadConfig(DictionaryAttr config);
 /// Returns 0 if the key is absent.
 int64_t getTargetThreadCount(DictionaryAttr config);
 
+/// Reads the CTA block dim stored by promoteOperandToShared.
+/// Returns 0 if the key is absent (legacy configs without block_dim).
+int64_t getBlockDim(DictionaryAttr config);
+
 /// Computes thread tile sizes for a copy op so that the resulting
 /// scf.forall trip count equals exactly `targetThreads`.
 /// `loopRanges` are the op's static loop ranges (after K-tiling).
 /// `elemBitWidth` is used to pick the vectorization width (128-bit loads).
+/// `blockDim` is the total thread count in the CTA (product of block dims).
+/// When > 0, per-thread work is floored to a multiple of the cp.async vector
+/// width so the innermost tile equals maxVec (4 f32 / 8 f16), enabling a
+/// single cp.async.16 instruction per row in ConvertMemRefToGpu.
+/// Pass 0 to use the legacy behaviour (no block-size constraint).
 SmallVector<int64_t> deriveThreadTileSizes(ArrayRef<int64_t> loopRanges,
                                            int64_t targetThreads,
-                                           unsigned elemBitWidth);
+                                           unsigned elemBitWidth,
+                                           int64_t blockDim = 0);
 
 /// Retrieve the lowering_config DictionaryAttr from an op, if present.
 DictionaryAttr getLoweringConfig(Operation *op);

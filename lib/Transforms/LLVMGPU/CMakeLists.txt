@@ -139,6 +139,7 @@ add_mlir_library(NovaLLVMGPUTransforms
   MLIRVectorToSCF
   MLIRVectorToGPU
   MLIRNVGPUDialect
+  MLIRNVVMDialect
   MLIRNVGPUToNVVM
   
   # IREE Dependencies (Using existing Nova linkage/vendored paths if available, otherwise adapting)

@@ -1,9 +1,27 @@
-
+// Nova GPU Apply Tiling Level Pass
+//
+// A unified pass that tiles a specific level (Reduction, Thread, or Subgroup)
+// for ops with lowering_config attributes inside workgroup scf.forall loops.
+//
+// Architecture mirrors IREE's GPUApplyTilingLevel.cpp + TileAndFuseUtils.cpp:
+//   - An enum `NovaTilingLevel` selects which loop level to tile.
+//   - `getTiledOps()` collects all linalg ops with non-zero tile sizes at the
+//     requested level (purely config-driven, like IREE).
+//   - `applyTileAndFuseToEachRoot()` tiles + fuses producers for each root,
+//     with IREE-matching fusion control: payloadOps exclusion, pad/dest
+//     blocking, and yield replacement tracking.
+//   - Level-specific cleanup patterns mirror IREE's post-tiling cleanup.
+//
+// Tiling levels:
+//   Reduction  — K dimension → scf.for (sequential)
+//   Thread     — M/N per-thread → scf.forall + GPUThreadMappingAttr
+//   Subgroup   — M/N per-warp  → scf.forall + GPUWarpMappingAttr
 
 #include "Passes.h"
 #include "NovaGPUTileAndFuseUtils.h"
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -112,27 +130,6 @@ getTiledOps(func::FuncOp funcOp, NovaTilingLevel tilingLevel) {
     if (tiles.empty() || !llvm::any_of(tiles, [](int64_t t) { return t > 0; }))
       return WalkResult::advance();
 
-    // Skip ops already tiled at Subgroup level: they live inside a
-    // #gpu.warp-mapped scf.forall from a prior run of this pass.
-    // Without this guard a second invocation (e.g. after canonicalization)
-    // would produce double-nested warp foralls.
-    if (tilingLevel == NovaTilingLevel::Subgroup) {
-      bool alreadyWarpTiled = false;
-      for (Operation *parent = target->getParentOp(); parent;
-           parent = parent->getParentOp()) {
-        if (auto forall = dyn_cast<scf::ForallOp>(parent)) {
-          auto mapping = forall.getMappingAttr();
-          if (mapping && !mapping.empty() &&
-              isa<gpu::GPUWarpMappingAttr>(mapping.getValue().front())) {
-            alreadyWarpTiled = true;
-            break;
-          }
-        }
-      }
-      if (alreadyWarpTiled)
-        return WalkResult::advance();
-    }
-
     targets.push_back(target);
     return WalkResult::advance();
   });
@@ -170,20 +167,59 @@ getTileSizes(RewriterBase &rewriter, TilingInterface tilingOp,
   if ((int64_t)tiles.size() > numLoops)
     return SmallVector<OpFoldResult>(numLoops, zero);
 
+  // Thread level: when the op is inside a warp-mapped forall (subgroup-tiled),
+  // zero out contraction dims for MMA ops.  The vectorization + vector unrolling
+  // pipeline handles per-warp subdivision to native MMA tile sizes.  Creating
+  // a thread forall for contraction dims inside a warp forall would produce
+  // incorrect GPU mapping (one thread per 16×8 tile instead of 32-thread
+  // warp-cooperative mma.sync).
+  //
+  // Non-contraction dims and non-MMA ops keep their thread tiles unchanged.
+  if (tilingLevel == NovaTilingLevel::Thread) {
+    // Check if this op is nested inside a warp-mapped scf.forall.
+    bool insideWarpForall = false;
+    if (auto forall = op->getParentOfType<scf::ForallOp>()) {
+      if (auto mapping = forall.getMappingAttr()) {
+        for (auto attr : mapping.getValue()) {
+          if (isa<gpu::GPUWarpMappingAttr>(attr)) {
+            insideWarpForall = true;
+            break;
+          }
+        }
+      }
+    }
+    if (insideWarpForall) {
+      int32_t mmaKind = getMmaKindRaw(config);
+      if (mmaKind != 0) {
+        // MMA contraction inside warp forall: zero out all tiles so no
+        // thread forall is created. The matmul stays at warp granularity.
+        auto subgroupTiles = getLoweringConfigTileSizes(config, kSubgroupKey);
+        for (int i = 0; i < (int)tiles.size() &&
+                        i < (int)subgroupTiles.size(); ++i) {
+          if (subgroupTiles[i] > 0)
+            tiles[i] = 0;
+        }
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[nova-tiling] zeroed MMA contraction thread tiles "
+                      "(inside warp forall): [";
+                   for (int64_t t : tiles) llvm::dbgs() << t << " ";
+                   llvm::dbgs() << "]\n");
+      }
+    }
+  }
+
   // Derived-thread config: recompute thread tiles from the op's actual
   // (K-tiled) loop ranges and the stored target_threads count.  This ensures
   // the copy forall trip count matches the matmul forall trip count, enabling
   // FuseForalls in Step 6.  Mirrors IREE's DerivedThreadConfigAttr.
   if (tilingLevel == NovaTilingLevel::Thread && isDerivedThreadConfig(config)) {
     int64_t targetThreads = getTargetThreadCount(config);
-    int64_t blockDim = getBlockDim(config);
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
       SmallVector<int64_t> loopRanges = linalgOp.getStaticLoopRanges();
       unsigned elemBits =
           getElementTypeOrSelf(linalgOp->getResultTypes()[0])
               .getIntOrFloatBitWidth();
-      tiles = deriveThreadTileSizes(loopRanges, targetThreads, elemBits,
-                                    blockDim);
+      tiles = deriveThreadTileSizes(loopRanges, targetThreads, elemBits);
       // Pad/truncate to numLoops.
       while ((int64_t)tiles.size() < numLoops)
         tiles.push_back(0);
@@ -196,93 +232,21 @@ getTileSizes(RewriterBase &rewriter, TilingInterface tilingOp,
     }
   }
 
-  // For non-derived-thread ops at Thread level, the correct per-subgroup
-  // tile size is wg_tile[d] / wg_subgroup[d], not thread[d].
-  // thread[d] is per-thread elements; the forall created here maps one
-  // iteration to one subgroup, so its step must be the subgroup tile.
-  if (tilingLevel == NovaTilingLevel::Thread && !isDerivedThreadConfig(config)) {
-    auto wgTiles    = getLoweringConfigTileSizes(config, kWorkgroupKey);
-    auto wgSubgroup = getLoweringConfigTileSizes(config, kWgSubgroupKey);
-    if (!wgTiles.empty() && !wgSubgroup.empty()) {
-      for (int64_t i = 0; i < (int64_t)tiles.size(); ++i) {
-        if (tiles[i] == 0) continue;  // leave reduction/unused dims at 0
-        int64_t sg = (i < (int64_t)wgSubgroup.size()) ? wgSubgroup[i] : 1;
-        int64_t wg = (i < (int64_t)wgTiles.size())    ? wgTiles[i]    : 0;
-        // sg == 0 means no subgroup tiling on this dim, leave tile as-is.
-        tiles[i] = (sg > 0 && wg > 0) ? wg / sg : 0;
-      }
-    }
-  }
-
+  // Thread level: clamp to max threads using the op's ACTUAL loop ranges.
+  //
+  // The thread forall iterates over actualDim / threadTile for each dim.
+  // When an op is fused into a block forall that doesn't tile some dims
+  // (e.g., a batch_matmul inside a single-block weight-gradient forall),
+  // the actualDims can be much larger than the workgroup tiles from config.
+  // We must clamp based on actualDims to limit real thread count ≤ 1024.
+  //
+  // This is safe because outer parallel dims now have threadTile=0 (not 1),
+  // so they don't create spurious thread iterations. Only dims with
+  // non-zero thread tiles contribute to the thread count.
   if (tilingLevel == NovaTilingLevel::Thread) {
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
       SmallVector<int64_t> actualDims = linalgOp.getStaticLoopRanges();
       clampThreadTilesToMaxThreads(actualDims, tiles);
-    }
-  }
-
-  // ── Subgroup level: validate tile sizes and clamp warp count ──────────────
-  // Three invariants enforced here:
-  //   1. subgroupTile[d] must not exceed workgroupTile[d].
-  //   2. workgroupTile[d] must be divisible by subgroupTile[d] (no partial
-  //      warps — every warp must own the same shape so layouts are uniform).
-  //      If not, walk down from the config value to the largest exact divisor.
-  //   3. Total warp count (product of forall trip counts) must not exceed
-  //      kMaxThreadsPerBlock / kWarpSize.  If it does, double tile sizes
-  //      (fewer trips = fewer warps) until the limit is satisfied.
-  if (tilingLevel == NovaTilingLevel::Subgroup) {
-    auto wgTiles = getLoweringConfigTileSizes(config, kWorkgroupKey);
-
-    // Guards 1 and 2: per-dimension bounds and divisibility.
-    for (int64_t i = 0; i < (int64_t)tiles.size(); ++i) {
-      if (tiles[i] <= 0) continue;
-      int64_t wg = (i < (int64_t)wgTiles.size()) ? wgTiles[i] : 0;
-      if (wg <= 0) continue;
-
-      // Guard 1: tile must not exceed workgroup tile.
-      if (tiles[i] > wg)
-        tiles[i] = wg;
-
-      // Guard 2: tile must divide workgroup tile evenly.
-      // Walk down from tiles[i] until wg % tiles[i] == 0.
-      while (tiles[i] > 1 && wg % tiles[i] != 0)
-        --tiles[i];
-    }
-
-    // Guard 3: total warp count <= kMaxThreadsPerBlock / kWarpSize.
-    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
-      SmallVector<int64_t> actualDims = linalgOp.getStaticLoopRanges();
-      constexpr int64_t kWarpSize = 32;
-      const int64_t maxWarps = kMaxThreadsPerBlock / kWarpSize;
-
-      auto computeTotalWarps = [&]() -> int64_t {
-        int64_t total = 1;
-        for (int i = 0; i < (int)tiles.size(); ++i) {
-          if (tiles[i] <= 0) continue;
-          if (i >= (int)actualDims.size() || actualDims[i] <= 0 ||
-              ShapedType::isDynamic(actualDims[i])) continue;
-          total *= (actualDims[i] + tiles[i] - 1) / tiles[i];
-        }
-        return total;
-      };
-
-      while (computeTotalWarps() > maxWarps) {
-        // Double the tile size on the dimension with the most warp trips.
-        int worstDim = -1;
-        int64_t worstTrips = 0;
-        for (int i = 0; i < (int)tiles.size(); ++i) {
-          if (tiles[i] <= 0) continue;
-          if (i >= (int)actualDims.size() || actualDims[i] <= 0 ||
-              ShapedType::isDynamic(actualDims[i])) continue;
-          int64_t trips = (actualDims[i] + tiles[i] - 1) / tiles[i];
-          if (trips > worstTrips) { worstTrips = trips; worstDim = i; }
-        }
-        if (worstDim < 0 || worstTrips <= 1) break;
-        tiles[worstDim] *= 2;
-        // Never exceed the workgroup tile.
-        if (worstDim < (int)wgTiles.size() && wgTiles[worstDim] > 0)
-          tiles[worstDim] = std::min(tiles[worstDim], wgTiles[worstDim]);
-      }
     }
   }
 
@@ -292,7 +256,98 @@ getTileSizes(RewriterBase &rewriter, TilingInterface tilingOp,
   return tileSizes;
 }
 
+//===----------------------------------------------------------------------===//
+// applyTileAndFuseToEachRoot — mirrors IREE's TileAndFuseUtils.cpp
+//
+// For each root op:
+//   1. Collect the set of ops that will be tiled+fused (for fusion control)
+//   2. Compute yield replacement set (dominance-based)
+//   3. Build tiling options (scf.for for Reduction, scf.forall for Thread/Sub)
+//   4. Build fusion control fn matching IREE's logic
+//   5. Tile and fuse
+//   6. Replace original uses with tiled results
+//===----------------------------------------------------------------------===//
 
+/// Fixes linalg.index uses inside tiled linalg.generic bodies for reduction
+/// dims tiled with PartialReductionOuterParallel at the Thread level.
+///
+/// Root cause: when the thread tiling pass tiles a reduction dim, it creates a
+/// scf.forall whose IV gives the tile-start offset. Formal operands are
+/// correctly sliced via tensor.extract_slice (offset embedded in the slice),
+/// but any tensor.extract on non-operand tensors inside the body still uses
+/// linalg.index i — which, after tiling, gives the tile-local index (0..T-1)
+/// rather than the global index (tile_start + 0..T-1).
+///
+/// Fix: for each tiled linalg.generic inside the forall, find every
+/// linalg.index i where dim i was tiled as a reduction, and replace its result
+/// with (forall_iv_for_dim_i + linalg.index i) everywhere it is used.
+static void fixupReductionTiledLinalgIndex(IRRewriter &rewriter,
+                                           linalg::LinalgOp originalOp,
+                                           scf::SCFTileAndFuseResult &result,
+                                           ArrayRef<OpFoldResult> tileSizes) {
+  // Find the enclosing scf.forall created by the tiling pass.
+  scf::ForallOp forallOp;
+  for (LoopLikeOpInterface loop : result.loops) {
+    if (auto fop = dyn_cast<scf::ForallOp>(loop.getOperation())) {
+      forallOp = fop;
+      break;
+    }
+  }
+  if (!forallOp)
+    return;
+
+  // Map each tiled reduction dimension to its forall induction variable.
+  // The forall IVs are created for non-zero tile dims in left-to-right order.
+  auto iterTypes = originalOp.getIteratorTypesArray();
+  SmallVector<std::pair<int, Value>> tiledReductionDimIVs;
+  {
+    SmallVector<Value> ivs = forallOp.getInductionVars();
+    int ivIdx = 0;
+    for (int i = 0;
+         i < (int)tileSizes.size() && ivIdx < (int)ivs.size(); ++i) {
+      if (!isZeroInteger(tileSizes[i])) {
+        if (i < (int)iterTypes.size() &&
+            linalg::isReductionIterator(iterTypes[i]))
+          tiledReductionDimIVs.push_back({i, ivs[ivIdx]});
+        ++ivIdx;
+      }
+    }
+  }
+  if (tiledReductionDimIVs.empty())
+    return;
+
+  // For each tiled linalg op, offset every linalg.index i (for a tiled
+  // reduction dim i) by the corresponding forall IV so callers of linalg.index
+  // that access non-operand tensors get the correct global position.
+  for (Operation *tiledOp : result.tiledAndFusedOps) {
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(tiledOp);
+    if (!linalgOp || linalgOp->getNumRegions() == 0)
+      continue;
+
+    SmallVector<std::pair<linalg::IndexOp, Value>> toFix;
+    linalgOp->getRegion(0).walk([&](linalg::IndexOp indexOp) {
+      for (auto [tiledDim, iv] : tiledReductionDimIVs) {
+        if ((int)indexOp.getDim() == tiledDim) {
+          toFix.push_back({indexOp, iv});
+          break;
+        }
+      }
+    });
+
+    for (auto [indexOp, iv] : toFix) {
+      rewriter.setInsertionPointAfter(indexOp);
+      Value localIdx = indexOp.getResult();
+      // globalIdx = tile start (forall IV) + tile-local offset (linalg.index).
+      Value globalIdx =
+          rewriter.create<arith::AddIOp>(indexOp.getLoc(), iv, localIdx);
+      // Replace all uses of localIdx with globalIdx except in the AddIOp
+      // itself, which reads localIdx as one of its operands.
+      localIdx.replaceUsesWithIf(globalIdx, [&](OpOperand &use) {
+        return use.getOwner() != globalIdx.getDefiningOp();
+      });
+    }
+  }
+}
 
 static LogicalResult
 applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
@@ -359,23 +414,17 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
       // Thread / Subgroup: parallel scf.forall with GPU mapping.
       tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
 
-      // Partial reduction (parallelising K across warps/threads) is only
-      // meaningful at Thread level. At Subgroup level the K dimension is
-      // already sequential (scf.for from the Reduction pass) and
-      // subgroupTiles[k]=0, so this path must never fire there — it would
-      // produce warp-level partial reductions with no warp shuffle to combine.
+      // Check if any non-zero tile is on a reduction dim (full-reduction ops).
+      // If so, use partial reduction to parallelize the reduction across threads.
       bool hasReductionTile = false;
-      if (tilingLevel == NovaTilingLevel::Thread) {
-        if (auto linalgOp =
-                dyn_cast<linalg::LinalgOp>(tilingOp.getOperation())) {
-          auto iterTypes = linalgOp.getIteratorTypesArray();
-          for (int i = 0;
-               i < (int)tileSizes.size() && i < (int)iterTypes.size(); ++i) {
-            if (!isZeroInteger(tileSizes[i]) &&
-                linalg::isReductionIterator(iterTypes[i])) {
-              hasReductionTile = true;
-              break;
-            }
+      if (auto linalgOp = dyn_cast<linalg::LinalgOp>(tilingOp.getOperation())) {
+        auto iterTypes = linalgOp.getIteratorTypesArray();
+        for (int i = 0; i < (int)tileSizes.size() && i < (int)iterTypes.size();
+             ++i) {
+          if (!isZeroInteger(tileSizes[i]) &&
+              linalg::isReductionIterator(iterTypes[i])) {
+            hasReductionTile = true;
+            break;
           }
         }
       }
@@ -391,16 +440,11 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
           continue;
         unsigned mappingId =
             static_cast<unsigned>(gpu::MappingId::LinearDim0) + idx++;
-        // Mapping is determined purely by tiling level — no mmaKind check.
-        // Subgroup level → always #gpu.warp (MMA ops, warp-granularity tiles).
-        // Thread level   → always #gpu.thread (copy/fill/elementwise ops).
-        // MMA ops have threadTiles=0 after NovaKernelConfig Change 1 so the
-        // Thread pass never reaches this code for them; the guard is gone.
-        if (tilingLevel == NovaTilingLevel::Subgroup) {
-          mapping.push_back(gpu::GPUWarpMappingAttr::get(
+        if (tilingLevel == NovaTilingLevel::Thread) {
+          mapping.push_back(gpu::GPUThreadMappingAttr::get(
               ctx, static_cast<gpu::MappingId>(mappingId)));
         } else {
-          mapping.push_back(gpu::GPUThreadMappingAttr::get(
+          mapping.push_back(gpu::GPUWarpMappingAttr::get(
               ctx, static_cast<gpu::MappingId>(mappingId)));
         }
       }
@@ -418,13 +462,22 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
         -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
       Operation *owner = originalProducer.getOwner();
 
-      // Reduction level: do not fuse pad ops here; handled by cleanup pattern
-      // (ExtractSliceOfPadTensorSwap) after tiling.
-      // Subgroup + Thread levels: fuse pad ops inline so they land inside the
-      // warp/thread forall body and are not left dangling outside it.
-      if (tilingLevel == NovaTilingLevel::Reduction) {
+      // Reduction/Subgroup: do not fuse pad ops. We fuse them as a cleanup
+      // pattern instead (ExtractSliceOfPadTensorSwap).
+      if (tilingLevel == NovaTilingLevel::Reduction ||
+          tilingLevel == NovaTilingLevel::Subgroup) {
         if (isa<tensor::PadOp>(owner))
           return std::nullopt;
+      }
+
+      // Subgroup level: do NOT fuse ops with derived_thread config into the
+      // warp forall.  These are workgroup-level cooperative copies that must
+      // remain at block scope so all threads cooperatively load the full tile.
+      if (tilingLevel == NovaTilingLevel::Subgroup) {
+        if (auto ownerConfig = getLoweringConfig(owner)) {
+          if (isDerivedThreadConfig(ownerConfig))
+            return std::nullopt;
+        }
       }
 
       // Yield replacement: needed for ops with post-root users, but NOT
@@ -458,19 +511,13 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
     // Build cleanup patterns (passed to tileConsumerAndFuseProducersUsingSCF).
     RewritePatternSet cleanupPatterns(ctx);
 
-    // Fuse pad without zero-slice guard for Reduction/Thread/Subgroup levels.
+    // Fuse pad without zero-slice guard for Reduction/Thread levels.
     if (tilingLevel == NovaTilingLevel::Reduction ||
-        tilingLevel == NovaTilingLevel::Thread    ||
-        tilingLevel == NovaTilingLevel::Subgroup) {
+        tilingLevel == NovaTilingLevel::Thread) {
       cleanupPatterns.add<linalg::ExtractSliceOfPadTensorSwapPattern>(
-    ctx, [](tensor::ExtractSliceOp sliceOp) -> std::optional<bool> {
-      auto padOp = sliceOp.getSource().getDefiningOp<tensor::PadOp>();
-      if (!padOp) return false;
-      for (Operation *user : padOp->getUsers())
-        if (user->hasAttr("nova.promote_to_workgroup"))
-          return std::nullopt; // skip this pattern entirely
-      return false;
-    });
+          ctx, [](tensor::ExtractSliceOp) -> std::optional<bool> {
+            return false; // no zero-slice guard
+          });
     }
 
     // Skip cleanup for Subgroup level — IREE skips because lane tiling
@@ -496,14 +543,34 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
       continue;
     }
 
+    // Fix tile-local linalg.index in tensor.extract for reduction dims tiled
+    // at the Thread level via PartialReductionOuterParallel.
+    //
+    // When tiling a reduction dim across threads, formal operands are correctly
+    // sliced (the tile-start offset is baked into tensor.extract_slice), but
+    // tensor.extract on non-operand tensors inside the linalg body still uses
+    // linalg.index i with a tile-local value (0..tile_size-1). Those callers
+    // need the global index (forall_iv + local), so we add the forall IV here.
+    if (tilingLevel == NovaTilingLevel::Thread) {
+      fixupReductionTiledLinalgIndex(
+          rewriter, cast<linalg::LinalgOp>(tilingOp.getOperation()), *result,
+          tileSizes);
+    }
 
+    // Replace original uses with tiled results.
+    // Use replaceAllUsesWith (not dominance-based replaceUsesWithIf) to
+    // ensure the original op becomes use_empty and can be erased. This is
+    // safe because the tiled loop result dominates all original users.
     for (auto [origValue, replacement] : result->replacements)
       rewriter.replaceAllUsesWith(origValue, replacement);
   }
   return success();
 }
 
-
+//===----------------------------------------------------------------------===//
+// applyCleanupPatterns — post-tiling cleanup
+// Mirrors IREE GPUApplyTilingLevel.cpp lines 107-122.
+//===----------------------------------------------------------------------===//
 
 static LogicalResult applyCleanupPatterns(func::FuncOp funcOp,
                                           NovaTilingLevel tilingLevel) {
@@ -553,6 +620,10 @@ struct NovaGPUApplyTilingLevelBase
       this->signalPassFailure();
       return;
     }
+
+    // Skip cleanup for Subgroup level — lane tiling follows.
+    if (tilingLevel == NovaTilingLevel::Subgroup)
+      return;
 
     if (failed(applyCleanupPatterns(funcOp, tilingLevel)))
       this->signalPassFailure();

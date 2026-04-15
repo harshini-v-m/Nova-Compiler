@@ -504,6 +504,90 @@ struct NovaGPUHoistVectorExtractInsertSlicePass
                << "[nova-hoist-slice] after moveLoopInvariantCode\n");
 
     // ------------------------------------------------------------------
+    // Step 3b: Hoist tensor.empty / alloc_tensor that are K-loop-invariant
+    // but nested inside an inner scf.forall (e.g. warp or thread forall).
+    //
+    // The standard LICM in Step 3 only moves ops that are *direct* children
+    // of the scf.for body and are loop-invariant.  In our pipeline, after
+    // subgroup tiling the smem buffer allocations (tensor.empty for the A and
+    // B promoted tiles) live inside the warp scf.forall, which itself is a
+    // direct child of the K-loop scf.for.  LICM treats scf.forall as an
+    // opaque region and never looks inside it for invariant ops.
+    //
+    // What we want:
+    //   scf.for %k (K-loop)
+    //     scf.forall (%warp) in (2,1)   ← warp forall
+    //       %smem_A = tensor.empty() : tensor<32x64xf32>   ← allocate EVERY k
+    //       %smem_B = tensor.empty() : tensor<64x16xf32>   ← allocate EVERY k
+    //       ... copy A/B into smem ...
+    //       ... mma ...
+    //
+    // After this step:
+    //   scf.forall (%warp) in (2,1)        ← warp forall (unchanged)
+    //     %smem_A = tensor.empty()          ← hoisted to before K-loop,
+    //     %smem_B = tensor.empty()          ← inside the warp forall body
+    //     scf.for %k (K-loop)
+    //       ... copy A/B into smem ...
+    //       ... mma ...
+    //
+    // Strategy: walk every scf.for.  For each tensor.empty / alloc_tensor
+    // found anywhere inside it, check if the op is K-loop-invariant (none of
+    // its operands use the for's IV or iter_args, transitively).  If so, find
+    // the outermost scf.forall ancestor that is still *inside* the scf.for
+    // (the "gateway" forall), and move the empty op to just before the for
+    // loop, but at the same nesting depth as the gateway forall — i.e. inside
+    // the gateway forall's enclosing block, just before the scf.for.
+    // ------------------------------------------------------------------
+    // Collect all (forOp, emptyOp) pairs first — no IR mutation during walk.
+    // Key: the scf.for to hoist before. Value: the tensor.empty to move.
+    SmallVector<std::pair<scf::ForOp, Operation *>> hoistWork;
+    funcOp.walk([&](scf::ForOp forOp) {
+      forOp.walk([&](Operation *op) {
+        if (!isa<tensor::EmptyOp, bufferization::AllocTensorOp>(op))
+          return;
+
+        // Check loop-invariance w.r.t. this forOp.
+        // tensor.empty with static shape has zero operands → trivially invariant.
+        bool invariant = true;
+        op->walk([&](Operation *inner) -> WalkResult {
+          if (!invariant) return WalkResult::interrupt();
+          for (Value v : inner->getOperands()) {
+            if (v == forOp.getInductionVar()) {
+              invariant = false;
+              return WalkResult::interrupt();
+            }
+            for (Value ia : forOp.getRegionIterArgs()) {
+              if (v == ia) {
+                invariant = false;
+                return WalkResult::interrupt();
+              }
+            }
+          }
+          return WalkResult::advance();
+        });
+        if (invariant)
+          hoistWork.emplace_back(forOp, op);
+      });
+    });
+
+    // Now apply all moves outside any walk — safe to mutate IR.
+    // Process innermost forOps first (walk order is post-order for the outer
+    // walk, which gives innermost forOps first), so hoisting out of a nested
+    // for before an outer one is handled naturally.
+    for (auto &[forOp, op] : hoistWork) {
+      // Skip if already moved out by a previous iteration (e.g. hoisted out
+      // of an inner for by a prior entry, now no longer inside this forOp).
+      if (!forOp->isProperAncestor(op))
+        continue;
+      // Operation::moveBefore works across blocks: it removes op from its
+      // current block and inserts it before forOp in forOp's block.
+      op->moveBefore(forOp);
+    }
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "[nova-hoist-slice] after hoisting K-loop-invariant empties\n");
+
+    // ------------------------------------------------------------------
     // Step 4: MLIR built-in subset hoisting.
     // Handles the standard case: extract_slice and insert_slice both use
     // the same loop iter_arg as their tensor. Works for both tensor and

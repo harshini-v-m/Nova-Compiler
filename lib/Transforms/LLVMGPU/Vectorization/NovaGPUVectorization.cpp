@@ -104,14 +104,15 @@ struct NovaGPUVectorizeMemrefCopyPass
 //===----------------------------------------------------------------------===//
 // NovaGPUUnrollToIntrinsicsPass
 //
-// Unrolls vector.contract ops to the native MMA shape read from the
-// surrounding op's lowering_config (mma_kind attribute).  Falls back to
-// {16, 16, 16} (WMMA_F32) when no config is present.
+// NOTE: This pass is now a no-op stub. M/N-batch unrolling to the native MMA
+// intrinsic shape has been absorbed into NovaGPUVectorDistributePass (§4.5),
+// which performs the unroll inline per K-step immediately after distributing
+// per-thread slices. Running a separate pass-over of already-distributed IR
+// is unnecessary and was the root cause of the massive static unroll explosion
+// (512+ contracts, 24KB register spill) seen in linear.log.
 //
-// Must run AFTER GenericVectorization (so vector.contract ops exist) and
-// AFTER PackToIntrinsics (so operand shapes are already multiples of the
-// MMA shape).  Runs BEFORE VectorDistribute so that each lane sees a single
-// MMA-sized fragment after distribution.
+// The registration is kept so existing pipeline strings using
+// --nova-gpu-unroll-to-intrinsics don't break, but the pass is a no-op.
 //===----------------------------------------------------------------------===//
 
 struct NovaGPUUnrollToIntrinsicsPass
@@ -120,108 +121,14 @@ struct NovaGPUUnrollToIntrinsicsPass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUUnrollToIntrinsicsPass)
 
   void runOnOperation() override {
-    auto funcOp = dyn_cast<FunctionOpInterface>(getOperation());
-    if (!funcOp) return;
-    MLIRContext *ctx = &getContext();
-    RewritePatternSet patterns(ctx);
-
-    llvm::errs() << "Checking Func: " << funcOp.getName() << "\n";
-
-    // Collect per-op MMA shapes so the filter can look them up.
-    // Walk upward from each vector.contract to find the nearest linalg op
-    // carrying a non-zero mma_kind in its lowering_config.
-    llvm::DenseMap<Operation *, SmallVector<int64_t, 3>> opShapeMap;
-    bool anyMMAKind = false;
-    funcOp.walk([&](vector::ContractionOp contractOp) {
-      Operation *cur = contractOp.getOperation();
-      while (cur) {
-        if (auto cfg = getLoweringConfig(cur)) {
-          int32_t k = getMmaKindRaw(cfg);
-          if (k != 0) {
-            opShapeMap[contractOp.getOperation()] = getMMAShape(k);
-            anyMMAKind = true;
-            return;
-          }
-        }
-        cur = cur->getParentOp();
-      }
-      // mma_kind == 0 means SIMT / CUDA-core path — record with a sentinel
-      // so we know the op exists but must NOT be unrolled.
-      opShapeMap[contractOp.getOperation()] = {};
-    });
-
-    // When every vector.contract in this function is on the SIMT (CUDA-core)
-    // path (mma_kind == 0), skip unrolling entirely.  The vector.contract ops
-    // will be lowered by the standard MLIR vector-to-loops path which emits
-    // FMA instructions, matching the precision of the eager (non-JIT) path.
-    // Unrolling with the {16,16,16} fallback would instead produce a sequence
-    // of arith.mulf + arith.addf with two roundings per multiply-add, causing
-    // systematic divergence from the reference output for large (e.g. 256x256)
-    // matmuls.
-    if (!anyMMAKind)
-      return;
-
-    // Use a single native shape derived from the first NON-EMPTY MMA contraction found
-    // (all contractions in one MMA kernel share the same intrinsic shape).
-    SmallVector<int64_t, 3> nativeShape;
-    for (auto &kv : opShapeMap) {
-      if (!kv.second.empty()) {
-        nativeShape = kv.second;
-        break;
-      }
-    }
-
-    if (nativeShape.empty())
-      return;
-
-    // Save the MMA lowering config BEFORE unrolling erases the original ops.
-    // populateVectorUnrollPatterns replaces original contracts with smaller
-    // tiled ones but does NOT copy the lowering_config attribute.  We re-attach
-    // it after rewriting so VectorDistributePass detects hasMMAContract=true.
-    DictionaryAttr mmaConfigToPropagate;
-    for (auto &kv : opShapeMap) {
-      if (!kv.second.empty()) {
-        if (auto cfg = getLoweringConfig(kv.first)) {
-          mmaConfigToPropagate = cfg;
-          break;
-        }
-        // [AUDIT] If the config is on a parent op (e.g. linalg.matmul outside the unrolled loop),
-        // we must find it.
-        Operation *cur = kv.first;
-        while (cur) {
-          if (auto cfg = getLoweringConfig(cur)) {
-            mmaConfigToPropagate = cfg;
-            break;
-          }
-          cur = cur->getParentOp();
-        }
-        if (mmaConfigToPropagate) break;
-      }
-    }
-
-    vector::UnrollVectorOptions options;
-    options.setNativeShape(nativeShape);
-    // Unroll all vector.contract ops in this function to the shared native shape.
-    // This handles unrolling even for newly created ops during the process.
-    vector::populateVectorUnrollPatterns(patterns, options);
-
-    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns))))
-      return signalPassFailure();
-
-    // Re-attach MMA config to all newly-created unrolled vector.contract ops.
-    if (mmaConfigToPropagate) {
-      funcOp.walk([&](vector::ContractionOp contractOp) {
-        if (!getLoweringConfig(contractOp))
-          setLoweringConfig(contractOp, mmaConfigToPropagate);
-      });
-    }
+    // No-op: unrolling is now handled inside NovaGPUVectorDistributePass.
   }
 
   StringRef getArgument() const override {
     return "nova-gpu-unroll-to-intrinsics";
   }
   StringRef getDescription() const override {
-    return "Unroll vector.contract to the MMA-native shape from lowering_config.";
+    return "(no-op) M/N-batch unroll is now inline in nova-gpu-vector-distribute.";
   }
 };
 

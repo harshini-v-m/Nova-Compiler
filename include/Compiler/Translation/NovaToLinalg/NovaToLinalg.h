@@ -8,7 +8,17 @@ namespace mlir {
 class Pass;
 class RewritePatternSet;
 class TypeConverter;
+class Value;
+class Location;
+class OpBuilder;
+class ConversionPatternRewriter;
 namespace nova {
+
+// Broadcasting utilities
+Value broadcastToShape(OpBuilder &b, Location loc,
+                       Value input, ArrayRef<int64_t> targetShape);
+Value broadcastTensor(ConversionPatternRewriter &rewriter, Location loc,
+                      Value input, ArrayRef<int64_t> targetShape);
 
 // From TNovaToLinalg.cpp — elementwise Nova ops → linalg.generic
 std::unique_ptr<Pass> createNovaElementwiseToLinalgPass();

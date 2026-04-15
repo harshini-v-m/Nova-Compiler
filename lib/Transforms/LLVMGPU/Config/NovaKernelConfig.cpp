@@ -1190,24 +1190,22 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   workgroupTiles[nDim] = sched.wgN;
   reductionTiles[kDim] = sched.wgK;
 
-  // threadTile = one MMA instruction shape (one MMA per thread slot).
-  threadTiles[mDim] = sched.intrinsic.mSize;
-  threadTiles[nDim] = sched.intrinsic.nSize;
+  // threadTiles for MMA M/N = 0: the Subgroup pass owns MMA tiling.
+  // The Thread pass checks anyNonZero and skips this op entirely.
+  // Copy/fill ops use derived_thread config (separate code path) and are
+  // unaffected by this zeroing.
+  threadTiles[mDim] = 0;
+  threadTiles[nDim] = 0;
 
-  // ── Global subgroup counts ("subgroup" field) ────────────────────────────
-  // = numWorkgroups × subgroupCountPerWG.
-  // Used as VectorDistribute global IDs / global tensor offset computation.
-  SmallVector<int64_t> loopRanges = matmul.getStaticLoopRanges();
-
-  int64_t numWgM = llvm::divideCeil(loopRanges[mDim], sched.wgM);
-  int64_t numWgN = llvm::divideCeil(loopRanges[nDim], sched.wgN);
-
-  subgroupTiles[mDim] = numWgM * sched.subgroupCount;
-  subgroupTiles[nDim] = numWgN * 1;
-  subgroupTiles[kDim] = 0; // K not distributed across subgroups
+  // ── Per-warp tile step ("subgroup" field) ────────────────────────────────
+  // = wgTile / warpsPerWG — what the Subgroup scf.forall iterates by.
+  // The Subgroup tiling pass reads this key directly as the forall step size.
+  subgroupTiles[mDim] = sched.wgM / sched.subgroupCount; // e.g. 64/4 = 16
+  subgroupTiles[nDim] = sched.wgN;   // N not split across warps (wgSg_N=1)
+  subgroupTiles[kDim] = 0;           // K not distributed across subgroups
 
   for (int64_t b : contractionDims->batch)
-    subgroupTiles[b] = llvm::divideCeil(loopRanges[b], workgroupTiles[b]);
+    subgroupTiles[b] = workgroupTiles[b]; // one warp owns full batch dim
 
   // ── Per-workgroup subgroup counts ("wg_subgroup" field) ──────────────────
   // = subgroupCountPerWG only (within one workgroup tile).
@@ -1245,8 +1243,8 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
              << " wgK=" << sched.wgK
              << " subgroupCount=" << sched.subgroupCount
              << " mnTilePerSubgroup=" << sched.mnTileCountPerSubgroup
-             << " globalSgM=" << subgroupTiles[mDim]
-             << " globalSgN=" << subgroupTiles[nDim]
+             << " sgStepM=" << subgroupTiles[mDim]
+             << " sgStepN=" << subgroupTiles[nDim]
              << " wgSgM=" << wgSubgroupTiles[mDim]
              << " doCPromo=" << doCPromotion
              << " promoProlog=" << promotePrologueOperands
@@ -1303,10 +1301,14 @@ static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
    while (tileK > 1 && dims.K % tileK != 0) tileK >>= 1;
 
 
- // [Fix6] Phase 2: shrink tileM until A+B+fused overhead fits maxSmem.
- // Use f32 (4 bytes/elem) conservatively since type info is not threaded here.
+ // [Fix-P1-4] Target at most half of maxSmem per block so at least 2 blocks
+ // fit per SM, doubling warp slots available for latency hiding (occupancy
+ // goes from ~17% to ~33% on sm_86 with 48KB shared memory).
  constexpr int32_t kF32Kind = 2;
- int64_t maxSmem = target.maxWorkgroupMemBytes;
+ int64_t maxSmem = target.maxWorkgroupMemBytes / 2;
+
+ // [Fix6] Phase 2: shrink tileM (then tileK) until A+B+fused overhead fits
+ // maxSmem. Use f32 (4 bytes/elem) conservatively.
  while (tileM > 1) {
    int64_t smem = computeSharedMemory(tileM, tileN, tileK,
                                       kF32Kind, kF32Kind,
@@ -1319,10 +1321,32 @@ static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
               << " > " << maxSmem << "), shrinking tileM to " << tileM
               << "\n");
  }
+ // If tileM is already 1 and smem is still over budget, halve tileK.
+ // This keeps the occupancy budget (maxSmem/2) respected even for wide K.
+ if (fusedInfo.forcedTileK < 0) {
+   while (tileK > 1) {
+     int64_t smem = computeSharedMemory(tileM, tileN, tileK,
+                                        kF32Kind, kF32Kind,
+                                        /*doCPromotion=*/false, fusedInfo);
+     if (smem <= maxSmem) break;
+     tileK /= 2;
+     LLVM_DEBUG(llvm::dbgs()
+                << "[nova-kernel-config] SIMT smem still too large (" << smem
+                << " > " << maxSmem << "), shrinking tileK to " << tileK
+                << "\n");
+   }
+ }
 
-
- int64_t threadTileM = std::max<int64_t>(1, tileM / wgX);
- int64_t threadTileN = std::max<int64_t>(1, tileN / wgY);
+ // [Fix-P0-1] Cap per-thread output tile to 4×4 = 16 accumulators maximum.
+ // The SIMT table entries can produce threadTileM=8, threadTileN=8 (64
+ // accumulators) for shapes like [128,64] which overflows the 255-register
+ // budget and spills 24KB of local memory per thread, destroying performance.
+ // 4×4 stays well within 64 live registers and eliminates all local mem spill.
+ static constexpr int64_t kMaxThreadTile = 4;
+ int64_t threadTileM = std::min(kMaxThreadTile,
+                                std::max<int64_t>(1, tileM / wgX));
+ int64_t threadTileN = std::min(kMaxThreadTile,
+                                std::max<int64_t>(1, tileN / wgY));
 
 
  auto contractionDims = mlir::linalg::inferContractionDims(matmul);
@@ -1387,9 +1411,11 @@ LogicalResult setContractConfig(linalg::LinalgOp op,
  if (op.getNumParallelLoops() < 2)            return failure();
 
 
- // Reject ops where all indexing maps are permutations (no broadcast).
- // Those should go through the reduction pipeline, not contract.
- if (llvm::any_of(op.getIndexingMapsArray(),
+ // Reject ops where ALL indexing maps are permutations (pure permutation ops
+ // have no contraction structure and should go through the reduction pipeline).
+ // Using any_of was wrong: standard linalg.matmul has a RHS map that is a
+ // permutation of its two operand dims, which would incorrectly reject it.
+ if (llvm::all_of(op.getIndexingMapsArray(),
                   [](AffineMap m) { return m.isPermutation(); }))
    return failure();
 

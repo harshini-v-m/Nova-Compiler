@@ -172,22 +172,48 @@ getHardwareLayout(int32_t mmaKind, int operandIdx) {
 
   // ── Ampere mma.sync tf32: m16n8k8 ───────────────────────────────────────
   // PTX: mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32
-  //   A  [M=16, K=8]:  16 threads on M (1 elem each), 2 threads on K (4 elem each)
-  //                    → 4 registers/thread, 32 threads × 4 = 128 = 16×8 ✓
-  //   B  [K=8,  N=8]:  2 threads on K (4 elem each), 8 threads on N (1 elem each)
-  //                    → 4 registers/thread, 32 threads × 4 = 128 = 8×8×2 ✓
-  //                    K layout MUST match A: thread=2, elem=4 (PTX ISA §9.7.13.4)
-  //   C  [M=16, N=8]:  16 threads on M (1 elem each), 8 threads on N (1 elem each)
-  //                    → 1 register/thread, 32 threads × 1 = 32 scalars visible to
-  //                    vector.contract. The hardware packs 2x2 blocks per thread in
-  //                    physical registers — that repack is done by UnrollToIntrinsics,
-  //                    not here. ACC elem_counts MUST match LHS M-elem and RHS N-elem
-  //                    so that vector.contract map verification passes.
+  // nvgpu.mma.sync fragment shapes (2D, per warp-lane, 32 lanes):
+  //   A  → vector<4x1xf32>   (mTile=2, kTile=2, numElemA=1: 2×2 × 1 = 4 elems)
+  //   B  → vector<2x1xf32>   (kTile=2, nTile=1, numElemB=1: 2×1 × 1 = 2 elems)
+  //   C  → vector<2x2xf32>   (mTile=2, nTile=1, numElemC=2: 2×1 × 2 = 4 elems)
+  //
+  // Layout convention for VectorDistribute per-thread slices:
+  //   thread × elem coverage must equal the MMA tile dimension.
+  //   All K-batching is done by the K-loop in distributeContractOp; per
+  //   K-step the contract sees one kTile=8 slice.
+  //
+  //   LHS [M=16, K=8]:  M: 16 threads × 1 elem, K: 2 threads × 4 elem
+  //                     per-thread: vector<1x1x4xf32>  (total 4 elem/thread ✓)
+  //   RHS [K=8,  N=8]:  K: 2 threads × 4 elem, N: 8 threads × 1 elem
+  //                     per-thread: vector<1x4x1xf32>  (total 4 elem/thread)
+  //                     NOTE: K coverage matches LHS K (2×4=8) ✓
+  //   ACC [M=16, N=8]:  M: 16 threads × 1 elem, N: 8 threads × 1 elem
+  //                     per-thread: vector<1x1x1xf32>  (total 1 elem/thread)
+  //                     The 4-elem nvgpu C fragment is produced by shape-casting
+  //                     the per-batch acc slices in emitMNBatchUnroll.
+  //
+  // emitMNBatchUnroll detects mma_kind != 0 and emits nvgpu.mma.sync with
+  // shape-casts: (1x1x4xf32→4x1xf32, 1x4x1xf32→2x1xf32, 1x1x1xf32→2x2xf32).
+  // ── Ampere mma.sync tf32: m16n8k8 ───────────────────────────────────────
+  // nvgpu.mma.sync fragment shapes (2D per lane, 32 lanes, tf32/f32):
+  //   A → vector<4x1xf32>  mTile=2, kTile=2, numElemA=1  → 4 regs/lane ✓
+  //   B → vector<2x1xf32>  kTile=2, nTile=1, numElemB=1  → 2 regs/lane ✓
+  //   C → vector<2x2xf32>  mTile=2, nTile=1, numElemC=2  → 4 regs/lane ✓
+  //
+  // K is NOT distributed across threads (thread_K=1); one thread holds all
+  // elem_K values for its row.  The K-loop in distributeContractOp steps by
+  // mmaShape_K=8 (fixed separately); batchCounts_K = totalK / mmaShape_K.
+  //
+  // Per-thread 3D slice shapes → shape-cast to 2D nvgpu fragment:
+  //   LHS [M=16, K=8]:  M: t=16,e=1  K: t=1,e=4  → [1,1,4] (4 elems) → [4,1] ✓
+  //   RHS [K=8,  N=8]:  K: t=1, e=2  N: t=8,e=1  → [1,2,1] (2 elems) → [2,1] ✓
+  //   ACC [M=16, N=8]:  M: t=8, e=2  N: t=4,e=2  → [1,2,2] (4 elems) → [2,2] ✓
+  //     (8×2=16 M-rows ✓, 4×2=8 N-cols ✓, kThreadCount=1 → no warp shuffle)
   case NVMMAIntrinsicValues::MMA_SYNC_TF32_16x8x8:
     switch (operandIdx) {
-    case 0: return OperandHWLayout{{1, 16, 1, 1}, {1, 2, 4, 16}}; // LHS: M={t=16,e=1}, K={t=2,e=4}
-    case 1: return OperandHWLayout{{1, 2,  4, 1}, {1, 8, 1,  4}}; // RHS: K={t=2,e=4}, N={t=8,e=1}
-    case 2: return OperandHWLayout{{1, 16, 1, 1}, {1, 8, 1,  4}}; // ACC: M={t=16,e=1}, N={t=8,e=1}
+    case 0: return OperandHWLayout{{1, 16, 1, 1}, {1, 1, 4,  0}}; // LHS: M={t=16,e=1,s=1}, K={t=1,e=4,s=0}
+    case 1: return OperandHWLayout{{1, 1,  2, 0}, {1, 8, 1,  4}}; // RHS: K={t=1,e=2,s=0},  N={t=8,e=1,s=4}
+    case 2: return OperandHWLayout{{1, 8,  2, 1}, {1, 4, 2,  4}}; // ACC: M={t=8,e=2,s=1},  N={t=4,e=2,s=4}
     }
     break;
 
@@ -385,7 +411,8 @@ computeOperandLayout(MLIRContext *ctx,
   // Compute strides on the projected counts so stride values respect the
   // operand's physical axis ordering after any map permutation.
   SmallVector<int64_t> projSgStrides     = computeStrides(projSgCounts);
-  SmallVector<int64_t> projThreadStrides = computeStrides(projThreadCounts);
+  SmallVector<int64_t> projThreadStrides;
+projectThroughMap(operandMap, threadStrides, projThreadStrides, 0);
 
   // ── 11. Shared memory flag ────────────────────────────────────────────────
   bool sharedMem = llvm::is_contained(getPromotedOperands(config),

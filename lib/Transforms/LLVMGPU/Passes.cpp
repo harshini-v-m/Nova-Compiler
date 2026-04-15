@@ -119,21 +119,38 @@ namespace mlir::nova
         createNovaConfigTrackingCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    // ── Step 3: Promote to shared memory [BEFORE K-tiling] ─────────────────
-    pm.addNestedPass<func::FuncOp>(
-        createNovaGPUPromoteMatmulOperandsPass());
-    pm.addNestedPass<func::FuncOp>(
-        createNovaConfigTrackingCanonicalizerPass());
-    pm.addPass(createCSEPass());
-
-    // ── Step 4: Tile K (reduction) dimension [AFTER promotion] ─────────────
+    // ── Step 3: Tile K (reduction) dimension ───────────────────────────────
+    // Must happen BEFORE operand promotion so that linalg.copy inserted by
+    // the promote pass covers only [wgM × kStep] (one K-tile) rather than
+    // the full [wgM × K] buffer.  K-tiling fuses the copy into the K-loop
+    // so each iteration cooperatively loads a kStep-wide slice into shared
+    // memory, enabling proper double-buffering and register reuse.
     pm.addNestedPass<func::FuncOp>(
         createNovaGPUApplyTilingLevelReductionPass());
     pm.addNestedPass<func::FuncOp>(
         createNovaConfigTrackingCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    // ── Step 5: Tile threads ────────────────────────────────────────────────
+    // ── Step 4: Promote operands to shared memory [INSIDE K-loop] ──────────
+    // Runs after K-tiling so the promoted linalg.copy lives inside the K-loop
+    // and covers exactly [wgM × kStep] per iteration, not the full K extent.
+    pm.addNestedPass<func::FuncOp>(
+        createNovaGPUPromoteMatmulOperandsPass());
+    pm.addNestedPass<func::FuncOp>(
+        createNovaConfigTrackingCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+    // ── Step 4.5: Tile subgroups (MMA ops → #gpu.warp scf.forall) ──────────
+    // Only fires for ops where "subgroup" tiles != 0 (i.e. mma_kind != 0).
+    // Copy/fill/elementwise ops have subgroup=0 and are skipped entirely.
+    pm.addNestedPass<func::FuncOp>(
+        createNovaGPUApplyTilingLevelSubgroupPass());
+    pm.addNestedPass<func::FuncOp>(
+        createNovaConfigTrackingCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+    // ── Step 5: Tile threads (copy/fill/elementwise → #gpu.thread forall) ──
+    // MMA ops have threadTiles=0 after Step 0 and are skipped here.
     pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelThreadPass());
     pm.addNestedPass<func::FuncOp>(
         createNovaConfigTrackingCanonicalizerPass());
@@ -220,66 +237,40 @@ namespace mlir::nova
         mlir::createConvertBufferizationToMemRefPass());
 
     pm.addNestedPass<func::FuncOp>(createNovaGPUVectorDistributePass());
-    // Canonicalizer folds 42 dead constants + 6 divui/muli/thread_id ops
-    // produced by the thread-offset arithmetic unrolling.
-    // CSE then deduplicates 5 more offset expressions shared across K-batch
-    // iterations.  Both are measured non-empty on the MMA path.
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    // ── Stage 23: Vectorize shared memory copies [AFTER bufferization] ──────
-    // Vectorizes linalg.copy on shared memory buffers → wide vector loads
-    // targeting 128-bit LDS.128 instructions on sm_80+.
-    pm.addNestedPass<func::FuncOp>(createNovaGPUVectorizeMemrefCopyPass());
-    // No cleanup needed: VectorizeMemrefCopy introduces clean transfer ops and
-    // leaves no dead constants or redundant expressions on the MMA path.
-
     // ── Step 8.5: Eliminate degenerate single-iteration foralls ────────────
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
-    // Canonicalizer folds 4 affine.apply ops whose results became constant
-    // after single-iteration forall inlining.  CSE produces no savings here.
     pm.addPass(createCanonicalizerPass());
 
     // ── Fill-copy forwarding and buffer coalescing ──────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaGPUFillCopyForwardingPass());
-    pm.addNestedPass<func::FuncOp>(
-        createNovaGPUCoalesceWorkgroupBuffersPass());
-    // Single Canon+CSE shared between FillCopy and Coalesce.
-    // Neither pass introduces constants or redundant subexpressions on the MMA
-    // path, so one cleanup round is sufficient for both.
+    pm.addNestedPass<func::FuncOp>(createNovaGPUCoalesceWorkgroupBuffersPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
     // ── Step 9: scf.forall → gpu.launch ────────────────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaGPUMapForallToGPUPass());
-    // MapForallToGPU introduces 47 index constants and 23 divui/remui ops for
-    // block/thread coordinate extraction.  Canonicalizer + CSE together remove
-    // 83 redundant ops (the largest cleanup in the post-distribute pipeline).
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
     // ── Step 10: Lower linalg → scf loops ──────────────────────────────────
     pm.addPass(createConvertLinalgToLoopsPass());
-    // CSE removes 1 affine.apply and 1 memref.subview that become duplicates
-    // after loop lowering.  Canonicalizer is also useful here for any remaining
-    // affine index ops.
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
     // ── Scalar accumulator + warp shuffle reduction ─────────────────────────
     pm.addNestedPass<func::FuncOp>(
         mlir::nova::createSCFScalarizeAccumulatorPass());
-    // SCFScalarize and WarpShuffleReduction produce no dead constants or
-    // redundant subexpressions on the MMA path (measured zero-delta).
-    // One shared Canon+CSE after both passes is sufficient.
     pm.addNestedPass<func::FuncOp>(
         mlir::nova::createNovaWarpShuffleReductionPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    // ── Loop optimizations ──────────────────────────────────────────────────
-    pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
-    pm.addPass(createCanonicalizerPass());
+    // // ── Loop optimizations ──────────────────────────────────────────────────
+    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
+    // pm.addPass(createCanonicalizerPass());
 
     // ── Reposition stores ───────────────────────────────────────────────────
     pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
@@ -350,9 +341,6 @@ namespace mlir::nova
                 }
               }
             });
-
-            // Step 2: Fold extract_strided_slice(transfer_read) → narrowed
-            //         transfer_read so LHS reaches MMA prepare patterns.
             {
               struct FoldExtractStridedSliceFromTransferRead
                   : public OpRewritePattern<vector::ExtractStridedSliceOp> {
@@ -415,14 +403,41 @@ namespace mlir::nova
                   funcOp, std::move(foldPatterns));
             }
 
+            {
+              RewritePatternSet castPatterns(&getContext());
+              vector::populateCastAwayVectorLeadingOneDimPatterns(
+                  castPatterns);
+              (void)applyPatternsAndFoldGreedily(
+                  funcOp, std::move(castPatterns));
+            }
+
             // Step 3: Prepare transfers → nvgpu fragment form.
             {
+              // Collect original contracts and their configs before unrolling
+              // replaces them.
+              llvm::DenseMap<Operation *, DictionaryAttr> configs;
+              funcOp.walk([&](vector::ContractionOp op) {
+                if (auto cfg = op->getAttrOfType<DictionaryAttr>(
+                        "lowering_config"))
+                  configs[op] = cfg;
+              });
+
               RewritePatternSet patterns(&getContext());
               populatePrepareVectorToMMAPatterns(patterns,
                                                  /*useNvGpu=*/true);
               if (failed(applyPatternsAndFoldGreedily(
                       funcOp, std::move(patterns))))
                 return signalPassFailure();
+
+              // Re-attach configs to the new prepared contracts.
+              // In this stage there's typically only one matmul being prepared.
+              if (!configs.empty()) {
+                DictionaryAttr sharedCfg = configs.begin()->second;
+                funcOp.walk([&](vector::ContractionOp op) {
+                  if (!op->hasAttr("lowering_config"))
+                    op->setAttr("lowering_config", sharedCfg);
+                });
+              }
             }
           }
           StringRef getArgument() const override {
@@ -582,6 +597,7 @@ namespace mlir::nova
     registerNovaGPUVectorAllocPass();
     registerNovaGPUCombineValueSemanticBarriersPass();
     registerNovaGPUVectorDistributePass();
+    registerNovaGPUUnrollToIntrinsicsPass();
 
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
       return mlir::nova::createNovaScfLoopUnrollPass();

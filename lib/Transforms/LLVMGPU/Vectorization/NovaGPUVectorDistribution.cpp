@@ -1,95 +1,73 @@
-//===- NovaGPUVectorDistribute.cpp - Per-thread vector distribution -------===//
+//===-- NovaGPUVectorDistribute.cpp ---------------------------------------===//
 //
-// Distributes vector.contract ops (and their feeding transfer_read/write ops)
-// so that each GPU thread holds only its own slice of the computation.
+// Distributes vector.contract (backed by nvgpu.mma.sync) to per-warp slices.
+// For mma_kind != 0 the pass emits nvgpu.mma.sync directly on warp-owned
+// fragments WITHOUT any per-thread index arithmetic.  For generic
+// vector.contract (mma_kind == 0) it falls back to per-thread slicing via
+// the layout attributes.
 //
-// Before this pass every thread redundantly holds the full tile:
-//   %lhs = vector.transfer_read ... : vector<1x16x64xf32>
-//   %rhs = vector.transfer_read ... : vector<1x64x8xf32>
-//   %acc = vector.transfer_read ... : vector<1x16x8xf32>
-//   %r   = vector.contract %lhs, %rhs, %acc
-//
-// After this pass each thread holds only its elem_counts slice:
-//   %lhs_t = vector.transfer_read ...[0, t_row, t_col] : vector<1x1x4xf32>
-//   %rhs_t = vector.transfer_read ...[0, t_k,   t_col] : vector<1x2x1xf32>
-//   %acc_t = vector.transfer_read ...[0, t_row,  t_col]: vector<1x2x2xf32>
-//   %r_t   = vector.contract %lhs_t, %rhs_t, %acc_t
-//             ← one warp-level MMA instruction after UnrollToIntrinsics
-//
-// Layout information is read from the nova.layout_0/1/2 DictionaryAttr
-// that NovaGPUConfigureTensorLayouts attached to the contract op.
-//
-// Thread offset formula (per dimension d):
-//   warp_id         = linearThreadId / warp_size
-//   warp_offset_d   = (warp_id   / sg_strides[d])     % sg_counts[d]
-//                     * elem_counts[d] * thread_counts[d]
-//   thread_offset_d = (tid / thread_strides[d])        % thread_counts[d]
-//                     * elem_counts[d]
-//   total_offset_d  = warp_offset_d + thread_offset_d
-//   (dims with stride 0 are not distributed → offset = 0)
-//
-// Pipeline position:
-//   NovaGPUVectorAllocPass        → stages operands through shared memory
-//   NovaGPUCombineValueBarriers   → merges value_barrier ops
-//   THIS PASS                     ← distribute to per-thread slices
-//   NovaGPUUnrollToIntrinsics     → unroll batch_counts → nvgpu.mma.sync
+// Key invariant: nvgpu.mma.sync is warp-synchronous.  All 32 threads in a
+// warp participate collectively; the hardware maps lane IDs to fragments
+// internally.  Emitting per-thread index arithmetic (divui/remui chains) on
+// top of mma.sync is both wrong and unnecessary.
 //
 //===----------------------------------------------------------------------===//
 
 #include "Passes.h"
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
+#include "Compiler/Transforms/LLVMGPU/NVIDIATargetUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 
 #define DEBUG_TYPE "nova-gpu-vector-distribute"
 
 using namespace mlir;
 
 namespace mlir::nova {
-
 namespace {
 
 //===----------------------------------------------------------------------===//
-// §1  Layout struct and DictionaryAttr reader
+// §1  Layout descriptor
 //===----------------------------------------------------------------------===//
 
-/// Per-operand layout extracted from a nova.layout_* DictionaryAttr.
 struct OperandLayout {
-  SmallVector<int64_t> sgCounts;      // warps per dim within workgroup
-  SmallVector<int64_t> sgStrides;     // strides to linearise warp index
-  SmallVector<int64_t> batchCounts;   // MMA tiles each warp owns per dim
-  SmallVector<int64_t> threadCounts;  // threads per dim within one MMA tile
-  SmallVector<int64_t> threadStrides; // strides to linearise thread index
-  SmallVector<int64_t> elemCounts;    // elements each thread holds per dim
+  SmallVector<int64_t> sgCounts;
+  SmallVector<int64_t> sgStrides;
+  SmallVector<int64_t> batchCounts;
+  SmallVector<int64_t> threadCounts;
+  SmallVector<int64_t> threadStrides;
+  SmallVector<int64_t> elemCounts;
+  bool sharedMem = false;
   int rank = 0;
 };
 
-/// Extract int64 array from an ArrayAttr field of a DictionaryAttr.
-static SmallVector<int64_t> getI64Array(DictionaryAttr dict, StringRef key) {
-  auto attr = dict.getAs<ArrayAttr>(key);
-  if (!attr) return {};
-  SmallVector<int64_t> result;
-  result.reserve(attr.size());
-  for (Attribute a : attr)
-    result.push_back(cast<IntegerAttr>(a).getInt());
-  return result;
+static SmallVector<int64_t> getI64Array(DictionaryAttr d, StringRef k) {
+  auto a = d.getAs<ArrayAttr>(k);
+  if (!a) return {};
+  SmallVector<int64_t> r;
+  for (Attribute x : a)
+    r.push_back(cast<IntegerAttr>(x).getInt());
+  return r;
 }
 
-/// Read nova.layout_<idx> DictionaryAttr from |op| into |layout|.
-static FailureOr<OperandLayout>
-readOperandLayout(Operation *op, int idx) {
+static FailureOr<OperandLayout> readLayout(Operation *op, int idx) {
   auto attr = op->getAttrOfType<DictionaryAttr>(
       "nova.layout_" + std::to_string(idx));
   if (!attr) return failure();
-
   OperandLayout L;
   L.sgCounts      = getI64Array(attr, "sg_counts");
   L.sgStrides     = getI64Array(attr, "sg_strides");
@@ -97,370 +75,627 @@ readOperandLayout(Operation *op, int idx) {
   L.threadCounts  = getI64Array(attr, "thread_counts");
   L.threadStrides = getI64Array(attr, "thread_strides");
   L.elemCounts    = getI64Array(attr, "elem_counts");
-  L.rank          = (int)L.elemCounts.size();
-
-  if (L.rank == 0 || L.sgCounts.size() != (size_t)L.rank ||
-      L.threadCounts.size() != (size_t)L.rank ||
-      L.elemCounts.size() != (size_t)L.rank)
+  if (auto b = attr.getAs<BoolAttr>("shared_mem"))
+    L.sharedMem = b.getValue();
+  L.rank = (int)L.elemCounts.size();
+  if (L.rank == 0 ||
+      (int)L.sgCounts.size()     != L.rank ||
+      (int)L.threadCounts.size() != L.rank ||
+      (int)L.batchCounts.size()  != L.rank)
     return failure();
-
   return L;
 }
 
-/// Returns the index of the reduction dimension in the contraction iteration space.
-static int getReductionDim(vector::ContractionOp op) {
-  auto iteratorTypes = op.getIteratorTypes().getValue();
-  for (int i = 0; i < (int)iteratorTypes.size(); ++i) {
-    if (cast<vector::IteratorTypeAttr>(iteratorTypes[i]).getValue() ==
-        vector::IteratorType::reduction)
-      return i;
-  }
-  return -1;
+//===----------------------------------------------------------------------===//
+// §2  MMA fragment shape derivation (generic, no op-specific knowledge)
+//
+// For mmaShape = [M, N, K] and element type of width W bits:
+//   shapeK   = 128 / W        (elements per 128-bit K-tile)
+//   numElemA = 32  / W        (A elements per thread)
+//   numElemB = 32  / W        (B elements per thread)
+//   numElemC = 2              (C elements per thread, always)
+//   mTile    = M / 8
+//   nTile    = N / 8
+//   kTile    = K / shapeK
+//   aFrag    = [mTile * kTile, numElemA]
+//   bFrag    = [kTile * nTile, numElemB]
+//   cFrag    = [mTile * nTile, numElemC]
+//===----------------------------------------------------------------------===//
+
+struct MMAFragmentShapes {
+  SmallVector<int64_t> a; // 2D
+  SmallVector<int64_t> b; // 2D
+  SmallVector<int64_t> c; // 2D
+  SmallVector<int64_t> mmaShape; // [M, N, K]
+};
+
+static FailureOr<MMAFragmentShapes>
+deriveMMAFragments(ArrayRef<int64_t> mmaShape, Type elemType) {
+  if (mmaShape.size() < 3) return failure();
+  int64_t M = mmaShape[0], N = mmaShape[1], K = mmaShape[2];
+  int64_t W       = elemType.getIntOrFloatBitWidth();
+  int64_t shapeK  = 128 / W;
+  int64_t numA    = 32 / W;
+  int64_t numB    = 32 / W;
+  int64_t numC    = 2;
+  int64_t mTile   = M / 8;
+  int64_t nTile   = N / 8;
+  int64_t kTile   = K / shapeK;
+  MMAFragmentShapes s;
+  s.a        = {mTile * kTile, numA};
+  s.b        = {kTile * nTile, numB};
+  s.c        = {mTile * nTile, numC};
+  s.mmaShape = SmallVector<int64_t>(mmaShape.begin(), mmaShape.end());
+  return s;
 }
 
-/// Maps a contract iteration dimension to an operand physical dimension index.
-static int mapContractDimToOperandDim(AffineMap map, int contractDim) {
-  for (int i = 0; i < (int)map.getNumResults(); ++i) {
-    if (auto expr = llvm::dyn_cast<AffineDimExpr>(map.getResult(i))) {
-      if (expr.getPosition() == (unsigned)contractDim)
-        return i;
+static SmallVector<int64_t> getMMAShapeFromOp(vector::ContractionOp op) {
+  Operation *cur = op.getOperation();
+  while (cur) {
+    if (auto cfg = getLoweringConfig(cur)) {
+      int32_t k = getMmaKindRaw(cfg);
+      if (k != 0) return getMMAShape(k);
     }
+    cur = cur->getParentOp();
   }
-  return -1;
+  return {};
+}
+
+static int32_t getMmaKindFromOp(vector::ContractionOp op) {
+  Operation *cur = op.getOperation();
+  while (cur) {
+    if (auto cfg = getLoweringConfig(cur))
+      if (int32_t k = getMmaKindRaw(cfg)) return k;
+    cur = cur->getParentOp();
+  }
+  return 0;
 }
 
 //===----------------------------------------------------------------------===//
-// §2  Thread-offset computation
+// §3  Forall helpers
 //===----------------------------------------------------------------------===//
 
-/// Warp size = product of thread_counts (total threads inside one MMA tile).
-static int64_t computeWarpSize(const OperandLayout &L) {
-  int64_t ws = 1;
-  for (int64_t tc : L.threadCounts) ws *= tc;
-  return ws;
+static bool isThreadForall(scf::ForallOp f) {
+  auto m = f.getMappingAttr();
+  if (!m || m.getValue().empty()) return false;
+  for (Attribute a : m.getValue())
+    if (!isa<gpu::GPUThreadMappingAttr>(a)) return false;
+  return true;
 }
 
-/// Emit arith ops to compute the per-thread offset along one dimension.
-///
-///   warp_id         = linearTid / warpSize
-///   warp_offset_d   = (warp_id   / sg_strides[d]) % sg_counts[d]
-///                     * elem_counts[d] * thread_counts[d]
-///   thread_offset_d = (linearTid / thread_strides[d]) % thread_counts[d]
-///                     * elem_counts[d]
-///   total_offset_d  = warp_offset_d + thread_offset_d
-///
-/// If stride == 0 the dimension is not distributed → returns constant 0.
+static scf::ForallOp findEnclosingThreadForall(Operation *op) {
+  for (Operation *p = op->getParentOp(); p; p = p->getParentOp())
+    if (auto f = dyn_cast<scf::ForallOp>(p))
+      if (isThreadForall(f)) return f;
+  return nullptr;
+}
+
+// Returns true if every mapping attr on `f` is a GPUWarpMappingAttr.
+static bool isWarpForall(scf::ForallOp f) {
+  auto m = f.getMappingAttr();
+  if (!m || m.empty()) return false;
+  for (Attribute a : m.getValue())
+    if (!isa<gpu::GPUWarpMappingAttr>(a)) return false;
+  return true;
+}
+
+// Walk up parent chain looking for the innermost #gpu.warp-mapped forall.
+// After the Subgroup tiling pass, MMA vector.contract ops live inside one
+// of these.  Returns nullptr for non-MMA ops (no warp forall present).
+static scf::ForallOp findEnclosingSubgroupForall(Operation *op) {
+  for (Operation *p = op->getParentOp(); p; p = p->getParentOp())
+    if (auto f = dyn_cast<scf::ForallOp>(p))
+      if (isWarpForall(f)) return f;
+  return nullptr;
+}
+
 static SmallVector<Value>
-computeDistributedOffsets(OpBuilder &b, Location loc,
-                          Value linearTid, int64_t warpSize,
-                          const OperandLayout &L) {
-  auto idx  = b.getIndexType();
-  auto cst  = [&](int64_t v) -> Value {
-    return b.create<arith::ConstantIndexOp>(loc, v);
-  };
+computeSgOffsets(OpBuilder &b, Location loc,
+                 const OperandLayout &L, scf::ForallOp sgForall) {
+  Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+  SmallVector<Value> off(L.rank, zero);
+  if (!sgForall) return off;
 
-  // warp_id = linearTid / warpSize
-  Value warpId = b.create<arith::DivUIOp>(loc, linearTid, cst(warpSize));
-
-  SmallVector<Value> offsets(L.rank);
-  for (int d = 0; d < L.rank; ++d) {
-    Value off = cst(0);
-
-    // ── Thread offset within the warp ────────────────────────────────
-    // stride 0 means "not distributed on this dim" → offset stays 0.
-    if (L.threadStrides[d] != 0 && L.threadCounts[d] > 1) {
-      // thread_index_d = (linearTid / stride) % count
-      Value div = b.create<arith::DivUIOp>(loc, linearTid,
-                                          cst(L.threadStrides[d]));
-      Value rem = b.create<arith::RemUIOp>(loc, div, cst(L.threadCounts[d]));
-      // thread_offset_d = thread_index_d * elem_counts[d]
-      off = b.create<arith::MulIOp>(loc, rem, cst(L.elemCounts[d]));
-    }
-
-    // ── Warp (subgroup) offset ────────────────────────────────────────
-    if (L.sgStrides[d] != 0 && L.sgCounts[d] > 1) {
-      // warp_index_d = (warp_id / sg_stride) % sg_count
-      Value div2 = b.create<arith::DivUIOp>(loc, warpId,
-                                           cst(L.sgStrides[d]));
-      Value rem2 = b.create<arith::RemUIOp>(loc, div2, cst(L.sgCounts[d]));
-      // warp_offset_d = warp_index_d * (elem * thread)
-      Value stride = cst(L.elemCounts[d] * L.threadCounts[d]);
-      Value warpOff = b.create<arith::MulIOp>(loc, rem2, stride);
-      off = b.create<arith::AddIOp>(loc, off, warpOff);
-    }
-
-    offsets[d] = off;
+  auto ivs = llvm::to_vector(sgForall.getInductionVars());
+  // Map: which forall IV drives which operand dimension?
+  // sg_strides[d] != 0 marks sg-distributed dimensions.
+  // We pair them with IVs in order.
+  int ivIdx = 0;
+  for (int d = 0; d < L.rank && ivIdx < (int)ivs.size(); ++d) {
+    if (L.sgStrides[d] == 0) continue;
+    int64_t elemsPerSg =
+        L.threadCounts[d] * L.batchCounts[d] * L.elemCounts[d];
+    Value stride = b.create<arith::ConstantIndexOp>(loc, elemsPerSg);
+    off[d] = b.create<arith::MulIOp>(loc, ivs[ivIdx++], stride);
   }
-  return offsets;
+  return off;
 }
 
 //===----------------------------------------------------------------------===//
-// §3  Per-thread vector type
+// §5  Generic per-thread offset (for non-MMA vector.contract fallback only)
+//
+// Only called when mma_kind == 0.  For mma_kind != 0 we emit nvgpu.mma.sync
+// which is warp-synchronous — no per-thread offsets are needed or correct.
 //===----------------------------------------------------------------------===//
 
-/// Build the per-thread VectorType from the layout.
-///
-/// For non-K (parallel) dimensions the shape is batchCounts[d] * elemCounts[d]
-/// so that UnrollToIntrinsics can still see and unroll the batch tiles.
-///
-/// For the K (reduction) dimension the K-batch loop in distributeContractOp
-/// already iterates over batchCounts[K], so each contract slice only covers
-/// elemCounts[K].  kAxis is the physical axis index for K in this operand
-/// (-1 if this operand has no K axis, e.g. ACC).
-static VectorType getPerThreadVectorType(VectorType fullType,
-                                          const OperandLayout &L,
-                                          int kAxis) {
+static SmallVector<Value>
+computeThreadOffsets(OpBuilder &b, Location loc,
+                     Value linearTid, const OperandLayout &L, int kAxis) {
+  Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+  SmallVector<Value> off(L.rank, zero);
+  for (int d = 0; d < L.rank; ++d) {
+    if (L.threadStrides[d] == 0 || L.threadCounts[d] <= 1) continue;
+    Value div = b.create<arith::DivUIOp>(
+        loc, linearTid,
+        b.create<arith::ConstantIndexOp>(loc, L.threadStrides[d]));
+    Value rem = b.create<arith::RemUIOp>(
+        loc, div,
+        b.create<arith::ConstantIndexOp>(loc, L.threadCounts[d]));
+    int64_t elems = (d == kAxis) ? L.elemCounts[d]
+                                 : L.batchCounts[d] * L.elemCounts[d];
+    off[d] = (elems == 1) ? rem
+                          : b.create<arith::MulIOp>(
+                                loc, rem,
+                                b.create<arith::ConstantIndexOp>(loc, elems));
+  }
+  return off;
+}
+
+//===----------------------------------------------------------------------===//
+// §6  Per-thread vector type (for non-MMA fallback)
+//===----------------------------------------------------------------------===//
+
+static VectorType perThreadType(VectorType full,
+                                const OperandLayout &L, int kAxis) {
   SmallVector<int64_t> shape(L.rank);
   for (int d = 0; d < L.rank; ++d)
-  if(d==kAxis){
-    shape[d]=L.elemCounts[d];
-  }
-  else{
-    shape[d]=L.batchCounts[d]*L.elemCounts[d];
-  } 
-  return VectorType::get(shape, fullType.getElementType());
+    shape[d] = (d == kAxis) ? L.elemCounts[d]
+                            : L.batchCounts[d] * L.elemCounts[d];
+  return VectorType::get(shape, full.getElementType());
+}
+
+/// Per-thread type for a single MMA tile (no M/N batch factor).
+/// Used inside emitMMASync's MN batch loop where batchCounts[M/N] is handled
+/// by the loop itself — the read type must cover exactly one tile's elements.
+static VectorType perTileThreadType(VectorType full,
+                                    const OperandLayout &L, int kAxis) {
+  SmallVector<int64_t> shape(L.rank);
+  for (int d = 0; d < L.rank; ++d)
+    shape[d] = L.elemCounts[d]; // no batchCounts multiplication for any dim
+  return VectorType::get(shape, full.getElementType());
 }
 
 //===----------------------------------------------------------------------===//
-// §4  Distribute one vector.transfer_read feeding the contract
+// §7  Transfer read/write helpers (index adjustment)
 //===----------------------------------------------------------------------===//
 
-/// Replace |readOp| with a sliced read at the thread's offset.
-/// |offsets| contains one Value per dim of the operand (already projected).
-/// Returns the new (smaller) vector value.
-static Value distributeTransferRead(OpBuilder &b,
-                                     vector::TransferReadOp readOp,
-                                     ArrayRef<Value> offsets,
-                                     VectorType perThreadType) {
-  Location loc = readOp.getLoc();
-
-  // Build new indices = original_indices + thread_offsets.
-  // original indices are usually all-zero from VectorAlloc.
-  SmallVector<Value> newIndices(readOp.getIndices().begin(),
-                                readOp.getIndices().end());
-  assert(newIndices.size() == offsets.size() &&
-         "index count must match operand rank");
-  for (int i = 0; i < (int)newIndices.size(); ++i) {
-    if (auto cst = newIndices[i].getDefiningOp<arith::ConstantIndexOp>()) {
-      if (cst.value() == 0 && offsets[i]) {
-        newIndices[i] = offsets[i];
-        continue;
-      }
-    }
-    newIndices[i] = b.create<arith::AddIOp>(loc, newIndices[i], offsets[i]);
+static Value adjustedTransferRead(OpBuilder &b,
+                                   vector::TransferReadOp src,
+                                   ArrayRef<Value> extraOff,
+                                   VectorType resultType) {
+  Location loc = src.getLoc();
+  SmallVector<Value> idx(src.getIndices().begin(), src.getIndices().end());
+  for (int i = 0; i < (int)idx.size(); ++i) {
+    bool isZeroOff = false;
+    if (auto c = extraOff[i].getDefiningOp<arith::ConstantIndexOp>())
+      isZeroOff = (c.value() == 0);
+    if (isZeroOff) continue;
+    if (auto c = idx[i].getDefiningOp<arith::ConstantIndexOp>())
+      if (c.value() == 0) { idx[i] = extraOff[i]; continue; }
+    idx[i] = b.create<arith::AddIOp>(loc, idx[i], extraOff[i]);
   }
-
-  // All dims are in-bounds for the per-thread slice.
-  SmallVector<bool> inBounds(perThreadType.getRank(), true);
-
+  SmallVector<bool> inBounds(resultType.getRank(), true);
   return b.create<vector::TransferReadOp>(
-              loc, perThreadType, readOp.getBase(), newIndices,
-              /*padding=*/std::nullopt, inBounds)
-      .getResult();
+      loc, resultType, src.getBase(), idx,
+      /*padding=*/std::nullopt, inBounds);
+}
+
+static void adjustedTransferWrite(OpBuilder &b,
+                                   vector::TransferWriteOp dst,
+                                   Value vec,
+                                   ArrayRef<Value> extraOff,
+                                   Value overrideBase = nullptr) {
+  Location loc = dst.getLoc();
+  SmallVector<Value> idx(dst.getIndices().begin(), dst.getIndices().end());
+  for (int i = 0; i < (int)idx.size(); ++i) {
+    bool isZeroOff = false;
+    if (auto c = extraOff[i].getDefiningOp<arith::ConstantIndexOp>())
+      isZeroOff = (c.value() == 0);
+    if (isZeroOff) continue;
+    if (auto c = idx[i].getDefiningOp<arith::ConstantIndexOp>())
+      if (c.value() == 0) { idx[i] = extraOff[i]; continue; }
+    idx[i] = b.create<arith::AddIOp>(loc, idx[i], extraOff[i]);
+  }
+  Value base = overrideBase ? overrideBase : dst.getBase();
+  SmallVector<bool> inBounds(
+      cast<VectorType>(vec.getType()).getRank(), true);
+  b.create<vector::TransferWriteOp>(loc, vec, base, idx, inBounds);
 }
 
 //===----------------------------------------------------------------------===//
-// §5  Distribute one vector.transfer_write that writes the result
+// §8  Warp shuffle reduction (for K-parallel threads, generic)
 //===----------------------------------------------------------------------===//
 
-/// Replace |writeOp| with a sliced write at the thread's offset.
-static void distributeTransferWrite(OpBuilder &b,
-                                     vector::TransferWriteOp writeOp,
-                                     Value perThreadResult,
-                                     ArrayRef<Value> offsets) {
-  Location loc = writeOp.getLoc();
-
-  SmallVector<Value> newIndices(writeOp.getIndices().begin(),
-                                writeOp.getIndices().end());
-  for (int i = 0; i < (int)newIndices.size(); ++i) {
-    if (auto cst = newIndices[i].getDefiningOp<arith::ConstantIndexOp>()) {
-      if (cst.value() == 0 && offsets[i]) {
-        newIndices[i] = offsets[i];
-        continue;
-      }
+static Value warpShuffleReduce(OpBuilder &b, Location loc, Value vec,
+                                int64_t kThreadCount, int64_t kStride) {
+  auto vt = cast<VectorType>(vec.getType());
+  int64_t n = 1;
+  for (int64_t d : vt.getShape()) n *= d;
+  auto flatTy = VectorType::get({n}, vt.getElementType());
+  Value flat = b.create<vector::ShapeCastOp>(loc, flatTy, vec);
+  auto i32 = b.getI32Type();
+  Value w32 = b.create<arith::ConstantOp>(loc, IntegerAttr::get(i32, 32));
+  for (int64_t step = 1; step < kThreadCount; step *= 2) {
+    Value mask = b.create<arith::ConstantOp>(
+        loc, IntegerAttr::get(i32, step * kStride));
+    Value snap = flat;
+    for (int64_t i = 0; i < n; ++i) {
+      Value e = b.create<vector::ExtractOp>(loc, snap, ArrayRef<int64_t>{i});
+      auto sh = b.create<gpu::ShuffleOp>(loc, e, mask, w32,
+                                          gpu::ShuffleMode::XOR);
+      Value r = b.create<arith::AddFOp>(loc, e, sh.getShuffleResult());
+      flat = b.create<vector::InsertOp>(loc, r, flat, ArrayRef<int64_t>{i});
     }
-    newIndices[i] = b.create<arith::AddIOp>(loc, newIndices[i], offsets[i]);
+  }
+  return b.create<vector::ShapeCastOp>(loc, vt, flat);
+}
+
+
+struct MMAEmitter {
+  OpBuilder &b;
+  Location loc;
+  vector::ContractionOp contractOp;
+  const OperandLayout &L0, &L1, &L2; // LHS, RHS, ACC layouts
+  vector::TransferReadOp lhsRead, rhsRead;
+  int lhsKAxis, rhsKAxis, accMAxis, accNAxis;
+  int64_t kBatchCount, kStep;
+  SmallVector<int64_t> mmaShape;
+  int32_t mmaKind;
+
+  // Emit one complete K-batch reduction and return the updated accumulator.
+  Value emit(Value accIn) {
+    if (mmaKind != 0)
+      return emitMMASync(accIn);
+    return emitGenericContract(accIn);
   }
 
-int r = llvm::cast<mlir::VectorType>(perThreadResult.getType()).getRank();
+private:
 
-  SmallVector<bool> inBounds(r, true);
+  Value emitMMASync(Value acc) {
+    auto elemTy = cast<VectorType>(contractOp.getLhs().getType())
+                      .getElementType();
+    auto frags = deriveMMAFragments(mmaShape, elemTy);
+    if (failed(frags))
+      return emitGenericContract(acc); // fallback
 
-  // The write result (updated tensor) replaces the original write result.
-  auto newWrite = b.create<vector::TransferWriteOp>(
-      loc, perThreadResult, writeOp.getBase(), newIndices, inBounds);
-  writeOp.replaceAllUsesWith(newWrite->getResults());
+    bool isTf32 =
+        static_cast<NVMMAIntrinsicValues>(mmaKind) ==
+        NVMMAIntrinsicValues::MMA_SYNC_TF32_16x8x8;
+
+    auto aFrag2D = VectorType::get(frags->a, elemTy);
+    auto bFrag2D = VectorType::get(frags->b, elemTy);
+    auto cFrag2D = VectorType::get(frags->c, elemTy);
+
+    auto lhsFullTy = cast<VectorType>(lhsRead.getResult().getType());
+    auto rhsFullTy = cast<VectorType>(rhsRead.getResult().getType());
+    auto lhsThrTy  = perTileThreadType(lhsFullTy, L0, lhsKAxis);
+    auto rhsThrTy  = perTileThreadType(rhsFullTy, L1, rhsKAxis);
+
+    // Sanity: per-tile element count must match 2D fragment size.
+    int64_t lhsThrElems = 1, rhsThrElems = 1;
+    for (int64_t d : lhsThrTy.getShape()) lhsThrElems *= d;
+    for (int64_t d : rhsThrTy.getShape()) rhsThrElems *= d;
+    int64_t aFragElems = frags->a[0] * frags->a[1];
+    int64_t bFragElems = frags->b[0] * frags->b[1];
+    // If mismatch, fall back — don't crash with bad shape_cast.
+    if (lhsThrElems != aFragElems || rhsThrElems != bFragElems)
+      return emitGenericContract(acc);
+
+    // Per-thread offsets driven by thread ID and layout strides.
+    Value tid = b.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+    SmallVector<Value> off0 = computeThreadOffsets(b, loc, tid, L0, lhsKAxis);
+    SmallVector<Value> off1 = computeThreadOffsets(b, loc, tid, L1, rhsKAxis);
+
+    // MN batch counts from layout.
+    int lhsMAxis = -1, rhsNAxis = -1;
+    for (int d = 0; d < L0.rank; ++d)
+      if (d != lhsKAxis) { lhsMAxis = d; break; }
+    for (int d = 0; d < L1.rank; ++d)
+      if (d != rhsKAxis) { rhsNAxis = d; break; }
+
+    int64_t batchM = (lhsMAxis >= 0) ? L0.batchCounts[lhsMAxis] : 1;
+    int64_t batchN = (rhsNAxis >= 0) ? L1.batchCounts[rhsNAxis] : 1;
+    // Step between consecutive MMA tiles in M/N direction = full MMA tile size
+    // = threadCounts * elemCounts (covers all threads × elements in that dim).
+    int64_t elemM  = (lhsMAxis >= 0)
+                         ? L0.threadCounts[lhsMAxis] * L0.elemCounts[lhsMAxis]
+                         : 1;
+    int64_t elemN  = (rhsNAxis >= 0)
+                         ? L1.threadCounts[rhsNAxis] * L1.elemCounts[rhsNAxis]
+                         : 1;
+
+    // ACC slice shape per MN tile.
+    SmallVector<int64_t> accSliceShape(
+        cast<VectorType>(acc.getType()).getShape());
+    if (accMAxis >= 0) accSliceShape[accMAxis] = L2.elemCounts[accMAxis];
+    if (accNAxis >= 0) accSliceShape[accNAxis] = L2.elemCounts[accNAxis];
+
+    SmallVector<int64_t> accOnes(cast<VectorType>(acc.getType()).getRank(), 1);
+
+    Value result = acc;
+
+    // For each K-batch step: advance the K-axis offset by kb * kStep,
+    // read the per-thread slice (matches 2D fragment element count), then
+    // shape-cast to the nvgpu.mma.sync fragment type.
+    for (int64_t kb = 0; kb < kBatchCount; ++kb) {
+      // Compute per-thread offsets for this K-batch step.
+      SmallVector<Value> lo0 = off0, lo1 = off1;
+      if (kb > 0) {
+        if (lhsKAxis >= 0) {
+          Value adv = b.create<arith::ConstantIndexOp>(loc, kb * kStep);
+          lo0[lhsKAxis] = b.create<arith::AddIOp>(loc, off0[lhsKAxis], adv);
+        }
+        if (rhsKAxis >= 0) {
+          Value adv = b.create<arith::ConstantIndexOp>(loc, kb * kStep);
+          lo1[rhsKAxis] = b.create<arith::AddIOp>(loc, off1[rhsKAxis], adv);
+        }
+      }
+
+      // MN tile loop: iterate over (batchM, batchN) tiles.
+      for (int64_t bm = 0; bm < batchM; ++bm) {
+        for (int64_t bn = 0; bn < batchN; ++bn) {
+          // Advance M-axis offset for this MN tile.
+          SmallVector<Value> lhsOff = lo0;
+          if (lhsMAxis >= 0 && bm > 0) {
+            Value advM = b.create<arith::ConstantIndexOp>(loc, bm * elemM);
+            lhsOff[lhsMAxis] = b.create<arith::AddIOp>(
+                loc, lo0[lhsMAxis], advM);
+          }
+          // Advance N-axis offset for this MN tile.
+          SmallVector<Value> rhsOff = lo1;
+          if (rhsNAxis >= 0 && bn > 0) {
+            Value advN = b.create<arith::ConstantIndexOp>(loc, bn * elemN);
+            rhsOff[rhsNAxis] = b.create<arith::AddIOp>(
+                loc, lo1[rhsNAxis], advN);
+          }
+
+          // Read per-thread A and B fragments from smem.
+          Value aSlice = adjustedTransferRead(b, lhsRead, lhsOff, lhsThrTy);
+          Value bSlice = adjustedTransferRead(b, rhsRead, rhsOff, rhsThrTy);
+
+          // Shape-cast 3D per-thread slice to 2D MMA fragment.
+          Value aFrag = b.create<vector::ShapeCastOp>(loc, aFrag2D, aSlice);
+          Value bFrag = b.create<vector::ShapeCastOp>(loc, bFrag2D, bSlice);
+
+          // ACC MN slice → 2D C fragment.
+          SmallVector<int64_t> accOff(
+              cast<VectorType>(result.getType()).getRank(), 0);
+          if (accMAxis >= 0) accOff[accMAxis] = bm * L2.elemCounts[accMAxis];
+          if (accNAxis >= 0) accOff[accNAxis] = bn * L2.elemCounts[accNAxis];
+          Value cSlice = b.create<vector::ExtractStridedSliceOp>(
+              loc, result, accOff, accSliceShape, accOnes);
+          Value cFrag = b.create<vector::ShapeCastOp>(loc, cFrag2D, cSlice);
+
+          // nvgpu.mma.sync — all 32 threads in the warp participate.
+          Value cResult = b.create<nvgpu::MmaSyncOp>(
+              loc, aFrag, bFrag, cFrag, frags->mmaShape, isTf32);
+
+          // Shape-cast C result back to 3D and insert into accumulator.
+          Value accResult = b.create<vector::ShapeCastOp>(
+              loc, VectorType::get(accSliceShape, elemTy), cResult);
+          result = b.create<vector::InsertStridedSliceOp>(
+              loc, accResult, result, accOff, accOnes);
+        }
+      }
+    }
+    return result;
+  }
+
+  // ── Generic vector.contract fallback ─────────────────────────────────────
+  //
+  // Uses per-thread offsets (divui/remui) for non-MMA ops only.
+  Value emitGenericContract(Value acc) {
+    Value tid = b.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+    auto lhsFullTy = cast<VectorType>(lhsRead.getResult().getType());
+    auto rhsFullTy = cast<VectorType>(rhsRead.getResult().getType());
+
+    auto lhsThr = perThreadType(lhsFullTy, L0, lhsKAxis);
+    auto rhsThr = perThreadType(rhsFullTy, L1, rhsKAxis);
+
+    SmallVector<Value> off0 = computeThreadOffsets(b, loc, tid, L0, lhsKAxis);
+    SmallVector<Value> off1 = computeThreadOffsets(b, loc, tid, L1, rhsKAxis);
+
+    for (int64_t kb = 0; kb < kBatchCount; ++kb) {
+      SmallVector<Value> lo0 = off0, lo1 = off1;
+      if (kb > 0 && lhsKAxis >= 0) {
+        Value adv0 = b.create<arith::ConstantIndexOp>(loc, kb * kStep);
+        Value adv1 = b.create<arith::ConstantIndexOp>(loc, kb * kStep);
+        lo0[lhsKAxis] = b.create<arith::AddIOp>(loc, off0[lhsKAxis], adv0);
+        lo1[rhsKAxis] = b.create<arith::AddIOp>(loc, off1[rhsKAxis], adv1);
+      }
+      Value lhsSlice = adjustedTransferRead(b, lhsRead, lo0, lhsThr);
+      Value rhsSlice = adjustedTransferRead(b, rhsRead, lo1, rhsThr);
+      auto partial = b.create<vector::ContractionOp>(
+          loc, lhsSlice, rhsSlice, acc,
+          contractOp.getIndexingMaps(), contractOp.getIteratorTypes());
+      if (auto cfg = contractOp->getAttr("lowering_config"))
+        partial->setAttr("lowering_config", cfg);
+      acc = partial.getResult();
+    }
+    return acc;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// §10  ACC axis detection (generic, layout-driven, no op-specific knowledge)
+//===----------------------------------------------------------------------===//
+
+static void findAccAxes(const OperandLayout &L2,
+                        int &accMAxis, int &accNAxis) {
+  accMAxis = accNAxis = -1;
+  // M axis: first dimension distributed across subgroups (sgStrides != 0).
+  for (int d = 0; d < L2.rank && accMAxis < 0; ++d)
+    if (L2.sgStrides[d] != 0) accMAxis = d;
+  // N axis: first dimension with multiple threads but no sg distribution.
+  for (int d = 0; d < L2.rank && accNAxis < 0; ++d)
+    if (d != accMAxis && L2.threadCounts[d] > 1 && L2.sgStrides[d] == 0)
+      accNAxis = d;
+  // Positional fallback.
+  if (accMAxis < 0) accMAxis = (L2.rank > 1) ? 1 : 0;
+  if (accNAxis < 0) accNAxis = (L2.rank > 2) ? 2 : (L2.rank > 1 ? 1 : 0);
 }
 
 //===----------------------------------------------------------------------===//
-// §6  Main per-contract distribution
+// §11  Contract-to-K-axis mapping
 //===----------------------------------------------------------------------===//
 
-/// Distribute a single vector.contract and its surrounding transfer ops.
-static LogicalResult distributeContractOp(IRRewriter &rewriter,
-                                           vector::ContractionOp contractOp) {
-  Location loc = contractOp.getLoc();
-  OpBuilder::InsertionGuard guard(rewriter);
-  // Insert ALL new ops just before the contract — this is inside the
-  // thread-mapped scf.forall body, which is the correct GPU kernel scope.
-  // gpu.thread_id must live inside the thread forall, not at function top,
-  // so that ConvertForallToGPU sees it inside the gpu.launch block.
-  rewriter.setInsertionPoint(contractOp);
+static int getReductionDim(vector::ContractionOp op) {
+  auto types = op.getIteratorTypes().getValue();
+  for (int i = 0; i < (int)types.size(); ++i)
+    if (cast<vector::IteratorTypeAttr>(types[i]).getValue() ==
+        vector::IteratorType::reduction)
+      return i;
+  return -1;
+}
 
-  // ── Compute linearThreadId ──────────────────────────────────────────────
-  // thread_id is inserted here (inside the thread forall) so it ends up
-  // inside the gpu.launch block after forall lowering.
-  // We use a pure 1-D layout: threads are mapped as linear_dim_0 → tidX.
-  // tidY and tidZ are unused in the current MMA mapping (all dims collapse
-  // to a single linear thread axis).
-  Value tidX = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-  Value linearTid = tidX;
+static int contractDimToOperandDim(AffineMap m, int contractDim) {
+  for (int i = 0; i < (int)m.getNumResults(); ++i)
+    if (auto e = llvm::dyn_cast<AffineDimExpr>(m.getResult(i)))
+      if ((int)e.getPosition() == contractDim) return i;
+  return -1;
+}
 
-  // ── Read layouts for all three operands ──────────────────────────────
-  FailureOr<OperandLayout> L0 = readOperandLayout(contractOp, 0); // LHS
-  FailureOr<OperandLayout> L1 = readOperandLayout(contractOp, 1); // RHS
-  FailureOr<OperandLayout> L2 = readOperandLayout(contractOp, 2); // ACC
+//===----------------------------------------------------------------------===//
+// §12  Main distribution function (barrier insertion delegated to
+//      NovaGPUInsertWorkgroupBarriersPass — see Memory/NovaGPUBufferize.cpp)
+//===----------------------------------------------------------------------===//
+
+static LogicalResult distributeContract(IRRewriter &rw,
+                                         vector::ContractionOp op,
+                                         int64_t kUnrollLimit) {
+  Location loc = op.getLoc();
+  OpBuilder::InsertionGuard guard(rw);
+  rw.setInsertionPoint(op);
+
+  // Read layouts.
+  auto L0 = readLayout(op, 0);
+  auto L1 = readLayout(op, 1);
+  auto L2 = readLayout(op, 2);
   if (failed(L0) || failed(L1) || failed(L2)) {
-    contractOp->emitError(
-        "nova-gpu-vector-distribute: missing or malformed nova.layout_* attrs");
+    op->emitError("nova-gpu-vector-distribute: missing nova.layout_* attrs");
     return failure();
   }
 
-  // ── Find the K-batch axis and count ──────────────────────────────────
-  int kDim = getReductionDim(contractOp);
-  int lhsKAxis = -1;
-  int rhsKAxis = -1;
-  int64_t kBatchCount = 1;
-  int64_t lhsKStep = 0;
-  int64_t rhsKStep = 0;
-
-  if (kDim != -1) {
-    auto maps = contractOp.getIndexingMapsArray();
-    lhsKAxis = mapContractDimToOperandDim(maps[0], kDim);
-    rhsKAxis = mapContractDimToOperandDim(maps[1], kDim);
-    if (lhsKAxis != -1 && rhsKAxis != -1) {
-      // Validate that both operands agree on K-batch count and K-step size.
-      // If they disagree the layout pass produced inconsistent K layouts.
-      int64_t lhsKBatch = L0->batchCounts[lhsKAxis];
-      int64_t rhsKBatch = L1->batchCounts[rhsKAxis];
-      if (lhsKBatch != rhsKBatch) {
-        contractOp->emitError(
-            "nova-gpu-vector-distribute: LHS K batch_count (")
-            << lhsKBatch << ") != RHS K batch_count (" << rhsKBatch
-            << "); layout pass produced inconsistent K decomposition";
-        return failure();
-      }
-      lhsKStep = L0->threadCounts[lhsKAxis] * L0->elemCounts[lhsKAxis];
-      rhsKStep = L1->threadCounts[rhsKAxis] * L1->elemCounts[rhsKAxis];
-      if (lhsKStep != rhsKStep) {
-        contractOp->emitError(
-            "nova-gpu-vector-distribute: LHS K step (")
-            << lhsKStep << ") != RHS K step (" << rhsKStep
-            << "); thread_counts*elem_counts must match on K axis";
-        return failure();
-      }
-      kBatchCount = lhsKBatch;
-    }
-  }
-
-  // Use warp size from LHS (all operands share the same warp).
-  int64_t warpSize = computeWarpSize(*L0);
-
-  // ── Compute per-thread offsets for each operand ───────────────────────
-  SmallVector<Value> off0 =
-      computeDistributedOffsets(rewriter, loc, linearTid, warpSize, *L0);
-  SmallVector<Value> off1 =
-      computeDistributedOffsets(rewriter, loc, linearTid, warpSize, *L1);
-  SmallVector<Value> off2 =
-      computeDistributedOffsets(rewriter, loc, linearTid, warpSize, *L2);
-
-  // ── Build per-thread vector types ────────────────────────────────────
-  auto lhsType = cast<VectorType>(contractOp.getLhs().getType());
-  auto rhsType = cast<VectorType>(contractOp.getRhs().getType());
-  auto accType = cast<VectorType>(contractOp.getAcc().getType());
-
-  // ACC has no K axis (-1), so all its dims get batchCounts * elemCounts.
-  VectorType lhsThread = getPerThreadVectorType(lhsType, *L0, lhsKAxis);
-  VectorType rhsThread = getPerThreadVectorType(rhsType, *L1, rhsKAxis);
-  VectorType accThread = getPerThreadVectorType(accType,  *L2, /*kAxis=*/-1);
-
-  // ── Find original reads ──────────────────────────────────────────────
-  auto lhsRead = contractOp.getLhs().getDefiningOp<vector::TransferReadOp>();
-  auto rhsRead = contractOp.getRhs().getDefiningOp<vector::TransferReadOp>();
-  auto accRead = contractOp.getAcc().getDefiningOp<vector::TransferReadOp>();
-
-  if (!lhsRead || !rhsRead || !accRead) {
-    contractOp->emitError("nova-gpu-vector-distribute: "
-                          "contract operands must be transfer_reads");
+  // Require transfer_read operands for LHS and RHS.
+  auto lhsRead = op.getLhs().getDefiningOp<vector::TransferReadOp>();
+  auto rhsRead = op.getRhs().getDefiningOp<vector::TransferReadOp>();
+  if (!lhsRead || !rhsRead) {
+    op->emitError("nova-gpu-vector-distribute: LHS/RHS must be transfer_reads");
     return failure();
   }
 
-  // ── Read initial ACC ─────────────────────────────────────────────────
-  // Each thread owns its ACC slice (distributeTransferRead).
-  Value acc = distributeTransferRead(rewriter, accRead, off2, accThread);
+  // K-axis info.
+  int kDim = getReductionDim(op);
+  auto maps = op.getIndexingMapsArray();
+  int lhsKAxis = (kDim >= 0) ? contractDimToOperandDim(maps[0], kDim) : -1;
+  int rhsKAxis = (kDim >= 0) ? contractDimToOperandDim(maps[1], kDim) : -1;
 
-  // ── K-batch unroll sequence ──────────────────────────────────────────
-  for (int64_t kb = 0; kb < kBatchCount; ++kb) {
-    SmallVector<Value> lhsOff = off0;
-    SmallVector<Value> rhsOff = off1;
-
-    if (kb > 0 && lhsKAxis != -1 && rhsKAxis != -1) {
-      // Advance each operand's K offset independently using its own kStep.
-      // After Bug 1 is fixed lhsKStep == rhsKStep, but we keep them separate
-      // so a future layout mismatch produces an error above, not silent wrong
-      // results here.
-      Value lhsAdvance =
-          rewriter.create<arith::ConstantIndexOp>(loc, kb * lhsKStep);
-      Value rhsAdvance =
-          rewriter.create<arith::ConstantIndexOp>(loc, kb * rhsKStep);
-      lhsOff[lhsKAxis] =
-          rewriter.create<arith::AddIOp>(loc, off0[lhsKAxis], lhsAdvance);
-      rhsOff[rhsKAxis] =
-          rewriter.create<arith::AddIOp>(loc, off1[rhsKAxis], rhsAdvance);
+  int64_t kBatch = 1, kStep = 1;
+  int64_t lhsKThreadStride = 0;
+  if (lhsKAxis >= 0 && rhsKAxis >= 0) {
+    // K-step from MMA shape (generic: derived purely from mmaShape[2]).
+    SmallVector<int64_t> mmaShape = getMMAShapeFromOp(op);
+    if (!mmaShape.empty()) {
+      kStep = mmaShape[2];
+    } else {
+      kStep = L0->threadCounts[lhsKAxis] * L0->elemCounts[lhsKAxis];
     }
-
-    Value lhsSlice = distributeTransferRead(rewriter, lhsRead, lhsOff, lhsThread);
-    Value rhsSlice = distributeTransferRead(rewriter, rhsRead, rhsOff, rhsThread);
-
-    auto partialContract = rewriter.create<vector::ContractionOp>(
-        loc, lhsSlice, rhsSlice, acc, contractOp.getIndexingMaps(),
-        contractOp.getIteratorTypes());
-
-    // Preserve lowering_config for downstream passes (UnrollToIntrinsics).
-    if (auto cfg = contractOp->getAttr("lowering_config"))
-      partialContract->setAttr("lowering_config", cfg);
-
-    acc = partialContract.getResult();
+    kBatch = L0->batchCounts[lhsKAxis];
+    lhsKThreadStride = L0->threadStrides[lhsKAxis];
   }
 
-  // ── Distribute the result transfer_write ─────────────────────────────
-  // The final fully-reduced ACC result feeds directly into a transfer_write.
-  Value contractResult = contractOp.getResult();
+  // ACC handling.
+  int accMAxis, accNAxis;
+  findAccAxes(*L2, accMAxis, accNAxis);
+
+  auto accRead = op.getAcc().getDefiningOp<vector::TransferReadOp>();
+  // After the Subgroup tiling pass, MMA contracts live inside a #gpu.warp
+  // forall.  findEnclosingSubgroupForall walks up for that.  For non-MMA
+  // contracts (mmaKind==0) it returns nullptr — computeSgOffsets handles
+  // nullptr by returning zero offsets, which is correct for that path.
+  scf::ForallOp sgForall = findEnclosingSubgroupForall(op);
+
+  // Build ACC vector.
+  // For MMA ops: ACC is read at sg-offset from global output (no smem bounce).
+  // For generic: ACC is read per-thread.
+  Value acc;
+  SmallVector<Value> off2;
+  auto accType = cast<VectorType>(op.getAcc().getType());
+  VectorType accThr = perThreadType(accType, *L2, /*kAxis=*/-1);
+  int32_t mmaKind = getMmaKindFromOp(op);
+
+  if (accRead) {
+    if (mmaKind != 0) {
+      // MMA path: read ACC at subgroup offset from global output.
+      off2 = computeSgOffsets(rw, loc, *L2, sgForall);
+      acc = adjustedTransferRead(rw, accRead, off2, accThr);
+    } else {
+      // Generic path: per-thread read.
+      Value tid = rw.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+      off2 = computeThreadOffsets(rw, loc, tid, *L2, /*kAxis=*/-1);
+      acc = adjustedTransferRead(rw, accRead, off2, accThr);
+    }
+  } else {
+    off2 = computeSgOffsets(rw, loc, *L2, sgForall);
+    if (auto c = op.getAcc().getDefiningOp<arith::ConstantOp>()) {
+      if (auto d = dyn_cast<DenseElementsAttr>(c.getValue()))
+        if (d.isSplat())
+          acc = rw.create<arith::ConstantOp>(
+              loc, DenseElementsAttr::get(accThr, d.getSplatValue<Attribute>()));
+    }
+    if (!acc)
+      acc = rw.create<arith::ConstantOp>(loc, rw.getZeroAttr(accThr));
+  }
+
+  // Emit MMA/contract.
+  SmallVector<int64_t> mmaShape = getMMAShapeFromOp(op);
+  MMAEmitter emitter{rw, loc, op, *L0, *L1, *L2,
+                     lhsRead, rhsRead,
+                     lhsKAxis, rhsKAxis, accMAxis, accNAxis,
+                     kBatch, kStep, mmaShape, mmaKind};
+  Value result = emitter.emit(acc);
+
+  // Warp-shuffle reduction if K is thread-parallel (generic path only).
+  if (mmaKind == 0 && lhsKAxis >= 0 && L0->threadCounts[lhsKAxis] > 1) {
+    int64_t kTC = L0->threadCounts[lhsKAxis];
+    int64_t stride = (lhsKThreadStride > 0) ? lhsKThreadStride : 1;
+    assert(llvm::isPowerOf2_64((uint64_t)kTC) && kTC <= 32);
+    result = warpShuffleReduce(rw, loc, result, kTC, stride);
+  }
+
+  // Write result.
+  Value contractResult = op.getResult();
   vector::TransferWriteOp resultWrite;
-  for (Operation *user : contractResult.getUsers()) {
-    if (auto w = dyn_cast<vector::TransferWriteOp>(user)) {
-      resultWrite = w;
-      break;
-    }
-  }
+  for (Operation *u : contractResult.getUsers())
+    if (auto w = dyn_cast<vector::TransferWriteOp>(u)) { resultWrite = w; break; }
 
   if (resultWrite) {
-    rewriter.setInsertionPoint(resultWrite);
-    distributeTransferWrite(rewriter, resultWrite, acc, off2);
-    rewriter.eraseOp(resultWrite);
+    rw.setInsertionPoint(resultWrite);
+    adjustedTransferWrite(rw, resultWrite, result, off2,
+                          /*overrideBase=*/nullptr);
+    rw.eraseOp(resultWrite);
   }
 
-  // Erase the original contract (reads are already replaced/erased by unroll).
-  rewriter.eraseOp(contractOp);
-  if (lhsRead->use_empty()) rewriter.eraseOp(lhsRead);
-  if (rhsRead->use_empty()) rewriter.eraseOp(rhsRead);
-  if (accRead->use_empty()) rewriter.eraseOp(accRead);
-
+  // Cleanup.
+  rw.eraseOp(op);
+  if (lhsRead->use_empty()) rw.eraseOp(lhsRead);
+  if (rhsRead->use_empty()) rw.eraseOp(rhsRead);
+  if (accRead && accRead->use_empty()) rw.eraseOp(accRead);
   return success();
 }
 
 //===----------------------------------------------------------------------===//
-// §7  Pass
+// §13  Pass
 //===----------------------------------------------------------------------===//
 
 struct NovaGPUVectorDistributePass
@@ -468,61 +703,47 @@ struct NovaGPUVectorDistributePass
                          OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUVectorDistributePass)
 
-  StringRef getArgument() const override {
-    return "nova-gpu-vector-distribute";
-  }
+  NovaGPUVectorDistributePass() = default;
+  NovaGPUVectorDistributePass(const NovaGPUVectorDistributePass &other)
+      : PassWrapper(other) {}
+
+  Option<int64_t> kBatchUnrollLimit{
+      *this, "k-batch-unroll-limit",
+      llvm::cl::desc("Max K-batch unroll (default 16)"),
+      llvm::cl::init(16)};
+
+  StringRef getArgument()    const override { return "nova-gpu-vector-distribute"; }
   StringRef getDescription() const override {
-    return "Distribute vector.contract and surrounding transfer ops to "
-           "per-thread slices using nova.layout_* DictionaryAttrs.";
+    return "Distribute vector.contract to warp-level nvgpu.mma.sync "
+           "(MMA path) or per-thread slices (generic fallback).";
   }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, gpu::GPUDialect,
-                    vector::VectorDialect, affine::AffineDialect,
-                    func::FuncDialect>();
+  void getDependentDialects(DialectRegistry &r) const override {
+    r.insert<arith::ArithDialect, gpu::GPUDialect, vector::VectorDialect,
+             func::FuncDialect, scf::SCFDialect, NVVM::NVVMDialect,
+             nvgpu::NVGPUDialect>();
   }
-
   void runOnOperation() override {
-    func::FuncOp funcOp = getOperation();
-    MLIRContext *ctx = &getContext();
-    IRRewriter rewriter(ctx);
+    func::FuncOp fn = getOperation();
+    IRRewriter rw(&getContext());
 
-    // ── Collect all contracts with nova.layout_0 ───────────────────────
-    // Collect upfront — modifying the IR during walk invalidates the iterator.
-    SmallVector<vector::ContractionOp> contracts;
-    funcOp.walk([&](vector::ContractionOp op) {
-      if (op->hasAttr("nova.layout_0"))
-        contracts.push_back(op);
+    SmallVector<vector::ContractionOp> ops;
+    fn.walk([&](vector::ContractionOp op) {
+      if (op->hasAttr("nova.layout_0")) ops.push_back(op);
     });
-
-    // ── Distribute each contract ────────────────────────────────────────
-    // gpu.thread_id is created inside distributeContractOp, right before the
-    // contract op itself — which is inside the thread-mapped scf.forall.
-    // That ensures thread_id ends up inside the gpu.launch block after
-    // ConvertForallToGPU, rather than floating at function scope.
-    for (vector::ContractionOp contractOp : contracts) {
-      if (failed(distributeContractOp(rewriter, contractOp))) {
-        signalPassFailure();
-        return;
-      }
-    }
-
-    LLVM_DEBUG(llvm::dbgs()
-               << "[nova-vector-distribute] distributed "
-               << contracts.size() << " contract(s)\n");
+    for (auto op : ops)
+      if (failed(distributeContract(rw, op, kBatchUnrollLimit)))
+        return signalPassFailure();
+    // Barrier insertion is intentionally omitted here.
+    // NovaGPUInsertWorkgroupBarriersPass owns all barrier placement and runs
+    // after bufferization, so inserting barriers here would create duplicates.
   }
 };
 
 } // namespace
 
-//===----------------------------------------------------------------------===//
-// Public API
-//===----------------------------------------------------------------------===//
-
 std::unique_ptr<Pass> createNovaGPUVectorDistributePass() {
   return std::make_unique<NovaGPUVectorDistributePass>();
 }
-
 void registerNovaGPUVectorDistributePass() {
   PassRegistration<NovaGPUVectorDistributePass>();
 }

@@ -1,8 +1,11 @@
 #include "Compiler/Dialect/nova/NovaDialect.h"
 #include "Compiler/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/PatternMatch.h"
@@ -91,23 +94,96 @@ public:
     if (!srcType || !dstType)
       return failure();
 
-    // Guard: do NOT convert copies that involve a GPU-specific address space
-    // (private or workgroup). Those are intra-kernel copies (e.g. padding
-    // copies from a plain memref into a thread-private register tile, or
-    // shared-memory fills). After GpuKernelOutliningPass these end up inside
-    // gpu.func where gpu.memcpy has no PTX equivalent and is marked illegal
-    // by createConvertGpuOpsToNVVMOps.
-    // Plain memref.copy ops in GPU address spaces are correctly lowered by
-    // FinalizeMemRefToLLVM via load/store sequences.
     auto isGpuAddrSpace = [](MemRefType t) {
       return mlir::isa_and_present<gpu::AddressSpaceAttr>(t.getMemorySpace());
     };
+
+    auto isIntMemSpace = [](MemRefType t, int64_t space) -> bool {
+      if (auto intAttr = llvm::dyn_cast_or_null<IntegerAttr>(t.getMemorySpace()))
+        return intAttr.getInt() == space;
+      return false;
+    };
+
+    // Intra-kernel async path: device global (space=1) → workgroup shared
+    // memory, inside a gpu.func. Convert to cp.async via nvgpu.device_async_copy
+    // + NVVM commit/wait.
+    //
+    // deriveThreadTileSizes (with blockDim) guarantees the innermost tile is
+    // exactly maxVec elements (4 f32 = 16 B for cp.async.16).  The outer dims
+    // may be > 1 (e.g. tile [1,4,4] for copy A) — we generate a sequential
+    // scf.for over those rows, emitting one cp.async.16 per row.
+    //
+    // Note: we use NVVM::CpAsyncCommitGroupOp / CpAsyncWaitGroupOp instead of
+    // nvgpu.device_async_create_group / nvgpu.device_async_wait because the
+    // nvgpu token type cannot survive the SCF-to-CF + NVGPU-to-NVVM lowering
+    // when the copy is inside scf.if — the token-based ops get silently dropped,
+    // leaving cp.async with no synchronisation.
+    if (op->getParentOfType<gpu::GPUFuncOp>() &&
+        isIntMemSpace(srcType, 1) &&
+        isGpuAddrSpace(dstType)) {
+      Location loc = op.getLoc();
+      MLIRContext *ctx = rewriter.getContext();
+      ArrayRef<int64_t> shape = dstType.getShape();
+      int64_t rank = shape.size();
+
+      // innerVec = innermost dim size = elements per cp.async instruction.
+      // deriveThreadTileSizes guarantees this equals maxVec (4 for f32).
+      int64_t innerVec = shape[rank - 1];
+
+      Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+      // Build a nest of scf.for loops over all dims except the innermost.
+      // Each iteration body emits one cp.async.16 covering `innerVec` elements.
+      // For tile [1,4,4]: two outer loops (range 1, range 4), innermost=4.
+      // For tile [1,1,4]: one trivial outer loop (range 1) — MLIR's
+      //   canonicalizer will fold it away; no runtime overhead.
+      SmallVector<Value> outerIVs;
+      for (int64_t d = 0; d < rank - 1; ++d) {
+        Value ub = rewriter.create<arith::ConstantIndexOp>(loc, shape[d]);
+        auto forOp = rewriter.create<scf::ForOp>(loc, c0, ub, c1);
+        outerIVs.push_back(forOp.getInductionVar());
+        rewriter.setInsertionPointToStart(forOp.getBody());
+      }
+
+      // Inside the loop body: compute the linearised indices for this row.
+      // dst subview is already the per-thread tile, so indices are the IVs
+      // plus [0] for the innermost dim.
+      SmallVector<Value> dstIdx(outerIVs.begin(), outerIVs.end());
+      dstIdx.push_back(c0); // innermost offset = 0 (cp.async covers full row)
+      SmallVector<Value> srcIdx(outerIVs.begin(), outerIVs.end());
+      srcIdx.push_back(c0);
+      // Pad to rank with c0 if src has more dims than dst (shouldn't happen
+      // for subviews but be safe).
+      while ((int64_t)srcIdx.size() < srcType.getRank())
+        srcIdx.push_back(c0);
+
+      rewriter.create<nvgpu::DeviceAsyncCopyOp>(
+          loc,
+          nvgpu::DeviceAsyncTokenType::get(ctx),
+          op.getTarget(), dstIdx,
+          op.getSource(), srcIdx,
+          rewriter.getIndexAttr(innerVec),
+          /*srcElements=*/Value{},
+          /*bypassL1=*/rewriter.getUnitAttr()); // bypass L1 for streaming loads
+
+      // Commit and immediately wait (numGroups=0) — single-buffered for now.
+      // For ping-pong: emit commit outside the loop and use waitGroup(1).
+      rewriter.create<NVVM::CpAsyncCommitGroupOp>(loc);
+      rewriter.create<NVVM::CpAsyncWaitGroupOp>(loc,
+                                                rewriter.getI32IntegerAttr(0));
+
+      rewriter.eraseOp(op);
+      return success();
+    }
+
+    // Guard: do NOT convert other copies that involve a GPU address space
+    // (private or workgroup). Those are lowered by FinalizeMemRefToLLVM via
+    // load/store sequences.
     if (isGpuAddrSpace(srcType) || isGpuAddrSpace(dstType))
       return failure();
 
-    // Only convert plain (no GPU address space) host-side copies to
-    // gpu.memcpy — these are cross-kernel host↔device transfers produced
-    // after ConvertMemRefToGpu promotes memref.alloc → gpu.alloc.
+    // Host-side path: plain host↔device copies → gpu.memcpy.
     rewriter.replaceOpWithNewOp<gpu::MemcpyOp>(
         op, TypeRange{}, ValueRange{}, op.getTarget(), op.getSource());
     return success();
@@ -119,8 +195,8 @@ struct ConvertMemRefToGpuPass
       ConvertMemRefToGpuPass>::ConvertMemRefToGpuBase;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry
-        .insert<gpu::GPUDialect, memref::MemRefDialect, func::FuncDialect>();
+    registry.insert<gpu::GPUDialect, memref::MemRefDialect, func::FuncDialect,
+                    nvgpu::NVGPUDialect, NVVM::NVVMDialect>();
   }
 
   void runOnOperation() override {

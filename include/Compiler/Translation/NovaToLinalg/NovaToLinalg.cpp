@@ -29,7 +29,7 @@ namespace nova {
 inline SmallVector<utils::IteratorType> getNParallelLoopsAttrs(unsigned n) {
   return SmallVector<utils::IteratorType>(n, utils::IteratorType::parallel);
 }
-static Value broadcastToShape(OpBuilder &b, Location loc,
+Value broadcastToShape(OpBuilder &b, Location loc,
                                Value input, ArrayRef<int64_t> targetShape) {
   auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
   if (!inputType)
@@ -699,7 +699,7 @@ struct NovaBroadcastInDimOpLowering
 };
 
 // Helper function to broadcast for matmul
-static Value broadcastTensor(ConversionPatternRewriter &rewriter, Location loc,
+Value broadcastTensor(ConversionPatternRewriter &rewriter, Location loc,
                              Value input, ArrayRef<int64_t> targetShape) {
   auto inputType = llvm::dyn_cast<RankedTensorType>(input.getType());
   if (!inputType) {

@@ -310,14 +310,37 @@ void NovaGenericVectorizationPass::runOnOperation() {
     if (hasStaticShape(linalgOp)) {
     if (failed(isWithinVectorSizeLimit(linalgOp))) continue;
 
-    // Skip shared memory promotion copies — these are handled by a dedicated
-    // pass (NovaGPULowerSharedMemCopies or equivalent) that understands the
-    // workgroup address space semantics. Vectorizing them here as plain copies
-    // loses the nova.promote_to_workgroup marker and causes the workgroup
-    // alloc_tensor to be eliminated as dead, making shared_mem=true on the
-    // downstream vector.contract a lie.
+    // ── Global→shared promotion barrier ──────────────────────────────────
+    // Two categories of linalg ops must NOT be vectorized here:
+    //
+    //  (1) linalg.copy {nova.promote_to_workgroup}
+    //      This is the direct global→shared staging copy inserted by
+    //      PromoteMatmulOperands.  It must stay as linalg.copy so that a
+    //      future pass can pattern-match it and emit nvgpu.device_async_copy
+    //      (cp.async PTX).  Vectorizing it into vector.transfer_read/write
+    //      destroys the global→shared structural signature.
+    //
+    //  (2) Any linalg op whose result feeds a nova.promote_to_workgroup copy.
+    //      For the weight (B-matrix) operand, PromoteMatmulOperands inserts a
+    //      linalg.generic reshape (tensor<32x4> → tensor<1x32x4>) whose output
+    //      is the `ins` of the promote_to_workgroup linalg.copy.  If we
+    //      vectorize the generic here, the output lands in a tensor.empty()
+    //      that OneShotBufferize aliases in-place with the workgroup buffer
+    //      (because the copy's outs is the only consumer).  Both ins and outs
+    //      of the linalg.copy then resolve to the same workgroup memref —
+    //      turning the global→shared copy into a shared→shared self-copy and
+    //      silently losing the actual global load.
+    //
+    // Shared→shared and shared→thread copies (plain linalg.copy without
+    // nova.promote_to_workgroup, and not feeding one) are fine to vectorize —
+    // they become vector.transfer_read/write which lower to LDS instructions.
     if (op->hasAttr("nova.promote_to_workgroup"))
-        continue;
+      continue;
+    bool feedsPromotionCopy = llvm::any_of(op->getUsers(), [](Operation *user) {
+      return user->hasAttr("nova.promote_to_workgroup");
+    });
+    if (feedsPromotionCopy)
+      continue;
 
     FailureOr<linalg::VectorizationResult> result =
         linalg::vectorize(rewriter, op, {}, {},

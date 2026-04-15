@@ -183,9 +183,21 @@ int64_t getTargetThreadCount(DictionaryAttr config) {
   return 0;
 }
 
+int64_t getBlockDim(DictionaryAttr config) {
+  if (!config)
+    return 0;
+  auto attr = config.get(kBlockDimKey);
+  if (!attr)
+    return 0;
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+    return intAttr.getInt();
+  return 0;
+}
+
 SmallVector<int64_t> deriveThreadTileSizes(ArrayRef<int64_t> loopRanges,
                                            int64_t targetThreads,
-                                           unsigned elemBitWidth) {
+                                           unsigned elemBitWidth,
+                                           int64_t blockDim) {
   int64_t rank = loopRanges.size();
   SmallVector<int64_t> tileSizes(rank, 1);
   if (targetThreads <= 0 || rank == 0)
@@ -196,26 +208,52 @@ SmallVector<int64_t> deriveThreadTileSizes(ArrayRef<int64_t> loopRanges,
   for (int64_t r : loopRanges)
     flatTrips *= r;
 
-  // If not evenly divisible, fall back to all-ones (each thread gets 1 elem).
-  if (flatTrips % targetThreads != 0)
-    return tileSizes;
-
-  // Per-thread work = total elements / target thread count.
-  int64_t perThread = flatTrips / targetThreads;
-
   // Max vector width from 128-bit loads (e.g., 4 for f32, 8 for f16).
+  // For cp.async, this is also the max elements per single instruction
+  // (cp.async.16 = 16 bytes = 4 f32 = 8 f16).
   int64_t maxVec = std::max<int64_t>(1, 128 / elemBitWidth);
 
+  // When blockDim is known, cap targetThreads so that each thread gets at
+  // least maxVec elements — this ensures innermost tile == maxVec, giving a
+  // single cp.async.16 instruction per row rather than a scalar ld/st loop.
+  // Example: Copy A [1,64,64], blockDim=256, maxVec=4 (f32)
+  //   uncapped: targetThreads=128 → perThread=32 → tile=[1,8,4] (8 cp.async)
+  //   capped:   targetThreads=min(128, 4096/4)=min(128,1024)=128 → same
+  //   but perThread clamped to max(maxVec, flatTrips/blockDim)=max(4,16)=16
+  //   → targetThreads = 4096/16 = 256 → tile=[1,4,4] (4 cp.async per thread)
+  //
+  // The key invariant: innermost tile is always exactly maxVec.  Outer tiles
+  // absorb any remaining perThread work so ConvertMemRefToGpu can emit one
+  // cp.async per row with dstElements=maxVec, iterating over outer dims.
+  int64_t effectiveThreads = targetThreads;
+  if (blockDim > 0) {
+    // Minimum perThread so we don't exceed blockDim threads for this copy.
+    int64_t minPerThread = (flatTrips + blockDim - 1) / blockDim;
+    // Clamp perThread to be at least maxVec (so innermost tile == maxVec)
+    // and at least minPerThread (so thread count stays within blockDim).
+    int64_t perThreadFloor = std::max(maxVec, minPerThread);
+    // Round up to a multiple of maxVec so innermost dim divides cleanly.
+    perThreadFloor = ((perThreadFloor + maxVec - 1) / maxVec) * maxVec;
+    // Recompute effective thread count from the floored perThread.
+    if (flatTrips % perThreadFloor == 0)
+      effectiveThreads = flatTrips / perThreadFloor;
+  }
+
+  // If not evenly divisible, fall back to all-ones (each thread gets 1 elem).
+  if (flatTrips % effectiveThreads != 0)
+    return tileSizes;
+
+  // Per-thread work = total elements / effective thread count.
+  int64_t perThread = flatTrips / effectiveThreads;
+
   // Distribute per-thread work across dims, innermost first.
-  // Innermost dim gets up to maxVec elements (for coalesced vector loads).
-  // Remaining per-thread work is spread to outer dims.
+  // Innermost dim is capped at maxVec for a single cp.async.16 instruction.
+  // Remaining per-thread work is spread into outer dims (these become the
+  // loop bounds in ConvertMemRefToGpu's generated scf.for).
   int64_t remaining = perThread;
   for (int64_t d = rank - 1; d >= 0 && remaining > 1; --d) {
     int64_t range = loopRanges[d];
-    // For innermost dim, cap at maxVec for vector load width.
-    int64_t maxTile = (d == rank - 1) ? std::min(maxVec, range)
-                                      : range;
-    // Find largest tile that divides both remaining and range.
+    int64_t maxTile = (d == rank - 1) ? std::min(maxVec, range) : range;
     int64_t tile = std::min(maxTile, remaining);
     while (tile > 1 && (range % tile != 0 || remaining % tile != 0))
       --tile;
@@ -223,14 +261,12 @@ SmallVector<int64_t> deriveThreadTileSizes(ArrayRef<int64_t> loopRanges,
     remaining /= tile;
   }
 
-  // Verify: product(loopRanges) / product(tileSizes) == targetThreads.
+  // Verify: product(loopRanges) / product(tileSizes) == effectiveThreads.
   int64_t actualThreads = 1;
   for (int64_t d = 0; d < rank; ++d)
     actualThreads *= (loopRanges[d] / tileSizes[d]);
 
-  if (actualThreads != targetThreads) {
-    // Fallback: couldn't achieve exact match, use all-ones.
-    // This means trip count = flatTrips, which won't fuse but is safe.
+  if (actualThreads != effectiveThreads) {
     return SmallVector<int64_t>(rank, 1);
   }
 

@@ -1530,11 +1530,109 @@ struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
     }
 
     auto loc = op.getLoc();
+    auto resultShape = resultType.getShape();
+    int64_t resultRank = resultShape.size();
 
-    //create nova::matmul and nova::add 
-    auto matmulOperation = rewriter.create<mlir::nova::MatmulOp>(loc, input, weight).getResult();
-    auto addOperation = rewriter.create<mlir::nova::AddOp>(loc, matmulOperation, bias);
-    rewriter.replaceOp(op, addOperation);
+    // 1. Prepare common operands (handle rank > 3 flattening)
+    Value lhs = input;
+    Value rhs = weight;
+    RankedTensorType currentResultType = resultType;
+
+    if (resultRank > 3) {
+      auto newShape = resultShape.drop_back(2);
+      
+      // Broadcast LHS to match result batch dimensions
+      SmallVector<int64_t> lhsTargetShape(newShape.begin(), newShape.end());
+      lhsTargetShape.push_back(inputType.getShape()[inputType.getRank() - 2]);
+      lhsTargetShape.push_back(inputType.getShape()[inputType.getRank() - 1]);
+      lhs = broadcastTensor(rewriter, loc, lhs, lhsTargetShape);
+      auto newLhsType = cast<RankedTensorType>(lhs.getType());
+
+      // Broadcast RHS to match result batch dimensions
+      SmallVector<int64_t> rhsTargetShape(newShape.begin(), newShape.end());
+      rhsTargetShape.push_back(weightType.getShape()[weightType.getRank() - 2]);
+      rhsTargetShape.push_back(weightType.getShape()[weightType.getRank() - 1]);
+      rhs = broadcastTensor(rewriter, loc, rhs, rhsTargetShape);
+      auto newRhsType = cast<RankedTensorType>(rhs.getType());
+
+      int64_t N = 1;
+      for (int64_t i = 0; i < (resultRank - 2); i++) {
+        N *= resultType.getShape()[i];
+      }
+
+      int64_t M = resultType.getShape()[resultRank - 2];
+      int64_t K = newLhsType.getShape()[newLhsType.getRank() - 1];
+      int64_t N_cols = resultType.getShape()[resultRank - 1];
+
+      SmallVector<int64_t> rank3_lhs_shape({N, M, K});
+      SmallVector<int64_t> rank3_rhs_shape({N, K, N_cols});
+      SmallVector<int64_t> rank3_output_shape({N, M, N_cols});
+
+      auto rank3LhsType = RankedTensorType::get(rank3_lhs_shape, newLhsType.getElementType());
+      auto rank3RhsType = RankedTensorType::get(rank3_rhs_shape, newRhsType.getElementType());
+      currentResultType = RankedTensorType::get(rank3_output_shape, resultType.getElementType());
+
+      SmallVector<ReassociationIndices> lhsReassociation;
+      ReassociationIndices batchIndices;
+      for (int64_t i = 0; i < resultRank - 2; ++i) batchIndices.push_back(i);
+      lhsReassociation.push_back(batchIndices);
+      lhsReassociation.push_back({resultRank - 2});
+      lhsReassociation.push_back({resultRank - 1});
+
+      SmallVector<ReassociationIndices> rhsReassociation;
+      for (int64_t i = 0; i < resultRank - 2; ++i) rhsReassociation.push_back({i}); // Wait, actually it should be same as above
+      // Re-using the logic from NovaMatmulOpLowering
+      rhsReassociation.clear();
+      rhsReassociation.push_back(batchIndices);
+      rhsReassociation.push_back({resultRank - 2});
+      rhsReassociation.push_back({resultRank - 1});
+
+      lhs = rewriter.create<tensor::CollapseShapeOp>(loc, rank3LhsType, lhs, lhsReassociation);
+      rhs = rewriter.create<tensor::CollapseShapeOp>(loc, rank3RhsType, rhs, rhsReassociation);
+    }
+
+    // 2. Prepare the fused 'outs' tensor (bias broadcasted)
+    Value broadcastedBias = broadcastTensor(rewriter, loc, bias, currentResultType.getShape());
+
+    // 3. Create the linalg op
+    // For batch_matmul, all three operands (A, B, C) must be 3D.
+    // When we arrive here with rank==3 via the straight path (resultRank==3,
+    // no collapse), lhs is already 3D but rhs may still be the original 2D
+    // weight tensor (shape [K, N]).  Broadcast it to [batch, K, N] so that
+    // linalg.batch_matmul receives uniform 3D operands.
+    if (currentResultType.getRank() == 3) {
+      auto rhsType = cast<RankedTensorType>(rhs.getType());
+      if (rhsType.getRank() == 2) {
+        int64_t batchDim = currentResultType.getShape()[0];
+        int64_t kDim     = rhsType.getShape()[0];
+        int64_t nDim     = rhsType.getShape()[1];
+        rhs = broadcastTensor(rewriter, loc, rhs, {batchDim, kDim, nDim});
+      }
+    }
+
+    Value matmulResult;
+    if (currentResultType.getRank() == 3) {
+      matmulResult = rewriter.create<linalg::BatchMatmulOp>(
+          loc, currentResultType, ValueRange{lhs, rhs}, broadcastedBias).getResult(0);
+    } else {
+      matmulResult = rewriter.create<linalg::MatmulOp>(
+          loc, currentResultType, ValueRange{lhs, rhs}, broadcastedBias).getResult(0);
+    }
+
+    // 4. Expand back if we collapsed
+    if (resultRank > 3) {
+      SmallVector<ReassociationIndices> resultReassociation;
+      ReassociationIndices expandedBatchIndices;
+      for (int64_t i = 0; i < resultRank - 2; ++i) expandedBatchIndices.push_back(i);
+      resultReassociation.push_back(expandedBatchIndices);
+      resultReassociation.push_back({resultRank - 2});
+      resultReassociation.push_back({resultRank - 1});
+
+      rewriter.replaceOpWithNewOp<tensor::ExpandShapeOp>(op, resultType, matmulResult, resultReassociation);
+    } else {
+      rewriter.replaceOp(op, matmulResult);
+    }
+
     return success();
   }
 };

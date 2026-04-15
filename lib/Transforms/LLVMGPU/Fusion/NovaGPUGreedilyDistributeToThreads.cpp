@@ -15,6 +15,7 @@
 // Mirrors IREE's GPUGreedilyDistributeToThreads.cpp.
 
 #include "Passes.h"
+#include "Compiler/Dialect/nova/NovaOps.h"
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -163,8 +164,14 @@ void tileToThreads(RewriterBase &rewriter,
     // would pull its entire body inside one thread's tile, turning a
     // workgroup-scoped copy into per-thread work and breaking the
     // nova.promote_to_workgroup semantic.
+    //
+    // Also refuse nova.fusion_barrier: fusing it into the forall body clones
+    // a dead barrier use per-thread and — after bufferization erases it —
+    // leaves the second epilogue forall reading the pre-barrier tensor
+    // directly, producing a spurious workgroup-to-workgroup copy chain that
+    // the barrier-insertion pass then wraps with barriers-inside-loops.
     Operation *defOp = originalProducer.getOwner();
-    if (isa<scf::ForOp, scf::ForallOp>(defOp))
+    if (isa<scf::ForOp, scf::ForallOp, nova::FusionBarrierOp>(defOp))
       return std::nullopt; // refuse fusion
     return scf::SCFTileAndFuseOptions::ControlFnResult{
         /*yieldProducerReplacement=*/false};

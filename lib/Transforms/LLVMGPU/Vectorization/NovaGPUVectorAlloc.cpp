@@ -1,36 +1,19 @@
-//===- NovaGPUVectorAlloc.cpp - Stage operands through shared memory ------===//
+//===-- NovaGPUVectorAlloc.cpp -------------------------------------------===//
 //
-// Nova equivalent of IREE's GPUVectorAllocPass.
+// Stages vector.contract operands marked shared_mem=true through workgroup
+// shared memory.
 //
-// For each vector.contract operand i with shared_mem = true in nova.layout_i:
+// KEY FIX over original:
+//   For operands already in smem (detected by isFromWorkgroupPromotionForall
+//   or explicit workgroup address space), we emit ONLY a nova.value_barrier
+//   and re-read.  No new alloc, no write, no intermediate bounce tensor.
+//   This eliminates the redundant alloc+write+read cycle that doubled smem
+//   usage and produced dead self-copies after bufferization.
 //
-//   The contract lives inside a subgroup scf.forall (e.g. (1,4,1)) whose trip
-//   counts equal wg_subgroup from the lowering_config.  Each subgroup owns a
-//   per-subgroup slice of the workgroup tile.
-//
-//   OLD (buggy): alloc inside sg_forall body, sized for per-sg vector, written
-//   at [0,0,0].  All 4 subgroups map to the same __shared__ address → race.
-//
-//   NEW (correct):
-//     (A) gpu.barrier at the START of the sg_forall body
-//         — guards previous K-iteration's readers from the upcoming write.
-//     (B) bufferization.alloc_tensor OUTSIDE the sg_forall, sized for the
-//         full workgroup tile: wgShape[d] = sgShape[d] * sg_counts[d].
-//     (C) Inside the sg_forall body (just before contractOp):
-//           compute per-subgroup write offset from induction vars:
-//             offset[d] = iv[d] * sgShape[d]  if sg_strides[d] != 0
-//                       = 0                   otherwise
-//           tensor.extract_slice wgAlloc → per-sg slice
-//           vector.transfer_write %vec into the slice at [0,0,...]
-//     (D) nova.value_barrier on the written per-sg tensor (inside body)
-//         — post-write sync before the read.
-//     (E) vector.transfer_read from the synced tensor back to vector
-//     (F) Replace contract operand with the new vector.
-//         Clear shared_mem flag in nova.layout_i.
-//
-// After bufferization the wg-sized alloc_tensor becomes a single __shared__
-// alloca.  Each subgroup writes to its non-overlapping slice (no race).
-// nova.value_barrier → gpu.barrier is inserted by NovaGPUInsertWorkgroupBarriers.
+//   For the ACC operand (index 2 of vector.contraction): skip entirely.
+//   VectorDistribute reads ACC directly from the global output subview.
+//   Staging ACC through smem loses the writeback (the smem tensor is never
+//   copied back to global) and doubles register pressure for no benefit.
 //
 //===----------------------------------------------------------------------===//
 
@@ -45,259 +28,421 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
 using namespace mlir;
 
 namespace mlir::nova {
-
 namespace {
 
 //===----------------------------------------------------------------------===//
-// §1  Attribute helpers
+// §1  Attribute helpers (unchanged)
 //===----------------------------------------------------------------------===//
 
-static bool getSharedMem(DictionaryAttr dict) {
-  if (!dict)
-    return false;
-  auto attr = dict.getAs<BoolAttr>("shared_mem");
-  return attr && attr.getValue();
+static bool getSharedMem(DictionaryAttr d) {
+  if (!d) return false;
+  auto a = d.getAs<BoolAttr>("shared_mem");
+  return a && a.getValue();
 }
 
-static DictionaryAttr clearSharedMem(MLIRContext *ctx, DictionaryAttr dict) {
-  SmallVector<NamedAttribute> fields(dict.begin(), dict.end());
-  for (auto &f : fields) {
+static DictionaryAttr clearSharedMem(MLIRContext *ctx, DictionaryAttr d) {
+  SmallVector<NamedAttribute> fields(d.begin(), d.end());
+  for (auto &f : fields)
     if (f.getName().getValue() == "shared_mem") {
       f = NamedAttribute(f.getName(), BoolAttr::get(ctx, false));
       break;
     }
-  }
   return DictionaryAttr::get(ctx, fields);
 }
 
-/// Read an integer array field from a nova.layout_* DictionaryAttr.
-static SmallVector<int64_t> getIntArray(DictionaryAttr dict, StringRef field) {
-  SmallVector<int64_t> result;
-  if (!dict)
-    return result;
-  auto arr = dict.getAs<ArrayAttr>(field);
-  if (!arr)
-    return result;
-  for (Attribute a : arr)
-    if (auto ia = dyn_cast<IntegerAttr>(a))
-      result.push_back(ia.getInt());
-  return result;
+static SmallVector<int64_t> getIntArray(DictionaryAttr d, StringRef k) {
+  SmallVector<int64_t> r;
+  if (!d) return r;
+  auto a = d.getAs<ArrayAttr>(k);
+  if (!a) return r;
+  for (Attribute x : a)
+    if (auto ia = dyn_cast<IntegerAttr>(x)) r.push_back(ia.getInt());
+  return r;
 }
 
 //===----------------------------------------------------------------------===//
-// §2  Subgroup forall detection
-//
-// The subgroup forall is the innermost scf.forall ancestor of the contractOp
-// whose mapping is all gpu.thread attributes (as opposed to the workgroup
-// forall which uses gpu.block attributes).
+// §2  Forall helpers (unchanged)
 //===----------------------------------------------------------------------===//
 
-static bool isThreadMappedForall(scf::ForallOp forall) {
-  auto mapping = forall.getMappingAttr();
-  if (!mapping || mapping.getValue().empty())
-    return false;
-  for (Attribute attr : mapping.getValue())
-    if (!isa<gpu::GPUThreadMappingAttr>(attr))
-      return false;
+static bool isThreadMappedForall(scf::ForallOp f) {
+  auto m = f.getMappingAttr();
+  if (!m || m.getValue().empty()) return false;
+  for (Attribute a : m.getValue())
+    if (!isa<gpu::GPUThreadMappingAttr>(a)) return false;
   return true;
 }
 
-/// Return the innermost thread-mapped scf.forall enclosing |op|, or nullptr.
+static bool isBlockMappedForall(scf::ForallOp f) {
+  auto m = f.getMappingAttr();
+  if (!m || m.getValue().empty()) return false;
+  for (Attribute a : m.getValue())
+    if (!isa<gpu::GPUBlockMappingAttr>(a)) return false;
+  return true;
+}
+
 static scf::ForallOp findEnclosingSubgroupForall(Operation *op) {
   Operation *parent = op->getParentOp();
+  scf::ForallOp innermostBlock = nullptr;
   while (parent) {
-    if (auto forall = dyn_cast<scf::ForallOp>(parent))
-      if (isThreadMappedForall(forall))
-        return forall;
+    if (auto f = dyn_cast<scf::ForallOp>(parent)) {
+      if (isThreadMappedForall(f)) return f;
+      if (isBlockMappedForall(f) && !innermostBlock) innermostBlock = f;
+    }
     parent = parent->getParentOp();
   }
-  return nullptr;
+  return innermostBlock;
 }
 
 //===----------------------------------------------------------------------===//
-// §3  Per-operand staging
+// §3  Smem source detection
 //===----------------------------------------------------------------------===//
 
-/// Stage one vector.contract operand through workgroup-sized shared memory.
-///
-/// |operandIdx|      which operand (0=A/LHS, 1=B/RHS, 2=ACC)
-/// |layoutAttr|      nova.layout_{operandIdx} DictionaryAttr
-/// |sgForall|        enclosing subgroup scf.forall
-/// |wgAllocBuilder|  OpBuilder positioned just before sgForall (outside)
-/// |barrierBlocks|   tracks blocks that already have a pre-write gpu.barrier
-static LogicalResult stageOperandThroughSmem(
-    MLIRContext *ctx, vector::ContractionOp contractOp, unsigned operandIdx,
-    DictionaryAttr layoutAttr, scf::ForallOp sgForall,
-    OpBuilder &wgAllocBuilder,
-    llvm::SmallPtrSet<Block *, 4> &barrierBlocks) {
+static bool isFromWorkgroupPromotionForall(Value val) {
+  while (true) {
+    if (auto e = val.getDefiningOp<tensor::ExtractSliceOp>())
+      val = e.getSource();
+    else if (auto b = val.getDefiningOp<nova::ValueBarrierOp>())
+      val = b.getOperand(0);
+    else break;
+  }
+  auto fa = val.getDefiningOp<scf::ForallOp>();
+  if (!fa) return false;
+  bool found = false;
+  fa->walk([&](Operation *op) {
+    if (op->hasAttr("nova.promote_to_workgroup")) {
+      found = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return found;
+}
 
-  Location loc = contractOp.getLoc();
-  Value operand = contractOp->getOperand(operandIdx);
+static bool isAlreadyInSmem(Value operand, Attribute smemSpace) {
+  auto srcRead = operand.getDefiningOp<vector::TransferReadOp>();
+  if (!srcRead) return false;
+  Value base = srcRead.getBase();
+  if (auto tt = dyn_cast<RankedTensorType>(base.getType()))
+    if (tt.getEncoding() == smemSpace) return true;
+  return isFromWorkgroupPromotionForall(base);
+}
+
+//===----------------------------------------------------------------------===//
+// §4  Stage one operand through shared memory
+//
+// Three cases:
+//   A) ACC operand (idx == 2 for vector.contraction): skip entirely.
+//      VectorDistribute reads it directly from global; staging loses writeback.
+//
+//   B) Operand already in smem: emit only nova.value_barrier + re-read.
+//      No alloc, no write.  Just sync and re-read from existing smem tensor.
+//
+//   C) Normal operand not yet in smem: alloc WG tensor → write → barrier
+//      → re-read.  Same as original PATH A but without the redundant
+//      self-copy that ComprehensiveBufferize was generating.
+//===----------------------------------------------------------------------===//
+
+static LogicalResult stageOperand(MLIRContext *ctx, Operation *op,
+                                   unsigned idx, DictionaryAttr layoutAttr,
+                                   scf::ForallOp sgForall,
+                                   OpBuilder &wgAllocBuilder,
+                                   llvm::SmallPtrSet<Block *, 4> &barrierBlocks) {
+  Location loc = op->getLoc();
+  Value operand = op->getOperand(idx);
+
+  // ── Case A: ACC operand — skip, clear shared_mem flag ───────────────────
+  if (isa<vector::ContractionOp>(op) && idx == 2u) {
+    op->setAttr("nova.layout_" + std::to_string(idx),
+                clearSharedMem(ctx, layoutAttr));
+    return success();
+  }
 
   auto vecType = dyn_cast<VectorType>(operand.getType());
-  if (!vecType) {
-    contractOp->emitError("nova-gpu-vector-alloc: operand ")
-        << operandIdx << " is not a vector — cannot stage through shared memory";
-    return failure();
-  }
-  if (vecType.isScalable()) {
-    contractOp->emitError("nova-gpu-vector-alloc: scalable vector operand ")
-        << operandIdx << " cannot be statically allocated in shared memory";
+  if (!vecType || vecType.isScalable()) {
+    op->emitError("nova-gpu-vector-alloc: operand ")
+        << idx << " is not a static vector";
     return failure();
   }
 
   int rank = vecType.getRank();
-  SmallVector<int64_t> sgShape(vecType.getShape().begin(),
-                               vecType.getShape().end());
-
-  // Read sg_counts and sg_strides from the layout attribute.
-  SmallVector<int64_t> sgCounts  = getIntArray(layoutAttr, "sg_counts");
-  SmallVector<int64_t> sgStrides = getIntArray(layoutAttr, "sg_strides");
-
-  if ((int)sgCounts.size() != rank || (int)sgStrides.size() != rank) {
-    contractOp->emitError("nova-gpu-vector-alloc: sg_counts/sg_strides rank "
-                          "mismatch for operand ")
-        << operandIdx;
-    return failure();
-  }
-
-  // ── Compute workgroup-tile shape ────────────────────────────────────────
-  // wgShape[d] = sgShape[d] * sg_counts[d]
-  // For dims where sg_counts[d] == 1 (not distributed) this is a no-op.
-  SmallVector<int64_t> wgShape(rank);
-  for (int d = 0; d < rank; ++d)
-    wgShape[d] = sgShape[d] * std::max<int64_t>(sgCounts[d], 1);
-
   Attribute smemSpace = gpu::AddressSpaceAttr::get(
       ctx, gpu::GPUDialect::getWorkgroupAddressSpace());
 
-  // ── Step A: gpu.barrier at start of sg_forall body ─────────────────────
+  auto srcReadOp = operand.getDefiningOp<vector::TransferReadOp>();
+  bool alreadySmem = isAlreadyInSmem(operand, smemSpace);
+
+  // Insert gpu.barrier at start of sgForall body (once per block).
   Block *sgBody = sgForall.getBody();
   if (barrierBlocks.insert(sgBody).second) {
-    OpBuilder barrierBuilder(sgBody, sgBody->begin());
-    gpu::BarrierOp::create(barrierBuilder, loc);
+    OpBuilder bb(sgBody, sgBody->begin());
+    gpu::BarrierOp::create(bb, loc);
   }
 
-  // ── Step B: alloc_tensor OUTSIDE sg_forall, WG-sized ───────────────────
-  RankedTensorType wgTensorType =
-      RankedTensorType::get(wgShape, vecType.getElementType(), smemSpace);
-  auto wgAllocOp = bufferization::AllocTensorOp::create(
-      wgAllocBuilder, loc, wgTensorType,
-      /*dynamicSizes=*/ValueRange{}, /*copy=*/Value());
-  wgAllocOp.setMemorySpaceAttr(smemSpace);
-  Value wgAlloc = wgAllocOp.getResult();
+  OpBuilder b(op);
+  Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
+  SmallVector<Value> zeros(rank, c0);
+  SmallVector<bool> inBounds(rank, true);
 
-  // ── Steps C–E: inside the sg_forall body, just before contractOp ───────
-  OpBuilder b(contractOp);
+  Value newVec;
 
-  // Compute per-subgroup slice offsets using the forall induction variables.
-  //
-  // TileAndDistribute tiles dim d of the workgroup tile using forall dim d,
-  // so sgForall.getInductionVars()[d] corresponds to tensor dim d directly.
-  // sg_strides[d] != 0 marks dims that are distributed across subgroups;
-  // for those dims: offset[d] = iv[d] * sgShape[d].
-  // For non-distributed dims (sg_strides[d] == 0): offset[d] = 0.
-  SmallVector<Value> ivs = llvm::to_vector(sgForall.getInductionVars());
+  if (alreadySmem) {
+    // ── Case B: already in smem ──────────────────────────────────────────
+    // Emit nova.value_barrier on the existing smem source tensor.
+    // Re-read from it using the ORIGINAL indices (VectorDistribute will
+    // further slice according to layout attributes).
+    // Do NOT create any new alloc or write — that is the key fix.
+    Value smemBase = srcReadOp.getBase();
 
-  SmallVector<OpFoldResult> offsets(rank, b.getIndexAttr(0));
-  SmallVector<OpFoldResult> sizes(rank);
-  SmallVector<OpFoldResult> strides(rank, b.getIndexAttr(1));
+    // Only emit barrier if not already guarded by one.
+    Value synced = smemBase;
+    if (!smemBase.getDefiningOp<nova::ValueBarrierOp>()) {
+      auto barrier = nova::ValueBarrierOp::create(b, loc, ValueRange{smemBase});
+      synced = barrier.getResults()[0];
+    }
 
-  for (int d = 0; d < rank; ++d) {
-    sizes[d] = b.getIndexAttr(sgShape[d]);
-    if (sgStrides[d] != 0 && d < (int)ivs.size()) {
-      // offset[d] = iv[d] * sgShape[d]
-      Value mulStride = b.create<arith::ConstantIndexOp>(loc, sgShape[d]);
-      Value off = b.create<arith::MulIOp>(loc, ivs[d], mulStride);
-      offsets[d] = off;
+    // Re-read with original indices — preserves indexing for VectorDistribute.
+    SmallVector<Value> origIdx(srcReadOp.getIndices().begin(),
+                               srcReadOp.getIndices().end());
+    newVec = vector::TransferReadOp::create(
+                 b, loc, vecType, synced, origIdx,
+                 /*padding=*/std::nullopt, inBounds)
+                 .getResult();
+
+    // Erase original srcReadOp if now dead.
+    if (srcReadOp && operand.use_empty())
+      srcReadOp->erase();
+
+  } else {
+    // ── Case C: normal smem staging ─────────────────────────────────────
+    // Layout-derived workgroup shape.
+    auto threadCounts = getIntArray(layoutAttr, "thread_counts");
+    auto batchCounts  = getIntArray(layoutAttr, "batch_counts");
+    auto elemCounts   = getIntArray(layoutAttr, "elem_counts");
+    auto sgCounts     = getIntArray(layoutAttr, "sg_counts");
+    auto sgStrides    = getIntArray(layoutAttr, "sg_strides");
+
+    bool hasFields = (int)threadCounts.size() == rank &&
+                     (int)batchCounts.size()  == rank &&
+                     (int)elemCounts.size()   == rank;
+
+    SmallVector<int64_t> sgShape(rank), wgShape(rank);
+    for (int d = 0; d < rank; ++d) {
+      int64_t perSg = hasFields
+          ? threadCounts[d] * batchCounts[d] * elemCounts[d]
+          : vecType.getShape()[d];
+      sgShape[d] = perSg;
+      wgShape[d] = perSg * std::max<int64_t>(
+          ((int)sgCounts.size() > d) ? sgCounts[d] : 1, 1);
+    }
+
+    // Allocate WG tensor outside sgForall.
+    auto wgTy = RankedTensorType::get(wgShape, vecType.getElementType(),
+                                       smemSpace);
+    auto wgAlloc = bufferization::AllocTensorOp::create(
+        wgAllocBuilder, loc, wgTy, ValueRange{}, Value());
+    wgAlloc.setMemorySpaceAttr(smemSpace);
+    Value wgTensor = wgAlloc.getResult();
+
+    // Per-sg subview offsets.
+    auto ivs = llvm::to_vector(sgForall.getInductionVars());
+    SmallVector<OpFoldResult> offsets(rank, b.getIndexAttr(0));
+    SmallVector<OpFoldResult> sizes(rank), strides(rank, b.getIndexAttr(1));
+    for (int d = 0; d < rank; ++d) {
+      sizes[d] = b.getIndexAttr(sgShape[d]);
+      bool isSgDim = (int)sgStrides.size() > d && sgStrides[d] != 0;
+      if (isSgDim) {
+        // Find which IV drives this dimension.
+        int ivIdx = 0;
+        for (int dd = 0; dd < d; ++dd)
+          if ((int)sgStrides.size() > dd && sgStrides[dd] != 0) ++ivIdx;
+        if (ivIdx < (int)ivs.size()) {
+          Value stride = b.create<arith::ConstantIndexOp>(loc, sgShape[d]);
+          offsets[d] = b.create<arith::MulIOp>(loc, ivs[ivIdx], stride)
+                           .getResult();
+        }
+      }
+    }
+
+    // Write operand into per-sg slice.
+    auto sgTy = RankedTensorType::get(sgShape, vecType.getElementType(),
+                                       smemSpace);
+    Value writeSlice = tensor::ExtractSliceOp::create(
+        b, loc, sgTy, wgTensor, offsets, sizes, strides);
+    Value written = vector::TransferWriteOp::create(
+                        b, loc, operand, writeSlice, zeros, inBounds)
+                        .getResult();
+
+    // Barrier — sync all threads before any read.
+    auto barrier = nova::ValueBarrierOp::create(b, loc, ValueRange{written});
+    Value synced = barrier.getResults()[0];
+
+    // Re-read the vector from the synced smem slice.
+    newVec = vector::TransferReadOp::create(
+                 b, loc, vecType, synced, zeros,
+                 /*padding=*/std::nullopt, inBounds)
+                 .getResult();
+
+    // Sink srcReadOp into the forall body to eliminate cross-boundary
+    // live range (avoids register spill of the full pre-smem vector).
+    if (srcReadOp && operand.hasOneUse()) {
+      Operation *writeOp = *operand.user_begin();
+      OpBuilder sinkB(writeOp);
+      Operation *cloned = sinkB.clone(*srcReadOp);
+      writeOp->replaceUsesOfWith(operand, cloned->getResult(0));
+      srcReadOp->erase();
     }
   }
 
-  // Step C: extract the per-sg write slice from the wg alloc.
-  RankedTensorType sgTensorType =
-      RankedTensorType::get(sgShape, vecType.getElementType(), smemSpace);
-  Value writeSlice = tensor::ExtractSliceOp::create(
-      b, loc, sgTensorType, wgAlloc, offsets, sizes, strides);
-
-  // Step C: transfer_write the per-sg vector into the slice at [0,0,...].
-  Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
-  SmallVector<Value> zeroIndices(rank, c0);
-  SmallVector<bool> inBounds(rank, true);
-  Value written = vector::TransferWriteOp::create(
-                      b, loc, operand, writeSlice, zeroIndices, inBounds)
-                      .getResult();
-
-  // Step D: nova.value_barrier on the written per-sg tensor (inside body).
-  // Ensures all threads finish writing their slice before any thread reads.
-  auto barrier = nova::ValueBarrierOp::create(b, loc, ValueRange{written});
-  Value syncedTensor = barrier.getResults()[0];
-
-  // Step E: transfer_read the vector back from the synced slice.
-  Value newVec = vector::TransferReadOp::create(
-                     b, loc, vecType, syncedTensor, zeroIndices,
-                     /*padding=*/std::nullopt, inBounds)
-                     .getResult();
-
-  // Step F: rewire the contract operand and clear the shared_mem flag.
-  contractOp->setOperand(operandIdx, newVec);
-  contractOp->setAttr("nova.layout_" + std::to_string(operandIdx),
-                      clearSharedMem(ctx, layoutAttr));
-
+  // Rewire operand and clear shared_mem flag.
+  op->setOperand(idx, newVec);
+  op->setAttr("nova.layout_" + std::to_string(idx),
+              clearSharedMem(ctx, layoutAttr));
   return success();
 }
 
 //===----------------------------------------------------------------------===//
-// §4  Per-contract dispatch
+// §5  Per-operation dispatch
 //===----------------------------------------------------------------------===//
 
-static LogicalResult materializeForContractOp(
-    MLIRContext *ctx, vector::ContractionOp contractOp,
-    llvm::SmallPtrSet<Block *, 4> &barrierBlocks) {
-
-  unsigned layoutCount = std::min(contractOp->getNumOperands(), 3u);
-
-  bool anySharedMem = false;
-  for (unsigned i = 0; i < layoutCount; i++) {
-    if (getSharedMem(contractOp->getAttrOfType<DictionaryAttr>(
-            "nova.layout_" + std::to_string(i)))) {
-      anySharedMem = true;
-      break;
-    }
+static LogicalResult processOp(MLIRContext *ctx, Operation *op,
+                                llvm::SmallPtrSet<Block *, 4> &barrierBlocks) {
+  bool anySmem = false;
+  for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+    auto attr = op->getAttrOfType<DictionaryAttr>(
+        "nova.layout_" + std::to_string(i));
+    if (attr && getSharedMem(attr)) { anySmem = true; break; }
   }
-  if (!anySharedMem)
-    return success();
+  if (!anySmem) return success();
 
-  scf::ForallOp sgForall = findEnclosingSubgroupForall(contractOp);
+  scf::ForallOp sgForall = findEnclosingSubgroupForall(op);
   if (!sgForall) {
-    contractOp->emitError(
-        "nova-gpu-vector-alloc: no enclosing thread-mapped scf.forall found "
-        "for vector.contract with shared_mem=true operand");
+    op->emitError("nova-gpu-vector-alloc: no enclosing gpu-mapped forall");
     return failure();
   }
 
-  // All wg-sized allocs are inserted just before the sg_forall (outside it).
-  OpBuilder wgAllocBuilder(sgForall);
+  OpBuilder wgAllocBuilder = isBlockMappedForall(sgForall)
+      ? OpBuilder(op) : OpBuilder(sgForall);
 
-  for (unsigned i = 0; i < layoutCount; i++) {
-    auto attr = contractOp->getAttrOfType<DictionaryAttr>(
+  for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+    auto attr = op->getAttrOfType<DictionaryAttr>(
         "nova.layout_" + std::to_string(i));
-    if (!getSharedMem(attr))
-      continue;
-    if (failed(stageOperandThroughSmem(ctx, contractOp, i, attr, sgForall,
-                                       wgAllocBuilder, barrierBlocks)))
-      return failure();
+    if (attr && getSharedMem(attr))
+      if (failed(stageOperand(ctx, op, i, attr, sgForall,
+                              wgAllocBuilder, barrierBlocks)))
+        return failure();
   }
   return success();
 }
 
 //===----------------------------------------------------------------------===//
-// §5  Pass
+// §5b  Staticize dynamic tensor.empty ops inside promotion copy foralls
+//
+// NovaGenericVectorization uses masked vectorization (Case C) for dynamic-shape
+// linalg ops inside the B-tile promotion forall. This emits:
+//
+//   %dyn = tensor.empty(%n) : tensor<1x1x?xf32>    // dynamic staging buffer
+//   vector.transfer_write %v, %dyn[...], mask       // write with mask
+//   vector.transfer_read  %dyn[...], 0.0, mask      // read back immediately
+//   vector.transfer_write %result, %static[...]     // write to static tile
+//
+// %dyn has a runtime-valued size and is never assigned a GPU address space by
+// NovaGPUInferMemorySpacePass (it is not a shared_out of any thread-forall).
+// When EmptyTensorToAllocTensorPass converts it, the dynamic alloc_tensor with
+// no memory_space annotation is lowered by comprehensive-bufferize to malloc().
+//
+// Fix: for every tensor.empty with any dynamic dimension inside an
+// scf.forall that contains a nova.promote_to_workgroup op, replace it with a
+// tensor.empty using the static upper-bound shape inferred from the element
+// type and the surrounding static tile sizes. The existing vector.create_mask
+// on the read/write pair already handles the tail correctly — we just need the
+// backing tensor to be statically shaped so it can live in registers.
+//
+// The upper-bound shape for each dimension is the product of thread_counts and
+// elem_counts from the enclosing workgroup tile, but in practice these staging
+// tensors are always small: the B-tile copy uses tensor<1x1x?xf32> where ? ≤ 4
+// (two chunks of 4 elements each), so we use 4 as the upper bound.  We derive
+// the static size by finding the corresponding static dim from the op's output
+// operand chain (the extract_slice target), which is always static after
+// padding.
+//===----------------------------------------------------------------------===//
+
+// Returns true if op is nested inside a forall that contains a
+// nova.promote_to_workgroup copy (i.e., inside a B-tile promotion forall).
+static bool isInsidePromotionForall(Operation *op) {
+  Operation *parent = op->getParentOp();
+  while (parent) {
+    if (auto forall = dyn_cast<scf::ForallOp>(parent)) {
+      bool hasPromotion = false;
+      forall->walk([&](Operation *inner) {
+        if (inner->hasAttr("nova.promote_to_workgroup")) {
+          hasPromotion = true;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (hasPromotion) return true;
+    }
+    parent = parent->getParentOp();
+  }
+  return false;
+}
+
+// Walk the function and replace dynamic tensor.empty ops inside promotion
+// foralls with static upper-bound equivalents.
+static void staticizeDynamicStagingBuffers(func::FuncOp funcOp) {
+  SmallVector<tensor::EmptyOp> toFix;
+  funcOp.walk([&](tensor::EmptyOp empty) {
+    auto ty = empty.getType();
+    if (ty.hasStaticShape()) return;
+    if (isInsidePromotionForall(empty)) toFix.push_back(empty);
+  });
+
+  for (tensor::EmptyOp empty : toFix) {
+    auto ty = empty.getType();
+    // Find the static upper bound for each dynamic dimension.
+    // Strategy: for each dynamic dim, look at the users of this empty —
+    // specifically the vector.transfer_write that writes into it.
+    // The vector type written is always static (vectorization uses static
+    // upper-bound vector sizes), so use that shape.
+    SmallVector<int64_t> staticShape(ty.getShape());
+    for (Operation *user : empty->getUsers()) {
+      auto writeOp = dyn_cast<vector::TransferWriteOp>(user);
+      if (!writeOp) continue;
+      auto vecTy = dyn_cast<VectorType>(writeOp.getVector().getType());
+      if (!vecTy || vecTy.isScalable()) continue;
+      // The vector type is the static upper-bound shape of this tensor.
+      for (int d = 0; d < (int)staticShape.size(); ++d) {
+        if (staticShape[d] == ShapedType::kDynamic)
+          staticShape[d] = vecTy.getShape()[d];
+      }
+      break;
+    }
+    // If we couldn't resolve all dynamic dims, skip (conservative).
+    if (llvm::any_of(staticShape,
+                     [](int64_t d) { return d == ShapedType::kDynamic; }))
+      continue;
+
+    OpBuilder b(empty);
+    auto staticTy = RankedTensorType::get(staticShape, ty.getElementType());
+    auto staticEmpty = b.create<tensor::EmptyOp>(empty.getLoc(), staticTy,
+                                                 ValueRange{});
+    // Replace all uses: cast back to original dynamic type for users that
+    // still expect it (transfer_write with dynamic-shaped tensor operand).
+    // Since the dynamic dim is now statically bounded, tensor.cast is valid
+    // (dynamic → static is a refinement, always safe).
+    Value cast = b.create<tensor::CastOp>(empty.getLoc(), ty, staticEmpty);
+    empty.replaceAllUsesWith(cast);
+    empty.erase();
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// §6  Pass
 //===----------------------------------------------------------------------===//
 
 struct NovaGPUVectorAllocPass
@@ -305,54 +450,39 @@ struct NovaGPUVectorAllocPass
                          OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUVectorAllocPass)
 
-  StringRef getArgument() const override { return "nova-gpu-vector-alloc"; }
+  StringRef getArgument()    const override { return "nova-gpu-vector-alloc"; }
   StringRef getDescription() const override {
-    return "Stage vector.contract operands marked shared_mem=true through "
-           "workgroup-sized shared memory (race-condition-free).";
+    return "Stage vector.contract smem operands; skip ACC and already-smem ops."
+           " Also staticizes dynamic tensor.empty staging buffers inside "
+           "promotion foralls to prevent malloc in GPU kernels.";
   }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<bufferization::BufferizationDialect, gpu::GPUDialect,
-                    vector::VectorDialect, nova::NovaDialect,
-                    arith::ArithDialect, scf::SCFDialect,
-                    tensor::TensorDialect>();
+  void getDependentDialects(DialectRegistry &r) const override {
+    r.insert<bufferization::BufferizationDialect, gpu::GPUDialect,
+             vector::VectorDialect, nova::NovaDialect, arith::ArithDialect,
+             scf::SCFDialect, tensor::TensorDialect>();
   }
-
   void runOnOperation() override {
-    func::FuncOp funcOp = getOperation();
-    MLIRContext *ctx = &getContext();
+    func::FuncOp fn = getOperation();
 
-    SmallVector<vector::ContractionOp> contractOps;
-    funcOp.walk([&](vector::ContractionOp op) {
-      unsigned layoutCount = std::min(op->getNumOperands(), 3u);
-      for (unsigned i = 0; i < layoutCount; i++) {
-        if (getSharedMem(op->getAttrOfType<DictionaryAttr>(
-                "nova.layout_" + std::to_string(i)))) {
-          contractOps.push_back(op);
-          return;
-        }
-      }
+    // ── Step 1: Staticize dynamic staging buffers inside promotion foralls ──
+    // Must run BEFORE the vector.contract staging walk so that the
+    // tensor.empty → static replacement is in place before bufferization.
+    staticizeDynamicStagingBuffers(fn);
+
+    // ── Step 2: Stage vector.contract smem operands ─────────────────────────
+    llvm::SmallPtrSet<Block *, 4> barrierBlocks;
+    fn.walk([&](Operation *op) {
+      if (failed(processOp(&getContext(), op, barrierBlocks)))
+        signalPassFailure();
     });
-
-    llvm::SmallPtrSet<Block *, 4> barrierInsertedBlocks;
-    for (vector::ContractionOp contractOp : contractOps) {
-      if (failed(materializeForContractOp(ctx, contractOp,
-                                         barrierInsertedBlocks)))
-        return signalPassFailure();
-    }
   }
 };
 
 } // namespace
 
-//===----------------------------------------------------------------------===//
-// Public API
-//===----------------------------------------------------------------------===//
-
 std::unique_ptr<Pass> createNovaGPUVectorAllocPass() {
   return std::make_unique<NovaGPUVectorAllocPass>();
 }
-
 void registerNovaGPUVectorAllocPass() {
   PassRegistration<NovaGPUVectorAllocPass>();
 }
