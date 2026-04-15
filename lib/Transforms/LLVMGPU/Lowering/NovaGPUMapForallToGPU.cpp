@@ -135,7 +135,6 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   int64_t blockDims[3] = {1, 1, 1};
   SmallVector<scf::ForallOp> warpForalls;
   SmallVector<scf::ForallOp> threadForalls;
-  SmallVector<scf::ForallOp> warpForalls;
 
   // Collect thread-mapped foralls and accumulate their bounds into blockDims.
   auto walkResult = blockForall.walk([&](scf::ForallOp inner) {
