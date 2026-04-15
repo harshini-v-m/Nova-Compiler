@@ -88,8 +88,12 @@ static bool matchScalarizePattern(scf::ForOp forOp,
 
   // Indices must be loop-invariant (none equals the induction variable).
   Value loopIV = forOp.getInductionVar();
-  for (Value idx : loadOp.getIndices())
+for (Value idx : loadOp.getIndices()) {
     if (idx == loopIV) return false;
+    // NEW: also reject indices whose defining op is inside the loop
+    if (Operation *defOp = idx.getDefiningOp())
+        if (forOp->isProperAncestor(defOp)) return false;
+}
 
   outLoad  = loadOp;
   outStore = storeOp;

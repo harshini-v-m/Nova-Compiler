@@ -546,26 +546,25 @@ struct NovaGPUHoistVectorExtractInsertSlicePass
         if (!isa<tensor::EmptyOp, bufferization::AllocTensorOp>(op))
           return;
 
-        // Check loop-invariance w.r.t. this forOp.
-        // tensor.empty with static shape has zero operands → trivially invariant.
-        bool invariant = true;
-        op->walk([&](Operation *inner) -> WalkResult {
-          if (!invariant) return WalkResult::interrupt();
-          for (Value v : inner->getOperands()) {
-            if (v == forOp.getInductionVar()) {
-              invariant = false;
-              return WalkResult::interrupt();
+        bool hoistable = true;
+        for (Value operand : op->getOperands()) {
+          if (Operation *defOp = operand.getDefiningOp()) {
+            // Operand produced by an op inside forOp — not available outside.
+            if (forOp->isProperAncestor(defOp)) {
+              hoistable = false;
+              break;
             }
-            for (Value ia : forOp.getRegionIterArgs()) {
-              if (v == ia) {
-                invariant = false;
-                return WalkResult::interrupt();
-              }
+          } else {
+            // Operand is a block argument — check if its owner block lives
+            // inside forOp (e.g. IV or iter_arg of a nested loop/forall).
+            Block *parentBlock = cast<BlockArgument>(operand).getOwner();
+            if (forOp->isProperAncestor(parentBlock->getParentOp())) {
+              hoistable = false;
+              break;
             }
           }
-          return WalkResult::advance();
-        });
-        if (invariant)
+        }
+        if (hoistable)
           hoistWork.emplace_back(forOp, op);
       });
     });

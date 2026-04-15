@@ -211,9 +211,9 @@ getHardwareLayout(int32_t mmaKind, int operandIdx) {
   //     (8×2=16 M-rows ✓, 4×2=8 N-cols ✓, kThreadCount=1 → no warp shuffle)
   case NVMMAIntrinsicValues::MMA_SYNC_TF32_16x8x8:
     switch (operandIdx) {
-    case 0: return OperandHWLayout{{1, 16, 1, 1}, {1, 1, 4,  0}}; // LHS: M={t=16,e=1,s=1}, K={t=1,e=4,s=0}
-    case 1: return OperandHWLayout{{1, 1,  2, 0}, {1, 8, 1,  4}}; // RHS: K={t=1,e=2,s=0},  N={t=8,e=1,s=4}
-    case 2: return OperandHWLayout{{1, 8,  2, 1}, {1, 4, 2,  4}}; // ACC: M={t=8,e=2,s=1},  N={t=4,e=2,s=4}
+    case 0: return OperandHWLayout{{1, 16, 1, 1}, {1, 2, 4, 16}}; // LHS: M={t=16,e=1,s=1}, K={t=2,e=4,s=16}
+    case 1: return OperandHWLayout{{1, 4, 2, 8}, {1, 8, 1, 1}};   // RHS: K={t=4,e=2,s=8},  N={t=8,e=1,s=1}
+    case 2: return OperandHWLayout{{1, 8, 2, 1}, {1, 4, 2, 8}};   // ACC: M={t=8,e=2,s=1},  N={t=4,e=2,s=8}
     }
     break;
 

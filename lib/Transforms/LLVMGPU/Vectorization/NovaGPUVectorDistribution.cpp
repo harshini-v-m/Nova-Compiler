@@ -220,25 +220,126 @@ computeSgOffsets(OpBuilder &b, Location loc,
 
 static SmallVector<Value>
 computeThreadOffsets(OpBuilder &b, Location loc,
-                     Value linearTid, const OperandLayout &L, int kAxis) {
+                     Value linearTid, const OperandLayout &L, int kAxis,
+                     bool mmaTileOnly = false,
+                     ArrayRef<int64_t> elemIdx = {}) {
   Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
   SmallVector<Value> off(L.rank, zero);
   for (int d = 0; d < L.rank; ++d) {
-    if (L.threadStrides[d] == 0 || L.threadCounts[d] <= 1) continue;
+    if (L.threadStrides[d] == 0 && L.threadCounts[d] <= 1) {
+      // Still might have element offsets even if thread count is 1
+      if (!elemIdx.empty() && d < (int)elemIdx.size() && elemIdx[d] > 0) {
+         off[d] = b.create<arith::ConstantIndexOp>(loc, elemIdx[d] * L.threadCounts[d]);
+      }
+      continue;
+    }
     Value div = b.create<arith::DivUIOp>(
         loc, linearTid,
         b.create<arith::ConstantIndexOp>(loc, L.threadStrides[d]));
     Value rem = b.create<arith::RemUIOp>(
         loc, div,
         b.create<arith::ConstantIndexOp>(loc, L.threadCounts[d]));
-    int64_t elems = (d == kAxis) ? L.elemCounts[d]
-                                 : L.batchCounts[d] * L.elemCounts[d];
-    off[d] = (elems == 1) ? rem
-                          : b.create<arith::MulIOp>(
-                                loc, rem,
-                                b.create<arith::ConstantIndexOp>(loc, elems));
+    int64_t baseElems = (mmaTileOnly) ? L.elemCounts[d]
+                                    : (d == kAxis) ? L.elemCounts[d]
+                                                   : L.batchCounts[d] * L.elemCounts[d];
+    Value tOff = (baseElems == 1) ? rem
+                               : b.create<arith::MulIOp>(
+                                     loc, rem,
+                                     b.create<arith::ConstantIndexOp>(loc, baseElems));
+    if (!elemIdx.empty() && d < (int)elemIdx.size() && elemIdx[d] > 0) {
+      Value eIdx = b.create<arith::ConstantIndexOp>(loc, elemIdx[d]);
+      // Element stride for this thread = span of all threads in this dim within one subgroup tile
+      int64_t eStride = L.threadCounts[d];
+      Value eOff = b.create<arith::MulIOp>(loc, eIdx, b.create<arith::ConstantIndexOp>(loc, eStride));
+      tOff = b.create<arith::AddIOp>(loc, tOff, eOff);
+    }
+    off[d] = tOff;
   }
   return off;
+}
+
+static SmallVector<Value>
+computeElementOffsets(OpBuilder &b, Location loc, const OperandLayout &L,
+                       ArrayRef<int64_t> elemIdx) {
+  Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+  SmallVector<Value> off(L.rank, zero);
+  for (int d = 0; d < L.rank; ++d) {
+    if (!elemIdx.empty() && d < (int)elemIdx.size() && elemIdx[d] > 0) {
+      off[d] = b.create<arith::ConstantIndexOp>(loc, elemIdx[d]);
+    }
+  }
+  return off;
+}
+
+static Value interleavedTransferRead(OpBuilder &b, vector::TransferReadOp read,
+                                     const OperandLayout &L, VectorType vType,
+                                     Value laneId, ArrayRef<Value> baseIndices) {
+  Location loc = read.getLoc();
+  auto shape = vType.getShape();
+  int vRank = shape.size();
+  int mRank = baseIndices.size();
+  Value result = b.create<arith::ConstantOp>(loc, vType, b.getZeroAttr(vType));
+
+  auto tOff = computeThreadOffsets(b, loc, laneId, L, -1, true);
+
+  int64_t totalElems = 1;
+  for (int64_t s : shape) totalElems *= s;
+
+  for (int64_t i = 0; i < totalElems; i++) {
+    SmallVector<int64_t> elemIdx(vRank);
+    int64_t temp = i;
+    for (int d = vRank - 1; d >= 0; d--) {
+      elemIdx[d] = temp % shape[d];
+      temp /= shape[d];
+    }
+    
+    auto eOff = computeElementOffsets(b, loc, L, elemIdx);
+    SmallVector<Value> finalOff;
+    for (int d = 0; d < mRank; d++) {
+      Value base = baseIndices[d];
+      Value totalDOff = b.create<arith::AddIOp>(loc, tOff[d], eOff[d]);
+      finalOff.push_back(b.create<arith::AddIOp>(loc, base, totalDOff));
+    }
+
+    Value scalar = b.create<memref::LoadOp>(loc, read.getBase(), finalOff);
+    result = b.create<vector::InsertOp>(loc, scalar, result, elemIdx);
+  }
+  return result;
+}
+
+static void interleavedTransferWrite(OpBuilder &b, vector::TransferWriteOp write,
+                                      Value data, const OperandLayout &L,
+                                      Value laneId, ArrayRef<Value> baseIndices) {
+  Location loc = write.getLoc();
+  auto vType = cast<VectorType>(data.getType());
+  auto shape = vType.getShape();
+  int vRank = shape.size();
+  int mRank = baseIndices.size();
+
+  auto tOff = computeThreadOffsets(b, loc, laneId, L, -1, true);
+
+  int64_t totalElems = 1;
+  for (int64_t s : shape) totalElems *= s;
+
+  for (int64_t i = 0; i < totalElems; i++) {
+    SmallVector<int64_t> elemIdx(vRank);
+    int64_t temp = i;
+    for (int d = vRank - 1; d >= 0; d--) {
+      elemIdx[d] = temp % shape[d];
+      temp /= shape[d];
+    }
+    
+    auto eOff = computeElementOffsets(b, loc, L, elemIdx);
+    SmallVector<Value> finalOff;
+    for (int d = 0; d < mRank; d++) {
+      Value base = baseIndices[d];
+      Value totalDOff = b.create<arith::AddIOp>(loc, tOff[d], eOff[d]);
+      finalOff.push_back(b.create<arith::AddIOp>(loc, base, totalDOff));
+    }
+
+    Value scalar = b.create<vector::ExtractOp>(loc, data, elemIdx);
+    b.create<memref::StoreOp>(loc, scalar, write.getBase(), finalOff);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -391,10 +492,14 @@ private:
     if (lhsThrElems != aFragElems || rhsThrElems != bFragElems)
       return emitGenericContract(acc);
 
-    // Per-thread offsets driven by thread ID and layout strides.
+    // Per-thread offsets driven by lane ID (tid % 32) and layout strides.
+    // Raw tid usage in kernels with >32 threads causes out-of-bounds access.
     Value tid = b.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-    SmallVector<Value> off0 = computeThreadOffsets(b, loc, tid, L0, lhsKAxis);
-    SmallVector<Value> off1 = computeThreadOffsets(b, loc, tid, L1, rhsKAxis);
+    Value constant32 = b.create<arith::ConstantIndexOp>(loc, 32);
+    Value laneId = b.create<arith::RemUIOp>(loc, tid, constant32);
+
+    SmallVector<Value> off0 = computeThreadOffsets(b, loc, laneId, L0, lhsKAxis, /*mmaTileOnly=*/true);
+    SmallVector<Value> off1 = computeThreadOffsets(b, loc, laneId, L1, rhsKAxis, /*mmaTileOnly=*/true);
 
     // MN batch counts from layout.
     int lhsMAxis = -1, rhsNAxis = -1;
@@ -427,41 +532,28 @@ private:
     // For each K-batch step: advance the K-axis offset by kb * kStep,
     // read the per-thread slice (matches 2D fragment element count), then
     // shape-cast to the nvgpu.mma.sync fragment type.
+    Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
     for (int64_t kb = 0; kb < kBatchCount; ++kb) {
-      // Compute per-thread offsets for this K-batch step.
-      SmallVector<Value> lo0 = off0, lo1 = off1;
+      // Compute tile offsets for this K-batch step (no thread offsets).
+      SmallVector<Value> tileOff0(L0.rank, zero), tileOff1(L1.rank, zero);
       if (kb > 0) {
-        if (lhsKAxis >= 0) {
-          Value adv = b.create<arith::ConstantIndexOp>(loc, kb * kStep);
-          lo0[lhsKAxis] = b.create<arith::AddIOp>(loc, off0[lhsKAxis], adv);
-        }
-        if (rhsKAxis >= 0) {
-          Value adv = b.create<arith::ConstantIndexOp>(loc, kb * kStep);
-          lo1[rhsKAxis] = b.create<arith::AddIOp>(loc, off1[rhsKAxis], adv);
-        }
+        if (lhsKAxis >= 0) tileOff0[lhsKAxis] = b.create<arith::ConstantIndexOp>(loc, kb * kStep);
+        if (rhsKAxis >= 0) tileOff1[rhsKAxis] = b.create<arith::ConstantIndexOp>(loc, kb * kStep);
       }
 
-      // MN tile loop: iterate over (batchM, batchN) tiles.
       for (int64_t bm = 0; bm < batchM; ++bm) {
         for (int64_t bn = 0; bn < batchN; ++bn) {
-          // Advance M-axis offset for this MN tile.
-          SmallVector<Value> lhsOff = lo0;
-          if (lhsMAxis >= 0 && bm > 0) {
-            Value advM = b.create<arith::ConstantIndexOp>(loc, bm * elemM);
-            lhsOff[lhsMAxis] = b.create<arith::AddIOp>(
-                loc, lo0[lhsMAxis], advM);
-          }
-          // Advance N-axis offset for this MN tile.
-          SmallVector<Value> rhsOff = lo1;
-          if (rhsNAxis >= 0 && bn > 0) {
-            Value advN = b.create<arith::ConstantIndexOp>(loc, bn * elemN);
-            rhsOff[rhsNAxis] = b.create<arith::AddIOp>(
-                loc, lo1[rhsNAxis], advN);
-          }
+          SmallVector<Value> lhsOff = tileOff0;
+          if (lhsMAxis >= 0 && bm > 0)
+            lhsOff[lhsMAxis] = b.create<arith::ConstantIndexOp>(loc, bm * elemM);
+          
+          SmallVector<Value> rhsOff = tileOff1;
+          if (rhsNAxis >= 0 && bn > 0)
+            rhsOff[rhsNAxis] = b.create<arith::ConstantIndexOp>(loc, bn * elemN);
 
-          // Read per-thread A and B fragments from smem.
-          Value aSlice = adjustedTransferRead(b, lhsRead, lhsOff, lhsThrTy);
-          Value bSlice = adjustedTransferRead(b, rhsRead, rhsOff, rhsThrTy);
+          // interleavedTransferRead adds thread (laneId) and element offsets internally.
+          Value aSlice = interleavedTransferRead(b, lhsRead, L0, lhsThrTy, laneId, lhsOff);
+          Value bSlice = interleavedTransferRead(b, rhsRead, L1, rhsThrTy, laneId, rhsOff);
 
           // Shape-cast 3D per-thread slice to 2D MMA fragment.
           Value aFrag = b.create<vector::ShapeCastOp>(loc, aFrag2D, aSlice);
@@ -496,14 +588,17 @@ private:
   // Uses per-thread offsets (divui/remui) for non-MMA ops only.
   Value emitGenericContract(Value acc) {
     Value tid = b.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+    Value constant32 = b.create<arith::ConstantIndexOp>(loc, 32);
+    Value laneId = b.create<arith::RemUIOp>(loc, tid, constant32);
+
     auto lhsFullTy = cast<VectorType>(lhsRead.getResult().getType());
     auto rhsFullTy = cast<VectorType>(rhsRead.getResult().getType());
 
     auto lhsThr = perThreadType(lhsFullTy, L0, lhsKAxis);
     auto rhsThr = perThreadType(rhsFullTy, L1, rhsKAxis);
 
-    SmallVector<Value> off0 = computeThreadOffsets(b, loc, tid, L0, lhsKAxis);
-    SmallVector<Value> off1 = computeThreadOffsets(b, loc, tid, L1, rhsKAxis);
+    SmallVector<Value> off0 = computeThreadOffsets(b, loc, laneId, L0, lhsKAxis);
+    SmallVector<Value> off1 = computeThreadOffsets(b, loc, laneId, L1, rhsKAxis);
 
     for (int64_t kb = 0; kb < kBatchCount; ++kb) {
       SmallVector<Value> lo0 = off0, lo1 = off1;
@@ -636,13 +731,20 @@ static LogicalResult distributeContract(IRRewriter &rw,
 
   if (accRead) {
     if (mmaKind != 0) {
-      // MMA path: read ACC at subgroup offset from global output.
-      off2 = computeSgOffsets(rw, loc, *L2, sgForall);
-      acc = adjustedTransferRead(rw, accRead, off2, accThr);
+      // MMA path: ACC is read from the tiled subview that the subgroup tiling
+      // pass already offset by warp_id * elemsPerWarp.  We must still add
+      // thread-level offsets within the warp tile.
+      Value tid = rw.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+      Value constant32 = rw.create<arith::ConstantIndexOp>(loc, 32);
+      Value laneId = rw.create<arith::RemUIOp>(loc, tid, constant32);
+      SmallVector<Value> accIndices(accRead.getIndices());
+      acc = interleavedTransferRead(rw, accRead, *L2, accThr, laneId, accIndices);
     } else {
       // Generic path: per-thread read.
       Value tid = rw.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-      off2 = computeThreadOffsets(rw, loc, tid, *L2, /*kAxis=*/-1);
+      Value constant32 = rw.create<arith::ConstantIndexOp>(loc, 32);
+      Value laneId = rw.create<arith::RemUIOp>(loc, tid, constant32);
+      off2 = computeThreadOffsets(rw, loc, laneId, *L2, /*kAxis=*/-1);
       acc = adjustedTransferRead(rw, accRead, off2, accThr);
     }
   } else {
@@ -681,8 +783,18 @@ static LogicalResult distributeContract(IRRewriter &rw,
 
   if (resultWrite) {
     rw.setInsertionPoint(resultWrite);
-    adjustedTransferWrite(rw, resultWrite, result, off2,
-                          /*overrideBase=*/nullptr);
+    Location wLoc = resultWrite.getLoc();
+    if (mmaKind != 0) {
+      // Partition. Fragmented transfers ensure no collision between threads.
+      Value tid = rw.create<gpu::ThreadIdOp>(wLoc, gpu::Dimension::x);
+      Value constant32 = rw.create<arith::ConstantIndexOp>(wLoc, 32);
+      Value laneId = rw.create<arith::RemUIOp>(wLoc, tid, constant32);
+      SmallVector<Value> writeIndices(resultWrite.getIndices());
+      interleavedTransferWrite(rw, resultWrite, result, *L2, laneId, writeIndices);
+    } else {
+      adjustedTransferWrite(rw, resultWrite, result, off2,
+                            /*overrideBase=*/nullptr);
+    }
     rw.eraseOp(resultWrite);
   }
 
@@ -720,7 +832,7 @@ struct NovaGPUVectorDistributePass
   void getDependentDialects(DialectRegistry &r) const override {
     r.insert<arith::ArithDialect, gpu::GPUDialect, vector::VectorDialect,
              func::FuncDialect, scf::SCFDialect, NVVM::NVVMDialect,
-             nvgpu::NVGPUDialect>();
+             nvgpu::NVGPUDialect, memref::MemRefDialect>();
   }
   void runOnOperation() override {
     func::FuncOp fn = getOperation();

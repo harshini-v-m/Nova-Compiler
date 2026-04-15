@@ -447,6 +447,17 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
         shouldFuse = false;
       }
 
+      // At Subgroup level, do NOT fuse ops marked nova.promote_to_workgroup
+      // inside the warp forall. These are cooperative global→smem copies that
+      // must remain at block scope so all threads cooperate on a single
+      // workgroup-sized buffer. If fused inside the warp forall, each warp
+      // iteration would write to the same per-warp-sized smem region and
+      // overwrite each other's data (race condition → CUDA_ERROR_ILLEGAL_ADDRESS).
+      if (tilingLevel == NovaTilingLevel::Subgroup &&
+          owner->hasAttr("nova.promote_to_workgroup")) {
+        shouldFuse = false;
+      }
+
       if (shouldFuse) {
         return scf::SCFTileAndFuseOptions::ControlFnResult{
             yieldProducerReplacement};
