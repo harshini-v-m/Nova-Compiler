@@ -63,6 +63,9 @@
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Transforms/DialectConversion.h"
 
 using namespace mlir;
 
@@ -535,6 +538,49 @@ namespace mlir::nova
       gpuPm.addPass(createConvertNVGPUToNVVMPass());
       ConvertGpuOpsToNVVMOpsOptions nvvmOpts;
       gpuPm.addPass(createConvertGpuOpsToNVVMOps(nvvmOpts));
+
+      gpuPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
+        struct FoldStructMemrefRoundtripsPass
+            : public PassWrapper<FoldStructMemrefRoundtripsPass,
+                                 OperationPass<gpu::GPUFuncOp>> {
+          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+              FoldStructMemrefRoundtripsPass)
+          void runOnOperation() override {
+            getOperation().walk([](UnrealizedConversionCastOp castToMemref) {
+              // Match: struct → memref (first cast)
+              if (castToMemref.getInputs().size() != 1 ||
+                  castToMemref.getOutputs().size() != 1)
+                return;
+              if (!isa<MemRefType>(castToMemref.getResult(0).getType()))
+                return;
+              if (!isa<LLVM::LLVMStructType>(
+                      castToMemref.getOperand(0).getType()))
+                return;
+              // Check: single user is memref → struct (second cast)
+              Value memrefVal = castToMemref.getResult(0);
+              for (Operation *user : llvm::make_early_inc_range(
+                       memrefVal.getUsers())) {
+                auto castBack =
+                    dyn_cast<UnrealizedConversionCastOp>(user);
+                if (!castBack || castBack.getInputs().size() != 1 ||
+                    castBack.getOutputs().size() != 1)
+                  continue;
+                if (!isa<LLVM::LLVMStructType>(
+                        castBack.getResult(0).getType()))
+                  continue;
+                // Replace uses of the round-trip result with the original struct
+                castBack.getResult(0).replaceAllUsesWith(
+                    castToMemref.getOperand(0));
+                castBack.erase();
+              }
+            });
+          }
+          StringRef getArgument() const override {
+            return "nova-fold-struct-memref-roundtrips";
+          }
+        };
+        return std::make_unique<FoldStructMemrefRoundtripsPass>();
+      }());
       gpuPm.addPass(createLowerAffinePass());
       gpuPm.addPass(createConvertIndexToLLVMPass());
       gpuPm.addPass(createArithToLLVMConversionPass());
