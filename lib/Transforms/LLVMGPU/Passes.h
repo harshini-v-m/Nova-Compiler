@@ -248,6 +248,15 @@ void registerNovaGPUDropVectorUnitDimsPass();
 std::unique_ptr<Pass> createNovaGPUHoistVectorExtractInsertSlicePass();
 void registerNovaGPUHoistVectorExtractInsertSlicePass();
 
+/// Populates patterns that fold insert/extract strided-slice chains into direct
+/// vector.transfer_read/write ops.  Used by GpuHardwareMappingPass (Stage 35)
+/// so the patterns are not re-implemented inline in Passes.cpp:
+///   • FoldExtractStridedSliceFromTransferRead  — rank-2 extract fold
+///   • FoldInsertStridedSliceIntoTransferWrite  — insert chain → per-tile writes
+///   • SplitTransferReadExtract                 — general minor-identity extract fold
+void populateGpuHardwareMappingStridedSlicePatterns(
+    mlir::RewritePatternSet &patterns);
+
 /// Normalizes strided-memref indices for WMMA load/store ops before NVVM legalization.
 /// No-op for the nvgpu.mma.sync (Ampere native) path.
 std::unique_ptr<Pass> createNovaGPUCastTypeToFitMMAPass();

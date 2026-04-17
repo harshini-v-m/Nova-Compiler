@@ -271,74 +271,177 @@ computeElementOffsets(OpBuilder &b, Location loc, const OperandLayout &L,
   return off;
 }
 
+// interleavedTransferRead / interleavedTransferWrite
+//
+// These functions handle the ACC operand whose per-thread vector type is
+//   shape[d] = batchCounts[d] * elemCounts[d]   (per perThreadType, kAxis=-1)
+//
+// The memory layout is NOT contiguous across batch tiles: between consecutive
+// batch tiles in dimension d there is a gap of (threadCounts[d] - 1) elements
+// because the adjacent elements belong to other threads in the warp.
+//
+// Correct memory offset for vector index vecIdx[d]:
+//   batchIdx[d]  = vecIdx[d] / elemCounts[d]
+//   tileIdx[d]   = vecIdx[d] % elemCounts[d]
+//   memOff[d]    = batchIdx[d] * (threadCounts[d] * elemCounts[d]) + tileIdx[d]
+//
+// The loop below iterates over (batchIdx, tileIdx) explicitly so the memory
+// offset and the insertion index into the result vector are both computed
+// correctly without any intermediate flat-element decode.
+
 static Value interleavedTransferRead(OpBuilder &b, vector::TransferReadOp read,
                                      const OperandLayout &L, VectorType vType,
-                                     Value laneId, ArrayRef<Value> baseIndices) {
+                                     Value laneId, ArrayRef<Value> baseIndices,
+                                     ArrayRef<Value> precomputedTOff = {}) {
   Location loc = read.getLoc();
-  auto shape = vType.getShape();
-  int vRank = shape.size();
-  int mRank = baseIndices.size();
+  auto shape = vType.getShape();   // shape[d] = batchCounts[d] * elemCounts[d]
+  int vRank  = shape.size();
+  int mRank  = baseIndices.size();
   Value result = b.create<arith::ConstantOp>(loc, vType, b.getZeroAttr(vType));
 
-  auto tOff = computeThreadOffsets(b, loc, laneId, L, -1, true);
+  // Thread offsets within a single MMA tile (no batch factor).
+  // Use pre-computed offsets if provided (avoids re-emitting divui/remui chains
+  // when called in a loop — thread position is constant across iterations).
+  SmallVector<Value> tOff;
+  if (!precomputedTOff.empty()) {
+    tOff = SmallVector<Value>(precomputedTOff.begin(), precomputedTOff.end());
+  } else {
+    tOff = computeThreadOffsets(b, loc, laneId, L, /*kAxis=*/-1,
+                                /*mmaTileOnly=*/true);
+  }
 
-  int64_t totalElems = 1;
-  for (int64_t s : shape) totalElems *= s;
+  // Iterate over all (batch, element) index combinations.
+  // elemShape[d] = elemCounts[d].
+  // batchShape[d] = vType.shape[d] / elemCounts[d]:
+  //   - For ACC (perThreadType):      shape[d] = batchCounts[d]*elemCounts[d] → batchShape[d] = batchCounts[d]
+  //   - For A/B (perTileThreadType):  shape[d] = elemCounts[d]                → batchShape[d] = 1
+  // Using vType.shape to derive batchShape prevents out-of-bounds vecIdx when
+  // the caller passes a tile-only vector type (no batch dimension in the vector).
+  SmallVector<int64_t> batchShape(vRank), elemShape(vRank);
+  int64_t totalBatch = 1, totalElem = 1;
+  for (int d = 0; d < vRank; ++d) {
+    elemShape[d]  = L.elemCounts[d];
+    batchShape[d] = (elemShape[d] > 0) ? (shape[d] / elemShape[d]) : 1;
+    totalBatch   *= batchShape[d];
+    totalElem    *= elemShape[d];
+  }
 
-  for (int64_t i = 0; i < totalElems; i++) {
-    SmallVector<int64_t> elemIdx(vRank);
-    int64_t temp = i;
-    for (int d = vRank - 1; d >= 0; d--) {
-      elemIdx[d] = temp % shape[d];
-      temp /= shape[d];
+  for (int64_t bi = 0; bi < totalBatch; ++bi) {
+    // Decode batch multi-index.
+    SmallVector<int64_t> bIdx(vRank);
+    int64_t tmp = bi;
+    for (int d = vRank - 1; d >= 0; --d) {
+      bIdx[d] = tmp % batchShape[d];
+      tmp     /= batchShape[d];
     }
-    
-    auto eOff = computeElementOffsets(b, loc, L, elemIdx);
-    SmallVector<Value> finalOff;
-    for (int d = 0; d < mRank; d++) {
-      Value base = baseIndices[d];
-      Value totalDOff = b.create<arith::AddIOp>(loc, tOff[d], eOff[d]);
-      finalOff.push_back(b.create<arith::AddIOp>(loc, base, totalDOff));
-    }
 
-    Value scalar = b.create<memref::LoadOp>(loc, read.getBase(), finalOff);
-    result = b.create<vector::InsertOp>(loc, scalar, result, elemIdx);
+    for (int64_t ei = 0; ei < totalElem; ++ei) {
+      // Decode within-tile element multi-index.
+      SmallVector<int64_t> eIdx(vRank);
+      tmp = ei;
+      for (int d = vRank - 1; d >= 0; --d) {
+        eIdx[d] = tmp % elemShape[d];
+        tmp     /= elemShape[d];
+      }
+
+      // Memory offset for this (batch, element):
+      //   tOff[d]  — thread's base within one MMA tile
+      //   batchIdx * threadCounts * elemCounts — full-tile stride per batch step
+      //   eIdx[d]  — element within the tile
+      SmallVector<Value> finalOff;
+      for (int d = 0; d < mRank; ++d) {
+        Value off = tOff[d];
+        int64_t batchStride = L.threadCounts[d] * L.elemCounts[d];
+        if (bIdx[d] > 0) {
+          Value bs = b.create<arith::ConstantIndexOp>(loc, bIdx[d] * batchStride);
+          off = b.create<arith::AddIOp>(loc, off, bs);
+        }
+        if (eIdx[d] > 0) {
+          Value es = b.create<arith::ConstantIndexOp>(loc, eIdx[d]);
+          off = b.create<arith::AddIOp>(loc, off, es);
+        }
+        finalOff.push_back(b.create<arith::AddIOp>(loc, baseIndices[d], off));
+      }
+
+      // Insertion index in the per-thread vector (contiguous batch*elem layout).
+      SmallVector<int64_t> vecIdx(vRank);
+      for (int d = 0; d < vRank; ++d)
+        vecIdx[d] = bIdx[d] * elemShape[d] + eIdx[d];
+
+      Value scalar = b.create<memref::LoadOp>(loc, read.getBase(), finalOff);
+      result = b.create<vector::InsertOp>(loc, scalar, result, vecIdx);
+    }
   }
   return result;
 }
 
 static void interleavedTransferWrite(OpBuilder &b, vector::TransferWriteOp write,
                                       Value data, const OperandLayout &L,
-                                      Value laneId, ArrayRef<Value> baseIndices) {
+                                      Value laneId, ArrayRef<Value> baseIndices,
+                                      ArrayRef<Value> precomputedTOff = {}) {
   Location loc = write.getLoc();
   auto vType = cast<VectorType>(data.getType());
-  auto shape = vType.getShape();
-  int vRank = shape.size();
-  int mRank = baseIndices.size();
+  auto shape = vType.getShape();   // shape[d] = batchCounts[d] * elemCounts[d]
+  int vRank  = shape.size();
+  int mRank  = baseIndices.size();
 
-  auto tOff = computeThreadOffsets(b, loc, laneId, L, -1, true);
+  // Thread offsets within a single MMA tile (no batch factor).
+  SmallVector<Value> tOff;
+  if (!precomputedTOff.empty()) {
+    tOff = SmallVector<Value>(precomputedTOff.begin(), precomputedTOff.end());
+  } else {
+    tOff = computeThreadOffsets(b, loc, laneId, L, /*kAxis=*/-1,
+                                /*mmaTileOnly=*/true);
+  }
 
-  int64_t totalElems = 1;
-  for (int64_t s : shape) totalElems *= s;
+  SmallVector<int64_t> batchShape(vRank), elemShape(vRank);
+  int64_t totalBatch = 1, totalElem = 1;
+  for (int d = 0; d < vRank; ++d) {
+    elemShape[d]  = L.elemCounts[d];
+    batchShape[d] = (elemShape[d] > 0) ? (shape[d] / elemShape[d]) : 1;
+    totalBatch   *= batchShape[d];
+    totalElem    *= elemShape[d];
+  }
 
-  for (int64_t i = 0; i < totalElems; i++) {
-    SmallVector<int64_t> elemIdx(vRank);
-    int64_t temp = i;
-    for (int d = vRank - 1; d >= 0; d--) {
-      elemIdx[d] = temp % shape[d];
-      temp /= shape[d];
+  for (int64_t bi = 0; bi < totalBatch; ++bi) {
+    SmallVector<int64_t> bIdx(vRank);
+    int64_t tmp = bi;
+    for (int d = vRank - 1; d >= 0; --d) {
+      bIdx[d] = tmp % batchShape[d];
+      tmp     /= batchShape[d];
     }
-    
-    auto eOff = computeElementOffsets(b, loc, L, elemIdx);
-    SmallVector<Value> finalOff;
-    for (int d = 0; d < mRank; d++) {
-      Value base = baseIndices[d];
-      Value totalDOff = b.create<arith::AddIOp>(loc, tOff[d], eOff[d]);
-      finalOff.push_back(b.create<arith::AddIOp>(loc, base, totalDOff));
-    }
 
-    Value scalar = b.create<vector::ExtractOp>(loc, data, elemIdx);
-    b.create<memref::StoreOp>(loc, scalar, write.getBase(), finalOff);
+    for (int64_t ei = 0; ei < totalElem; ++ei) {
+      SmallVector<int64_t> eIdx(vRank);
+      tmp = ei;
+      for (int d = vRank - 1; d >= 0; --d) {
+        eIdx[d] = tmp % elemShape[d];
+        tmp     /= elemShape[d];
+      }
+
+      SmallVector<Value> finalOff;
+      for (int d = 0; d < mRank; ++d) {
+        Value off = tOff[d];
+        int64_t batchStride = L.threadCounts[d] * L.elemCounts[d];
+        if (bIdx[d] > 0) {
+          Value bs = b.create<arith::ConstantIndexOp>(loc, bIdx[d] * batchStride);
+          off = b.create<arith::AddIOp>(loc, off, bs);
+        }
+        if (eIdx[d] > 0) {
+          Value es = b.create<arith::ConstantIndexOp>(loc, eIdx[d]);
+          off = b.create<arith::AddIOp>(loc, off, es);
+        }
+        finalOff.push_back(b.create<arith::AddIOp>(loc, baseIndices[d], off));
+      }
+
+      // Extraction index from the per-thread vector (contiguous batch*elem layout).
+      SmallVector<int64_t> vecIdx(vRank);
+      for (int d = 0; d < vRank; ++d)
+        vecIdx[d] = bIdx[d] * elemShape[d] + eIdx[d];
+
+      Value scalar = b.create<vector::ExtractOp>(loc, data, vecIdx);
+      b.create<memref::StoreOp>(loc, scalar, write.getBase(), finalOff);
+    }
   }
 }
 
@@ -416,6 +519,82 @@ static void adjustedTransferWrite(OpBuilder &b,
 //===----------------------------------------------------------------------===//
 // §8  Warp shuffle reduction (for K-parallel threads, generic)
 //===----------------------------------------------------------------------===//
+static bool hasWorkgroupAddressSpace(MemRefType memType) {
+  if (auto addrSpace = dyn_cast_or_null<gpu::AddressSpaceAttr>(
+          memType.getMemorySpace()))
+    return addrSpace.getValue() == gpu::AddressSpace::Workgroup;
+  return false;
+}
+
+
+struct LdMatrixConfig {
+  int32_t numTiles;
+  bool transpose;       // PTX ldmatrix.trans flag — only valid for 16-bit types
+  bool indexTranspose;  // true when row→K-axis, col→N-axis (B operand memory layout)
+  // Row/col computation parameters (all derived from mmaShape + elemWidth)
+  int64_t rowMod;   // row = laneId % rowMod
+  int64_t colDiv;   // colGroup = laneId / colDiv
+  int64_t colMul;   // col = colGroup * colMul
+};
+
+// ldmatrix is only defined for 16-bit element types (f16/bf16/i16).
+// For wider types (tf32/f32/f64) callers must fall back to scalar LDS loads.
+static bool canUseLdMatrix(Type elemType) {
+  return elemType.getIntOrFloatBitWidth() <= 16;
+}
+
+static LdMatrixConfig computeLdMatrixConfig(
+    ArrayRef<int64_t> mmaShape, Type elemType, bool isOperandB) {
+  int64_t M = mmaShape[0], N = mmaShape[1], K = mmaShape[2];
+  int64_t W = elemType.getIntOrFloatBitWidth();
+  int64_t elemsPerLine = 128 / W;  // elements in one 128-bit load
+
+  LdMatrixConfig cfg;
+  if (!isOperandB) {
+    // A operand: row-major, shape is M × K
+    int64_t mTile = M / 8;
+    int64_t kTile = K / elemsPerLine;
+    cfg.numTiles       = mTile * kTile;
+    cfg.transpose      = false;  // ldmatrix.trans not needed for A
+    cfg.indexTranspose = false;  // row → M-axis, col → K-axis
+    cfg.rowMod         = M;            // row cycles over M rows
+    cfg.colDiv         = M;            // new column group every M lanes
+    cfg.colMul         = elemsPerLine; // each group shifts by elemsPerLine columns
+  } else {
+    // B operand: transposed (col-major in MMA terms), shape is K × N.
+    // NOTE: computeLdMatrixConfig must only be called when canUseLdMatrix()
+    // is true (W <= 16). For wider types callers use interleavedTransferRead.
+    int64_t kTile = K / elemsPerLine;
+    int64_t nTile = N / 8;
+    cfg.numTiles       = kTile * nTile;
+    cfg.transpose      = true;
+    cfg.indexTranspose = true; // row → K-axis, col → N-axis
+    cfg.rowMod         = K;            // row cycles over K rows
+    cfg.colDiv         = K;            // new column group every K lanes
+    cfg.colMul         = elemsPerLine; // each group shifts by elemsPerLine columns
+  }
+  return cfg;
+}
+
+/// Build the ldmatrix row and col index values from laneId and config.
+static std::pair<Value, Value> buildLdMatrixIndices(
+    OpBuilder &b, Location loc, Value laneId, const LdMatrixConfig &cfg) {
+  Value rowMod = b.create<arith::ConstantIndexOp>(loc, cfg.rowMod);
+  Value row = b.create<arith::RemUIOp>(loc, laneId, rowMod);
+
+  Value col;
+  if (cfg.colMul == 0 || cfg.colDiv >= 32) {
+    // All lanes fit within one group — col is always 0
+    col = b.create<arith::ConstantIndexOp>(loc, 0);
+  } else {
+    Value colDiv = b.create<arith::ConstantIndexOp>(loc, cfg.colDiv);
+    Value colMul = b.create<arith::ConstantIndexOp>(loc, cfg.colMul);
+    Value group = b.create<arith::DivUIOp>(loc, laneId, colDiv);
+    col = b.create<arith::MulIOp>(loc, group, colMul);
+  }
+  return {row, col};
+}
+
 
 static Value warpShuffleReduce(OpBuilder &b, Location loc, Value vec,
                                 int64_t kThreadCount, int64_t kStride) {
@@ -467,11 +646,12 @@ private:
                       .getElementType();
     auto frags = deriveMMAFragments(mmaShape, elemTy);
     if (failed(frags))
-      return emitGenericContract(acc); // fallback
+      return emitGenericContract(acc);
 
-    bool isTf32 =
-        static_cast<NVMMAIntrinsicValues>(mmaKind) ==
-        NVMMAIntrinsicValues::MMA_SYNC_TF32_16x8x8;
+    // isTf32: nvgpu.mma.sync requires this flag when inputs are f32 (tf32 precision).
+    // Derived from element type — f32 inputs always imply tf32 MMA;
+    // f16/bf16/i8 inputs never do. This avoids a hardcoded intrinsic enum check.
+    bool isTf32 = elemTy.isF32();
 
     auto aFrag2D = VectorType::get(frags->a, elemTy);
     auto bFrag2D = VectorType::get(frags->b, elemTy);
@@ -482,26 +662,60 @@ private:
     auto lhsThrTy  = perTileThreadType(lhsFullTy, L0, lhsKAxis);
     auto rhsThrTy  = perTileThreadType(rhsFullTy, L1, rhsKAxis);
 
-    // Sanity: per-tile element count must match 2D fragment size.
     int64_t lhsThrElems = 1, rhsThrElems = 1;
     for (int64_t d : lhsThrTy.getShape()) lhsThrElems *= d;
     for (int64_t d : rhsThrTy.getShape()) rhsThrElems *= d;
     int64_t aFragElems = frags->a[0] * frags->a[1];
     int64_t bFragElems = frags->b[0] * frags->b[1];
-    // If mismatch, fall back — don't crash with bad shape_cast.
     if (lhsThrElems != aFragElems || rhsThrElems != bFragElems)
       return emitGenericContract(acc);
 
-    // Per-thread offsets driven by lane ID (tid % 32) and layout strides.
-    // Raw tid usage in kernels with >32 threads causes out-of-bounds access.
     Value tid = b.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
     Value constant32 = b.create<arith::ConstantIndexOp>(loc, 32);
     Value laneId = b.create<arith::RemUIOp>(loc, tid, constant32);
 
-    SmallVector<Value> off0 = computeThreadOffsets(b, loc, laneId, L0, lhsKAxis, /*mmaTileOnly=*/true);
-    SmallVector<Value> off1 = computeThreadOffsets(b, loc, laneId, L1, rhsKAxis, /*mmaTileOnly=*/true);
+    // ── Detect shared memory ──
+    auto lhsMemType = cast<MemRefType>(lhsRead.getBase().getType());
+    auto rhsMemType = cast<MemRefType>(rhsRead.getBase().getType());
+    bool lhsIsShared = false, rhsIsShared = false;
+    if (auto as = dyn_cast_or_null<gpu::AddressSpaceAttr>(
+            lhsMemType.getMemorySpace()))
+      lhsIsShared = (as.getValue() == gpu::AddressSpace::Workgroup);
+    if (auto as = dyn_cast_or_null<gpu::AddressSpaceAttr>(
+            rhsMemType.getMemorySpace()))
+      rhsIsShared = (as.getValue() == gpu::AddressSpace::Workgroup);
 
-    // MN batch counts from layout.
+    // ldmatrix is only legal for 16-bit element types (f16/bf16).
+    // For wider types (tf32/f32) shared-mem operands must use scalar LDS
+    // (interleavedTransferRead) even though the data lives in shared memory.
+    const bool useLdm = canUseLdMatrix(elemTy);
+
+    // ── Derive ldmatrix configs from mmaShape + element type ──
+    LdMatrixConfig ldmCfgA, ldmCfgB;
+    Value ldmA_row, ldmA_col, ldmB_row, ldmB_col;
+
+    if (lhsIsShared && useLdm) {
+      ldmCfgA = computeLdMatrixConfig(mmaShape, elemTy, /*isOperandB=*/false);
+      std::tie(ldmA_row, ldmA_col) =
+          buildLdMatrixIndices(b, loc, laneId, ldmCfgA);
+    }
+    if (rhsIsShared && useLdm) {
+      ldmCfgB = computeLdMatrixConfig(mmaShape, elemTy, /*isOperandB=*/true);
+      std::tie(ldmB_row, ldmB_col) =
+          buildLdMatrixIndices(b, loc, laneId, ldmCfgB);
+    }
+
+    // ── Scalar fallback offsets (when NOT using ldmatrix) ──
+    // Computed once here, passed as precomputedTOff into interleavedTransferRead
+    // to avoid re-emitting divui/remui/muli thread-position arithmetic on every
+    // iteration of the kb × bm × bn loop (kAxis irrelevant when mmaTileOnly=true).
+    SmallVector<Value> off0, off1;
+    if (!lhsIsShared || !useLdm)
+      off0 = computeThreadOffsets(b, loc, laneId, L0, /*kAxis=*/-1, /*mmaTileOnly=*/true);
+    if (!rhsIsShared || !useLdm)
+      off1 = computeThreadOffsets(b, loc, laneId, L1, /*kAxis=*/-1, /*mmaTileOnly=*/true);
+
+    // ── MN batch axis detection ──
     int lhsMAxis = -1, rhsNAxis = -1;
     for (int d = 0; d < L0.rank; ++d)
       if (d != lhsKAxis) { lhsMAxis = d; break; }
@@ -510,71 +724,95 @@ private:
 
     int64_t batchM = (lhsMAxis >= 0) ? L0.batchCounts[lhsMAxis] : 1;
     int64_t batchN = (rhsNAxis >= 0) ? L1.batchCounts[rhsNAxis] : 1;
-    // Step between consecutive MMA tiles in M/N direction = full MMA tile size
-    // = threadCounts * elemCounts (covers all threads × elements in that dim).
-    int64_t elemM  = (lhsMAxis >= 0)
-                         ? L0.threadCounts[lhsMAxis] * L0.elemCounts[lhsMAxis]
-                         : 1;
-    int64_t elemN  = (rhsNAxis >= 0)
-                         ? L1.threadCounts[rhsNAxis] * L1.elemCounts[rhsNAxis]
-                         : 1;
 
-    // ACC slice shape per MN tile.
+    // FIX: use MMA tile dimensions directly instead of
+    // threadCounts * elemCounts which is wrong for non-standard shapes.
+    // elemM = number of M rows in one MMA tile = mmaShape[0]
+    // elemN = number of N cols in one MMA tile = mmaShape[1]
+    int64_t elemM = mmaShape[0];  // e.g. 16 for m16n8k8
+    int64_t elemN = mmaShape[1];  // e.g.  8 for m16n8k8
+
     SmallVector<int64_t> accSliceShape(
         cast<VectorType>(acc.getType()).getShape());
     if (accMAxis >= 0) accSliceShape[accMAxis] = L2.elemCounts[accMAxis];
     if (accNAxis >= 0) accSliceShape[accNAxis] = L2.elemCounts[accNAxis];
-
-    SmallVector<int64_t> accOnes(cast<VectorType>(acc.getType()).getRank(), 1);
+    SmallVector<int64_t> accOnes(
+        cast<VectorType>(acc.getType()).getRank(), 1);
 
     Value result = acc;
-
-    // For each K-batch step: advance the K-axis offset by kb * kStep,
-    // read the per-thread slice (matches 2D fragment element count), then
-    // shape-cast to the nvgpu.mma.sync fragment type.
     Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+
     for (int64_t kb = 0; kb < kBatchCount; ++kb) {
-      // Compute tile offsets for this K-batch step (no thread offsets).
-      SmallVector<Value> tileOff0(L0.rank, zero), tileOff1(L1.rank, zero);
-      if (kb > 0) {
-        if (lhsKAxis >= 0) tileOff0[lhsKAxis] = b.create<arith::ConstantIndexOp>(loc, kb * kStep);
-        if (rhsKAxis >= 0) tileOff1[rhsKAxis] = b.create<arith::ConstantIndexOp>(loc, kb * kStep);
+      int64_t kOff = kb * kStep;
+
+      // Cache A fragments across bn: A depends on (kb, bm), not bn.
+      // Cache B fragments across bm: B depends on (kb, bn), not bm.
+      SmallVector<Value> aFragCache(batchM), bFragCache(batchN);
+
+      for (int64_t bm = 0; bm < batchM; ++bm) {
+        if (lhsIsShared && useLdm) {
+          aFragCache[bm] = emitLdMatrix(
+              lhsRead, lhsMAxis, lhsKAxis,
+              ldmA_row, ldmA_col, ldmCfgA,
+              bm * elemM, kOff, aFrag2D, zero);
+        } else {
+          SmallVector<Value> tileOff(L0.rank, zero);
+          if (kOff > 0 && lhsKAxis >= 0)
+            tileOff[lhsKAxis] = b.create<arith::ConstantIndexOp>(loc, kOff);
+          if (bm > 0 && lhsMAxis >= 0)
+            tileOff[lhsMAxis] =
+                b.create<arith::ConstantIndexOp>(loc, bm * elemM);
+          Value aSlice = interleavedTransferRead(
+              b, lhsRead, L0, lhsThrTy, laneId, tileOff, off0);
+          aFragCache[bm] = b.create<vector::ShapeCastOp>(loc, aFrag2D, aSlice);
+        }
+      }
+
+      for (int64_t bn = 0; bn < batchN; ++bn) {
+        if (rhsIsShared && useLdm) {
+          bFragCache[bn] = emitLdMatrix(
+              rhsRead, rhsNAxis, rhsKAxis,
+              ldmB_row, ldmB_col, ldmCfgB,
+              bn * elemN, kOff, bFrag2D, zero);
+        } else {
+          SmallVector<Value> tileOff(L1.rank, zero);
+          if (kOff > 0 && rhsKAxis >= 0)
+            tileOff[rhsKAxis] = b.create<arith::ConstantIndexOp>(loc, kOff);
+          if (bn > 0 && rhsNAxis >= 0)
+            tileOff[rhsNAxis] =
+                b.create<arith::ConstantIndexOp>(loc, bn * elemN);
+          Value bSlice = interleavedTransferRead(
+              b, rhsRead, L1, rhsThrTy, laneId, tileOff, off1);
+          bFragCache[bn] = b.create<vector::ShapeCastOp>(loc, bFrag2D, bSlice);
+        }
       }
 
       for (int64_t bm = 0; bm < batchM; ++bm) {
         for (int64_t bn = 0; bn < batchN; ++bn) {
-          SmallVector<Value> lhsOff = tileOff0;
-          if (lhsMAxis >= 0 && bm > 0)
-            lhsOff[lhsMAxis] = b.create<arith::ConstantIndexOp>(loc, bm * elemM);
-          
-          SmallVector<Value> rhsOff = tileOff1;
-          if (rhsNAxis >= 0 && bn > 0)
-            rhsOff[rhsNAxis] = b.create<arith::ConstantIndexOp>(loc, bn * elemN);
+          Value aFrag = aFragCache[bm];
+          Value bFrag = bFragCache[bn];
 
-          // interleavedTransferRead adds thread (laneId) and element offsets internally.
-          Value aSlice = interleavedTransferRead(b, lhsRead, L0, lhsThrTy, laneId, lhsOff);
-          Value bSlice = interleavedTransferRead(b, rhsRead, L1, rhsThrTy, laneId, rhsOff);
-
-          // Shape-cast 3D per-thread slice to 2D MMA fragment.
-          Value aFrag = b.create<vector::ShapeCastOp>(loc, aFrag2D, aSlice);
-          Value bFrag = b.create<vector::ShapeCastOp>(loc, bFrag2D, bSlice);
-
-          // ACC MN slice → 2D C fragment.
+          // ── ACC slice → C fragment ──
           SmallVector<int64_t> accOff(
               cast<VectorType>(result.getType()).getRank(), 0);
-          if (accMAxis >= 0) accOff[accMAxis] = bm * L2.elemCounts[accMAxis];
-          if (accNAxis >= 0) accOff[accNAxis] = bn * L2.elemCounts[accNAxis];
+          if (accMAxis >= 0)
+            accOff[accMAxis] = bm * L2.elemCounts[accMAxis];
+          if (accNAxis >= 0)
+            accOff[accNAxis] = bn * L2.elemCounts[accNAxis];
           Value cSlice = b.create<vector::ExtractStridedSliceOp>(
               loc, result, accOff, accSliceShape, accOnes);
-          Value cFrag = b.create<vector::ShapeCastOp>(loc, cFrag2D, cSlice);
+          Value cFrag =
+              b.create<vector::ShapeCastOp>(loc, cFrag2D, cSlice);
 
-          // nvgpu.mma.sync — all 32 threads in the warp participate.
+          // ── nvgpu.mma.sync ──
           Value cResult = b.create<nvgpu::MmaSyncOp>(
-              loc, aFrag, bFrag, cFrag, frags->mmaShape, isTf32);
+              loc, aFrag, bFrag, cFrag,
+              frags->mmaShape, isTf32);
 
-          // Shape-cast C result back to 3D and insert into accumulator.
           Value accResult = b.create<vector::ShapeCastOp>(
-              loc, VectorType::get(accSliceShape, elemTy), cResult);
+              loc,
+              VectorType::get(accSliceShape, elemTy),
+              cResult);
           result = b.create<vector::InsertStridedSliceOp>(
               loc, accResult, result, accOff, accOnes);
         }
@@ -583,6 +821,62 @@ private:
     return result;
   }
 
+  Value emitLdMatrix(vector::TransferReadOp read,
+                     int spatialAxis, int kAxis,
+                     Value ldmRow, Value ldmCol,
+                     const LdMatrixConfig &cfg,
+                     int64_t spatialOff, int64_t kOff,
+                     VectorType fragType, Value zero) {
+    SmallVector<Value> baseIndices(read.getIndices());
+    int memRank = baseIndices.size();
+
+    // ldmatrix row maps to the "row" dimension of the operand:
+    //   For A (indexTranspose=false): row → M-axis (spatialAxis), col → K-axis
+    //   For B (indexTranspose=true):  row → K-axis,               col → N-axis (spatialAxis)
+    // NOTE: cfg.indexTranspose controls the memory index mapping.
+    //       cfg.transpose is ONLY the PTX ldmatrix.trans flag (valid ≤16-bit only).
+    int rowDim, colDim;
+    if (!cfg.indexTranspose) {
+      // A: row → spatialAxis (M), col → kAxis
+      rowDim = spatialAxis;
+      colDim = kAxis;
+    } else {
+      // B: row → kAxis, col → spatialAxis (N)
+      rowDim = kAxis;
+      colDim = spatialAxis;
+    }
+
+    SmallVector<Value> ldmIndices(memRank, zero);
+    for (int d = 0; d < memRank; ++d) {
+      Value idx = baseIndices[d];
+      if (d == rowDim) {
+        // Add hardware row + tile offset
+        Value off = ldmRow;
+        int64_t tileOff = cfg.indexTranspose ? kOff : spatialOff;
+        if (tileOff > 0) {
+          Value tOff = b.create<arith::ConstantIndexOp>(loc, tileOff);
+          off = b.create<arith::AddIOp>(loc, off, tOff);
+        }
+        ldmIndices[d] = b.create<arith::AddIOp>(loc, idx, off);
+      } else if (d == colDim) {
+        // Add hardware col + tile offset
+        Value off = ldmCol;
+        int64_t tileOff = cfg.indexTranspose ? spatialOff : kOff;
+        if (tileOff > 0) {
+          Value tOff = b.create<arith::ConstantIndexOp>(loc, tileOff);
+          off = b.create<arith::AddIOp>(loc, off, tOff);
+        }
+        ldmIndices[d] = b.create<arith::AddIOp>(loc, idx, off);
+      } else {
+        // Batch or other dims: just use base
+        ldmIndices[d] = idx;
+      }
+    }
+
+    return b.create<nvgpu::LdMatrixOp>(
+        loc, fragType, read.getBase(), ldmIndices,
+        cfg.transpose, cfg.numTiles);
+  }
   // ── Generic vector.contract fallback ─────────────────────────────────────
   //
   // Uses per-thread offsets (divui/remui) for non-MMA ops only.

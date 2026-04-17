@@ -202,32 +202,6 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   if (walkResult.wasInterrupted())
     return failure();
 
-  // Collect warp-mapped foralls (MMA ops after Subgroup tiling pass) and
-  // add their thread contribution: each warp forall iteration = kWarpSize
-  // threads, so totalWarps * kWarpSize threads are needed in blockDims.x.
-  auto warpWalkResult = blockForall.walk([&](scf::ForallOp inner) {
-    if (inner == blockForall)
-      return WalkResult::advance();
-    if (!hasWarpMapping(inner))
-      return WalkResult::advance();
-
-    warpForalls.push_back(inner);
-    int64_t totalWarps = 1;
-    for (auto ub : inner.getMixedUpperBound()) {
-      if (auto cst = getConstantIntValue(ub)) {
-        totalWarps *= *cst;
-      } else {
-        inner.emitError("non-static warp forall upper bound");
-        return WalkResult::interrupt();
-      }
-    }
-    blockDims[0] = std::max(blockDims[0], totalWarps * kWarpSize);
-    return WalkResult::advance();
-  });
-
-  if (warpWalkResult.wasInterrupted())
-    return failure();
-
   // ---- ALGORITHM STEP 3: Clamp block dims to CUDA's 1024-thread limit ----
   //
   // PERFORMANCE CRITICAL: CUDA's maximum threads per block is 1024. If the
@@ -316,52 +290,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   auto insertPt = launchBody.without_terminator().end();
   launchBody.getOperations().splice(insertPt, forallBody->getOperations());
 
-  // ---- ALGORITHM STEP 7a: Convert warp foralls inside the launch body ----
-  //
-  // Warp foralls use GPUWarpMappingAttr (linear). Each warp forall IV is
-  // replaced by: warpId = threadIdx.x / 32, then decomposed into per-dim
-  // warp indices. Warp foralls are processed FIRST because they are outer
-  // (thread foralls are nested inside them for SIMT ops, or absent for MMA).
-  for (auto warpForall : warpForalls) {
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPoint(warpForall);
-    auto warpMapping = warpForall.getMappingAttr().getValue();
-    auto warpUBs = warpForall.getMixedUpperBound();
-
-    // warpId = threadIdx.x / 32
-    auto tidX = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-    Value warpId = rewriter.create<arith::DivUIOp>(loc, tidX, cstIdx(32));
-
-    // Decompose warpId into per-dim warp IVs (linear warp mapping).
-    SmallVector<std::pair<int64_t, unsigned>> dimOrder;
-    for (auto [idx, attr] : llvm::enumerate(warpMapping)) {
-      auto wAttr = cast<gpu::GPUWarpMappingAttr>(attr);
-      dimOrder.emplace_back(wAttr.getRelativeIndex(), idx);
-    }
-    llvm::sort(dimOrder,
-               [](auto &a, auto &b) { return a.first < b.first; });
-
-    int64_t stride = 1;
-    for (auto [linearDimIdx, forallIvIdx] : dimOrder) {
-      int64_t bound = *getConstantIntValue(warpUBs[forallIvIdx]);
-      Value strideVal = cstIdx(stride);
-      Value div = rewriter.create<arith::DivUIOp>(loc, warpId, strideVal);
-      Value boundVal = cstIdx(bound);
-      Value iv = rewriter.create<arith::RemUIOp>(loc, div, boundVal);
-      warpForall.getInductionVar(forallIvIdx).replaceAllUsesWith(iv);
-      stride *= bound;
-    }
-
-    // Splice warp forall body into parent, erase the forall shell.
-    rewriter.eraseOp(warpForall.getTerminator());
-    Block *warpBody = warpForall.getBody();
-    Block *parentBlock = warpForall->getBlock();
-    parentBlock->getOperations().splice(Block::iterator(warpForall),
-                                        warpBody->getOperations());
-    rewriter.eraseOp(warpForall);
-  }
-
-  // ---- ALGORITHM STEP 7b: Convert thread foralls inside the launch body ----
+  // ---- ALGORITHM STEP 7a: Convert thread foralls inside the launch body ----
   for (auto threadForall : threadForalls) {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(threadForall);

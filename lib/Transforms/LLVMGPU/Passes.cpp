@@ -39,6 +39,7 @@
 #include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
@@ -63,6 +64,9 @@
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Transforms/DialectConversion.h"
 
 using namespace mlir;
 
@@ -260,38 +264,29 @@ namespace mlir::nova
 
     pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
 
-    // ── Step 10.5: Stride-32 parallelization for single-thread reductions ──
-    // Rewrites scf.for reduction loops inside single-thread gpu.launch ops
-    // to use 32 threads with stride-32 access: lb=tid.x, step=32.
-    // Must run BEFORE SCFScalarize (which creates atomic_rmw from stores)
-    // and BEFORE WarpShuffle (which converts atomic_rmw to shfl.sync.bfly).
-    pm.addNestedPass<func::FuncOp>(createNovaStrideReductionPass());
-
-    pm.addNestedPass<func::FuncOp>(
-        mlir::nova::createSCFScalarizeAccumulatorPass());
+    // // ── Scalar accumulator + warp shuffle reduction ─────────────────────────
+    // pm.addNestedPass<func::FuncOp>(
+    //     mlir::nova::createSCFScalarizeAccumulatorPass());
+     pm.addNestedPass<func::FuncOp>(
+        mlir::vector::createLowerVectorMultiReductionPass(
+            mlir::vector::VectorMultiReductionLowering::InnerReduction));
     pm.addPass(createCanonicalizerPass());
+    
+    // pm.addNestedPass<func::FuncOp>(
+    //     mlir::nova::createNovaWarpShuffleReductionPass());
+    // pm.addPass(createCanonicalizerPass());
+    // pm.addPass(createCSEPass());
 
-    // ── Step 10.8: Loop split + vectorize (both reduction and non-reduction) ─
-    // LoopSplit splits loops at condition boundaries (helps non-reduction
-    // vectorization). The vectorizer then handles BOTH modes:
-    //   Mode A: non-reduction loops (step=1, no iter_args) → vector.load/store
-    //   Mode B: reduction loops (iter_args) → vector.load + vector.reduction
-    // Must run BEFORE WarpShuffle because the vectorized reduction emits
-    // vector.reduction → scalar, which feeds into the atomic_rmw that
-    // WarpShuffle matches.
-    pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
-    pm.addPass(createCanonicalizerPass());
+    // // ── Loop optimizations ──────────────────────────────────────────────────
+    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
+    // pm.addPass(createCanonicalizerPass());
 
-    pm.addNestedPass<func::FuncOp>(
-        mlir::nova::createNovaScfLoopVectorizePass(4));
-    pm.addPass(createCanonicalizerPass());
-
-    // ── Warp butterfly shuffle reduction ────────────────────────────────────
-    // Replaces double-atomic reduction patterns with register-based shuffle
-    // + thread-0 write. Also matches values from vector::ReductionOp.
-    pm.addNestedPass<func::FuncOp>(
-        mlir::nova::createNovaWarpShuffleReductionPass());
-    pm.addPass(createCanonicalizerPass());
+    // Lower vector.multi_reduction → inner-reduction (transfer_read/write +
+    // arith) before GPU kernel outlining so the ops are still on func::FuncOp
+    // where this pass can see them.
+   
+    // ── Reposition stores ───────────────────────────────────────────────────
+    pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
 
     // ── Step 11: Insert workgroup barriers ──────────────────────────────────
     pm.addNestedPass<func::FuncOp>(
@@ -359,272 +354,23 @@ namespace mlir::nova
                 }
               }
             });
-            {
-              struct FoldExtractStridedSliceFromTransferRead
-                  : public OpRewritePattern<vector::ExtractStridedSliceOp> {
-                using OpRewritePattern::OpRewritePattern;
-                LogicalResult matchAndRewrite(
-                    vector::ExtractStridedSliceOp extractOp,
-                    PatternRewriter &rewriter) const override {
-                  auto extractType =
-                      cast<VectorType>(extractOp.getType());
-                  if (extractType.getRank() != 2) return failure();
-                  auto readOp =
-                      extractOp.getVector()
-                          .getDefiningOp<vector::TransferReadOp>();
-                  if (!readOp) return failure();
-                  if (!isa<MemRefType>(readOp.getBase().getType()))
-                    return failure();
-                  if (readOp.getMask() || readOp.hasOutOfBoundsDim())
-                    return failure();
-                  auto strides = extractOp.getStrides()
-                                     .getAsValueRange<IntegerAttr>();
-                  if (!llvm::all_of(strides, [](const APInt &v) {
-                        return v.isOne();
-                      }))
-                    return failure();
-                  SmallVector<int64_t> offsets;
-                  for (auto attr :
-                       extractOp.getOffsets()
-                           .getAsValueRange<IntegerAttr>())
-                    offsets.push_back(attr.getSExtValue());
-                  if ((int64_t)offsets.size() !=
-                      (int64_t)readOp.getIndices().size())
-                    return failure();
-                  Location loc = extractOp.getLoc();
-                  SmallVector<Value> newIndices =
-                      llvm::to_vector(readOp.getIndices());
-                  for (size_t i = 0; i < offsets.size(); ++i) {
-                    if (offsets[i] != 0) {
-                      Value off =
-                          rewriter.create<arith::ConstantIndexOp>(
-                              loc, offsets[i]);
-                      newIndices[i] =
-                          rewriter.create<arith::AddIOp>(
-                              loc, newIndices[i], off);
-                    }
-                  }
-                  SmallVector<bool> inBounds(2, true);
-                  rewriter.replaceOpWithNewOp<vector::TransferReadOp>(
-                      extractOp, extractType, readOp.getBase(),
-                      newIndices, readOp.getPermutationMapAttr(),
-                      readOp.getPadding(), /*mask=*/Value{},
-                      rewriter.getBoolArrayAttr(inBounds));
-                  return success();
-                }
-              };
-              RewritePatternSet foldPatterns(&getContext());
-              foldPatterns
-                  .add<FoldExtractStridedSliceFromTransferRead>(
-                      &getContext());
-              (void)applyPatternsAndFoldGreedily(
-                  funcOp, std::move(foldPatterns));
-            }
-
-            {
-              RewritePatternSet castPatterns(&getContext());
-              vector::populateCastAwayVectorLeadingOneDimPatterns(
-                  castPatterns);
-              (void)applyPatternsAndFoldGreedily(
-                  funcOp, std::move(castPatterns));
-            }
-
-            // Step 2b: Decompose insert_strided_slice + transfer_write chains.
+            // Steps 1, 2b, 2.5: fold extract/insert strided-slice ↔ transfer
+            // read/write chains, and cast away vector leading unit dims.
             //
-            // UnrollToIntrinsics produces:
-            //   %v0 = contract(...) : vector<16x8>  // MMA tile [0,0]
-            //   %v1 = contract(...) : vector<16x8>  // MMA tile [0,8]
-            //   %a  = insert_strided_slice %v0, %init {offsets=[0,0]}
-            //   %b  = insert_strided_slice %v1, %a   {offsets=[0,8]}
-            //   ...
-            //   transfer_write %final, memref[base0, base1] : vector<32x16>
+            // Pattern implementations live in NovaGPUHoistExtractInsert.cpp;
+            // see populateGpuHardwareMappingStridedSlicePatterns for details:
+            //   • FoldExtractStridedSliceFromTransferRead  — simple rank-2 extract fold
+            //   • FoldInsertStridedSliceIntoTransferWrite  — insert chain → per-tile writes
+            //   • SplitTransferReadExtract                 — general minor-identity extract fold
             //
-            // ConvertVectorToGPU cannot handle insert_strided_slice in the
-            // forward slice from contracts. We decompose into individual writes:
-            //   transfer_write %v0, memref[base0+0,  base1+0]  : vector<16x8>
-            //   transfer_write %v1, memref[base0+0,  base1+8]  : vector<16x8>
-            //   ...
+            // CastAwayVectorLeadingOneDims normalises vector<1x16x8> → vector<16x8>
+            // so the rank-2 checks in the folding patterns fire on all types.
             {
-              struct FoldInsertStridedSliceIntoTransferWrite
-                  : public OpRewritePattern<vector::TransferWriteOp> {
-                using OpRewritePattern::OpRewritePattern;
-                LogicalResult matchAndRewrite(
-                    vector::TransferWriteOp writeOp,
-                    PatternRewriter &rewriter) const override {
-                  // Only handle 2D writes to memref.
-                  auto writeType = writeOp.getVectorType();
-                  if (writeType.getRank() != 2) return failure();
-                  if (!isa<MemRefType>(writeOp.getBase().getType()))
-                    return failure();
-                  if (writeOp.getMask() || writeOp.hasOutOfBoundsDim())
-                    return failure();
-                  // Must have identity permutation map.
-                  if (!writeOp.getPermutationMap().isIdentity())
-                    return failure();
-
-                  // Trace back through the chain of insert_strided_slice ops
-                  // to collect all individual tile values and their offsets.
-                  struct TileInfo {
-                    Value value;       // the vector<16x8> being inserted
-                    SmallVector<int64_t, 2> offsets;
-                  };
-                  SmallVector<TileInfo> tiles;
-                  Value current = writeOp.getVector();
-                  bool foundChain = false;
-                  while (auto insertOp =
-                             current.getDefiningOp<vector::InsertStridedSliceOp>()) {
-                    foundChain = true;
-                    auto strides =
-                        insertOp.getStrides().getAsValueRange<IntegerAttr>();
-                    if (!llvm::all_of(strides,
-                                      [](const APInt &v) { return v.isOne(); }))
-                      return failure();
-                    SmallVector<int64_t, 2> offsets;
-                    for (auto attr :
-                         insertOp.getOffsets().getAsValueRange<IntegerAttr>())
-                      offsets.push_back(attr.getSExtValue());
-                    if (offsets.size() != 2) return failure();
-                    tiles.push_back({insertOp.getValueToStore(), offsets});
-                    current = insertOp.getDest();
-                  }
-                  if (!foundChain) return failure();
-
-                  // Emit individual transfer_write ops for each tile.
-                  Location loc = writeOp.getLoc();
-                  SmallVector<Value> baseIndices =
-                      llvm::to_vector(writeOp.getIndices());
-                  for (auto &tile : tiles) {
-                    SmallVector<Value> newIndices =
-                        llvm::to_vector(baseIndices);
-                    for (size_t i = 0; i < tile.offsets.size(); ++i) {
-                      if (tile.offsets[i] != 0) {
-                        Value off = rewriter.create<arith::ConstantIndexOp>(
-                            loc, tile.offsets[i]);
-                        newIndices[i] = rewriter.create<arith::AddIOp>(
-                            loc, newIndices[i], off);
-                      }
-                    }
-                    auto tileType = cast<VectorType>(tile.value.getType());
-                    SmallVector<bool> inBounds(tileType.getRank(), true);
-                    rewriter.create<vector::TransferWriteOp>(
-                        loc, tile.value, writeOp.getBase(), newIndices,
-                        inBounds);
-                  }
-                  rewriter.eraseOp(writeOp);
-                  return success();
-                }
-              };
-              RewritePatternSet writeFoldPatterns(&getContext());
-              writeFoldPatterns.add<FoldInsertStridedSliceIntoTransferWrite>(
-                  &getContext());
+              RewritePatternSet hwPatterns(&getContext());
+              nova::populateGpuHardwareMappingStridedSlicePatterns(hwPatterns);
+              vector::populateCastAwayVectorLeadingOneDimPatterns(hwPatterns);
               (void)applyPatternsAndFoldGreedily(funcOp,
-                                                  std::move(writeFoldPatterns));
-            }
-
-            // Step 2.5: Lower extract_strided_slice(transfer_read) →
-            // direct smaller transfer_read.
-            //
-            // populatePrepareVectorToMMAPatterns (Step 3) requires that the
-            // MMA accumulator operand of every vector.contract comes DIRECTLY
-            // from a vector.transfer_read.  When the tile subgroup size is
-            // [1,32,16] the unroller produces 2×2 MMA tiles per warp, so
-            // the accumulator is loaded as vector<32x16xf32> and each
-            // vector<16x8xf32> fragment is extracted via
-            // vector.extract_strided_slice.  Step 3 cannot match this chain.
-            //
-            // This pass folds the extraction offset into the read indices:
-            //   %big  = transfer_read %mem[b, m, n]  : vector<32x16xf32>
-            //   %frag = extract_strided_slice %big {off=[dm,dn], sz=[16,8]}
-            // becomes:
-            //   %frag = transfer_read %mem[b, m+dm, n+dn] : vector<16x8xf32>
-            //
-            // This is exactly the read-side symmetric of the write-side
-            // FoldInsertStridedSliceIntoTransferWrite above.
-            {
-              struct SplitTransferReadExtract
-                  : public OpRewritePattern<vector::ExtractStridedSliceOp> {
-                using OpRewritePattern::OpRewritePattern;
-                LogicalResult matchAndRewrite(
-                    vector::ExtractStridedSliceOp extractOp,
-                    PatternRewriter &rewriter) const override {
-                  // Only handle 2-D extractions (MMA accumulator tiles).
-                  auto resultType =
-                      cast<VectorType>(extractOp.getType());
-                  if (resultType.getRank() != 2) return failure();
-
-                  // Source must be a transfer_read from a memref.
-                  auto readOp = extractOp.getVector()
-                                    .getDefiningOp<vector::TransferReadOp>();
-                  if (!readOp) return failure();
-                  if (!isa<MemRefType>(readOp.getBase().getType()))
-                    return failure();
-
-                  // Source vector must be 2-D.
-                  auto srcVecType = readOp.getVectorType();
-                  if (srcVecType.getRank() != 2) return failure();
-
-                  // No mask allowed.
-                  if (readOp.getMask()) return failure();
-
-                  // Strides of the extract must all be 1.
-                  auto strides =
-                      extractOp.getStrides().getAsValueRange<IntegerAttr>();
-                  if (!llvm::all_of(strides,
-                                    [](const APInt &v) { return v.isOne(); }))
-                    return failure();
-
-                  // Permutation map must be a "minor identity": the last
-                  // vecRank input dimensions mapped to output in order.
-                  // This guarantees that extract offsets [dm, dn] directly
-                  // correspond to the last two memref indices.
-                  AffineMap permMap = readOp.getPermutationMap();
-                  unsigned numMemDims =
-                      cast<MemRefType>(readOp.getBase().getType()).getRank();
-                  unsigned vecRank = srcVecType.getRank(); // 2
-                  if (permMap.getNumResults() != vecRank) return failure();
-                  unsigned dimBase = numMemDims - vecRank;
-                  for (unsigned i = 0; i < vecRank; ++i) {
-                    auto dim =
-                        dyn_cast<AffineDimExpr>(permMap.getResult(i));
-                    if (!dim || dim.getPosition() != dimBase + i)
-                      return failure();
-                  }
-
-                  // Gather extract offsets.
-                  SmallVector<int64_t, 2> offsets;
-                  for (auto attr :
-                       extractOp.getOffsets().getAsValueRange<IntegerAttr>())
-                    offsets.push_back(attr.getSExtValue());
-                  if ((unsigned)offsets.size() != vecRank) return failure();
-
-                  // Build adjusted indices for the new read.
-                  Location loc = extractOp.getLoc();
-                  SmallVector<Value> newIndices =
-                      llvm::to_vector(readOp.getIndices());
-                  for (unsigned i = 0; i < vecRank; ++i) {
-                    if (offsets[i] != 0) {
-                      Value cst = rewriter.create<arith::ConstantIndexOp>(
-                          loc, offsets[i]);
-                      newIndices[dimBase + i] = rewriter.create<arith::AddIOp>(
-                          loc, newIndices[dimBase + i], cst);
-                    }
-                  }
-
-                  // Emit the new smaller transfer_read.
-                  // The permutation map stays the same (same rank mapping,
-                  // just a smaller result vector type).
-                  SmallVector<bool> inBounds(resultType.getRank(), true);
-                  Value newRead = rewriter.create<vector::TransferReadOp>(
-                      loc, resultType, readOp.getBase(), newIndices,
-                      readOp.getPadding(), permMap, inBounds);
-                  rewriter.replaceOp(extractOp, newRead);
-                  return success();
-                }
-              };
-              RewritePatternSet readSplitPatterns(&getContext());
-              readSplitPatterns.add<SplitTransferReadExtract>(&getContext());
-              (void)applyPatternsAndFoldGreedily(
-                  funcOp, std::move(readSplitPatterns));
+                                                 std::move(hwPatterns));
             }
 
             // Step 3: Prepare transfers → nvgpu fragment form.
@@ -809,6 +555,49 @@ namespace mlir::nova
       gpuPm.addPass(createConvertNVGPUToNVVMPass());
       ConvertGpuOpsToNVVMOpsOptions nvvmOpts;
       gpuPm.addPass(createConvertGpuOpsToNVVMOps(nvvmOpts));
+
+      gpuPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
+        struct FoldStructMemrefRoundtripsPass
+            : public PassWrapper<FoldStructMemrefRoundtripsPass,
+                                 OperationPass<gpu::GPUFuncOp>> {
+          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+              FoldStructMemrefRoundtripsPass)
+          void runOnOperation() override {
+            getOperation().walk([](UnrealizedConversionCastOp castToMemref) {
+              // Match: struct → memref (first cast)
+              if (castToMemref.getInputs().size() != 1 ||
+                  castToMemref.getOutputs().size() != 1)
+                return;
+              if (!isa<MemRefType>(castToMemref.getResult(0).getType()))
+                return;
+              if (!isa<LLVM::LLVMStructType>(
+                      castToMemref.getOperand(0).getType()))
+                return;
+              // Check: single user is memref → struct (second cast)
+              Value memrefVal = castToMemref.getResult(0);
+              for (Operation *user : llvm::make_early_inc_range(
+                       memrefVal.getUsers())) {
+                auto castBack =
+                    dyn_cast<UnrealizedConversionCastOp>(user);
+                if (!castBack || castBack.getInputs().size() != 1 ||
+                    castBack.getOutputs().size() != 1)
+                  continue;
+                if (!isa<LLVM::LLVMStructType>(
+                        castBack.getResult(0).getType()))
+                  continue;
+                // Replace uses of the round-trip result with the original struct
+                castBack.getResult(0).replaceAllUsesWith(
+                    castToMemref.getOperand(0));
+                castBack.erase();
+              }
+            });
+          }
+          StringRef getArgument() const override {
+            return "nova-fold-struct-memref-roundtrips";
+          }
+        };
+        return std::make_unique<FoldStructMemrefRoundtripsPass>();
+      }());
       gpuPm.addPass(createLowerAffinePass());
       gpuPm.addPass(createConvertIndexToLLVMPass());
       gpuPm.addPass(createArithToLLVMConversionPass());
@@ -831,7 +620,9 @@ namespace mlir::nova
     pm.addPass(createCSEPass());
     pm.addPass(createSCFToControlFlowPass());
     pm.addPass(createConvertControlFlowToLLVMPass());
+    pm.addPass(createConvertVectorToLLVMPass());
     pm.addPass(createArithToLLVMConversionPass());
+    pm.addPass(mlir::createUBToLLVMConversionPass());
     pm.addPass(memref::createExpandStridedMetadataPass());
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
     // 13.5b — Patch host-side loads/stores from GPU device pointers produced
@@ -877,7 +668,9 @@ namespace mlir::nova
     registerNovaGPUVectorAllocPass();
     registerNovaGPUCombineValueSemanticBarriersPass();
     registerNovaGPUVectorDistributePass();
-    registerNovaGPUUnrollToIntrinsicsPass();
+    // NOTE: NovaGPUUnrollToIntrinsicsPass is a no-op stub — unrolling to MMA
+    // intrinsics is handled inside NovaGPUVectorDistributePass (§4.5 MMAEmitter).
+    // The pass registration is intentionally removed here to avoid confusion.
     registerNovaStrideReductionPass();
 
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {

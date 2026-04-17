@@ -51,6 +51,9 @@
 #include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/SubsetOpInterface.h"
 #include "mlir/Pass/Pass.h"
@@ -405,7 +408,216 @@ struct VectorInsertStridedFolder final
 };
 
 //===----------------------------------------------------------------------===//
-// §4  The pass
+// §4  GPU hardware-mapping strided-slice ↔ transfer folding patterns
+//
+// These patterns fold the insert/extract strided-slice chains that the
+// VectorDistribute pass emits into direct vector.transfer_read/write ops,
+// making the MMA fragments visible to ConvertVectorToGPU (Stage 35).
+//
+// They are collected here (not inline in Passes.cpp) so that
+// GpuHardwareMappingPass can call populateGpuHardwareMappingStridedSlicePatterns
+// instead of re-implementing them locally.
+//===----------------------------------------------------------------------===//
+
+/// Fold a 2-D vector.extract_strided_slice whose source is a
+/// vector.transfer_read from a memref into a direct, smaller transfer_read
+/// with the extraction offsets folded into the read indices.
+///
+///   %big  = vector.transfer_read %mem[i, j] : vector<32x16xf32>
+///   %frag = vector.extract_strided_slice %big {off=[dm,dn], sz=[16,8]}
+/// →
+///   %frag = vector.transfer_read %mem[i+dm, j+dn] : vector<16x8xf32>
+///
+/// Condition: no mask, strides all 1, number of offsets == number of
+/// memref indices (simple rank-2 case).
+struct FoldExtractStridedSliceFromTransferRead
+    : public OpRewritePattern<vector::ExtractStridedSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::ExtractStridedSliceOp extractOp,
+                                PatternRewriter &rewriter) const override {
+    auto extractType = cast<VectorType>(extractOp.getType());
+    if (extractType.getRank() != 2)
+      return failure();
+    auto readOp =
+        extractOp.getVector().getDefiningOp<vector::TransferReadOp>();
+    if (!readOp)
+      return failure();
+    if (!isa<MemRefType>(readOp.getBase().getType()))
+      return failure();
+    if (readOp.getMask() || readOp.hasOutOfBoundsDim())
+      return failure();
+    auto strides = extractOp.getStrides().getAsValueRange<IntegerAttr>();
+    if (!llvm::all_of(strides, [](const APInt &v) { return v.isOne(); }))
+      return failure();
+    SmallVector<int64_t> offsets;
+    for (auto attr : extractOp.getOffsets().getAsValueRange<IntegerAttr>())
+      offsets.push_back(attr.getSExtValue());
+    if ((int64_t)offsets.size() != (int64_t)readOp.getIndices().size())
+      return failure();
+    Location loc = extractOp.getLoc();
+    SmallVector<Value> newIndices = llvm::to_vector(readOp.getIndices());
+    for (size_t i = 0; i < offsets.size(); ++i) {
+      if (offsets[i] != 0) {
+        Value off = rewriter.create<arith::ConstantIndexOp>(loc, offsets[i]);
+        newIndices[i] = rewriter.create<arith::AddIOp>(loc, newIndices[i], off);
+      }
+    }
+    SmallVector<bool> inBounds(2, true);
+    rewriter.replaceOpWithNewOp<vector::TransferReadOp>(
+        extractOp, extractType, readOp.getBase(), newIndices,
+        readOp.getPermutationMapAttr(), readOp.getPadding(), /*mask=*/Value{},
+        rewriter.getBoolArrayAttr(inBounds));
+    return success();
+  }
+};
+
+/// Decompose a vector.transfer_write whose source is a chain of
+/// vector.insert_strided_slice ops into one transfer_write per tile.
+///
+///   %a  = vector.insert_strided_slice %v0, %init {off=[0,0]}
+///   %b  = vector.insert_strided_slice %v1, %a   {off=[0,8]}
+///   vector.transfer_write %b, %mem[i, j]
+/// →
+///   vector.transfer_write %v0, %mem[i+0,  j+0]
+///   vector.transfer_write %v1, %mem[i+0,  j+8]
+///
+/// Conditions: 2-D write to a memref, identity permutation map, no mask,
+/// all insert strides == 1, 2-D offsets in each insert.
+struct FoldInsertStridedSliceIntoTransferWrite
+    : public OpRewritePattern<vector::TransferWriteOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::TransferWriteOp writeOp,
+                                PatternRewriter &rewriter) const override {
+    auto writeType = writeOp.getVectorType();
+    if (writeType.getRank() != 2)
+      return failure();
+    if (!isa<MemRefType>(writeOp.getBase().getType()))
+      return failure();
+    if (writeOp.getMask() || writeOp.hasOutOfBoundsDim())
+      return failure();
+    if (!writeOp.getPermutationMap().isIdentity())
+      return failure();
+
+    struct TileInfo {
+      Value value;
+      SmallVector<int64_t, 2> offsets;
+    };
+    SmallVector<TileInfo> tiles;
+    Value current = writeOp.getVector();
+    bool foundChain = false;
+    while (auto insertOp =
+               current.getDefiningOp<vector::InsertStridedSliceOp>()) {
+      foundChain = true;
+      auto strides = insertOp.getStrides().getAsValueRange<IntegerAttr>();
+      if (!llvm::all_of(strides, [](const APInt &v) { return v.isOne(); }))
+        return failure();
+      SmallVector<int64_t, 2> offsets;
+      for (auto attr : insertOp.getOffsets().getAsValueRange<IntegerAttr>())
+        offsets.push_back(attr.getSExtValue());
+      if (offsets.size() != 2)
+        return failure();
+      tiles.push_back({insertOp.getValueToStore(), offsets});
+      current = insertOp.getDest();
+    }
+    if (!foundChain)
+      return failure();
+
+    Location loc = writeOp.getLoc();
+    SmallVector<Value> baseIndices = llvm::to_vector(writeOp.getIndices());
+    for (auto &tile : tiles) {
+      SmallVector<Value> newIndices = llvm::to_vector(baseIndices);
+      for (size_t i = 0; i < tile.offsets.size(); ++i) {
+        if (tile.offsets[i] != 0) {
+          Value off =
+              rewriter.create<arith::ConstantIndexOp>(loc, tile.offsets[i]);
+          newIndices[i] = rewriter.create<arith::AddIOp>(loc, newIndices[i], off);
+        }
+      }
+      auto tileType = cast<VectorType>(tile.value.getType());
+      SmallVector<bool> inBounds(tileType.getRank(), true);
+      rewriter.create<vector::TransferWriteOp>(loc, tile.value,
+                                               writeOp.getBase(), newIndices,
+                                               inBounds);
+    }
+    rewriter.eraseOp(writeOp);
+    return success();
+  }
+};
+
+/// General-rank fold of vector.extract_strided_slice(vector.transfer_read)
+/// into a direct smaller transfer_read.  Handles the case where the source
+/// memref has more dimensions than the vector (e.g. a batch dimension):
+/// the extraction offsets are applied only to the last `vecRank` indices.
+///
+///   %big  = vector.transfer_read %mem[b, m, n]  : vector<32x16xf32>
+///            with permutation map (d0,d1,d2) → (d1, d2)
+///   %frag = vector.extract_strided_slice %big {off=[dm,dn], sz=[16,8]}
+/// →
+///   %frag = vector.transfer_read %mem[b, m+dm, n+dn] : vector<16x8xf32>
+///
+/// Conditions: 2-D result, 2-D source vector, source from memref, no mask,
+/// strides all 1, permutation map is a minor identity (last vecRank dims).
+struct SplitTransferReadExtract
+    : public OpRewritePattern<vector::ExtractStridedSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::ExtractStridedSliceOp extractOp,
+                                PatternRewriter &rewriter) const override {
+    auto resultType = cast<VectorType>(extractOp.getType());
+    if (resultType.getRank() != 2)
+      return failure();
+    auto readOp =
+        extractOp.getVector().getDefiningOp<vector::TransferReadOp>();
+    if (!readOp)
+      return failure();
+    if (!isa<MemRefType>(readOp.getBase().getType()))
+      return failure();
+    auto srcVecType = readOp.getVectorType();
+    if (srcVecType.getRank() != 2)
+      return failure();
+    if (readOp.getMask())
+      return failure();
+    auto strides = extractOp.getStrides().getAsValueRange<IntegerAttr>();
+    if (!llvm::all_of(strides, [](const APInt &v) { return v.isOne(); }))
+      return failure();
+    // Permutation map must be a minor identity: the last vecRank input
+    // dimensions mapped to output in order.
+    AffineMap permMap = readOp.getPermutationMap();
+    unsigned numMemDims =
+        cast<MemRefType>(readOp.getBase().getType()).getRank();
+    unsigned vecRank = srcVecType.getRank(); // 2
+    if (permMap.getNumResults() != vecRank)
+      return failure();
+    unsigned dimBase = numMemDims - vecRank;
+    for (unsigned i = 0; i < vecRank; ++i) {
+      auto dim = dyn_cast<AffineDimExpr>(permMap.getResult(i));
+      if (!dim || dim.getPosition() != dimBase + i)
+        return failure();
+    }
+    SmallVector<int64_t, 2> offsets;
+    for (auto attr : extractOp.getOffsets().getAsValueRange<IntegerAttr>())
+      offsets.push_back(attr.getSExtValue());
+    if ((unsigned)offsets.size() != vecRank)
+      return failure();
+    Location loc = extractOp.getLoc();
+    SmallVector<Value> newIndices = llvm::to_vector(readOp.getIndices());
+    for (unsigned i = 0; i < vecRank; ++i) {
+      if (offsets[i] != 0) {
+        Value cst = rewriter.create<arith::ConstantIndexOp>(loc, offsets[i]);
+        newIndices[dimBase + i] =
+            rewriter.create<arith::AddIOp>(loc, newIndices[dimBase + i], cst);
+      }
+    }
+    SmallVector<bool> inBounds(resultType.getRank(), true);
+    Value newRead = rewriter.create<vector::TransferReadOp>(
+        loc, resultType, readOp.getBase(), newIndices, readOp.getPadding(),
+        permMap, inBounds);
+    rewriter.replaceOp(extractOp, newRead);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// §5  The pass
 //===----------------------------------------------------------------------===//
 
 struct NovaGPUHoistVectorExtractInsertSlicePass
@@ -739,6 +951,19 @@ struct NovaGPUHoistVectorExtractInsertSlicePass
 //===----------------------------------------------------------------------===//
 // Public API
 //===----------------------------------------------------------------------===//
+
+/// Populates the three strided-slice ↔ transfer folding patterns used by
+/// GpuHardwareMappingPass (Stage 35) in Passes.cpp.
+///
+///  • FoldExtractStridedSliceFromTransferRead  — simple rank-2 extract fold
+///  • FoldInsertStridedSliceIntoTransferWrite  — insert chain → per-tile writes
+///  • SplitTransferReadExtract                 — general minor-identity extract fold
+void populateGpuHardwareMappingStridedSlicePatterns(
+    RewritePatternSet &patterns) {
+  patterns.add<FoldExtractStridedSliceFromTransferRead,
+               FoldInsertStridedSliceIntoTransferWrite,
+               SplitTransferReadExtract>(patterns.getContext());
+}
 
 std::unique_ptr<Pass> createNovaGPUHoistVectorExtractInsertSlicePass() {
   return std::make_unique<NovaGPUHoistVectorExtractInsertSlicePass>();
