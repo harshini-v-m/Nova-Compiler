@@ -39,6 +39,7 @@
 #include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
@@ -263,18 +264,27 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    // ── Scalar accumulator + warp shuffle reduction ─────────────────────────
-    pm.addNestedPass<func::FuncOp>(
-        mlir::nova::createSCFScalarizeAccumulatorPass());
-    pm.addNestedPass<func::FuncOp>(
-        mlir::nova::createNovaWarpShuffleReductionPass());
+    // // ── Scalar accumulator + warp shuffle reduction ─────────────────────────
+    // pm.addNestedPass<func::FuncOp>(
+    //     mlir::nova::createSCFScalarizeAccumulatorPass());
+     pm.addNestedPass<func::FuncOp>(
+        mlir::vector::createLowerVectorMultiReductionPass(
+            mlir::vector::VectorMultiReductionLowering::InnerReduction));
     pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
+    
+    // pm.addNestedPass<func::FuncOp>(
+    //     mlir::nova::createNovaWarpShuffleReductionPass());
+    // pm.addPass(createCanonicalizerPass());
+    // pm.addPass(createCSEPass());
 
     // // ── Loop optimizations ──────────────────────────────────────────────────
     // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
     // pm.addPass(createCanonicalizerPass());
 
+    // Lower vector.multi_reduction → inner-reduction (transfer_read/write +
+    // arith) before GPU kernel outlining so the ops are still on func::FuncOp
+    // where this pass can see them.
+   
     // ── Reposition stores ───────────────────────────────────────────────────
     pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
 
@@ -604,7 +614,9 @@ namespace mlir::nova
     pm.addPass(createCSEPass());
     pm.addPass(createSCFToControlFlowPass());
     pm.addPass(createConvertControlFlowToLLVMPass());
+    pm.addPass(createConvertVectorToLLVMPass());
     pm.addPass(createArithToLLVMConversionPass());
+    pm.addPass(mlir::createUBToLLVMConversionPass());
     pm.addPass(memref::createExpandStridedMetadataPass());
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
     pm.addPass(createConvertFuncToLLVMPass());
