@@ -259,14 +259,22 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
+    // ── Step 9.5: Sink arith.constant ops into gpu.launch bodies ───────────
+    // Prevents dense<true> mask constants (e.g. vector.gather all-true mask)
+    // from being captured as kernel arguments by the outliner (Step 12).
+    // Without this, the PTX backend sees an opaque runtime predicate and emits
+    // 4 serial @%p-guarded ld.global instead of 4 parallel unconditional loads.
+    pm.addPass(mlir::createGpuLaunchSinkIndexComputationsPass());
+
     // ── Step 10: Lower linalg → scf loops ──────────────────────────────────
     pm.addPass(createConvertLinalgToLoopsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    // // ── Scalar accumulator + warp shuffle reduction ─────────────────────────
-    // pm.addNestedPass<func::FuncOp>(
-    //     mlir::nova::createSCFScalarizeAccumulatorPass());
+    // ── Scalar accumulator: scalarize loop accumulators, atomicize cross-block
+    // stores, and insert gpu.memset before distributed reduction launches.
+    pm.addNestedPass<func::FuncOp>(
+        mlir::nova::createSCFScalarizeAccumulatorPass());
      pm.addNestedPass<func::FuncOp>(
         mlir::vector::createLowerVectorMultiReductionPass(
             mlir::vector::VectorMultiReductionLowering::InnerReduction));
@@ -276,17 +284,9 @@ namespace mlir::nova
     //     mlir::nova::createNovaWarpShuffleReductionPass());
     // pm.addPass(createCanonicalizerPass());
     // pm.addPass(createCSEPass());
-
-    // // ── Loop optimizations ──────────────────────────────────────────────────
-    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
-    // pm.addPass(createCanonicalizerPass());
-
-    // Lower vector.multi_reduction → inner-reduction (transfer_read/write +
-    // arith) before GPU kernel outlining so the ops are still on func::FuncOp
-    // where this pass can see them.
    
     // ── Reposition stores ───────────────────────────────────────────────────
-    pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
+    // pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
 
     // ── Step 11: Insert workgroup barriers ──────────────────────────────────
     pm.addNestedPass<func::FuncOp>(
@@ -463,29 +463,6 @@ namespace mlir::nova
       // vector.contract → nvgpu.mma.sync
       gpuHwPm.addNestedPass<gpu::GPUFuncOp>(
           createConvertVectorToGPUPass(/*useNvGpu=*/true));
-
-      // Fix missing tf32_enabled on f32 nvgpu.mma.sync ops
-      gpuHwPm.addNestedPass<gpu::GPUFuncOp>(
-          [&]() -> std::unique_ptr<Pass> {
-        struct FixMmaSyncTF32Pass
-            : public PassWrapper<FixMmaSyncTF32Pass,
-                                 OperationPass<gpu::GPUFuncOp>> {
-          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FixMmaSyncTF32Pass)
-          void runOnOperation() override {
-            getOperation().walk([](nvgpu::MmaSyncOp mmaSyncOp) {
-              auto aType = dyn_cast<VectorType>(
-                  mmaSyncOp.getMatrixA().getType());
-              if (aType && aType.getElementType().isF32() &&
-                  !mmaSyncOp.getTf32Enabled())
-                mmaSyncOp.setTf32Enabled(true);
-            });
-          }
-          StringRef getArgument() const override {
-            return "nova-fix-mma-sync-tf32";
-          }
-        };
-        return std::make_unique<FixMmaSyncTF32Pass>();
-      }());
 
       gpuHwPm.addPass(createCanonicalizerPass());
       gpuHwPm.addPass(createCSEPass());

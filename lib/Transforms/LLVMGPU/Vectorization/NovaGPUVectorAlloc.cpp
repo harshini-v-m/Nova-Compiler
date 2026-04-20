@@ -112,6 +112,8 @@ static bool isFromWorkgroupPromotionForall(Value val) {
   }
   auto fa = val.getDefiningOp<scf::ForallOp>();
   if (!fa) return false;
+
+  // Case 1: forall body contains nova.promote_to_workgroup (original check)
   bool found = false;
   fa->walk([&](Operation *op) {
     if (op->hasAttr("nova.promote_to_workgroup")) {
@@ -120,7 +122,20 @@ static bool isFromWorkgroupPromotionForall(Value val) {
     }
     return WalkResult::advance();
   });
-  return found;
+  if (found) return true;
+
+  if (isThreadMappedForall(fa)) {
+    Operation *parent = fa->getParentOp();
+    while (parent) {
+      if (auto pf = dyn_cast<scf::ForallOp>(parent)) {
+        if (isBlockMappedForall(pf))
+          return true;
+      }
+      parent = parent->getParentOp();
+    }
+  }
+
+  return false;
 }
 
 static bool isAlreadyInSmem(Value operand, Attribute smemSpace) {

@@ -188,6 +188,8 @@ void registerNovaGPUCoalesceWorkgroupBuffersPass();
 std::unique_ptr<Pass> createNovaRepositionStorePass();
 void registerNovaRepositionStorePass();
 
+std::unique_ptr<Pass> createSCFScalarizeAccumulatorPass();
+
 std::unique_ptr<Pass> createNovaMultiConsumerFusion();
 void registerNovaMultiConsumerFusion();
 

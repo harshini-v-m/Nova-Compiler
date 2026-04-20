@@ -49,6 +49,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/Utils/Utils.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
 #include "mlir/IR/Dominance.h"
@@ -402,9 +403,47 @@ struct NovaGPUHoistVectorExtractInsertSlicePass
     // data doesn't change across loop iterations, then moves both outside.
     // ------------------------------------------------------------------
     linalg::hoistRedundantVectorTransfers(funcOp);
+    SmallVector<std::pair<vector::TransferReadOp, scf::ForallOp>> sinkWork;
+funcOp.walk([&](vector::TransferReadOp readOp) {
+  auto vType = readOp.getVectorType();
+  int64_t numElements = vType.getNumElements();
+  if (numElements <= 32)
+    return; // Small reads are fine to hoist
 
-    LLVM_DEBUG(llvm::dbgs()
-               << "[nova-hoist-slice] after hoistRedundantVectorTransfers\n");
+  // Check if the next op is a warp-mapped forall
+  Operation *nextOp = readOp->getNextNode();
+  if (!nextOp)
+    return;
+  auto forallOp = dyn_cast<scf::ForallOp>(nextOp);
+  if (!forallOp)
+    return;
+
+  // Check if it's warp-mapped
+  auto mapping = forallOp.getMappingAttr();
+  if (!mapping || mapping.getValue().empty())
+    return;
+  bool isWarpMapped = llvm::all_of(mapping.getValue(), [](Attribute a) {
+    return isa<gpu::GPUWarpMappingAttr>(a);
+  });
+  if (!isWarpMapped)
+    return;
+
+  // Check all uses are inside the forall
+  bool allUsesInside = llvm::all_of(readOp->getUsers(), [&](Operation *user) {
+    return forallOp->isProperAncestor(user);
+  });
+  if (!allUsesInside)
+    return;
+
+  sinkWork.emplace_back(readOp, forallOp);
+});
+
+for (auto &[readOp, forallOp] : sinkWork) {
+  readOp->moveBefore(&forallOp.getBody()->front());
+}
+
+LLVM_DEBUG(llvm::dbgs()
+           << "[nova-hoist-slice] after sinking large reads back into warp foralls\n");
 
     // Re-sink tensor.empty / alloc_tensor ops that were incorrectly hoisted
     // out of scf.forall by the LICM preamble inside hoistRedundantVectorTransfers.

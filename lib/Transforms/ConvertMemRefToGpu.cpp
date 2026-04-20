@@ -104,20 +104,6 @@ public:
       return false;
     };
 
-    // Intra-kernel async path: device global (space=1) → workgroup shared
-    // memory, inside a gpu.func. Convert to cp.async via nvgpu.device_async_copy
-    // + NVVM commit/wait.
-    //
-    // deriveThreadTileSizes (with blockDim) guarantees the innermost tile is
-    // exactly maxVec elements (4 f32 = 16 B for cp.async.16).  The outer dims
-    // may be > 1 (e.g. tile [1,4,4] for copy A) — we generate a sequential
-    // scf.for over those rows, emitting one cp.async.16 per row.
-    //
-    // Note: we use NVVM::CpAsyncCommitGroupOp / CpAsyncWaitGroupOp instead of
-    // nvgpu.device_async_create_group / nvgpu.device_async_wait because the
-    // nvgpu token type cannot survive the SCF-to-CF + NVGPU-to-NVVM lowering
-    // when the copy is inside scf.if — the token-based ops get silently dropped,
-    // leaving cp.async with no synchronisation.
     if (op->getParentOfType<gpu::GPUFuncOp>() &&
         isIntMemSpace(srcType, 1) &&
         isGpuAddrSpace(dstType)) {
@@ -133,11 +119,6 @@ public:
       Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
       Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
 
-      // Build a nest of scf.for loops over all dims except the innermost.
-      // Each iteration body emits one cp.async.16 covering `innerVec` elements.
-      // For tile [1,4,4]: two outer loops (range 1, range 4), innermost=4.
-      // For tile [1,1,4]: one trivial outer loop (range 1) — MLIR's
-      //   canonicalizer will fold it away; no runtime overhead.
       SmallVector<Value> outerIVs;
       for (int64_t d = 0; d < rank - 1; ++d) {
         Value ub = rewriter.create<arith::ConstantIndexOp>(loc, shape[d]);
@@ -146,9 +127,6 @@ public:
         rewriter.setInsertionPointToStart(forOp.getBody());
       }
 
-      // Inside the loop body: compute the linearised indices for this row.
-      // dst subview is already the per-thread tile, so indices are the IVs
-      // plus [0] for the innermost dim.
       SmallVector<Value> dstIdx(outerIVs.begin(), outerIVs.end());
       dstIdx.push_back(c0); // innermost offset = 0 (cp.async covers full row)
       SmallVector<Value> srcIdx(outerIVs.begin(), outerIVs.end());
@@ -177,9 +155,6 @@ public:
       return success();
     }
 
-    // Guard: do NOT convert other copies that involve a GPU address space
-    // (private or workgroup). Those are lowered by FinalizeMemRefToLLVM via
-    // load/store sequences.
     if (isGpuAddrSpace(srcType) || isGpuAddrSpace(dstType))
       return failure();
 
@@ -324,12 +299,6 @@ struct ConvertMemRefToGpuPass
       store.erase();
     }
 
-    // 6. Copy host-side memref.get_global constants to GPU memory before
-    //    they are passed to gpu.launch_func arguments.
-    //    After kernel outlining (Step 12), constants that were used inside
-    //    gpu.launch become gpu.launch_func arguments, but their data
-    //    remains in host memory — the GPU kernel cannot dereference host
-    //    pointers via ld.global, causing CUDA_ERROR_ILLEGAL_ADDRESS.
     module->walk([&](memref::GetGlobalOp getGlobal) {
       // Only handle host-side get_globals (not inside gpu.func).
       if (getGlobal->getParentOfType<gpu::GPUFuncOp>())
