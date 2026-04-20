@@ -53,6 +53,8 @@ add_mlir_library(NovaLLVMGPUTransforms
   Memory/NovaConvertSharedMemAllocs.cpp
   # Coalesce workgroup allocs with non-overlapping live ranges
   Memory/NovaGPUCoalesceWorkgroupBuffers.cpp
+  # Multi-buffer workgroup allocs for cp.async software pipelining
+  Memory/NovaGPUMultiBuffering.cpp
   # Forward fill/copy operations
   Memory/NovaGPUFillCopyForwarding.cpp
   # Eliminate tensor.empty ops pre-bufferization

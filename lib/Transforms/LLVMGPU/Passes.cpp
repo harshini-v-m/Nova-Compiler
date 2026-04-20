@@ -504,7 +504,19 @@ namespace mlir::nova
    pm.addNestedPass<func::FuncOp>(createNovaGPUCoalesceWorkgroupBuffersPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
 
-   
+    // -------------------------------------------------------------------------
+    // Multi-buffer workgroup allocs used inside scf.for (the matmul K-loop).
+    // Widens `memref<TxSxf32, #workgroup>` → `memref<N x TxSxf32, #workgroup>`
+    // and indexes by `(iv mod N)`. Prerequisite for software-pipelined cp.async
+    // overlap; on its own it only changes shared-memory size/indexing and is
+    // perf-neutral, so it is safe to enable before the pipelining pass lands.
+    // Must run BEFORE NovaConvertSharedMemAllocs (alloc → memref.global) and
+    // BEFORE MapForallToGPU (the scf.for users must still be visible).
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaGPUMultiBufferingPass(/*numBuffers=*/2));
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    pm.addNestedPass<func::FuncOp>(createCSEPass());
+
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
     pm.addPass(createCanonicalizerPass());
 
@@ -1419,6 +1431,7 @@ namespace mlir::nova
     registerNovaWarpShuffleReductionPass();
     registerNovaGPUFillCopyForwardingPass();
     registerNovaGPUCoalesceWorkgroupBuffersPass();
+    registerNovaGPUMultiBufferingPass();
     registerNovaStrideReductionPass();
 
     // Register the full optimized pipeline as a named pipeline so it can be

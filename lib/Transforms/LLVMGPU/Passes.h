@@ -193,6 +193,18 @@ void registerNovaGPUFillCopyForwardingPass();
 std::unique_ptr<Pass> createNovaGPUCoalesceWorkgroupBuffersPass();
 void registerNovaGPUCoalesceWorkgroupBuffersPass();
 
+// Multi-buffers every workgroup-memory `memref.alloc` used inside an `scf.for`
+// loop. Rewrites `memref<TxS, #shared>` → `memref<N x TxS, #shared>` and indexes
+// uses by `(loopIV mod N)`, enabling a later software-pipelining pass to overlap
+// `cp.async` of iteration i+N-1 with compute of iteration i without a RAW
+// hazard on the same shared-memory tile.
+//
+// Must run AFTER bufferization and BEFORE NovaConvertSharedMemAllocs (which
+// turns the alloc into memref.global and would block the rewrite).
+// Ported from IREE's GPUMultiBuffering.cpp.
+std::unique_ptr<Pass> createNovaGPUMultiBufferingPass(unsigned numBuffers = 2);
+void registerNovaGPUMultiBufferingPass();
+
 std::unique_ptr<Pass> createNovaRepositionStorePass();
 void registerNovaRepositionStorePass();
 
