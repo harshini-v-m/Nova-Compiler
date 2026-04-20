@@ -183,7 +183,7 @@ extractRowColBase(memref::SubViewOp sv, int64_t srcRank) {
   return {rowBase, colBase};
 }
 
-/// Rewrite the column index of one load/store/transfer op.
+/// Rewrite the column index of one scalar load/store op.
 ///
 /// The load/store uses subview-local indices. We reconstruct:
 ///   absRow      = rowBase + localRow
@@ -192,6 +192,14 @@ extractRowColBase(memref::SubViewOp sv, int64_t srcRank) {
 ///   newLocalCol = swizzledCol - colBase
 ///
 /// then replace localCol with newLocalCol in the op's index list.
+///
+/// NOTE: vector.transfer_read/write ops are intentionally NOT rewritten here.
+/// Swizzle scatters each element to a different (XOR'd) address. A wide
+/// vector transfer reads/writes N *contiguous* elements from a single
+/// starting index — offsetting that index by phase gives the wrong layout
+/// (elements are no longer contiguous after swizzle). Only scalar
+/// memref.load/store accesses individual elements and can be correctly
+/// swizzled on a per-element basis.
 static void rewriteSubviewAccess(Operation *op,
                                  const DimBase &rowBase,
                                  const DimBase &colBase,
@@ -199,18 +207,15 @@ static void rewriteSubviewAccess(Operation *op,
   OpBuilder b(op);
   Location loc = op->getLoc();
 
-  // Collect indices.
+  // Only rewrite scalar load/store ops. Wide vector transfers load/store
+  // contiguous ranges and cannot be corrected by a single start-index XOR.
   SmallVector<Value> indices;
   if (auto ld = dyn_cast<memref::LoadOp>(op))
     indices.assign(ld.getIndices().begin(), ld.getIndices().end());
   else if (auto st = dyn_cast<memref::StoreOp>(op))
     indices.assign(st.getIndices().begin(), st.getIndices().end());
-  else if (auto rd = dyn_cast<vector::TransferReadOp>(op))
-    indices.assign(rd.getIndices().begin(), rd.getIndices().end());
-  else if (auto wr = dyn_cast<vector::TransferWriteOp>(op))
-    indices.assign(wr.getIndices().begin(), wr.getIndices().end());
   else
-    return;
+    return; // skip vector.transfer_read/write
 
   int64_t rank = (int64_t)indices.size();
   if (rank < 2) return;
@@ -257,10 +262,6 @@ static void rewriteSubviewAccess(Operation *op,
     ld.getIndicesMutable().assign(indices);
   else if (auto st = dyn_cast<memref::StoreOp>(op))
     st.getIndicesMutable().assign(indices);
-  else if (auto rd = dyn_cast<vector::TransferReadOp>(op))
-    rd.getIndicesMutable().assign(indices);
-  else if (auto wr = dyn_cast<vector::TransferWriteOp>(op))
-    wr.getIndicesMutable().assign(indices);
 }
 
 //===----------------------------------------------------------------------===//
@@ -338,6 +339,31 @@ struct NovaGPUApplySwizzlePass
           computeSwizzleParams(logicalInnerDim, elemBytes);
       if (maxPhase < 2) return;
 
+      // ---- Guard: skip allocs that have ANY vector.transfer_read/write user ----
+      // When vector.transfer_read compiles to ldmatrix, it reads contiguous
+      // physical addresses — it does NOT apply hardware XOR swizzle unless a
+      // swizzle descriptor (TMA) is used.  If we XOR-swizzle the scalar stores
+      // but leave the vector reads un-swizzled, reads get wrong elements.
+      //
+      // Walk all subviews of this alloc transitively and bail out if any user
+      // is a vector.transfer_read or vector.transfer_write.
+      bool hasVectorUser = false;
+      // BFS over the subview tree rooted at this alloc.
+      SmallVector<Operation *> worklist(alloc->getUsers().begin(),
+                                        alloc->getUsers().end());
+      while (!worklist.empty() && !hasVectorUser) {
+        Operation *cur = worklist.pop_back_val();
+        if (isa<vector::TransferReadOp, vector::TransferWriteOp>(cur)) {
+          hasVectorUser = true;
+          break;
+        }
+        if (auto sv = dyn_cast<memref::SubViewOp>(cur)) {
+          for (Operation *u : sv.getResult().getUsers())
+            worklist.push_back(u);
+        }
+      }
+      if (hasVectorUser) return;
+
       swizzleMap[alloc.getOperation()] = {maxPhase, elemsPerBank};
     });
 
@@ -395,10 +421,11 @@ struct NovaGPUApplySwizzlePass
 
       auto [rowBase, colBase] = extractRowColBase(sv, srcRank);
 
-      // Rewrite every load/store/transfer_read/transfer_write on this subview.
+      // Rewrite scalar load/store ops on this subview.
+      // vector.transfer_read/write are intentionally skipped — they access
+      // contiguous ranges and cannot be corrected by a single XOR offset.
       for (Operation *user : llvm::make_early_inc_range(sv.getResult().getUsers())) {
-        if (isa<memref::LoadOp, memref::StoreOp,
-                vector::TransferReadOp, vector::TransferWriteOp>(user))
+        if (isa<memref::LoadOp, memref::StoreOp>(user))
           rewriteSubviewAccess(user, rowBase, colBase, maxPhase, elemsPerBank);
       }
     });

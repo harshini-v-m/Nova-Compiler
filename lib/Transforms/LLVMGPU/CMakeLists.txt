@@ -84,6 +84,11 @@ add_mlir_library(NovaLLVMGPUTransforms
   # Erase nova.fusion_barrier ops
   Lowering/NovaGPUEraseFusionBarriers.cpp
 
+
+# ── Transpose ─────────────────────────────────────────────────────────────
+  # Fold linalg.generic transpose into matmul indexing maps
+  Transpose/NovaFoldTransposeIntoConsumer.cpp
+  
   # ── Vectorization ──────────────────────────────────────────────────────────
   # Normalize MMA load/store memref indices for NVVM legalization
   Vectorization/NovaGPUCastTypeToFitMMA.cpp

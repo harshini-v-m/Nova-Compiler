@@ -46,6 +46,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
@@ -111,6 +112,7 @@ static void promoteOperandToShared(OpBuilder &builder,
   builder.setInsertionPoint(op);
 
   Location loc = op->getLoc();
+  MLIRContext *ctx = builder.getContext();
   Value operand = dpsOp.getDpsInputOperand(inputIdx)->get();
   auto tensorType = dyn_cast<RankedTensorType>(operand.getType());
   if (!tensorType)
@@ -132,7 +134,67 @@ static void promoteOperandToShared(OpBuilder &builder,
       return;
   }
 
-  // Phase 1: tensor.empty() + linalg.copy with thread-only lowering_config.
+  // Detect transposed operand cases produced by NovaFoldTransposeIntoConsumer.
+  //
+  // The fold pass folds transpose(A) or transpose(B) into a matmul, producing
+  // a linalg.generic whose operand indexing maps deviate from the canonical
+  // linalg.matmul maps:
+  //
+  //   Canonical A map: (d0,d2)  — A is [M,K] in memory
+  //   Canonical B map: (d2,d1)  — B is [K,N] in memory
+  //
+  //   Transposed-A map: (d2,d0) — A is physically [K,M] in memory
+  //   Transposed-B map: (d1,d2) — B is physically [N,K] in memory
+  //
+  // If we copy a transposed operand as-is into shared memory the warp
+  // distribution patterns later insert a vector.transpose to correct the
+  // logical layout and flip the vector.contract map to the non-canonical form.
+  // ConvertVectorToGPU only recognises the canonical maps and therefore never
+  // emits nvgpu.mma.sync — MMA is completely lost in the PTX.
+  //
+  // Fix: detect each transposed case here and physically transpose the operand
+  // into a canonically-shaped shared buffer during promotion. We also update
+  // the parent op's indexing map back to the canonical form so the rest of the
+  // pipeline sees a standard contraction and ConvertVectorToGPU can lower it to
+  // nvgpu.mma.sync. This does not affect normal (non-transposed) operands
+  // because the map comparisons will simply not match.
+  bool needsTransposedCopy = false;
+  AffineMap canonicalMapForParent; // canonical map to restore on the parent op
+  if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
+    if (genericOp.getNumDpsInputs() == 2 && genericOp.getNumLoops() == 3) {
+      AffineMap operandMap = genericOp.getIndexingMapsArray()[inputIdx];
+
+      if (inputIdx == 1) {
+        // Transposed-B: fold pass changes B map from canonical (d2,d1) [K,N]
+        // to (d1,d2) [N,K].  Detect and fix by transposing to [K,N] in smem.
+        AffineMap transposedBMap = AffineMap::get(
+            3, 0,
+            {getAffineDimExpr(1, ctx), getAffineDimExpr(2, ctx)}, ctx);
+        if (operandMap == transposedBMap) {
+          needsTransposedCopy = true;
+          // Restore canonical B map: (d2,d1)
+          canonicalMapForParent = AffineMap::get(
+              3, 0,
+              {getAffineDimExpr(2, ctx), getAffineDimExpr(1, ctx)}, ctx);
+        }
+      } else if (inputIdx == 0) {
+        // Transposed-A: fold pass changes A map from canonical (d0,d2) [M,K]
+        // to (d2,d0) [K,M].  Detect and fix by transposing to [M,K] in smem.
+        AffineMap transposedAMap = AffineMap::get(
+            3, 0,
+            {getAffineDimExpr(2, ctx), getAffineDimExpr(0, ctx)}, ctx);
+        if (operandMap == transposedAMap) {
+          needsTransposedCopy = true;
+          // Restore canonical A map: (d0,d2)
+          canonicalMapForParent = AffineMap::get(
+              3, 0,
+              {getAffineDimExpr(0, ctx), getAffineDimExpr(2, ctx)}, ctx);
+        }
+      }
+    }
+  }
+
+  // Phase 1: tensor.empty() + copy into shared memory.
   //
   // The copy has NO workgroup or reduction tiles, so:
   //   - K-tiling (Step 4) fuses it as a producer into the K-loop, naturally
@@ -146,9 +208,51 @@ static void promoteOperandToShared(OpBuilder &builder,
   // This mirrors IREE's DerivedThreadConfigAttr approach.
   SmallVector<OpFoldResult> mixedSizes =
       tensor::getMixedSizes(builder, loc, operand);
-  Value empty = tensor::EmptyOp::create(builder, loc, mixedSizes,
-                                        tensorType.getElementType());
-  auto copyOp = linalg::CopyOp::create(builder, loc, operand, empty);
+
+  // For transposed operands flip the shared buffer shape to canonical layout so
+  // the rest of the pipeline (warp distribution → ConvertVectorToGPU) sees the
+  // standard form and can emit nvgpu.mma.sync without inserting extra transposes.
+  Value empty;
+  if (needsTransposedCopy && mixedSizes.size() == 2) {
+    // Swap the two dimensions: physical [N,K]→[K,N] for B, [K,M]→[M,K] for A.
+    SmallVector<OpFoldResult> transposedSizes = {mixedSizes[1], mixedSizes[0]};
+    empty = tensor::EmptyOp::create(builder, loc, transposedSizes,
+                                    tensorType.getElementType());
+  } else {
+    empty = tensor::EmptyOp::create(builder, loc, mixedSizes,
+                                    tensorType.getElementType());
+  }
+
+  // Emit the copy — either a plain linalg.copy (canonical layout) or a
+  // transpose linalg.generic (for the physically-transposed operand case).
+  linalg::LinalgOp copyOp;
+  if (needsTransposedCopy) {
+    // Emit a transpose generic: reads operand[i,j], writes shared[j,i].
+    //   ins map:  (d0,d1) → (d1,d0)  — read from the original transposed tensor
+    //   outs map: (d0,d1) → (d0,d1)  — write canonically into shared buffer
+    // This works identically for both the A and B transposed cases because the
+    // physical layout swap is the same 2-D transpose in both cases.
+    AffineMap insMap = AffineMap::get(
+        2, 0, {getAffineDimExpr(1, ctx), getAffineDimExpr(0, ctx)}, ctx);
+    AffineMap outsMap = AffineMap::getMultiDimIdentityMap(2, ctx);
+    SmallVector<utils::IteratorType> iters(2, utils::IteratorType::parallel);
+    copyOp = builder.create<linalg::GenericOp>(
+        loc, empty.getType(), ValueRange{operand}, ValueRange{empty},
+        ArrayRef<AffineMap>{insMap, outsMap}, iters,
+        [](OpBuilder &b, Location l, ValueRange args) {
+          b.create<linalg::YieldOp>(l, args[0]);
+        });
+
+    // Update the parent generic's indexing map for this operand back to the
+    // canonical form. Safe here because we replace the operand below.
+    if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
+      SmallVector<AffineMap> maps = genericOp.getIndexingMapsArray();
+      maps[inputIdx] = canonicalMapForParent;
+      genericOp.setIndexingMapsAttr(builder.getAffineMapArrayAttr(maps));
+    }
+  } else {
+    copyOp = linalg::CopyOp::create(builder, loc, operand, empty);
+  }
 
   // Attach a derived-thread lowering_config: placeholder thread tiles [1,..,1]
   // plus a "derived_thread = true" marker and the contraction's target thread
@@ -199,7 +303,6 @@ static void promoteOperandToShared(OpBuilder &builder,
   SmallVector<int64_t> zeros(numLoops, 0);
   // Build the base config with placeholder thread tiles.
   SmallVector<NamedAttribute> attrs;
-  MLIRContext *ctx = builder.getContext();
   setLoweringConfigTileSizes(ctx, attrs, kWorkgroupKey, zeros);
   setLoweringConfigTileSizes(ctx, attrs, kReductionKey, zeros);
   setLoweringConfigTileSizes(ctx, attrs, kThreadKey, threadTiles);
@@ -214,18 +317,18 @@ static void promoteOperandToShared(OpBuilder &builder,
     attrs.emplace_back(StringAttr::get(ctx, kTargetThreadsKey),
                        b.getI64IntegerAttr(targetThreads));
   }
-  setLoweringConfig(copyOp, DictionaryAttr::get(ctx, attrs));
+  setLoweringConfig(copyOp.getOperation(), DictionaryAttr::get(ctx, attrs));
 
   // Mark this copy as a promoted-input copy so InferMemorySpace can
   // unconditionally classify its destination as workgroup memory.
   // The marker survives K-tiling and Thread-tiling because MLIR clones
   // preserve all op attributes on tiled successors.
-  copyOp->setAttr(StringAttr::get(ctx, kPromoteToWorkgroupAttr),
-                  UnitAttr::get(ctx));
+  copyOp.getOperation()->setAttr(StringAttr::get(ctx, kPromoteToWorkgroupAttr),
+                                 UnitAttr::get(ctx));
 
   // Replace the operand with the copy result.
   op->setOperand(dpsOp.getDpsInputOperand(inputIdx)->getOperandNumber(),
-                 copyOp.getResult(0));
+                 copyOp->getResult(0));
 }
 
 /// Result promotion: promote a DPS init result to shared memory.

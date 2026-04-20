@@ -14,6 +14,10 @@
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Utils/Utils.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/Operation.h"
 
 namespace mlir::nova {
 
@@ -261,6 +265,31 @@ void setMatmulLoweringConfigAttrs(Operation *op,
     appendPaddingList(ctx, attrs, paddingSizes);
   auto configDict = DictionaryAttr::get(ctx, attrs);
   setLoweringConfig(op, configDict);
+}
+
+bool isTrueContraction(Operation *op) {
+  if (isa<linalg::BatchMatmulOp, linalg::MatmulOp, linalg::MatvecOp,
+          linalg::VecmatOp, linalg::BatchMatvecOp>(op))
+    return true;
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  if (!linalgOp) return false;
+  if (linalg::isaContractionOpInterface(linalgOp)) return true;
+  
+  auto indexMaps = linalgOp.getIndexingMapsArray();
+  if (indexMaps.size() < 3) return false;
+  auto iterTypes = linalgOp.getIteratorTypesArray();
+  unsigned numLoops = iterTypes.size();
+  bool foundLhsOnly = false;
+  bool foundRhsOnly = false;
+  for (unsigned i = 0; i < numLoops; ++i) {
+    if (iterTypes[i] != utils::IteratorType::parallel) continue;
+    bool inInput0 = indexMaps[0].isFunctionOfDim(i);
+    bool inInput1 = indexMaps[1].isFunctionOfDim(i);
+    // Unique parallel dim for LHS or RHS suggests a contraction pattern.
+    if (inInput0 && !inInput1) foundLhsOnly = true;
+    if (!inInput0 && inInput1) foundRhsOnly = true;
+  }
+  return foundLhsOnly && foundRhsOnly;
 }
 
 } // namespace mlir::nova

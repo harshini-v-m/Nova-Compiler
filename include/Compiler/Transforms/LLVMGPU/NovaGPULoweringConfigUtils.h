@@ -139,6 +139,11 @@ void setMatmulLoweringConfigAttrs(Operation *op,
 /// scf.forall (defense-in-depth against stale configs at thread tiling).
 void removeLoweringConfig(Operation *op);
 
+/// Returns true if the op represents a matmul-like contraction, even if it is
+/// a linalg.generic that doesn't strictly implement ContractionOpInterface.
+/// Broadened to recognize patterns with multiple batch dimensions.
+bool isTrueContraction(Operation *op);
+
 } // namespace mlir::nova
 
 #endif // NOVA_TRANSFORMS_LLVMGPU_NOVAGPULOWERINGCONFIGUTILS_H_

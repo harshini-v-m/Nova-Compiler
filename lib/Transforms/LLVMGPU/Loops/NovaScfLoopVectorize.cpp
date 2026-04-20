@@ -299,6 +299,25 @@ static bool analyzeLoop(scf::ForOp loop, int64_t vf, VectorizableLoop &result) {
     if (!ub)
       return false;
 
+    // ── REGISTER EXPLOSION GUARD ─────────────────────────────────────────────
+    // When the vectorized reduction loop has a large static trip count, the
+    // NVPTX / LLVM backend fully unrolls it because the trip count after
+    // vectorization (ub / VF) appears "small enough" to LLVM's unroller.
+    // Each unrolled iteration keeps M × N separate vector<VF x f32> lanes as
+    // distinct SSA vregs, producing O(M * N * K) unique .b32 PTX registers
+    // (~73,521 per matmul kernel, 97.8% of total register budget).
+    //
+    // Guard: skip Mode B vectorization when ub > MAX_VECTORIZED_TRIP * VF.
+    // At VF=4 this means we only vectorize loops with trip count <= 256,
+    // matching the regime where vectorization is profitable without causing
+    // catastrophic unrolling.  Larger K-loops remain as scalar iter_arg
+    // loops and are handled correctly by WarpShuffle and the NVPTX backend
+    // without register explosion.
+    static constexpr int64_t MAX_VECTORIZED_TRIP = 64;
+    if (*ub > MAX_VECTORIZED_TRIP * vf)
+      return false;
+    // ─────────────────────────────────────────────────────────────────────────
+
     // ub must be divisible by (step * VF) for access pattern restructuring.
     int64_t newStep = *step * vf;
     if (*ub % newStep != 0)

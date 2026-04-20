@@ -21,6 +21,7 @@
 #include "Compiler/Transforms/LLVMGPU/NovaGPULoweringConfigUtils.h"
 #include "Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -65,10 +66,24 @@ public:
     };
 
     Operation *newOp = skipCasts(replacements.front());
-    // Only propagate if the replacement is the same op kind (conservative).
-    // Propagating configs across op-kind boundaries would incorrectly stamp
-    // tiling configs on unrelated ops.
-    if (!newOp || newOp->getName() != op->getName())
+    if (!newOp)
+      return;
+
+    // Primary check: same op kind (e.g. linalg.matmul → linalg.matmul).
+    // Fallback: allow propagation across linalg op variants (e.g.
+    // linalg.batch_matmul → linalg.generic) when MLIR canonicalization
+    // changes the named form.  Guard with a loop-count check so we don't
+    // stamp matmul configs onto unrelated reduction/elementwise ops.
+    bool sameKind = (newOp->getName() == op->getName());
+    bool compatibleLinalg = false;
+    if (!sameKind) {
+      auto origLinalg = dyn_cast<linalg::LinalgOp>(op);
+      auto newLinalg  = dyn_cast<linalg::LinalgOp>(newOp);
+      if (origLinalg && newLinalg &&
+          origLinalg.getNumLoops() == newLinalg.getNumLoops())
+        compatibleLinalg = true;
+    }
+    if (!sameKind && !compatibleLinalg)
       return;
 
     // Verify all replacement values come from the same op.

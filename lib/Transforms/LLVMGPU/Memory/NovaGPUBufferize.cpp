@@ -138,7 +138,8 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
     if (hoistTarget)
       builder.setInsertionPoint(hoistTarget);
 
-    return memref::AllocOp::create(builder, loc, allocType, dynamicSizes)
+    return memref::AllocOp::create(builder, loc, allocType, dynamicSizes,
+                                   builder.getI64IntegerAttr(16))
         .getResult();
   }
 

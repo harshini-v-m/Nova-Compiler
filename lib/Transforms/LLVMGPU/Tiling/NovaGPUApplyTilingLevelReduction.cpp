@@ -557,6 +557,23 @@ applyTileAndFuseToEachRoot(func::FuncOp funcOp, IRRewriter &rewriter,
           tileSizes);
     }
 
+    // Propagate lowering_config (including mma_kind) from the original op to
+    // all tiled+fused inner ops that did not receive a config from the tiler.
+    //
+    // scf::tileConsumerAndFuseProducersUsingSCF uses its own IRRewriter
+    // without the ConfigTrackingListener, so newly created linalg ops inside
+    // the generated loops have no lowering_config.  Without this, downstream
+    // GenericVectorization sees mma_kind == 0 on the inner op (savedMmaConfig
+    // stays null), does not stamp the resulting vector.contract with mma_kind,
+    // and VectorDistributePass takes the SIMT outer-product path — causing
+    // register explosion in the 12 batch-attention kernels.
+    if (auto outerCfg = getLoweringConfig(tilingOp.getOperation())) {
+      for (Operation *tiledOp : result->tiledAndFusedOps) {
+        if (isa<linalg::LinalgOp>(tiledOp) && !getLoweringConfig(tiledOp))
+          setLoweringConfig(tiledOp, outerCfg);
+      }
+    }
+
     // Replace original uses with tiled results.
     // Use replaceAllUsesWith (not dominance-based replaceUsesWithIf) to
     // ensure the original op becomes use_empty and can be erased. This is

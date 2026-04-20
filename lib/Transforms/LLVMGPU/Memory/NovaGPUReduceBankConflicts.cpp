@@ -16,18 +16,18 @@
 //   128, column 0 of every row maps to the same bank — a 32-way conflict for
 //   any warp that reads column 0 of all 32 rows simultaneously.
 //
-// Padding amount: 64_bits / elemBitWidth elements (= always 8 bytes):
-//   f32 (32-bit):  pad 2 elements per row  → stride += 8 bytes
-//   f16/bf16 (16-bit):  pad 4 elements     → stride += 8 bytes
-//   f64 (64-bit):  pad 1 element           → stride += 8 bytes
+// Padding amount: 16 bytes / elemBytes elements (= always 16 bytes):
+//   f32 (4 B):   pad 4 elements per row  → stride += 16 bytes
+//   f16/bf16 (2 B): pad 8 elements       → stride += 16 bytes
+//   f64 (8 B):   pad 2 elements          → stride += 16 bytes
 //
 // Example (f32, 128-column tile):
 //   Before: memref<128x128xf32, workgroup>  → row stride = 512 bytes = 4×128
 //           → 32-way bank conflict on col-0 access pattern
-//   After:  %padded = memref.alloc() : memref<128x130xf32, workgroup>
+//   After:  %padded = memref.alloc() : memref<128x132xf32, workgroup>
 //           %view   = memref.subview %padded[0,0][128,128][1,1]
-//           → row stride = 520 bytes (not a multiple of 128)
-//           → bank conflicts eliminated for typical column access patterns
+//           → row stride = 528 bytes (not a multiple of 128, 16-byte aligned)
+//           → bank conflicts eliminated; ldmatrix 16-byte alignment satisfied
 //
 // Pre-flight check: the pass skips any allocation where the padded footprint
 // would itself exceed maxWorkgroupMemBytes — GPUCheckResourceUsagePass will
@@ -189,7 +189,19 @@ struct NovaGPUReduceBankConflictsPass
                                                paddedAlloc.getResult(),
                                                offsets, sizes, strides);
 
-      // Replace all uses of the original unpadded alloc with the subview.
+      // Replace all uses of the original unpadded alloc with the subview,
+      // EXCEPT dealloc ops — those must target the padded base alloc, not a
+      // subview.  Deallocing a subview is undefined behaviour (it's not an
+      // allocation root); we redirect them to paddedAlloc before the blanket
+      // replaceAllUsesWith so the dealloc keeps pointing at valid memory.
+      SmallVector<memref::DeallocOp> deallocsToFix;
+      for (Operation *user : llvm::make_early_inc_range(alloc.getResult().getUsers())) {
+        if (auto dealloc = dyn_cast<memref::DeallocOp>(user))
+          deallocsToFix.push_back(dealloc);
+      }
+      for (memref::DeallocOp dealloc : deallocsToFix)
+        dealloc.getMemrefMutable().assign(paddedAlloc.getResult());
+
       alloc.getResult().replaceAllUsesWith(subview.getResult());
       alloc.erase();
 
@@ -202,10 +214,19 @@ struct NovaGPUReduceBankConflictsPass
       // whereas the source now carries stride 130.  The verifier catches this
       // as a layout mismatch.
       //
-      // Fix: walk the use-def chain from our new subview and recompute each
-      // downstream SubViewOp's result type by multiplying the source strides
-      // by the subview's own static strides.  The offset is always left as
-      // dynamic (ShapedType::kDynamic) because subview offsets are runtime.
+      // Walk the use-def chain from our new subview and recompute each
+      // downstream SubViewOp's result type using the canonical MLIR helper.
+      // The helper correctly handles:
+      //   - same-rank subviews (strides multiplied through, offsets composed)
+      //   - rank-reducing subviews (e.g. memref<1x64x8xf32> → memref<64x8xf32>
+      //     when a unit-size leading dim is sliced away) — this was the
+      //     case that crashed the old hand-rolled math, which assumed the
+      //     result rank matched the source rank.
+      //   - dynamic offset/stride/size sentinels — the helper threads
+      //     ShapedType::kDynamic through arithmetic without spurious folds.
+      // The original (now stale) result shape is preserved so any consumers
+      // that already match on it (vector.transfer_read, linalg.copy, ...)
+      // keep verifying; only the layout (strides + offset) is recomputed.
       // -----------------------------------------------------------------------
       SmallVector<Value> worklist = {subview.getResult()};
       SmallPtrSet<Operation *, 16> visited;
@@ -218,52 +239,25 @@ struct NovaGPUReduceBankConflictsPass
           if (!sv)
             continue;
 
-          // Get the source memref's strides from its StridedLayoutAttr.
-          // SubViewOp results always carry an explicit StridedLayoutAttr, so
-          // this cast is safe for any subview chained from our padding subview.
+          auto oldResultType = sv.getType();
           auto srcType = cast<MemRefType>(sv.getSource().getType());
-          auto srcLayout = dyn_cast<StridedLayoutAttr>(srcType.getLayout());
-          if (!srcLayout)
-            continue;
 
-          ArrayRef<int64_t> srcStrides = srcLayout.getStrides();
-          SmallVector<int64_t> svStaticStrides =
-              llvm::to_vector(sv.getStaticStrides());
-          SmallVector<int64_t> svStaticOffsets =
-              llvm::to_vector(sv.getStaticOffsets());
+          MemRefType newResultType = memref::SubViewOp::inferRankReducedResultType(
+              oldResultType.getShape(), srcType,
+              sv.getStaticOffsets(), sv.getStaticSizes(),
+              sv.getStaticStrides());
 
-          // result_stride[i] = src_stride[i] * sv_static_stride[i]
-          SmallVector<int64_t> newStrides;
-          newStrides.reserve(srcStrides.size());
-          for (size_t i = 0; i < srcStrides.size(); ++i) {
-            if (ShapedType::isDynamic(srcStrides[i]) ||
-                ShapedType::isDynamic(svStaticStrides[i]))
-              newStrides.push_back(ShapedType::kDynamic);
-            else
-              newStrides.push_back(srcStrides[i] * svStaticStrides[i]);
+          // Preserve the original element type and memory space — the
+          // inference helper uses the source's, which should match, but
+          // be defensive in case a downstream pass altered them.
+          if (newResultType.getElementType() != oldResultType.getElementType() ||
+              newResultType.getMemorySpace() != oldResultType.getMemorySpace()) {
+            newResultType = MemRefType::get(
+                newResultType.getShape(), oldResultType.getElementType(),
+                newResultType.getLayout(), oldResultType.getMemorySpace());
           }
-
-          // result_base_offset = src_base_offset + Σ(sv_offset[i] * src_stride[i])
-          // If any term is dynamic the whole offset is dynamic.
-          int64_t newOffset = srcLayout.getOffset();
-          for (size_t i = 0; i < srcStrides.size(); ++i) {
-            if (ShapedType::isDynamic(newOffset) ||
-                ShapedType::isDynamic(svStaticOffsets[i]) ||
-                ShapedType::isDynamic(srcStrides[i])) {
-              newOffset = ShapedType::kDynamic;
-              break;
-            }
-            newOffset += svStaticOffsets[i] * srcStrides[i];
-          }
-
-          auto oldResult = sv.getType();
-          auto newResultType = MemRefType::get(
-              oldResult.getShape(), oldResult.getElementType(),
-              StridedLayoutAttr::get(ctx, newOffset, newStrides),
-              oldResult.getMemorySpace());
 
           sv.getResult().setType(newResultType);
-          // Continue propagating down any further subview chains.
           worklist.push_back(sv.getResult());
         }
       }
@@ -275,7 +269,8 @@ struct NovaGPUReduceBankConflictsPass
   }
   StringRef getDescription() const override {
     return "Pads the innermost dimension of workgroup shared memory allocs "
-           "by 64 bits to shift row bank alignment and reduce bank conflicts";
+           "by 16 bytes (4 f32 / 8 f16 elems) to shift row bank alignment "
+           "and satisfy ldmatrix 16-byte alignment on Ampere+";
   }
 };
 

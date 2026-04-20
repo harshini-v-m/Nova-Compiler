@@ -279,6 +279,9 @@ void registerNovaGPUVectorWrapPass();
 std::unique_ptr<Pass> createNovaGPUWarpToSCFPass();
 void registerNovaGPUWarpToSCFPass();
 
+std::unique_ptr<Pass> createNovaFoldTransposeIntoConsumerPass();
+void registerNovaFoldTransposeIntoConsumerPass();
+
 std::unique_ptr<Pass> createNovaStrideReductionPass();
 void registerNovaStrideReductionPass();
 } // namespace nova

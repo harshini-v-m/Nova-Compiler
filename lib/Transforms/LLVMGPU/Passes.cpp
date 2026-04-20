@@ -51,6 +51,7 @@
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
 #include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "Compiler/Transforms/FixGpuLaunch.h"
 
 #include "Compiler/Transforms/LLVMGPU/LoopSplit.h"
@@ -164,6 +165,7 @@ namespace mlir::nova
     pm.addNestedPass<mlir::func::FuncOp>(createFuseMatmulBiasPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
     pm.addNestedPass<func::FuncOp>(createFuseMatmulBiasPass());
+    pm.addNestedPass<func::FuncOp>(createNovaFoldTransposeIntoConsumerPass());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaCheckInsParallelFuse());
     pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgHorizontalFusionPass());
      pm.addNestedPass<mlir::func::FuncOp>(createNovaMultiConsumerFusion());
@@ -478,7 +480,7 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaGPUReduceBankConflictsPass(cudaArch));
+    pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaGPUReduceBankConflictsPass(cudaArch));
     // pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
 
 
@@ -1298,6 +1300,50 @@ namespace mlir::nova
       gpuPm.addPass(createArithToLLVMConversionPass());
       gpuPm.addPass(createConvertMathToLLVMPass());
       gpuPm.addPass(createConvertVectorToLLVMPass()); // all index→i64 already done
+
+      // Upgrade LLVM vector load/store alignment so NVPTX emits ld.global.v4.b32
+      // instead of 4× scalar ld.global.b32. ConvertVectorToLLVMPass uses the ABI
+      // element alignment (4 bytes for f32); NVPTX requires align=16 for 128-bit
+      // coalesced loads. We bump every 1-D vector load/store to min(vecBytes, 16).
+      gpuPm.addPass([&]() -> std::unique_ptr<Pass> {
+        struct UpgradeVectorAlignmentPass
+            : public PassWrapper<UpgradeVectorAlignmentPass,
+                                 OperationPass<gpu::GPUModuleOp>> {
+          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(UpgradeVectorAlignmentPass)
+          void runOnOperation() override {
+            getOperation().walk([](LLVM::LoadOp loadOp) {
+              auto vecTy = dyn_cast<VectorType>(loadOp.getType());
+              if (!vecTy || vecTy.getRank() != 1 ||
+                  !vecTy.getElementType().isIntOrFloat())
+                return;
+              uint64_t vecBytes =
+                  (vecTy.getElementType().getIntOrFloatBitWidth() / 8) *
+                  vecTy.getNumElements();
+              uint64_t targetAlign = std::min(vecBytes, (uint64_t)16);
+              if (loadOp.getAlignment().value_or(0) < targetAlign)
+                loadOp.setAlignment(targetAlign);
+            });
+            getOperation().walk([](LLVM::StoreOp storeOp) {
+              auto vecTy =
+                  dyn_cast<VectorType>(storeOp.getValue().getType());
+              if (!vecTy || vecTy.getRank() != 1 ||
+                  !vecTy.getElementType().isIntOrFloat())
+                return;
+              uint64_t vecBytes =
+                  (vecTy.getElementType().getIntOrFloatBitWidth() / 8) *
+                  vecTy.getNumElements();
+              uint64_t targetAlign = std::min(vecBytes, (uint64_t)16);
+              if (storeOp.getAlignment().value_or(0) < targetAlign)
+                storeOp.setAlignment(targetAlign);
+            });
+          }
+          StringRef getArgument() const override {
+            return "nova-upgrade-vector-alignment";
+          }
+        };
+        return std::make_unique<UpgradeVectorAlignmentPass>();
+      }());
+
       gpuPm.addPass(createReconcileUnrealizedCastsPass());
       gpuPm.addPass(createReconcileUnrealizedCastsPass()); // catch chains
     }

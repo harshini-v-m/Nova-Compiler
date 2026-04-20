@@ -51,6 +51,22 @@ namespace {
 // Helpers
 //===----------------------------------------------------------------------===//
 
+/// Returns true if all statically-shaped operands of linalgOp fit within
+/// maxVectorSize elements. Ops that exceed this limit would produce vectors
+/// too large for the NVPTX register file (>128-bit → llvm.mlir.poison).
+/// Mirrors IREE's isWithinVectorSizeLimit in GenericVectorization.cpp.
+static bool isWithinVectorSizeLimit(linalg::LinalgOp linalgOp,
+                                    int64_t maxVectorSize = 1 << 17) {
+  int64_t maxFlatVecSize = 1;
+  for (OpOperand &operand : linalgOp->getOpOperands()) {
+    auto type = dyn_cast<ShapedType>(operand.get().getType());
+    if (!type) continue;
+    if (!type.hasStaticShape()) return false;
+    maxFlatVecSize = std::max(maxFlatVecSize, type.getNumElements());
+  }
+  return maxFlatVecSize < maxVectorSize;
+}
+
 /// Returns the MMA intrinsic shape {M, N, K} for the given intrinsic enum
 /// value. Returns {16, 16, 16} (WMMA default) if unrecognised.
 static SmallVector<int64_t, 3> getMMAShape(int32_t mmaKindRaw) {
@@ -70,6 +86,28 @@ static SmallVector<int64_t, 3> getMMAShape(int32_t mmaKindRaw) {
       // Default fallback for NVIDIA Tensor Cores if no specific kind matched.
       return {16, 16, 16};
   }
+}
+
+/// Returns true when \p contractOp has a valid 2-D matmul indexing structure:
+///   LHS[d0,d2], RHS[d2,d1], ACC[d0,d1]   (d0=M, d1=N, d2=K)
+///
+/// 3-D reduction contracts (e.g. dbeta/dgamma with indexing maps
+/// (d0,d1,d2)->(d0,d1,d2)) must NOT receive an MMA lowering config.
+/// PrepareVectorToMMA cannot match them; if they reach that pass with
+/// mma_kind != 0 they produce invalid nvvm.mma.sync shapes and cause PTX
+/// register explosion (K-loop full-unroll × 512-element accumulator).
+static bool isMatmulContract(vector::ContractionOp contractOp) {
+  auto accType = dyn_cast<VectorType>(contractOp.getAcc().getType());
+  if (!accType || accType.getRank() != 2)
+    return false; // ACC must be a 2-D vector (M×N).
+  auto maps = contractOp.getIndexingMapsArray();
+  if (maps.size() != 3)
+    return false;
+  if (maps[2].getNumResults() != 2)
+    return false; // ACC map must index exactly 2 of the 3 loop dims.
+  if (maps[0].getNumResults() != 2 || maps[1].getNumResults() != 2)
+    return false; // LHS and RHS must each index 2 dims.
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -164,6 +202,12 @@ struct NovaGPUPackToIntrinsicsPass
 struct NovaGPUGenericVectorizationPass
     : public PassWrapper<NovaGPUGenericVectorizationPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUGenericVectorizationPass)
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<tensor::TensorDialect, linalg::LinalgDialect,
+                    vector::VectorDialect, arith::ArithDialect>();
+  }
+
   // Detect whether a linalg.generic has the standard matmul contraction body:
   //   %0 = arith.mulf %arg0, %arg1 : f32
   //   %1 = arith.addf %arg2, %0   : f32   (or arith.addf %0, %arg2)
@@ -257,10 +301,20 @@ struct NovaGPUGenericVectorizationPass
     MLIRContext *ctx = op.getContext();
     auto maps = op.getIndexingMapsArray();
 
-    // Verify indexing maps.
-    //   2D: A=[d0,d2], B=[d2,d1], C=[d0,d1]                    (3 iter dims)
-    //   3D fully-batched: A=[d0,d1,d3], B=[d0,d3,d2], C=[d0,d1,d2]  (4 iter dims)
-    //   3D broadcast:     A=[d0,d1,d3], B=[d3,d2],   C=[d0,d1,d2]  (4 iter dims, B no batch)
+    // Verify indexing maps.  We accept both the standard orientation and the
+    // transposed variants that arise in backward-pass matmuls:
+    //
+    //   Standard 2D:            A=[d0,d2], B=[d2,d1], C=[d0,d1]
+    //   Transposed-A 2D:        A=[d2,d0], B=[d2,d1], C=[d0,d1]  ← dWeight = X^T @ dY
+    //
+    //   Standard 3D broadcast:  A=[d0,d1,d3], B=[d3,d2],   C=[d0,d1,d2]
+    //   Transposed-B broadcast: A=[d0,d1,d3], B=[d2,d3],   C=[d0,d1,d2]  ← dInput = dY @ W^T
+    //
+    //   Standard 3D fully-batched: A=[d0,d1,d3], B=[d0,d3,d2], C=[d0,d1,d2]
+    //
+    // For transposed cases we emit a vector.transfer_read with a swapping
+    // permutation map so the resulting vector.contract always sees the
+    // canonical orientation A=[d0,d2], B=[d2,d1], C=[d0,d1].
     AffineMap expectedA, expectedB, expectedC;
     if (!isBatch) {
       expectedA = AffineMap::get(3, 0,
@@ -286,14 +340,53 @@ struct NovaGPUGenericVectorizationPass
       expectedC = AffineMap::get(4, 0,
           {getAffineDimExpr(0, ctx), getAffineDimExpr(1, ctx), getAffineDimExpr(2, ctx)}, ctx);
     }
-    if (maps[0] != expectedA || maps[1] != expectedB || maps[2] != expectedC) return false;
+
+    // Track whether a transpose of A or B is needed.
+    bool isTransposeA = false; // A stored as [K,M], read as vector<M×K>
+    bool isTransposeB = false; // B stored as [N,K], read as vector<K×N>
+
+    if (maps[0] == expectedA && maps[1] == expectedB && maps[2] == expectedC) {
+      // Standard orientation — nothing to do.
+    } else if (!isBatch) {
+      // 2D transposed-A: A=[d2,d0], B=[d2,d1], C=[d0,d1]
+      // Arises in dWeight = input^T @ grad_output.
+      AffineMap tA = AffineMap::get(3, 0,
+          {getAffineDimExpr(2, ctx), getAffineDimExpr(0, ctx)}, ctx);
+      AffineMap tB = AffineMap::get(3, 0,
+          {getAffineDimExpr(2, ctx), getAffineDimExpr(1, ctx)}, ctx);
+      if (maps[0] == tA && maps[1] == tB && maps[2] == expectedC)
+        isTransposeA = true;
+      else
+        return false;
+    } else if (isBatch && bIsBroadcast) {
+      // 3D broadcast transposed-B: A=[d0,d1,d3], B=[d2,d3], C=[d0,d1,d2]
+      // Arises in dInput = grad_output @ weight^T  (weight stored as [D,H]).
+      AffineMap tBcast = AffineMap::get(4, 0,
+          {getAffineDimExpr(2, ctx), getAffineDimExpr(3, ctx)}, ctx);
+      if (maps[0] == expectedA && maps[1] == tBcast && maps[2] == expectedC)
+        isTransposeB = true;
+      else
+        return false;
+    } else {
+      return false;
+    }
 
     // Extract logical M, N, K from the appropriate shape dimensions.
+    // For transposed operands the K dimension lives in a different slot.
     int64_t M, N, K;
     if (!isBatch) {
-      M = cTy.getShape()[0]; N = cTy.getShape()[1]; K = aTy.getShape()[1];
+      M = cTy.getShape()[0]; N = cTy.getShape()[1];
+      // Transposed-A: A stored as [K, M] → K is shape[0].
+      // Standard:     A stored as [M, K] → K is shape[1].
+      K = isTransposeA ? aTy.getShape()[0] : aTy.getShape()[1];
     } else if (bIsBroadcast) {
-      M = cTy.getShape()[1]; N = cTy.getShape()[2]; K = aTy.getShape()[2];
+      M = cTy.getShape()[1];
+      if (isTransposeB) {
+        // Transposed-B broadcast: B stored as [N, K].
+        N = bTy.getShape()[0]; K = bTy.getShape()[1];
+      } else {
+        N = cTy.getShape()[2]; K = aTy.getShape()[2];
+      }
     } else {
       M = cTy.getShape()[1]; N = cTy.getShape()[2]; K = aTy.getShape()[2];
     }
@@ -311,30 +404,90 @@ struct NovaGPUGenericVectorizationPass
     // in_bounds has one entry per *vector* dimension (always 2D here).
     SmallVector<bool> inBoundsVec = {true, true};
 
-    Value lhs, rhs, acc;
+    // Permutation map that swaps the two vector dimensions: (d0,d1) → (d1,d0).
+    // Used for transposed reads: reads vector<M×K> from a [K×M] tensor or
+    // vector<K×N> from a [N×K] tensor.
+    auto swapDims2D = AffineMap::get(2, 0,
+        {getAffineDimExpr(1, ctx), getAffineDimExpr(0, ctx)}, ctx);
+
+    // c_2d holds the rank-reduced (2D) ACC slice for the batch path; it is
+    // set in the isBatch branch below and re-used in the write-back section.
+    Value lhs, rhs, acc, c_2d;
     if (!isBatch) {
       SmallVector<Value> zeroIdx = {zeroI, zeroI};
-      // Implicit identity permutation map for same-rank 2D transfers.
-      lhs = rewriter.create<vector::TransferReadOp>(loc, lhsVT, ins[0],  zeroIdx, zero, inBoundsVec);
+      if (isTransposeA) {
+        // A is stored as [K, M]; read with swapping map to produce vector<M×K>.
+        lhs = rewriter.create<vector::TransferReadOp>(loc, lhsVT, ins[0], zeroIdx, zero, swapDims2D, inBoundsVec);
+      } else {
+        // Standard: A is [M, K] — identity permutation (inferred from vector rank).
+        lhs = rewriter.create<vector::TransferReadOp>(loc, lhsVT, ins[0], zeroIdx, zero, inBoundsVec);
+      }
       rhs = rewriter.create<vector::TransferReadOp>(loc, rhsVT, ins[1],  zeroIdx, zero, inBoundsVec);
       acc = rewriter.create<vector::TransferReadOp>(loc, accVT, outs[0], zeroIdx, zero, inBoundsVec);
     } else {
-      // A and C are rank-3 [1, M, K] / [1, M, N].  Use a projection map that
-      // drops the batch d0 (always 0), mapping src dims (d0,d1,d2) → (d1,d2).
-      SmallVector<Value> zeroIdx3 = {zeroI, zeroI, zeroI};
-      auto projAC = AffineMap::get(3, 0,
-          {getAffineDimExpr(1, ctx), getAffineDimExpr(2, ctx)}, ctx);
-      // Builder: (loc, vectorType, source, indices, padding, permutationMap, inBounds)
-      lhs = rewriter.create<vector::TransferReadOp>(loc, lhsVT, ins[0],  zeroIdx3, zero, projAC, inBoundsVec);
-      acc = rewriter.create<vector::TransferReadOp>(loc, accVT, outs[0], zeroIdx3, zero, projAC, inBoundsVec);
+      // A and C are rank-3 [1,M,K] / [1,M,N].  Extract rank-reducing 2D slices
+      // so that the downstream vector.transfer_read/write ops use 2D tensors
+      // with identity permutation maps.
+      //
+      // WHY this matters:
+      //   The previous approach used a projection map (d0,d1,d2)→(d1,d2) on 3D
+      //   tensors.  After UnrollToIntrinsicsPass the unrolled contracts assemble
+      //   their partial results via vector.insert_strided_slice into a full
+      //   vector<M×N>, which is then flushed by a single transfer_write with
+      //   that projection map.
+      //
+      //   FoldInsertStridedSliceIntoTransferWrite (Stage 35a Step 2b) checks
+      //   writeOp.getPermutationMap().isIdentity() and returns failure() for
+      //   any non-identity map.  The projection map is NOT identity, so the
+      //   insert_strided_slice chain is never decomposed into individual tile
+      //   writes.  PrepareVectorToMMAPatterns (Step 3) then cannot wrap the
+      //   individual 16×8×8 contracts, ConvertVectorToGPU sees bare contracts,
+      //   and they fall back to the SIMT (FMA) path → SIMT:32.
+      //
+      //   By extracting a 2D slice before the vector reads, every transfer_write
+      //   targets a 2D tensor (→ 2D memref after bufferization) with an implicit
+      //   identity map.  The fold pattern succeeds, PrepareVectorToMMAPatterns
+      //   wraps each unrolled 16×8×8 contract, and ConvertVectorToGPU emits
+      //   nvgpu.mma.sync for all batch matmul tiles.
+      SmallVector<OpFoldResult> batchOff = {
+          rewriter.getIndexAttr(0), rewriter.getIndexAttr(0), rewriter.getIndexAttr(0)};
+      SmallVector<OpFoldResult> batchStr = {
+          rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1)};
+
+      // LHS: tensor<1×M×K> → tensor<M×K>  (rank-reducing, drops batch dim 0)
+      SmallVector<OpFoldResult> sliceSzA = {
+          rewriter.getIndexAttr(1), rewriter.getIndexAttr(M), rewriter.getIndexAttr(K)};
+      Value a_2d = rewriter.create<tensor::ExtractSliceOp>(
+          loc, RankedTensorType::get({M, K}, elemTy),
+          ins[0], batchOff, sliceSzA, batchStr);
+
+      // ACC: tensor<1×M×N> → tensor<M×N>  (rank-reducing, drops batch dim 0)
+      SmallVector<OpFoldResult> sliceSzC = {
+          rewriter.getIndexAttr(1), rewriter.getIndexAttr(M), rewriter.getIndexAttr(N)};
+      c_2d = rewriter.create<tensor::ExtractSliceOp>(
+          loc, RankedTensorType::get({M, N}, elemTy),
+          outs[0], batchOff, sliceSzC, batchStr);
+
+      SmallVector<Value> zeroIdx2 = {zeroI, zeroI};
+      lhs = rewriter.create<vector::TransferReadOp>(loc, lhsVT, a_2d, zeroIdx2, zero, inBoundsVec);
+      acc = rewriter.create<vector::TransferReadOp>(loc, accVT, c_2d, zeroIdx2, zero, inBoundsVec);
 
       if (bIsBroadcast) {
-        // B is rank-2 [K, N] with no batch dim — use plain 2D transfer_read.
-        SmallVector<Value> zeroIdx2 = {zeroI, zeroI};
-        rhs = rewriter.create<vector::TransferReadOp>(loc, rhsVT, ins[1], zeroIdx2, zero, inBoundsVec);
+        if (isTransposeB) {
+          // B is stored as [N, K]; read with swapping map to produce vector<K×N>.
+          rhs = rewriter.create<vector::TransferReadOp>(loc, rhsVT, ins[1], zeroIdx2, zero, swapDims2D, inBoundsVec);
+        } else {
+          // Standard: B is rank-2 [K, N] with no batch dim.
+          rhs = rewriter.create<vector::TransferReadOp>(loc, rhsVT, ins[1], zeroIdx2, zero, inBoundsVec);
+        }
       } else {
-        // B is rank-3 [1, K, N] — same projection as A/C.
-        rhs = rewriter.create<vector::TransferReadOp>(loc, rhsVT, ins[1], zeroIdx3, zero, projAC, inBoundsVec);
+        // Fully-batched B: tensor<1×K×N> → tensor<K×N>  (rank-reducing)
+        SmallVector<OpFoldResult> sliceSzB = {
+            rewriter.getIndexAttr(1), rewriter.getIndexAttr(K), rewriter.getIndexAttr(N)};
+        Value b_2d = rewriter.create<tensor::ExtractSliceOp>(
+            loc, RankedTensorType::get({K, N}, elemTy),
+            ins[1], batchOff, sliceSzB, batchStr);
+        rhs = rewriter.create<vector::TransferReadOp>(loc, rhsVT, b_2d, zeroIdx2, zero, inBoundsVec);
       }
     }
 
@@ -360,17 +513,40 @@ struct NovaGPUGenericVectorizationPass
     if (auto cfg = getLoweringConfig(op.getOperation()))
       setLoweringConfig(contractOp, cfg);
 
-    // Write the contraction result back, using the same projection for 3D.
+    // Write the contraction result back.
+    //
+    // WHY the batch path must write to c_2d (not outs[0] with a projection):
+    //   After UnrollToIntrinsicsPass the unrolled contracts assemble their
+    //   results via vector.insert_strided_slice into a full vector<M×N>, then
+    //   flush it with a single transfer_write.
+    //
+    //   FoldInsertStridedSliceIntoTransferWrite (Stage 35a) requires
+    //   writeOp.getPermutationMap().isIdentity().  Writing to outs[0]
+    //   (tensor<1×M×N>) with the projection (d0,d1,d2)→(d1,d2) fails that
+    //   check, so the insert_strided_slice chain is never decomposed into
+    //   per-tile writes.  PrepareVectorToMMAPatterns then cannot match the
+    //   individual 16×8 contracts and all fall back to SIMT → SIMT:32.
+    //
+    //   Writing to c_2d (tensor<M×N>, implicit identity map) lets the fold
+    //   succeed, PrepareVectorToMMA matches every tile, and ConvertVectorToGPU
+    //   emits nvgpu.mma.sync for all of them.  The updated slice is then
+    //   reinserted into outs[0] via tensor.insert_slice, which bufferizes
+    //   cleanly without interfering with the vector-level MMA lowering.
     Value writeResult;
     if (isBatch) {
-      SmallVector<Value> zeroIdx3 = {zeroI, zeroI, zeroI};
-      auto projW = AffineMap::get(3, 0,
-          {getAffineDimExpr(1, ctx), getAffineDimExpr(2, ctx)}, ctx);
+      SmallVector<Value> zeroIdx2W = {zeroI, zeroI};
       auto writeOp = rewriter.create<vector::TransferWriteOp>(
-          loc, contractOp.getResult(), outs[0], zeroIdx3, projW, inBoundsVec);
+          loc, contractOp.getResult(), c_2d, zeroIdx2W, inBoundsVec);
       if (auto cfg = getLoweringConfig(op.getOperation()))
         setLoweringConfig(writeOp, cfg);
-      writeResult = writeOp->getResult(0);
+      SmallVector<OpFoldResult> insOffsets = {
+          rewriter.getIndexAttr(0), rewriter.getIndexAttr(0), rewriter.getIndexAttr(0)};
+      SmallVector<OpFoldResult> insSizes = {
+          rewriter.getIndexAttr(1), rewriter.getIndexAttr(M), rewriter.getIndexAttr(N)};
+      SmallVector<OpFoldResult> insStrides = {
+          rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1)};
+      writeResult = rewriter.create<tensor::InsertSliceOp>(
+          loc, writeOp->getResult(0), outs[0], insOffsets, insSizes, insStrides);
     } else {
       SmallVector<Value> zeroIdx = {zeroI, zeroI};
       auto writeOp = rewriter.create<vector::TransferWriteOp>(
@@ -565,62 +741,128 @@ struct NovaGPUGenericVectorizationPass
     }
 
 
-    // 1b. Vectorize remaining Linalg operations and replace them with the results.
-    //    Skip fill-like ops to avoid vector<NxMxf32> when the fill tile is large.
-    //    NVPTX can't lower vectors wider than 128 bits → llvm.mlir.poison →
-    //    all __shared__ memory demoted → GPU kernel hangs.
+    // 1b. Vectorize remaining Linalg operations bottom-to-top.
     //
-    //    Detection: a fill-like generic body yields only values captured from
-    //    the outer scope (no block argument is used by any op in the body).
-    //    Contractions and elementwise ops always use at least one block arg.
-    funcOp.walk([&](linalg::LinalgOp linalgOp) {
-      // Explicit linalg.fill: always skip vectorization.
-      if (isa<linalg::FillOp>(linalgOp.getOperation()))
-        return;
+    //    Bottom-to-top ordering: linalg::vectorize() traces the use-def chain
+    //    upward to infer vector sizes. Vectorizing a consumer before its producer
+    //    means the producer's type is still a tensor — size inference reads the
+    //    wrong (non-vector) shape and silently produces incorrect tile sizes.
+    //    Reversing the walk-order list ensures every producer is already in
+    //    vector form when its consumer is processed.
+    //
+    //    Skip: linalg.fill and fill-like generics (body never uses block args).
+    //    These produce large constant vectors that NVPTX cannot lower (>128 bits
+    //    → llvm.mlir.poison → shared memory demotion → kernel hang).
+    //
+    //    PackOp/UnPackOp are collected separately: they do not implement the
+    //    LinalgOp interface so they are missed by the typed walk, but they ARE
+    //    vectorizable and must be handled — NovaGPUPackToIntrinsicsPass creates
+    //    them and they must reach vector form before bufferization.
+    {
+      // Collect PackOp/UnPackOp candidates separately (not LinalgOp subtypes).
+      SmallVector<Operation *> packCandidates;
+      funcOp.walk([&](Operation *op) {
+        if (isa<linalg::PackOp, linalg::UnPackOp>(op))
+          packCandidates.push_back(op);
+      });
 
-      // Generalized fill (linalg.generic with no ins or yield-from-constant):
-      // skip if no block argument appears as an operand in the body.
-      if (auto genericOp = dyn_cast<linalg::GenericOp>(linalgOp.getOperation())) {
-        bool usesBlockArg = false;
-        for (Operation &innerOp : genericOp.getRegion().front()) {
-          for (Value operand : innerOp.getOperands()) {
-            if (isa<BlockArgument>(operand)) {
-              usesBlockArg = true;
-              break;
+      // Collect regular linalg candidates with fill-skip and size-guard logic.
+      SmallVector<linalg::LinalgOp> candidates;
+      funcOp.walk([&](linalg::LinalgOp linalgOp) {
+        // Explicit linalg.fill: always skip vectorization.
+        if (isa<linalg::FillOp>(linalgOp.getOperation()))
+          return;
+        // Generalized fill-like generic: skip if body never uses a block arg.
+        // Such a body only captures outer-scope constants and yields them;
+        // vectorizing it would create a large constant vector that NVPTX
+        // cannot lower (>128-bit vectors → llvm.mlir.poison).
+        if (auto genericOp =
+                dyn_cast<linalg::GenericOp>(linalgOp.getOperation())) {
+          bool usesBlockArg = false;
+          for (Operation &innerOp : genericOp.getRegion().front()) {
+            for (Value operand : innerOp.getOperands()) {
+              if (isa<BlockArgument>(operand)) {
+                usesBlockArg = true;
+                break;
+              }
             }
+            if (usesBlockArg) break;
           }
-          if (usesBlockArg)
-            break;
+          if (!usesBlockArg)
+            return;
         }
-        if (!usesBlockArg)
-          return; // fill-like: body is a constant write, not a computation
+        // Guard against ops whose operands exceed the NVPTX vector size limit.
+        if (!isWithinVectorSizeLimit(linalgOp))
+          return;
+        candidates.push_back(linalgOp);
+      });
+
+      // Bottom-to-top: producers before consumers so size inference succeeds.
+      std::reverse(candidates.begin(), candidates.end());
+
+      for (linalg::LinalgOp linalgOp : candidates) {
+        rewriter.setInsertionPoint(linalgOp);
+        auto res = linalg::vectorize(rewriter, linalgOp);
+        if (succeeded(res))
+          rewriter.replaceOp(linalgOp, res->replacements);
       }
 
-      rewriter.setInsertionPoint(linalgOp);
-      auto result = linalg::vectorize(rewriter, linalgOp);
-      if (succeeded(result)) {
-        rewriter.replaceOp(linalgOp, result->replacements);
+      // Vectorize pack/unpack ops after regular linalg ops. They are consumers
+      // of the packed data, so processing them last is consistent with
+      // bottom-to-top ordering at the inter-op level.
+      for (Operation *op : packCandidates) {
+        if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+          rewriter.setInsertionPoint(linalgOp);
+          auto res = linalg::vectorize(rewriter, linalgOp);
+          if (succeeded(res))
+            rewriter.replaceOp(linalgOp, res->replacements);
+        }
       }
-    });
+    }
 
 
-    // 2. Lower multi-dimensional reductions via InnerReduction then fold into
-    //    vector.contract so they follow the same outer-product → llvm.fma
-    //    path as matmul contractions in VectorDistributePass.
+    // 2a. Contract recognition pass — MUST run before InnerReduction.
     //
-    //    WHY InnerReduction over InnerParallel:
-    //    InnerParallel expands vector.multi_reduction directly into a chain of
-    //    vector.extract + arith.addf ops (sequential scalar adds).  InnerReduction
-    //    instead emits vector.reduction ops (1-D hardware reductions) for the
-    //    inner dim.  populateVectorReductionToContractPatterns then converts
-    //    each vector.reduction to a vector.contract (dot-product with a unit
-    //    vector), which VectorDistributePass lowers via outer-product →
-    //    llvm.fma (single rounding, matching the eager path for reductions).
+    //     linalg::vectorize() emits vector.multi_reduction for ALL matmul
+    //     shapes, including transposed operands (e.g. grad_weight = X^T @ dY,
+    //     where the A-operand indexing map is [d2,d0] and tryVectorizeAsContraction
+    //     does not handle it).  The lowered form is:
     //
-    //    NOTE: Do NOT lower vector.contract here. Surviving contracts must reach
-    //    PrepareVectorToGPU (post-GPU-outlining) so they can be converted to
-    //    gpu.subgroup_mma_compute → TF32 mma.sync. Lowering them to outer-product
-    //    here would destroy the TF32 tensor-core path and produce plain FP32 results.
+    //       broadcast(A) × broadcast(B) → vector.multi_reduction<add>
+    //
+    //     populateVectorReductionToContractPatterns recognises this pattern and
+    //     converts it directly to a 2-D vector.contract — but only if the
+    //     broadcasts are still adjacent (not already decomposed).
+    //
+    //     If populateVectorMultiReductionLoweringPatterns (InnerReduction) runs
+    //     first in the same greedy pass, it fires on the multi_reduction before
+    //     the contraction pattern can match, converting the 3-D multi_reduction
+    //     into per-row 1-D vector.reduction chains.  Those become 1-D dot-product
+    //     contracts (K=1536) that UnrollToIntrinsicsPass cannot unroll to MMA
+    //     shapes.  LLVM's PTX backend then fully unrolls the K loop:
+    //       1536 K-steps × (M=32 + N=16) operands = 73,728 virtual registers
+    //     → catastrophic register pressure → 1h45m PTX compilation.
+    //
+    //     Fix: run Sink + ReductionToContract + FoldArith in a SEPARATE pass
+    //     before InnerReduction so the 2-D contract is created first.
+    {
+      RewritePatternSet patterns(context);
+      vector::populateVectorTransferPermutationMapLoweringPatterns(patterns);
+      vector::populateSinkVectorOpsPatterns(patterns);
+      vector::populateVectorReductionToContractPatterns(patterns);
+      vector::populateFoldArithExtensionPatterns(patterns);
+      if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+        return signalPassFailure();
+      }
+    }
+
+    // 2b. Lower remaining multi_reductions (non-matmul reductions, layer-norm
+    //     accumulators, etc.) via InnerReduction, then lower transfers and
+    //     shape casts.
+    //
+    //     NOTE: Do NOT lower vector.contract here. Surviving contracts must
+    //     reach PrepareVectorToGPU (post-GPU-outlining) to be converted to
+    //     gpu.subgroup_mma_compute → TF32/F16 mma.sync intrinsics.
     {
       RewritePatternSet patterns(context);
       vector::populateVectorMultiReductionLoweringPatterns(
@@ -628,7 +870,6 @@ struct NovaGPUGenericVectorizationPass
       vector::populateVectorReductionToContractPatterns(patterns);
       vector::populateVectorTransferLoweringPatterns(patterns, /*maxTransferRank=*/1);
       vector::populateVectorShapeCastLoweringPatterns(patterns);
-
       if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
       }
@@ -642,7 +883,14 @@ struct NovaGPUGenericVectorizationPass
     // and fall back to the SIMT outer-product path.
     if (savedMmaConfig) {
       funcOp.walk([&](vector::ContractionOp contractOp) {
-        if (!getLoweringConfig(contractOp))
+        // Only propagate MMA config to matmul contracts (2-D ACC, standard
+        // M/N/K indexing maps). 3-D reduction contracts (dbeta, dgamma) must
+        // NOT receive mma_kind != 0 — PrepareVectorToMMA cannot match them,
+        // and if they reach that pass with a non-zero mma_kind they fall back
+        // to the SIMT path with a 512-element accumulator still live, causing
+        // the NVPTX backend to fully unroll the K loop and explode to 70k+
+        // virtual registers.
+        if (!getLoweringConfig(contractOp) && isMatmulContract(contractOp))
           setLoweringConfig(contractOp, savedMmaConfig);
       });
     }
@@ -685,32 +933,36 @@ struct NovaGPUVectorizeMemrefCopyPass
     if (!funcOp) return;
     IRRewriter rewriter(&getContext());
     MLIRContext *context = &getContext();
-    funcOp.walk([&](memref::CopyOp copyOp) {
-      // Skip copies where source or destination is a function argument.
-      // These are typically D2H output copies (e.g. memref.copy device_buf,
-      // func_arg). They must stay as memref.copy until createConvertMemRefToGpuPass
-      // (Step 12) converts them to gpu.memcpy → cudaMemcpyAsync. If vectorized
-      // here, the host-side vector.transfer_read later reads from a device
-      // pointer (after ConvertMemRefToGpu upgrades the alloc) = illegal access.
-      // Also skip copies to view-like ops (expand_shape etc.) of func args.
-      auto isFuncArg = [](Value v) -> bool {
-        if (isa<BlockArgument>(v))
-          return true;
-        // Follow view-like ops (expand_shape, subview, cast) back to the root.
-        Operation *defOp = v.getDefiningOp();
-        while (defOp && isa<memref::ExpandShapeOp, memref::SubViewOp,
-                            memref::CastOp, memref::ReinterpretCastOp,
-                            memref::CollapseShapeOp>(defOp)) {
-          v = defOp->getOperand(0);
-          if (isa<BlockArgument>(v))
-            return true;
-          defOp = v.getDefiningOp();
-        }
-        return false;
-      };
-      if (isFuncArg(copyOp.getSource()) || isFuncArg(copyOp.getTarget()))
+    // WHY linalg::CopyOp (not memref::CopyOp):
+    //   gpuCopyFn in NovaGPUBufferize.cpp emits linalg::CopyOp (not
+    //   memref::CopyOp) for every intra-kernel global→shared promotion.
+    //   Walking memref::CopyOp here found zero matches, making this pass a
+    //   complete no-op for the entire global→shared fill path.  Every copy
+    //   then fell through to createConvertLinalgToLoopsPass which expanded
+    //   each linalg.copy into a scalar scf.for+memref.load/store loop —
+    //   thousands of scalar ld.global.b32 PTX loads, zero ld.global.v4.b32.
+    //
+    // WHY AssumeAlignmentOp:
+    //   PTX requires ptr.align >= 16 for ld.global.v4.b32. Global pointer
+    //   parameters arrive with .align 1 because FinalizeMemRefToLLVM sees no
+    //   alignment metadata on the memref descriptor. Asserting 16-byte
+    //   alignment on the source here propagates an llvm.assume(align 16)
+    //   through to PTXAS, which then legally emits vectorized loads.
+    //   All current tile configs have innermost-dim offsets that are multiples
+    //   of 4 floats (16 bytes), so the assertion holds at runtime.
+    funcOp.walk([&](linalg::CopyOp copyOp) {
+      Value src = copyOp.getDpsInputs()[0];
+      Value dst = copyOp.getDpsInits()[0];
+      auto dstType = dyn_cast<MemRefType>(dst.getType());
+      if (!dstType) return;
+      auto dstAddrSpace =
+          dyn_cast_or_null<gpu::AddressSpaceAttr>(dstType.getMemorySpace());
+      if (!dstAddrSpace ||
+          dstAddrSpace.getValue() != gpu::GPUDialect::getWorkgroupAddressSpace())
         return;
-      (void)linalg::vectorizeCopy(rewriter, copyOp);
+      rewriter.setInsertionPoint(copyOp);
+      rewriter.create<memref::AssumeAlignmentOp>(copyOp.getLoc(), src, 16);
+      (void)linalg::vectorize(rewriter, copyOp);
     });
 
     // Lower reductions via InnerReduction + ReductionToContract (same as
@@ -951,11 +1203,12 @@ struct NovaGPUVectorDistributePass
     //     gpu.subgroup_mma_compute → mma.sync PTX.
     //
     //   SIMT path (hasMMAContract == false):
-    //     Lower vector.contract → vector.outerproduct → llvm.fma.  This path
-    //     is numerically correct (FP32 FMA, single rounding) but MUST NOT be
-    //     used for large matmuls (e.g. 5120×5120): the outer-product chains
-    //     for K=5120 create enormous register pressure that causes GPU kernel
-    //     stalling regardless of whether PTX compilation succeeds.
+    //     Conditionally lower vector.contract → outer-product → llvm.fma ONLY
+    //     when the per-lane accumulator is small enough to avoid register
+    //     spilling.  Large contracts (K > kMaxOuterProductK or per-lane acc
+    //     > kMaxRegsPerThread) are left for ConvertVectorToLLVMPass (inside
+    //     the GPU module at Passes.cpp Stage 38d2), which lowers them via a
+    //     real scf loop — constant register pressure regardless of K.
     // -----------------------------------------------------------------------
     bool hasMMAContract = false;
     funcOp.walk([&](vector::ContractionOp contractOp) {
@@ -973,28 +1226,113 @@ struct NovaGPUVectorDistributePass
     });
 
     if (!hasMMAContract) {
-      // SIMT (CUDA-core) path: lower vector.contract → outer-product → llvm.fma.
-      // Safe for small tile sizes where the outerproduct chain fits in registers.
-      RewritePatternSet patterns(ctx);
-      vector::populateVectorContractLoweringPatterns(
-          patterns, vector::VectorContractLowering::OuterProduct);
-      vector::populateVectorTransferLoweringPatterns(patterns,
-                                                     /*maxTransferRank=*/1);
-      (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
+      // Register-budget guard for OuterProduct lowering.
+      //
+      // OuterProduct physically unrolls the K reduction: for a contract
+      // vector<LHS=[M×K]> × vector<RHS=[K×N]> → vector<ACC=[M×N]>,
+      // each of the K outerproduct steps keeps the FULL M×N accumulator live.
+      //
+      // We use two register-pressure models and take the worst case:
+      //
+      //   Model A — interleaved operands during outer-product chain:
+      //     total = M×N + K×(M+N),  per lane = total / 32
+      //
+      //   Model B — NVPTX K-loop full-unroll (LLVM NVPTX fully unrolls
+      //     scf.for loops with static trip counts):
+      //     total = K × M×N,  per lane = K×MN / 32
+      //     Example: M=32, N=16, K=64 → 64×512/32 = 1024 regs/lane
+      //
+      // For SM86 (65,536 regs / 2048 threads = 32 regs/thread @ 100%):
+      //   Safe budget = 128 regs/thread (50% occupancy, typical optimum).
+      //
+      // If ANY contract in this function exceeds this budget, skip the
+      // OuterProduct expansion entirely and let ConvertVectorToLLVMPass
+      // (Passes.cpp Stage 38d2, inside gpuPm) handle it via an scf.for loop,
+      // which has constant register pressure regardless of K.
+      static constexpr int64_t kMaxRegsPerThread = 128;
+      static constexpr int64_t kSimtWarpSize = 32;
+
+      bool outerProductSafe = true;
+      funcOp.walk([&](vector::ContractionOp contractOp) {
+        if (!outerProductSafe) return; // already decided
+        auto accType = dyn_cast<VectorType>(contractOp.getAcc().getType());
+        auto lhsType = dyn_cast<VectorType>(contractOp.getLhs().getType());
+        if (!accType || !lhsType) return;
+
+        int64_t accElems = accType.getNumElements(); // M×N (or 1 for scalar)
+
+        // Estimate K from the LHS vector: for a matmul contract with
+        // LHS=[M×K] and ACC=[M×N], K = lhsElems / accShape[0].
+        // For non-matmul contracts (e.g. 3D dbeta, scalar acc), lhsRank != 2
+        // or accRank != 2 — fall back to conservative 1 for K.
+        int64_t K = 1;
+        if (lhsType.getRank() == 2 && accType.getRank() == 2) {
+          int64_t M = accType.getShape()[0];
+          if (M > 0) K = lhsType.getNumElements() / M;
+        }
+
+        // Two models for register pressure — take the worst case:
+        //
+        // Model A — outer-product chain (LHS/RHS operands interleaved):
+        //   acc=M×N + K×M (lhs cols) + K×N (rhs rows)  =  MN + K×(M+N)
+        //   per lane = (MN + K×(M+N)) / warpSize
+        //
+        // Model B — NVPTX backend K-loop full-unroll (static trip counts):
+        //   LLVM's NVPTX backend fully unrolls scf.for loops with static
+        //   trip counts.  Each of the K outer-product steps creates a full
+        //   copy of the M×N accumulator in registers, so the actual live
+        //   set at any unrolled iteration is K × M×N floats.
+        //   per lane = K × MN / warpSize
+        //
+        // For M=32, N=16, K=64:
+        //   Model A: (512 + 64×48) / 32 = 112  ← old code: would PASS
+        //   Model B: 64 × 512 / 32      = 1024  ← correct:  must FAIL
+        int64_t MN = accElems;
+        int64_t MplusN = (accType.getRank() == 2)
+                           ? accType.getShape()[0] + accType.getShape()[1]
+                           : 2;
+        int64_t perLaneRegsA = std::max<int64_t>(1, (MN + K * MplusN) / kSimtWarpSize);
+        int64_t perLaneRegsB = std::max<int64_t>(1, (K * MN) / kSimtWarpSize);
+        int64_t worstCaseRegs = std::max(perLaneRegsA, perLaneRegsB);
+
+        if (worstCaseRegs > kMaxRegsPerThread) {
+          outerProductSafe = false;
+          llvm::errs()
+              << "[nova-simt-guard] Skipping OuterProduct for contract with "
+              << "acc=" << accElems << " K=" << K
+              << " → modelA=" << perLaneRegsA
+              << " modelB=" << perLaneRegsB
+              << " worst=" << worstCaseRegs
+              << " > " << kMaxRegsPerThread
+              << " budget. Using scf-loop lowering instead.\n";
+        }
+      });
+
+      if (outerProductSafe) {
+        // SIMT (CUDA-core) path: lower vector.contract → outer-product → llvm.fma.
+        // Estimated register pressure fits within budget — safe to unroll.
+        RewritePatternSet patterns(ctx);
+        vector::populateVectorContractLoweringPatterns(
+            patterns, vector::VectorContractLowering::OuterProduct);
+        vector::populateVectorTransferLoweringPatterns(patterns,
+                                                       /*maxTransferRank=*/1);
+        (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
+
+        // Step 3: Flatten shape-cast chains introduced by outer-product lowering.
+        // Only needed when OuterProduct ran — contracts must keep 2-D tile shapes
+        // on MMA path, and on the loop path there are no shape-casts to flatten.
+        RewritePatternSet shapeCastPatterns(ctx);
+        vector::populateVectorShapeCastLoweringPatterns(shapeCastPatterns);
+        (void)applyPatternsAndFoldGreedily(funcOp, std::move(shapeCastPatterns));
+      }
+      // If !outerProductSafe: vector.contract ops survive and are
+      // lowered by ConvertVectorToLLVMPass inside the GPU module
+      // (Passes.cpp Stage 38d2, ~line 1277/1300). That path uses an
+      // scf.for over K with a scalar fma body — constant register pressure
+      // regardless of K tile size.
     }
     // MMA path: vector.contract ops are preserved for ConvertVectorToGPU
     // (mma.sync / tensor-core lowering in the GPU pass pipeline).
-
-    // -----------------------------------------------------------------------
-    // Step 3: Flatten shape-cast chains introduced by outer-product lowering.
-    // Skip on the MMA path — contracts must keep their 2-D tile shapes so
-    // ConvertVectorToGPU pattern matching succeeds.
-    // -----------------------------------------------------------------------
-    if (!hasMMAContract) {
-      RewritePatternSet patterns(ctx);
-      vector::populateVectorShapeCastLoweringPatterns(patterns);
-      (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
-    }
 
     // -----------------------------------------------------------------------
     // Step 4: Wrap warp-level vector ops inside gpu.warp_execute_on_lane_0.
@@ -1270,14 +1608,23 @@ struct NovaGPUUnrollToIntrinsicsPass
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
 
-    llvm::errs() << "Checking Func: " << funcOp.getName() << "\n";
-
     // Collect per-op MMA shapes so the filter can look them up.
     // Walk upward from each vector.contract to find the nearest linalg op
     // carrying a non-zero mma_kind in its lowering_config.
+    //
+    // CRITICAL: Only consider contracts that have a 2D matmul structure
+    // (ACC is vector<M×N>). Reduction contracts like dbeta/dgamma have 3D
+    // accumulator maps and must NOT be tagged as MMA — PrepareVectorToMMA
+    // cannot match them and their survival causes nvvm.mma.sync with invalid
+    // shapes (k=64 instead of k=8) and nvvm.ldmatrix num=32/64 errors.
     llvm::DenseMap<Operation *, SmallVector<int64_t, 3>> opShapeMap;
     bool anyMMAKind = false;
     funcOp.walk([&](vector::ContractionOp contractOp) {
+      // Skip non-matmul contracts (3D reductions like dbeta, dgamma).
+      if (!isMatmulContract(contractOp)) {
+        opShapeMap[contractOp.getOperation()] = {}; // sentinel: SIMT path
+        return;
+      }
       Operation *cur = contractOp.getOperation();
       while (cur) {
         if (auto cfg = getLoweringConfig(cur)) {
@@ -1330,8 +1677,7 @@ struct NovaGPUUnrollToIntrinsicsPass
           mmaConfigToPropagate = cfg;
           break;
         }
-        // [AUDIT] If the config is on a parent op (e.g. linalg.matmul outside the unrolled loop),
-        // we must find it.
+        // Walk upward if config is on parent op (e.g. linalg.matmul).
         Operation *cur = kv.first;
         while (cur) {
           if (auto cfg = getLoweringConfig(cur)) {
@@ -1344,19 +1690,33 @@ struct NovaGPUUnrollToIntrinsicsPass
       }
     }
 
+    // Use a per-op shape callback so that:
+    //   • MMA contracts get unrolled to nativeShape {M, N, K}.
+    //   • SIMT contracts (opShapeMap value is empty) are skipped entirely.
+    //   • Non-matmul 3D reduction contracts (also empty in map) are skipped.
+    // Without this filter, populateVectorUnrollPatterns would unroll EVERY
+    // vector.contract in the function using the same nativeShape — including
+    // dbeta/dgamma reductions — producing contracts with wrong accumulator
+    // shapes that PrepareVectorToMMA cannot lower.
     vector::UnrollVectorOptions options;
-    options.setNativeShape(nativeShape);
-    // Unroll all vector.contract ops in this function to the shared native shape.
-    // This handles unrolling even for newly created ops during the process.
+    options.setNativeShapeFn(
+        [&](Operation *op) -> std::optional<SmallVector<int64_t, 3>> {
+          auto it = opShapeMap.find(op);
+          if (it == opShapeMap.end() || it->second.empty())
+            return std::nullopt; // Skip: SIMT or non-matmul contract.
+          return it->second;     // MMA contract: unroll to native shape.
+        });
     vector::populateVectorUnrollPatterns(patterns, options);
 
     if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns))))
       return signalPassFailure();
 
     // Re-attach MMA config to all newly-created unrolled vector.contract ops.
+    // Non-matmul contracts (dbeta etc.) must NOT receive an MMA config —
+    // they will be lowered via the SIMT/scalar path.
     if (mmaConfigToPropagate) {
       funcOp.walk([&](vector::ContractionOp contractOp) {
-        if (!getLoweringConfig(contractOp))
+        if (!getLoweringConfig(contractOp) && isMatmulContract(contractOp))
           setLoweringConfig(contractOp, mmaConfigToPropagate);
       });
     }
