@@ -246,6 +246,22 @@ SmallVector<int64_t> deriveThreadTileSizes(ArrayRef<int64_t> loopRanges,
   // Per-thread work = total elements / effective thread count.
   int64_t perThread = flatTrips / effectiveThreads;
 
+  // Prefer perThread >= maxVec so the innermost tile reaches maxVec (128-bit
+  // load width).  If the current perThread is smaller than maxVec, reduce
+  // effectiveThreads until perThread hits maxVec — as long as the resulting
+  // thread count stays within [warpSize, targetThreads] and divides evenly.
+  // Example: loopRanges=[1,4,128], target=256, maxVec=4 →
+  //   perThread=2 < 4 → try effectiveThreads=128 → perThread=4=maxVec ✓
+  if (perThread < maxVec) {
+    constexpr int64_t kWarpSize = 32;
+    int64_t preferred = flatTrips / maxVec;
+    if (preferred >= kWarpSize && preferred <= targetThreads &&
+        flatTrips % preferred == 0) {
+      effectiveThreads = preferred;
+      perThread = maxVec;
+    }
+  }
+
   // Distribute per-thread work across dims, innermost first.
   // Innermost dim is capped at maxVec for a single cp.async.16 instruction.
   // Remaining per-thread work is spread into outer dims (these become the

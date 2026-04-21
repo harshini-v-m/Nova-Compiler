@@ -16,18 +16,18 @@
 //   128, column 0 of every row maps to the same bank — a 32-way conflict for
 //   any warp that reads column 0 of all 32 rows simultaneously.
 //
-// Padding amount: 64_bits / elemBitWidth elements (= always 8 bytes):
-//   f32 (32-bit):  pad 2 elements per row  → stride += 8 bytes
-//   f16/bf16 (16-bit):  pad 4 elements     → stride += 8 bytes
-//   f64 (64-bit):  pad 1 element           → stride += 8 bytes
+// Padding amount: 16 bytes / elemBytes elements (= always 16 bytes):
+//   f32 (4 B):   pad 4 elements per row  → stride += 16 bytes
+//   f16/bf16 (2 B): pad 8 elements       → stride += 16 bytes
+//   f64 (8 B):   pad 2 elements          → stride += 16 bytes
 //
 // Example (f32, 128-column tile):
 //   Before: memref<128x128xf32, workgroup>  → row stride = 512 bytes = 4×128
 //           → 32-way bank conflict on col-0 access pattern
-//   After:  %padded = memref.alloc() : memref<128x130xf32, workgroup>
+//   After:  %padded = memref.alloc() : memref<128x132xf32, workgroup>
 //           %view   = memref.subview %padded[0,0][128,128][1,1]
-//           → row stride = 520 bytes (not a multiple of 128)
-//           → bank conflicts eliminated for typical column access patterns
+//           → row stride = 528 bytes (not a multiple of 128, 16-byte aligned)
+//           → bank conflicts eliminated; ldmatrix 16-byte alignment satisfied
 //
 // Pre-flight check: the pass skips any allocation where the padded footprint
 // would itself exceed maxWorkgroupMemBytes — GPUCheckResourceUsagePass will
@@ -100,6 +100,10 @@ struct NovaGPUReduceBankConflictsPass
         return;
       if (ShapedType::isDynamic(memrefType.getShape().back()))
         return;
+      if (alloc->hasAttr("nova.swizzled")) {
+        llvm::errs() << "[nova-reduce-bank-conflicts] skipping swizzled alloc: " << alloc << "\n";
+        return;
+      }
       wgAllocs.push_back(alloc);
     });
 
@@ -189,7 +193,19 @@ struct NovaGPUReduceBankConflictsPass
                                                paddedAlloc.getResult(),
                                                offsets, sizes, strides);
 
-      // Replace all uses of the original unpadded alloc with the subview.
+      // Replace all uses of the original unpadded alloc with the subview,
+      // EXCEPT dealloc ops — those must target the padded base alloc, not a
+      // subview.  Deallocing a subview is undefined behaviour (it's not an
+      // allocation root); we redirect them to paddedAlloc before the blanket
+      // replaceAllUsesWith so the dealloc keeps pointing at valid memory.
+      SmallVector<memref::DeallocOp> deallocsToFix;
+      for (Operation *user : llvm::make_early_inc_range(alloc.getResult().getUsers())) {
+        if (auto dealloc = dyn_cast<memref::DeallocOp>(user))
+          deallocsToFix.push_back(dealloc);
+      }
+      for (memref::DeallocOp dealloc : deallocsToFix)
+        dealloc.getMemrefMutable().assign(paddedAlloc.getResult());
+
       alloc.getResult().replaceAllUsesWith(subview.getResult());
       alloc.erase();
 
@@ -233,14 +249,16 @@ struct NovaGPUReduceBankConflictsPass
               llvm::to_vector(sv.getStaticOffsets());
 
           // result_stride[i] = src_stride[i] * sv_static_stride[i]
-          SmallVector<int64_t> newStrides;
-          newStrides.reserve(srcStrides.size());
+          // Keep the full per-source-dim stride list; we'll filter out the
+          // dropped dims below for rank-reducing subviews.
+          SmallVector<int64_t> allStrides;
+          allStrides.reserve(srcStrides.size());
           for (size_t i = 0; i < srcStrides.size(); ++i) {
             if (ShapedType::isDynamic(srcStrides[i]) ||
                 ShapedType::isDynamic(svStaticStrides[i]))
-              newStrides.push_back(ShapedType::kDynamic);
+              allStrides.push_back(ShapedType::kDynamic);
             else
-              newStrides.push_back(srcStrides[i] * svStaticStrides[i]);
+              allStrides.push_back(srcStrides[i] * svStaticStrides[i]);
           }
 
           // result_base_offset = src_base_offset + Σ(sv_offset[i] * src_stride[i])
@@ -256,7 +274,28 @@ struct NovaGPUReduceBankConflictsPass
             newOffset += svStaticOffsets[i] * srcStrides[i];
           }
 
+          // Phase 5 fix: strip strides for dropped dims on rank-reducing
+          // subviews.  The multi-buffer pass (Phase 1 of software pipelining)
+          // produces rank-reducing subviews of the form
+          //   memref.subview %ring[%i, 0, 0][1, M, K][1,1,1] :
+          //     memref<N×M×K> to memref<M×K, strided<[K, 1], offset: ?>>
+          // where the leading unit dim is dropped.  Without this filter we
+          // would pass 3 strides to a rank-2 MemRefType::get and crash the
+          // verifier.
+          llvm::SmallBitVector droppedDims = sv.getDroppedDims();
+          SmallVector<int64_t> newStrides;
+          newStrides.reserve(allStrides.size() - droppedDims.count());
+          for (size_t i = 0; i < allStrides.size(); ++i) {
+            if (!droppedDims.test(i))
+              newStrides.push_back(allStrides[i]);
+          }
+
           auto oldResult = sv.getType();
+          // Safety: if stride filtering disagrees with the result rank (e.g.,
+          // pre-existing malformed subview), skip this op rather than crash.
+          if (static_cast<int64_t>(newStrides.size()) != oldResult.getRank())
+            continue;
+
           auto newResultType = MemRefType::get(
               oldResult.getShape(), oldResult.getElementType(),
               StridedLayoutAttr::get(ctx, newOffset, newStrides),
@@ -275,7 +314,8 @@ struct NovaGPUReduceBankConflictsPass
   }
   StringRef getDescription() const override {
     return "Pads the innermost dimension of workgroup shared memory allocs "
-           "by 64 bits to shift row bank alignment and reduce bank conflicts";
+           "by 16 bytes (4 f32 / 8 f16 elems) to shift row bank alignment "
+           "and satisfy ldmatrix 16-byte alignment on Ampere+";
   }
 };
 

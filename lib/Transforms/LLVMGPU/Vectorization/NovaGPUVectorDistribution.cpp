@@ -288,20 +288,16 @@ computeElementOffsets(OpBuilder &b, Location loc, const OperandLayout &L,
 // The loop below iterates over (batchIdx, tileIdx) explicitly so the memory
 // offset and the insertion index into the result vector are both computed
 // correctly without any intermediate flat-element decode.
-
 static Value interleavedTransferRead(OpBuilder &b, vector::TransferReadOp read,
                                      const OperandLayout &L, VectorType vType,
                                      Value laneId, ArrayRef<Value> baseIndices,
                                      ArrayRef<Value> precomputedTOff = {}) {
   Location loc = read.getLoc();
-  auto shape = vType.getShape();   // shape[d] = batchCounts[d] * elemCounts[d]
+  auto shape = vType.getShape();
   int vRank  = shape.size();
   int mRank  = baseIndices.size();
   Value result = b.create<arith::ConstantOp>(loc, vType, b.getZeroAttr(vType));
 
-  // Thread offsets within a single MMA tile (no batch factor).
-  // Use pre-computed offsets if provided (avoids re-emitting divui/remui chains
-  // when called in a loop — thread position is constant across iterations).
   SmallVector<Value> tOff;
   if (!precomputedTOff.empty()) {
     tOff = SmallVector<Value>(precomputedTOff.begin(), precomputedTOff.end());
@@ -310,24 +306,40 @@ static Value interleavedTransferRead(OpBuilder &b, vector::TransferReadOp read,
                                 /*mmaTileOnly=*/true);
   }
 
-  // Iterate over all (batch, element) index combinations.
-  // elemShape[d] = elemCounts[d].
-  // batchShape[d] = vType.shape[d] / elemCounts[d]:
-  //   - For ACC (perThreadType):      shape[d] = batchCounts[d]*elemCounts[d] → batchShape[d] = batchCounts[d]
-  //   - For A/B (perTileThreadType):  shape[d] = elemCounts[d]                → batchShape[d] = 1
-  // Using vType.shape to derive batchShape prevents out-of-bounds vecIdx when
-  // the caller passes a tile-only vector type (no batch dimension in the vector).
   SmallVector<int64_t> batchShape(vRank), elemShape(vRank);
-  int64_t totalBatch = 1, totalElem = 1;
+  int64_t totalBatch = 1;
   for (int d = 0; d < vRank; ++d) {
     elemShape[d]  = L.elemCounts[d];
     batchShape[d] = (elemShape[d] > 0) ? (shape[d] / elemShape[d]) : 1;
     totalBatch   *= batchShape[d];
-    totalElem    *= elemShape[d];
+  }
+
+  // ── Detect contiguous inner dimension for vectorized loads ──
+  // If the innermost dimension of elemShape has size > 1 and stride 1 in the
+  // source memref, we can load the entire inner row with one vector.transfer_read
+  // instead of N scalar memref.load + vector.insert sequences.
+  int innerDim = vRank - 1;
+  int64_t innerElemCount = elemShape[innerDim];
+
+  // Check if the source memref has stride 1 on the innermost dimension.
+  // For subviews of shared memory (stride [64,1] or [8,1]) this is always true.
+  bool innerContiguous = false;
+  if (innerElemCount > 1) {
+    auto memType = cast<MemRefType>(read.getBase().getType());
+    // For static strides: check last stride == 1
+    // For dynamic strides from subviews: conservatively check layout
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    if (succeeded(memType.getStridesAndOffset(strides, offset))) {
+      if (!strides.empty() && strides.back() == 1)
+        innerContiguous = true;
+    }
+    // Also handle the case where memref has identity layout (no explicit strides)
+    if (memType.getLayout().isIdentity())
+      innerContiguous = true;
   }
 
   for (int64_t bi = 0; bi < totalBatch; ++bi) {
-    // Decode batch multi-index.
     SmallVector<int64_t> bIdx(vRank);
     int64_t tmp = bi;
     for (int d = vRank - 1; d >= 0; --d) {
@@ -335,41 +347,104 @@ static Value interleavedTransferRead(OpBuilder &b, vector::TransferReadOp read,
       tmp     /= batchShape[d];
     }
 
-    for (int64_t ei = 0; ei < totalElem; ++ei) {
-      // Decode within-tile element multi-index.
-      SmallVector<int64_t> eIdx(vRank);
-      tmp = ei;
-      for (int d = vRank - 1; d >= 0; --d) {
-        eIdx[d] = tmp % elemShape[d];
-        tmp     /= elemShape[d];
+    if (innerContiguous) {
+  int64_t outerTotal = 1;
+  SmallVector<int64_t> outerShape(vRank, 1);
+  for (int d = 0; d < vRank; ++d) {
+    if (d != innerDim) {
+      outerShape[d] = elemShape[d];
+      outerTotal *= elemShape[d];
+    }
+  }
+
+  for (int64_t oi = 0; oi < outerTotal; ++oi) {
+    SmallVector<int64_t> outerIdx(vRank, 0);
+    tmp = oi;
+    for (int d = vRank - 2; d >= 0; --d) {
+      outerIdx[d] = tmp % outerShape[d];
+      tmp /= outerShape[d];
+    }
+
+    // Compute memory indices for the start of this row
+    SmallVector<Value> loadOff;
+    for (int d = 0; d < mRank; ++d) {
+      Value off = tOff[d];
+      int64_t batchStride = L.threadCounts[d] * L.elemCounts[d];
+      if (bIdx[d] > 0) {
+        Value bs = b.create<arith::ConstantIndexOp>(loc, bIdx[d] * batchStride);
+        off = b.create<arith::AddIOp>(loc, off, bs);
       }
-
-      // Memory offset for this (batch, element):
-      //   tOff[d]  — thread's base within one MMA tile
-      //   batchIdx * threadCounts * elemCounts — full-tile stride per batch step
-      //   eIdx[d]  — element within the tile
-      SmallVector<Value> finalOff;
-      for (int d = 0; d < mRank; ++d) {
-        Value off = tOff[d];
-        int64_t batchStride = L.threadCounts[d] * L.elemCounts[d];
-        if (bIdx[d] > 0) {
-          Value bs = b.create<arith::ConstantIndexOp>(loc, bIdx[d] * batchStride);
-          off = b.create<arith::AddIOp>(loc, off, bs);
-        }
-        if (eIdx[d] > 0) {
-          Value es = b.create<arith::ConstantIndexOp>(loc, eIdx[d]);
-          off = b.create<arith::AddIOp>(loc, off, es);
-        }
-        finalOff.push_back(b.create<arith::AddIOp>(loc, baseIndices[d], off));
+      if (d != innerDim && outerIdx[d] > 0) {
+        Value es = b.create<arith::ConstantIndexOp>(loc, outerIdx[d]);
+        off = b.create<arith::AddIOp>(loc, off, es);
       }
+      loadOff.push_back(b.create<arith::AddIOp>(loc, baseIndices[d], off));
+    }
 
-      // Insertion index in the per-thread vector (contiguous batch*elem layout).
-      SmallVector<int64_t> vecIdx(vRank);
-      for (int d = 0; d < vRank; ++d)
-        vecIdx[d] = bIdx[d] * elemShape[d] + eIdx[d];
+    // Emit a single vector load
+    auto rowType = VectorType::get({innerElemCount}, vType.getElementType());
+    Value padding = b.create<arith::ConstantOp>(
+        loc, vType.getElementType(), b.getZeroAttr(vType.getElementType()));
+    SmallVector<bool> inBounds(1, true);
+    Value row = b.create<vector::TransferReadOp>(
+        loc, rowType, read.getBase(), loadOff, padding, inBounds);
 
-      Value scalar = b.create<memref::LoadOp>(loc, read.getBase(), finalOff);
-      result = b.create<vector::InsertOp>(loc, scalar, result, vecIdx);
+    // ── Direct insertion instead of element-by-element ──
+    // Compute the insertion point in the result vector
+    SmallVector<int64_t> insertOff(vRank, 0);
+    SmallVector<int64_t> insertSize(vRank, 1);
+    SmallVector<int64_t> insertStride(vRank, 1);
+    for (int d = 0; d < vRank; ++d) {
+      if (d == innerDim) {
+        insertOff[d] = bIdx[d] * elemShape[d];
+        insertSize[d] = innerElemCount;
+      } else {
+        insertOff[d] = bIdx[d] * elemShape[d] + outerIdx[d];
+        insertSize[d] = 1;
+      }
+    }
+
+    // Reshape the 1-D loaded row to match the slice shape for insertion
+    auto sliceType = VectorType::get(insertSize, vType.getElementType());
+    Value shaped = b.create<vector::ShapeCastOp>(loc, sliceType, row);
+    result = b.create<vector::InsertStridedSliceOp>(
+        loc, shaped, result, insertOff, insertStride);
+  }
+} else {
+      // ── Scalar fallback: original element-by-element path ──
+      int64_t totalElem = 1;
+      for (int d = 0; d < vRank; ++d) totalElem *= elemShape[d];
+
+      for (int64_t ei = 0; ei < totalElem; ++ei) {
+        SmallVector<int64_t> eIdx(vRank);
+        tmp = ei;
+        for (int d = vRank - 1; d >= 0; --d) {
+          eIdx[d] = tmp % elemShape[d];
+          tmp     /= elemShape[d];
+        }
+
+        SmallVector<Value> finalOff;
+        for (int d = 0; d < mRank; ++d) {
+          Value off = tOff[d];
+          int64_t batchStride = L.threadCounts[d] * L.elemCounts[d];
+          if (bIdx[d] > 0) {
+            Value bs = b.create<arith::ConstantIndexOp>(loc, bIdx[d] * batchStride);
+            off = b.create<arith::AddIOp>(loc, off, bs);
+          }
+          if (eIdx[d] > 0) {
+            Value es = b.create<arith::ConstantIndexOp>(loc, eIdx[d]);
+            off = b.create<arith::AddIOp>(loc, off, es);
+          }
+          finalOff.push_back(b.create<arith::AddIOp>(loc, baseIndices[d], off));
+        }
+
+        SmallVector<int64_t> vecIdx(vRank);
+        for (int d = 0; d < vRank; ++d)
+          vecIdx[d] = bIdx[d] * elemShape[d] + eIdx[d];
+
+        Value scalar = b.create<memref::LoadOp>(loc, read.getBase(), finalOff);
+        result = b.create<vector::InsertOp>(loc, scalar, result, vecIdx);
+      }
     }
   }
   return result;
@@ -381,11 +456,10 @@ static void interleavedTransferWrite(OpBuilder &b, vector::TransferWriteOp write
                                       ArrayRef<Value> precomputedTOff = {}) {
   Location loc = write.getLoc();
   auto vType = cast<VectorType>(data.getType());
-  auto shape = vType.getShape();   // shape[d] = batchCounts[d] * elemCounts[d]
+  auto shape = vType.getShape();
   int vRank  = shape.size();
   int mRank  = baseIndices.size();
 
-  // Thread offsets within a single MMA tile (no batch factor).
   SmallVector<Value> tOff;
   if (!precomputedTOff.empty()) {
     tOff = SmallVector<Value>(precomputedTOff.begin(), precomputedTOff.end());
@@ -395,12 +469,27 @@ static void interleavedTransferWrite(OpBuilder &b, vector::TransferWriteOp write
   }
 
   SmallVector<int64_t> batchShape(vRank), elemShape(vRank);
-  int64_t totalBatch = 1, totalElem = 1;
+  int64_t totalBatch = 1;
   for (int d = 0; d < vRank; ++d) {
     elemShape[d]  = L.elemCounts[d];
     batchShape[d] = (elemShape[d] > 0) ? (shape[d] / elemShape[d]) : 1;
     totalBatch   *= batchShape[d];
-    totalElem    *= elemShape[d];
+  }
+
+  int innerDim = vRank - 1;
+  int64_t innerElemCount = elemShape[innerDim];
+
+  bool innerContiguous = false;
+  if (innerElemCount > 1) {
+    auto memType = cast<MemRefType>(write.getBase().getType());
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    if (succeeded(memType.getStridesAndOffset(strides, offset))) {
+      if (!strides.empty() && strides.back() == 1)
+        innerContiguous = true;
+    }
+    if (memType.getLayout().isIdentity())
+      innerContiguous = true;
   }
 
   for (int64_t bi = 0; bi < totalBatch; ++bi) {
@@ -411,40 +500,101 @@ static void interleavedTransferWrite(OpBuilder &b, vector::TransferWriteOp write
       tmp     /= batchShape[d];
     }
 
-    for (int64_t ei = 0; ei < totalElem; ++ei) {
-      SmallVector<int64_t> eIdx(vRank);
-      tmp = ei;
-      for (int d = vRank - 1; d >= 0; --d) {
-        eIdx[d] = tmp % elemShape[d];
-        tmp     /= elemShape[d];
+    if (innerContiguous) {
+      int64_t outerTotal = 1;
+      SmallVector<int64_t> outerShape(vRank, 1);
+      for (int d = 0; d < vRank; ++d) {
+        if (d != innerDim) {
+          outerShape[d] = elemShape[d];
+          outerTotal *= elemShape[d];
+        }
       }
 
-      SmallVector<Value> finalOff;
-      for (int d = 0; d < mRank; ++d) {
-        Value off = tOff[d];
-        int64_t batchStride = L.threadCounts[d] * L.elemCounts[d];
-        if (bIdx[d] > 0) {
-          Value bs = b.create<arith::ConstantIndexOp>(loc, bIdx[d] * batchStride);
-          off = b.create<arith::AddIOp>(loc, off, bs);
+      for (int64_t oi = 0; oi < outerTotal; ++oi) {
+        SmallVector<int64_t> outerIdx(vRank, 0);
+        tmp = oi;
+        for (int d = vRank - 2; d >= 0; --d) {
+          outerIdx[d] = tmp % outerShape[d];
+          tmp /= outerShape[d];
         }
-        if (eIdx[d] > 0) {
-          Value es = b.create<arith::ConstantIndexOp>(loc, eIdx[d]);
-          off = b.create<arith::AddIOp>(loc, off, es);
+
+        // ── Direct extraction using ExtractStridedSliceOp ──
+        SmallVector<int64_t> extractOff(vRank, 0);
+        SmallVector<int64_t> extractSize(vRank, 1);
+        SmallVector<int64_t> extractStride(vRank, 1);
+        for (int d = 0; d < vRank; ++d) {
+          if (d == innerDim) {
+            extractOff[d] = bIdx[d] * elemShape[d];
+            extractSize[d] = innerElemCount;
+          } else {
+            extractOff[d] = bIdx[d] * elemShape[d] + outerIdx[d];
+            extractSize[d] = 1;
+          }
         }
-        finalOff.push_back(b.create<arith::AddIOp>(loc, baseIndices[d], off));
+
+        Value slice = b.create<vector::ExtractStridedSliceOp>(
+            loc, data, extractOff, extractSize, extractStride);
+        auto rowType = VectorType::get({innerElemCount}, vType.getElementType());
+        Value row = b.create<vector::ShapeCastOp>(loc, rowType, slice);
+
+        // Compute memory indices for the start of this row
+        SmallVector<Value> storeOff;
+        for (int d = 0; d < mRank; ++d) {
+          Value off = tOff[d];
+          int64_t batchStride = L.threadCounts[d] * L.elemCounts[d];
+          if (bIdx[d] > 0) {
+            Value bs = b.create<arith::ConstantIndexOp>(loc, bIdx[d] * batchStride);
+            off = b.create<arith::AddIOp>(loc, off, bs);
+          }
+          if (d != innerDim && outerIdx[d] > 0) {
+            Value es = b.create<arith::ConstantIndexOp>(loc, outerIdx[d]);
+            off = b.create<arith::AddIOp>(loc, off, es);
+          }
+          storeOff.push_back(b.create<arith::AddIOp>(loc, baseIndices[d], off));
+        }
+
+        SmallVector<bool> inBounds(1, true);
+        b.create<vector::TransferWriteOp>(
+            loc, row, write.getBase(), storeOff, inBounds);
       }
+    } else {
+      // ── Scalar fallback ──
+      int64_t totalElem = 1;
+      for (int d = 0; d < vRank; ++d) totalElem *= elemShape[d];
 
-      // Extraction index from the per-thread vector (contiguous batch*elem layout).
-      SmallVector<int64_t> vecIdx(vRank);
-      for (int d = 0; d < vRank; ++d)
-        vecIdx[d] = bIdx[d] * elemShape[d] + eIdx[d];
+      for (int64_t ei = 0; ei < totalElem; ++ei) {
+        SmallVector<int64_t> eIdx(vRank);
+        tmp = ei;
+        for (int d = vRank - 1; d >= 0; --d) {
+          eIdx[d] = tmp % elemShape[d];
+          tmp     /= elemShape[d];
+        }
 
-      Value scalar = b.create<vector::ExtractOp>(loc, data, vecIdx);
-      b.create<memref::StoreOp>(loc, scalar, write.getBase(), finalOff);
+        SmallVector<Value> finalOff;
+        for (int d = 0; d < mRank; ++d) {
+          Value off = tOff[d];
+          int64_t batchStride = L.threadCounts[d] * L.elemCounts[d];
+          if (bIdx[d] > 0) {
+            Value bs = b.create<arith::ConstantIndexOp>(loc, bIdx[d] * batchStride);
+            off = b.create<arith::AddIOp>(loc, off, bs);
+          }
+          if (eIdx[d] > 0) {
+            Value es = b.create<arith::ConstantIndexOp>(loc, eIdx[d]);
+            off = b.create<arith::AddIOp>(loc, off, es);
+          }
+          finalOff.push_back(b.create<arith::AddIOp>(loc, baseIndices[d], off));
+        }
+
+        SmallVector<int64_t> vecIdx(vRank);
+        for (int d = 0; d < vRank; ++d)
+          vecIdx[d] = bIdx[d] * elemShape[d] + eIdx[d];
+
+        Value scalar = b.create<vector::ExtractOp>(loc, data, vecIdx);
+        b.create<memref::StoreOp>(loc, scalar, write.getBase(), finalOff);
+      }
     }
   }
 }
-
 //===----------------------------------------------------------------------===//
 // §6  Per-thread vector type (for non-MMA fallback)
 //===----------------------------------------------------------------------===//

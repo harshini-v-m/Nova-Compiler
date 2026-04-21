@@ -1122,14 +1122,20 @@ struct NovaScatterAddOpLowering
           rewriter.getContext(), gpu::MappingId::DimX));
     }
 
-    auto outerForall = scf::ForallOp::create(
-        rewriter, loc, outerLbs, outerUbs, outerSteps, ValueRange{},
+    auto outerForall = rewriter.create<scf::ForallOp>(
+        loc, outerLbs, outerUbs, outerSteps, ValueRange{},
         rewriter.getArrayAttr(blockMapping));
 
     {
       Block *outerBody = outerForall.getBody();
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(outerBody, outerBody->without_terminator().begin());
+
+      // Capture outer IVs directly from block args — getInductionVars() on a
+      // ConversionPatternRewriter-created op can return remapped values after
+      // the insertion point moves into a nested body.
+      SmallVector<Value> outerIVsSaved(outerBody->getArguments().begin(),
+                                       outerBody->getArguments().end());
 
       // Inner forall: thread-mapped over the innermost dim.
       SmallVector<OpFoldResult> innerUbs;
@@ -1140,8 +1146,8 @@ struct NovaScatterAddOpLowering
       else
         innerUbs.push_back(rewriter.getIndexAttr(innerSize));
 
-      auto innerForall = scf::ForallOp::create(
-          rewriter, loc,
+      auto innerForall = rewriter.create<scf::ForallOp>(
+          loc,
           SmallVector<OpFoldResult>{rewriter.getIndexAttr(0)}, innerUbs,
           SmallVector<OpFoldResult>{rewriter.getIndexAttr(1)}, ValueRange{},
           rewriter.getArrayAttr(SmallVector<Attribute>{
@@ -1153,14 +1159,13 @@ struct NovaScatterAddOpLowering
 
       // Compose IVs: outer IVs (blocks) + inner IV (thread within block).
       SmallVector<Value> ivs;
-      ValueRange outerIVs = outerForall.getInductionVars();
       if (srcRank == 1) {
         // 1D: elemIdx = blockIV * kMaxThreadsPerBlock + threadIV,
         // guarded against the last-block tail when N % 1024 != 0.
         Value elemIdx = rewriter.create<arith::AddIOp>(
             loc,
             rewriter.create<arith::MulIOp>(
-                loc, outerIVs[0],
+                loc, outerIVsSaved[0],
                 rewriter.create<arith::ConstantIndexOp>(loc, kMaxThreadsPerBlock)),
             innerForall.getInductionVars()[0]);
         Value inBounds = rewriter.create<arith::CmpIOp>(
@@ -1171,7 +1176,7 @@ struct NovaScatterAddOpLowering
         rewriter.setInsertionPointToStart(ifOp.thenBlock());
         ivs.push_back(elemIdx);
       } else {
-        for (Value iv : outerIVs)
+        for (Value iv : outerIVsSaved)
           ivs.push_back(iv);
         ivs.push_back(innerForall.getInductionVars()[0]);
       }

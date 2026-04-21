@@ -54,6 +54,7 @@
 #include "Compiler/Transforms/LLVMGPU/NovaScfLoopVectorize.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/Dialect/Vector/Transforms/VectorDistribution.h"
@@ -243,7 +244,7 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(createNovaGPUVectorDistributePass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
-
+    //  pm.addNestedPass<func::FuncOp>(createNovaGPUReduceBankConflictsPass());
     // ── Step 8.5: Eliminate degenerate single-iteration foralls ────────────
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
     pm.addPass(createCanonicalizerPass());
@@ -254,9 +255,54 @@ namespace mlir::nova
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
+    // ── Step 8.75: Vectorize memref.copy ops that target workgroup (shared)
+    // memory so they lower to vector.transfer ops instead of a
+    // @memrefCopy runtime call.  @memrefCopy is declared in the host
+    // builtin.module only; if a copy reaches gpu.module outlining it
+    // becomes an out-of-scope symbol reference and LLVM translation fails.
+    // Restrict to workgroup-destined copies only — host-side embedding-table
+    // copies must NOT be vectorized here (they are device→device memrefs
+    // and produce unrealized_conversion_cast on the host side).
+    pm.addNestedPass<func::FuncOp>([&]() -> std::unique_ptr<Pass> {
+      struct VectorizeCopiesOnlyPass
+          : public PassWrapper<VectorizeCopiesOnlyPass,
+                               OperationPass<func::FuncOp>> {
+        MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VectorizeCopiesOnlyPass)
+        void runOnOperation() override {
+          IRRewriter rewriter(&getContext());
+          getOperation().walk([&](memref::CopyOp op) {
+            auto dstTy = dyn_cast<MemRefType>(op.getTarget().getType());
+            if (!dstTy) return;
+            // Only vectorize copies whose destination is workgroup (shared) memory.
+            auto memSpace = dstTy.getMemorySpace();
+            if (!memSpace) return;
+            auto gpuSpace = dyn_cast<gpu::AddressSpaceAttr>(memSpace);
+            if (!gpuSpace ||
+                gpuSpace.getValue() !=
+                    gpu::GPUDialect::getWorkgroupAddressSpace())
+              return;
+            rewriter.setInsertionPoint(op);
+            (void)linalg::vectorizeCopy(rewriter, op);
+          });
+        }
+        StringRef getArgument() const override {
+          return "nova-vectorize-copies-only";
+        }
+      };
+      return std::make_unique<VectorizeCopiesOnlyPass>();
+    }());
+
     // ── Step 9: scf.forall → gpu.launch ────────────────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaGPUMapForallToGPUPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
 
+    // ── Step 9.5: Sink arith.constant ops into gpu.launch bodies ───────────
+    // Prevents dense<true> mask constants (e.g. vector.gather all-true mask)
+    // from being captured as kernel arguments by the outliner (Step 12).
+    // Without this, the PTX backend sees an opaque runtime predicate and emits
+    // 4 serial @%p-guarded ld.global instead of 4 parallel unconditional loads.
+    pm.addPass(mlir::createGpuLaunchSinkIndexComputationsPass());
 
     // ── Step 10: Lower linalg → scf loops ──────────────────────────────────
     pm.addPass(createConvertLinalgToLoopsPass());
@@ -264,9 +310,10 @@ namespace mlir::nova
 
     pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
 
-    // // ── Scalar accumulator + warp shuffle reduction ─────────────────────────
-    // pm.addNestedPass<func::FuncOp>(
-    //     mlir::nova::createSCFScalarizeAccumulatorPass());
+    // ── Scalar accumulator: scalarize loop accumulators, atomicize cross-block
+    // stores, and insert gpu.memset before distributed reduction launches.
+    pm.addNestedPass<func::FuncOp>(
+        mlir::nova::createSCFScalarizeAccumulatorPass());
      pm.addNestedPass<func::FuncOp>(
         mlir::vector::createLowerVectorMultiReductionPass(
             mlir::vector::VectorMultiReductionLowering::InnerReduction));
@@ -276,17 +323,9 @@ namespace mlir::nova
     //     mlir::nova::createNovaWarpShuffleReductionPass());
     // pm.addPass(createCanonicalizerPass());
     // pm.addPass(createCSEPass());
-
-    // // ── Loop optimizations ──────────────────────────────────────────────────
-    // pm.addNestedPass<func::FuncOp>(mlir::nova::createNovaScfLoopSplitPass());
-    // pm.addPass(createCanonicalizerPass());
-
-    // Lower vector.multi_reduction → inner-reduction (transfer_read/write +
-    // arith) before GPU kernel outlining so the ops are still on func::FuncOp
-    // where this pass can see them.
    
     // ── Reposition stores ───────────────────────────────────────────────────
-    pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
+    // pm.addNestedPass<mlir::func::FuncOp>(createNovaRepositionStorePass());
 
     // ── Step 11: Insert workgroup barriers ──────────────────────────────────
     pm.addNestedPass<func::FuncOp>(

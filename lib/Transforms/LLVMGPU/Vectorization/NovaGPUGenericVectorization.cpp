@@ -2,56 +2,34 @@
 //
 // Vectorize linalg ops to vector.* for the Nova MMA pipeline.
 //
-// Two categories of ops:
-//
+// Three categories:
 //   A. MMA contraction ops (linalg.batch_matmul with nova.layout_* attrs):
-//        Parks nova.layout_0/1/2 + lowering_config on the enclosing
-//        scf.forall before linalg::vectorize erases the op, then transfers
-//        them to the vector.contract after Phase 2 canonicalization.
+//        Parks nova.layout_* + lowering_config on the enclosing scf.forall
+//        before linalg::vectorize erases the op, then transfers them to the
+//        vector.contract after Phase 2 canonicalization.
+//        (The contract only appears after populateVectorReductionToContractPatterns
+//        which runs via an internal rewriter; the forall is the stable anchor.)
+//   B. Static-shape non-MMA ops: linalg::vectorize → vector.transfer_read/write.
+//        Pure-gather generics (only index→extract→yield) are rewritten to
+//        transfer_read directly.  Mixed bodies with a label-driven gather have
+//        the tensor.extract hoisted out so no vector.gather is emitted.
+//   C. Dynamic-shape ops: inferNovaVectorSizes() → ValueBounds UB analysis →
+//        masked vectorize (mask eliminated in Phase 3 if statically all-true).
 //
-//        Why park on the forall and not intercept at creation?
-//        linalg::vectorize for batch_matmul emits an outer-product /
-//        multi-reduce decomposition — NOT a vector.contract directly.
-//        The vector.contract only appears after Phase 2's
-//        populateVectorReductionToContractPatterns, which runs through its
-//        own internal rewriter.  A RewriterBase::Listener on the outer
-//        IRRewriter never fires for ops created by the pattern driver.
-//        The enclosing scf.forall is stable across both phases and is the
-//        only reliable anchor to correlate a contract back to its source.
-//
-//   B. Static-shape non-MMA ops (linalg.copy, tensor.pad, etc.):
-//        linalg::vectorize(op, {})  →  vector.transfer_read/write
-//        No masking needed — shapes are guaranteed static after padding.
-//
-//   C. Dynamic-shape ops (GELU epilogue on tensor<1x64x?xf32>):
-//        inferNovaVectorSizes() → ValueBounds UB analysis → vectorSizes
-//        linalg::vectorize(op, vectorSizes) → vector.mask { ... }
-//        Mask eliminated in Phase 3 if statically all-true.
-//
-// Pipeline position:
-//   NovaGPUConfigureTensorLayouts   → attaches nova.layout_* to matmul
-//           ↓
-//   NovaGenericVectorization        ← THIS PASS
-//           ↓
-//   NovaGPUUnrollToIntrinsics       → reads batch_counts from layout on contract
-//           ↓
-//   NovaGPUVectorDistribute         → reads sg/thread/elem from layout on contract
-//
-// Phase 1: Vectorize all LinalgOps + tensor.pad bottom-up.
-//          MMA ops → park attrs on parent scf.forall, then plain vectorize.
-//          Static ops → plain vectorize.
-//          Dynamic ops → masked vectorize via ValueBounds.
-// Phase 2: Canonicalize to vector.contract
-//          (TransferPermMap + Sink + ReductionToContract).
-// Phase 2.5: Transfer parked nova.layout_* from scf.forall → vector.contract.
-// Phase 3: Eliminate always-true vector.mask ops.
-// Phase 4: Canonicalize mask predicates.
-// Phase 5: Lower vector.mask { transfer } to predicated form.
+// Phases:
+//   1. Vectorize all LinalgOps + tensor.pad (bottom-up).
+//   2. Canonicalize to vector.contract.
+//   2.5. Transfer parked nova.layout_* from forall → contract.
+//   3. Eliminate always-true vector.mask ops.
+//   4. Canonicalize mask predicates.
+//   5. Lower vector.mask { transfer } to predicated form.
 //
 //===----------------------------------------------------------------------===//
 
 #include "Compiler/Transforms/LLVMGPU/NovaVectorSizeUtils.h"
 #include "Passes.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -62,6 +40,7 @@
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "mlir/Pass/Pass.h"
@@ -76,7 +55,7 @@ namespace mlir::nova {
 namespace {
 
 //===----------------------------------------------------------------------===//
-// §1  Constants
+// Constants
 //===----------------------------------------------------------------------===//
 
 static constexpr int64_t kMaxVectorSize = 4096LL * 4096LL;
@@ -86,15 +65,14 @@ static constexpr StringLiteral kLayout1        = "nova.layout_1";
 static constexpr StringLiteral kLayout2        = "nova.layout_2";
 static constexpr StringLiteral kLoweringConfig = "lowering_config";
 
-// Temporary attributes parked on the parent scf.forall during Phase 1.
-// Cleared during Phase 2.5 once transferred to vector.contract.
+// Temporary attrs parked on the parent scf.forall during Phase 1.
 static constexpr StringLiteral kPendingLayout0 = "nova._pl0";
 static constexpr StringLiteral kPendingLayout1 = "nova._pl1";
 static constexpr StringLiteral kPendingLayout2 = "nova._pl2";
 static constexpr StringLiteral kPendingConfig  = "nova._pc";
 
 //===----------------------------------------------------------------------===//
-// §2  Pure helpers
+// Pure helpers
 //===----------------------------------------------------------------------===//
 
 static bool hasStaticShape(linalg::LinalgOp op) {
@@ -110,10 +88,8 @@ static LogicalResult isWithinVectorSizeLimit(linalg::LinalgOp op) {
   int64_t maxFlat = 1;
   for (OpOperand &operand : op->getOpOperands()) {
     auto ty = dyn_cast<ShapedType>(operand.get().getType());
-    if (!ty)
-      continue;
-    if (!ty.hasStaticShape())
-      return failure();
+    if (!ty || !ty.hasStaticShape())
+      return ty ? failure() : success();
     maxFlat = std::max(maxFlat, ty.getNumElements());
   }
   return success(maxFlat < kMaxVectorSize);
@@ -123,27 +99,413 @@ static bool isMmaContractionOp(Operation *op) {
   return op->hasAttr(kLayout0);
 }
 
-//===----------------------------------------------------------------------===//
-// §3  MMA op vectorization — forall-parking layout transfer
+// Returns true when the linalg body is only index computation + tensor.extract
+// + yield — no value-domain arithmetic.
+static bool isPureGatherBody(linalg::LinalgOp linalgOp) {
+  Block &body = linalgOp->getRegion(0).front();
+  auto yieldOp = cast<linalg::YieldOp>(body.getTerminator());
+  if (yieldOp.getNumOperands() != 1)
+    return false;
+  Value yieldedVal = yieldOp.getOperand(0);
+  if (!isa_and_nonnull<tensor::ExtractOp>(yieldedVal.getDefiningOp()))
+    return false;
+
+  for (Operation &op : body) {
+    if (isa<linalg::YieldOp, linalg::IndexOp, tensor::ExtractOp,
+            tensor::ExtractSliceOp, arith::IndexCastOp,
+            affine::AffineApplyOp>(&op))
+      continue;
+    if (auto constOp = dyn_cast<arith::ConstantOp>(&op)) {
+      if (constOp.getType().isIntOrIndex())
+        continue;
+      return false; // float constant → real computation
+    }
+    if (isa<arith::AddIOp, arith::MulIOp, arith::SubIOp,
+            arith::RemSIOp, arith::DivSIOp, arith::RemUIOp,
+            arith::DivUIOp>(&op)) {
+      if (llvm::all_of(op.getResultTypes(), [](Type t) { return t.isIntOrIndex(); }))
+        continue;
+      return false;
+    }
+    return false;
+  }
+  return true;
+}
+
+// Returns true if `val`'s def-chain mentions any linalg.IndexOp with dim == vecDim.
+static bool mentionsVecDim(Value val, unsigned vecDim) {
+  SmallVector<Value> worklist = {val};
+  llvm::SmallPtrSet<Value, 16> visited;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second) continue;
+    Operation *def = v.getDefiningOp();
+    if (!def) continue;
+    if (auto idx = dyn_cast<linalg::IndexOp>(def))
+      if (idx.getDim() == vecDim) return true;
+    for (Value operand : def->getOperands())
+      worklist.push_back(operand);
+  }
+  return false;
+}
+
+// Returns true when extractOp inside linalgOp is stride-1 along vecDim.
+// Fills varyingIdxPos and baseIndices (nullptr at varyingIdxPos).
+static bool isContiguousExtract(linalg::LinalgOp linalgOp,
+                                tensor::ExtractOp extractOp,
+                                unsigned vecDim,
+                                unsigned &varyingIdxPos,
+                                SmallVectorImpl<Value> &baseIndices) {
+  auto indices = extractOp.getIndices();
+  unsigned numIdx = indices.size();
+  int varyingCount = 0;
+  int varying = -1;
+  for (unsigned i = 0; i < numIdx; ++i) {
+    if (!mentionsVecDim(indices[i], vecDim)) continue;
+    ++varyingCount;
+    varying = (int)i;
+  }
+  if (varyingCount != 1) return false;
+
+  // Find the linalg.IndexOp leaf in the varying index chain.
+  linalg::IndexOp idxLeaf;
+  {
+    SmallVector<Value> wl = {indices[varying]};
+    llvm::SmallPtrSet<Value, 8> vis;
+    while (!wl.empty()) {
+      Value v = wl.pop_back_val();
+      if (!vis.insert(v).second) continue;
+      if (auto op = dyn_cast_or_null<linalg::IndexOp>(v.getDefiningOp()))
+        if (op.getDim() == vecDim) { idxLeaf = op; break; }
+      if (auto *def = v.getDefiningOp())
+        for (Value o : def->getOperands()) wl.push_back(o);
+    }
+  }
+  if (!idxLeaf) return false;
+
+  // Verify stride-1: linalg.index must not appear under any MulIOp.
+  {
+    SmallVector<Value> wl = {indices[varying]};
+    llvm::SmallPtrSet<Value, 8> vis;
+    while (!wl.empty()) {
+      Value v = wl.pop_back_val();
+      if (!vis.insert(v).second || v == idxLeaf.getResult()) continue;
+      auto *def = v.getDefiningOp();
+      if (!def) continue;
+      if (isa<arith::MulIOp>(def))
+        for (Value o : def->getOperands())
+          if (mentionsVecDim(o, vecDim)) return false;
+      for (Value o : def->getOperands()) wl.push_back(o);
+    }
+  }
+
+  varyingIdxPos = (unsigned)varying;
+  baseIndices.resize(numIdx);
+  for (unsigned i = 0; i < numIdx; ++i)
+    baseIndices[i] = (i == (unsigned)varying) ? Value{} : indices[i];
+  return true;
+}
+
+// Rewrites a pure-gather linalg.generic (body = index→extract→yield) to
+// vector.transfer_read + broadcast + transfer_write.  Returns true if rewritten.
+static bool tryRewriteContiguousExtract(IRRewriter &rewriter,
+                                        linalg::LinalgOp linalgOp) {
+  auto outTy = dyn_cast<RankedTensorType>(linalgOp->getResultTypes().front());
+  if (!outTy || !outTy.hasStaticShape() || outTy.getRank() < 1) return false;
+  if (!isPureGatherBody(linalgOp)) return false;
+
+  unsigned vecDim = (unsigned)(outTy.getRank() - 1);
+  int64_t vecWidth = outTy.getDimSize(vecDim);
+
+  tensor::ExtractOp extractOp;
+  for (Operation &op : linalgOp->getRegion(0).front())
+    if (auto e = dyn_cast<tensor::ExtractOp>(&op)) { extractOp = e; break; }
+  if (!extractOp) return false;
+
+  unsigned varyingPos = 0;
+  SmallVector<Value> baseIndices;
+  if (!isContiguousExtract(linalgOp, extractOp, vecDim, varyingPos, baseIndices))
+    return false;
+
+  Location loc = linalgOp.getLoc();
+  rewriter.setInsertionPoint(linalgOp);
+  Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+
+  // Clone the varying index chain outside the body with linalg.index(vecDim) → c0.
+  IRMapping mapping;
+  std::function<Value(Value)> cloneOutside = [&](Value v) -> Value {
+    if (mapping.contains(v)) return mapping.lookup(v);
+    if (!linalgOp->getRegion(0).isAncestor(v.getParentRegion())) return v;
+    if (auto ba = dyn_cast<BlockArgument>(v)) {
+      unsigned argIdx = ba.getArgNumber();
+      if (argIdx < (unsigned)linalgOp.getNumDpsInputs()) {
+        Value inputTensor = linalgOp.getDpsInputOperand(argIdx)->get();
+        auto inTy = cast<RankedTensorType>(inputTensor.getType());
+        SmallVector<Value> zeros(inTy.getRank(), c0);
+        Value scalar = rewriter.create<tensor::ExtractOp>(loc, inputTensor, zeros);
+        mapping.map(v, scalar);
+        return scalar;
+      }
+      mapping.map(v, c0);
+      return c0;
+    }
+    Operation *def = v.getDefiningOp();
+    if (auto idx = dyn_cast<linalg::IndexOp>(def))
+      if (idx.getDim() == vecDim) { mapping.map(v, c0); return c0; }
+    SmallVector<Value> newOperands;
+    for (Value operand : def->getOperands())
+      newOperands.push_back(cloneOutside(operand));
+    OperationState state(loc, def->getName());
+    state.addOperands(newOperands);
+    state.addTypes(def->getResultTypes());
+    state.addAttributes(llvm::to_vector(def->getAttrs()));
+    Operation *cloned = rewriter.create(state);
+    for (auto [orig, rep] : llvm::zip(def->getResults(), cloned->getResults()))
+      mapping.map(orig, rep);
+    return mapping.lookup(v);
+  };
+
+  Value baseCol = cloneOutside(extractOp.getIndices()[varyingPos]);
+
+  SmallVector<Value> transferIndices;
+  for (unsigned i = 0; i < baseIndices.size(); ++i)
+    transferIndices.push_back(i == varyingPos ? baseCol : cloneOutside(baseIndices[i]));
+
+  Value srcTensor = extractOp.getTensor();
+  auto elemTy = cast<RankedTensorType>(srcTensor.getType()).getElementType();
+  VectorType vecTy = VectorType::get({vecWidth}, elemTy);
+  Value pad = rewriter.create<arith::ConstantOp>(loc, elemTy,
+                                                  rewriter.getZeroAttr(elemTy));
+  Value flat = rewriter.create<vector::TransferReadOp>(
+      loc, vecTy, srcTensor, transferIndices, pad, SmallVector<bool>(1, true));
+
+  int64_t rank = outTy.getRank();
+  VectorType outVecTy = VectorType::get(outTy.getShape(), elemTy);
+  Value broad = rewriter.create<vector::BroadcastOp>(loc, outVecTy, flat);
+  Value empty = rewriter.create<tensor::EmptyOp>(loc, outTy.getShape(), elemTy);
+  SmallVector<Value> zeros(rank, c0);
+  Value result = rewriter.create<vector::TransferWriteOp>(
+      loc, broad, empty, zeros, SmallVector<bool>(rank, true)).getResult();
+
+  rewriter.replaceOp(linalgOp, result);
+  return true;
+}
+
+// Hoists all tensor.extract ops out of a mixed-body linalg.generic
+// (index computation + extracts + value arithmetic) so linalg::vectorize
+// emits vector.transfer_read instead of vector.gather.
 //
-// linalg::vectorize on batch_matmul emits an outer-product decomposition
-// (vector.outerproduct / vector.multi_reduce), NOT a vector.contract.
-// The contract only materialises in Phase 2 via
-// populateVectorReductionToContractPatterns.
-//
-// Strategy:
-//   1. Save nova.layout_* + lowering_config on the enclosing scf.forall
-//      (stable through Phase 2) under temporary "nova._pl*" attr names.
-//   2. Call linalg::vectorize normally.
-//   3. After Phase 2, walk all vector.contract ops: find the nearest
-//      ancestor scf.forall that carries pending attrs, attach them, and
-//      remove the temporaries.
-//===----------------------------------------------------------------------===//
+// For each tensor.extract in the body: computes the scalar per lane outside
+// the body, packs into a new input tensor, rebuilds the generic with the
+// extract replaced by the corresponding new block arg.  Handles one or more
+// extracts (e.g. the embedding + position lookup in the token embedding kernel
+// has two: %4[pos, col] and %3[tok, col]).
+static bool tryHoistLabelDrivenExtract(IRRewriter &rewriter,
+                                        linalg::LinalgOp linalgOp) {
+  auto outTy = dyn_cast<RankedTensorType>(linalgOp->getResultTypes().front());
+  if (!outTy || !outTy.hasStaticShape()) return false;
+  if (isPureGatherBody(linalgOp)) return false; // handled by tryRewriteContiguousExtract
+  // linalg::vectorize mis-assigns write targets for multi-output ops when
+  // hoisted inputs shift operandSegmentSizes — skip and let the main loop
+  // handle them with vectorizeNDExtract=true.
+  if (linalgOp.getNumDpsInits() != 1) return false;
+
+  Block &body = linalgOp->getRegion(0).front();
+
+  // Collect all tensor.extract ops in the body.
+  SmallVector<tensor::ExtractOp> extractOps;
+  for (Operation &op : body)
+    if (auto e = dyn_cast<tensor::ExtractOp>(&op))
+      extractOps.push_back(e);
+  if (extractOps.empty()) return false;
+
+  // All extracted tensors must be defined outside the linalg body.
+  for (tensor::ExtractOp e : extractOps) {
+    Value src = e.getTensor();
+    if (linalgOp->getRegion(0).isAncestor(src.getParentRegion())) return false;
+    if (!dyn_cast<RankedTensorType>(src.getType())) return false;
+  }
+
+  int64_t numLanes = outTy.getNumElements();
+  if (numLanes > 16) return false;
+
+  Location loc = linalgOp.getLoc();
+  rewriter.setInsertionPoint(linalgOp);
+
+  int64_t rank = outTy.getRank();
+  unsigned vecDim = (unsigned)(rank - 1);
+  unsigned numIns = linalgOp.getNumDpsInputs();
+
+  // Extract scalar from original input tensor at [0,..,lane] for each input.
+  auto extractScalarInput = [&](unsigned inputIdx, int64_t lane) -> Value {
+    Value inTensor = linalgOp.getDpsInputOperand(inputIdx)->get();
+    auto inTy = dyn_cast<RankedTensorType>(inTensor.getType());
+    if (!inTy) return {};
+    SmallVector<Value> idxVals;
+    for (int d = 0; d < (int)inTy.getRank(); ++d)
+      idxVals.push_back(rewriter.create<arith::ConstantIndexOp>(
+          loc, d == (int)inTy.getRank() - 1 ? lane : 0));
+    return rewriter.create<tensor::ExtractOp>(loc, inTensor, idxVals);
+  };
+
+  // Clone a value from the body for a concrete lane, substituting block args
+  // with per-lane scalars and linalg.index(vecDim) with the lane constant.
+  // `extractResults` maps each original extract result to its already-cloned
+  // scalar for this lane (so the index chain of one extract can reference
+  // results of another op that was already cloned).
+  auto cloneForLane = [&](Value v, int64_t lane,
+                           const SmallVectorImpl<Value> &inputScalars,
+                           IRMapping &mapping) -> Value {
+    std::function<Value(Value)> clone = [&](Value val) -> Value {
+      if (mapping.contains(val)) return mapping.lookup(val);
+      if (!linalgOp->getRegion(0).isAncestor(val.getParentRegion())) return val;
+      if (auto ba = dyn_cast<BlockArgument>(val)) {
+        Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+        mapping.map(val, zero);
+        return zero;
+      }
+      Operation *def = val.getDefiningOp();
+      if (auto idxOp = dyn_cast<linalg::IndexOp>(def)) {
+        Value c = rewriter.create<arith::ConstantIndexOp>(
+            loc, idxOp.getDim() == vecDim ? lane : 0);
+        mapping.map(val, c);
+        return c;
+      }
+      SmallVector<Value> newOps;
+      for (Value o : def->getOperands()) newOps.push_back(clone(o));
+      OperationState state(loc, def->getName());
+      state.addOperands(newOps);
+      state.addTypes(def->getResultTypes());
+      state.addAttributes(llvm::to_vector(def->getAttrs()));
+      Operation *cloned = rewriter.create(state);
+      for (auto [orig, rep] : llvm::zip(def->getResults(), cloned->getResults()))
+        mapping.map(orig, rep);
+      return mapping.lookup(val);
+    };
+    return clone(v);
+  };
+
+  // For each tensor.extract, build a hoisted tensor<numLanes x elemTy> (flat),
+  // then reshape to match outTy.
+  auto packAndReshape = [&](ArrayRef<Value> scalars, Type elemTy) -> Value {
+    Value packed = rewriter.create<tensor::FromElementsOp>(
+        loc, RankedTensorType::get({numLanes}, elemTy), scalars);
+    if (rank == 1) return packed;
+    SmallVector<ReassociationIndices> reassoc(1);
+    for (int64_t d = 0; d < rank; ++d) reassoc[0].push_back(d);
+    return rewriter.create<tensor::ExpandShapeOp>(
+        loc, RankedTensorType::get(outTy.getShape(), elemTy), packed, reassoc);
+  };
+
+  // Build the hoisted input tensors — one per tensor.extract.
+  SmallVector<Value> hoistedTensors;
+  hoistedTensors.reserve(extractOps.size());
+
+  for (tensor::ExtractOp extractOp : extractOps) {
+    Value srcTensor = extractOp.getTensor();
+    auto elemTy = cast<RankedTensorType>(srcTensor.getType()).getElementType();
+    SmallVector<Value> laneScalars;
+    for (int64_t lane = 0; lane < numLanes; ++lane) {
+      // Build a shared mapping per lane: block args → per-lane input scalars.
+      IRMapping laneMapping;
+      SmallVector<Value> inputScalars(numIns);
+      for (unsigned i = 0; i < numIns; ++i)
+        inputScalars[i] = extractScalarInput(i, lane);
+      for (unsigned i = 0; i < numIns; ++i)
+        laneMapping.map(linalgOp.getRegionInputArgs()[i], inputScalars[i]);
+
+      SmallVector<Value> idxCloned;
+      for (Value idx : extractOp.getIndices())
+        idxCloned.push_back(cloneForLane(idx, lane, inputScalars, laneMapping));
+      laneScalars.push_back(
+          rewriter.create<tensor::ExtractOp>(loc, srcTensor, idxCloned));
+    }
+    hoistedTensors.push_back(packAndReshape(laneScalars, elemTy));
+  }
+
+  // Rebuild linalg.generic: append hoisted tensors as new inputs (before outs).
+  SmallVector<Value> newInputs(linalgOp.getDpsInputs());
+  for (Value h : hoistedTensors) newInputs.push_back(h);
+
+  // Build new map list: [orig_input_maps..., hoisted_input_maps..., output_maps...].
+  // Hoisted tensors are packed to out0's shape (packAndReshape uses outTy), so they
+  // use out0's affine map (oldMaps[numIns]). Using oldMaps.back() is wrong for
+  // multi-output ops because it picks the last output's (possibly lower-rank) map.
+  auto oldMaps = linalgOp.getIndexingMapsArray();
+  AffineMap hoistedMap = oldMaps[numIns];
+  SmallVector<AffineMap> newMaps;
+  newMaps.append(oldMaps.begin(), oldMaps.begin() + numIns);
+  for (size_t i = 0; i < extractOps.size(); ++i)
+    newMaps.push_back(hoistedMap);
+  newMaps.append(oldMaps.begin() + numIns, oldMaps.end());
+
+  unsigned numExtracts = (unsigned)extractOps.size();
+
+  auto newLinalgOp = rewriter.create<linalg::GenericOp>(
+      loc,
+      linalgOp->getResultTypes(),
+      newInputs, linalgOp.getDpsInits(),
+      newMaps,
+      linalgOp.getIteratorTypesArray(),
+      [&](OpBuilder &b, Location innerLoc, ValueRange args) {
+        // args layout: [original inputs...] [hoisted inputs...] [original outs...]
+        // original outs start at: numIns + numExtracts
+        IRMapping bodyMap;
+        for (unsigned i = 0; i < numIns; ++i)
+          bodyMap.map(body.getArgument(i), args[i]);
+        unsigned numOuts = linalgOp.getNumDpsInits();
+        for (unsigned i = 0; i < numOuts; ++i)
+          bodyMap.map(body.getArgument(numIns + i), args[numIns + numExtracts + i]);
+        // Map each extract result → its hoisted block arg.
+        for (unsigned i = 0; i < numExtracts; ++i)
+          bodyMap.map(extractOps[i].getResult(), args[numIns + i]);
+
+        for (Operation &op : body) {
+          // Skip all original extract ops — replaced by block args above.
+          if (llvm::is_contained(extractOps, &op)) continue;
+          if (isa<linalg::YieldOp>(&op)) {
+            SmallVector<Value> yieldVals;
+            for (Value v : cast<linalg::YieldOp>(op).getValues())
+              yieldVals.push_back(bodyMap.lookupOrDefault(v));
+            b.create<linalg::YieldOp>(innerLoc, yieldVals);
+            continue;
+          }
+          SmallVector<Value> newOperands;
+          for (Value operand : op.getOperands())
+            newOperands.push_back(bodyMap.lookupOrDefault(operand));
+          OperationState state(innerLoc, op.getName());
+          state.addOperands(newOperands);
+          state.addTypes(op.getResultTypes());
+          state.addAttributes(llvm::to_vector(op.getAttrs()));
+          Operation *cloned = b.create(state);
+          for (auto [orig, rep] : llvm::zip(op.getResults(), cloned->getResults()))
+            bodyMap.map(orig, rep);
+        }
+      });
+
+  // Copy non-structural attrs from original op.
+  MLIRContext *ctx = rewriter.getContext();
+  auto mapsAttrName = StringAttr::get(ctx, "indexing_maps");
+  auto iterAttrName = StringAttr::get(ctx, "iterator_types");
+  for (auto attr : linalgOp->getAttrs())
+    if (attr.getName() != mapsAttrName && attr.getName() != iterAttrName)
+      newLinalgOp->setAttr(attr.getName(), attr.getValue());
+
+  rewriter.replaceOp(linalgOp, newLinalgOp->getResults());
+
+  // Immediately vectorize — the new generic has no tensor.extract.
+  rewriter.setInsertionPoint(newLinalgOp);
+  FailureOr<linalg::VectorizationResult> vecResult =
+      linalg::vectorize(rewriter, newLinalgOp, {}, {}, /*vectorizeNDExtract=*/false);
+  if (succeeded(vecResult))
+    rewriter.replaceOp(newLinalgOp, vecResult->replacements);
+
+  return true;
+}
 
 static LogicalResult vectorizeMmaOp(IRRewriter &rewriter, Operation *op) {
-  // Park layout attrs on the parent scf.forall before linalg::vectorize
-  // erases op.  The forall is stable across Phase 2 while the linalg op
-  // is not.
+  // Park layout attrs on the parent scf.forall before linalg::vectorize erases op.
+  // The forall is stable across Phase 2 while the linalg op is not.
   auto parentForall = op->getParentOfType<scf::ForallOp>();
   if (!parentForall) {
     op->emitError("nova-generic-vectorization: MMA batch_matmul is not "
@@ -156,56 +518,39 @@ static LogicalResult vectorizeMmaOp(IRRewriter &rewriter, Operation *op) {
   if (auto a = op->getAttr(kLoweringConfig)) parentForall->setAttr(kPendingConfig,  a);
 
   FailureOr<linalg::VectorizationResult> result =
-      linalg::vectorize(rewriter, op,
-                        /*inputVectorSizes=*/{},
-                        /*inputScalableVecDims=*/{},
-                        /*vectorizeNDExtract=*/true);
-  if (failed(result))
-    return failure();
+      linalg::vectorize(rewriter, op, {}, {}, /*vectorizeNDExtract=*/true);
+  if (failed(result)) return failure();
 
   rewriter.replaceOp(op, result->replacements);
   return success();
 }
 
-// Called after Phase 2.  Walks every vector.contract in funcOp; for any
-// contract that is still missing nova.layout_*, climbs the parent chain
-// looking for a scf.forall that carries pending attrs.  When found, attaches
-// them to the contract and removes the temporaries from the forall.
+// Walks vector.contracts after Phase 2 and transfers pending nova.layout_*
+// attrs from the enclosing scf.forall to the contract.
 static void transferParkedLayoutAttrs(func::FuncOp funcOp) {
-  funcOp.walk([](vector::ContractionOp contractOp) {
-    if (contractOp->hasAttr(kLayout0))
-      return; // already annotated
-
-    // Walk up through nested foralls until we find pending attrs.
-    scf::ForallOp forall =
-        contractOp->getParentOfType<scf::ForallOp>();
+  funcOp.walk([&](vector::ContractionOp contractOp) {
+    if (contractOp->hasAttr(kLayout0)) return;
+    scf::ForallOp forall = contractOp->getParentOfType<scf::ForallOp>();
     while (forall) {
       if (!forall->hasAttr(kPendingLayout0)) {
         forall = forall->getParentOfType<scf::ForallOp>();
         continue;
       }
-      if (auto a = forall->getAttr(kPendingLayout0))
-        contractOp->setAttr(kLayout0, a);
-      if (auto a = forall->getAttr(kPendingLayout1))
-        contractOp->setAttr(kLayout1, a);
-      if (auto a = forall->getAttr(kPendingLayout2))
-        contractOp->setAttr(kLayout2, a);
-      if (auto a = forall->getAttr(kPendingConfig))
-        contractOp->setAttr(kLoweringConfig, a);
+      if (auto a = forall->getAttr(kPendingLayout0)) contractOp->setAttr(kLayout0, a);
+      if (auto a = forall->getAttr(kPendingLayout1)) contractOp->setAttr(kLayout1, a);
+      if (auto a = forall->getAttr(kPendingLayout2)) contractOp->setAttr(kLayout2, a);
+      if (auto a = forall->getAttr(kPendingConfig))  contractOp->setAttr(kLoweringConfig, a);
       forall->removeAttr(kPendingLayout0);
       forall->removeAttr(kPendingLayout1);
       forall->removeAttr(kPendingLayout2);
       forall->removeAttr(kPendingConfig);
       return;
     }
-    // No pending attrs found — the contract did not originate from an MMA
-    // op, or the forall structure is unexpected.  Not a hard error; the
-    // absence of nova.layout_* will be caught by downstream passes.
   });
 }
 
 //===----------------------------------------------------------------------===//
-// §4  The pass
+// The pass
 //===----------------------------------------------------------------------===//
 
 struct NovaGenericVectorizationPass
@@ -213,9 +558,7 @@ struct NovaGenericVectorizationPass
                          OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGenericVectorizationPass)
 
-  StringRef getArgument() const override {
-    return "nova-generic-vectorization";
-  }
+  StringRef getArgument() const override { return "nova-generic-vectorization"; }
   StringRef getDescription() const override {
     return "Vectorize linalg ops to vector.contract / vector.transfer_*. "
            "MMA ops: park nova.layout_* on parent scf.forall, vectorize, "
@@ -238,50 +581,28 @@ void NovaGenericVectorizationPass::runOnOperation() {
   MLIRContext *ctx = funcOp.getContext();
   IRRewriter rewriter(ctx);
 
-  // -------------------------------------------------------------------------
-  // Phase 1: Vectorize all LinalgOps and tensor.pad ops, bottom-up.
-  //
-  //   Case A — MMA contraction ops (have nova.layout_0 attr):
-  //     Always static.  Park layout attrs on parent scf.forall, then call
-  //     linalg::vectorize.  Attrs are transferred to vector.contract after
-  //     Phase 2 (see Phase 2.5 below).
-  //
-  //   Case B — Static non-MMA linalg ops:
-  //     Size-limit check, then plain linalg::vectorize with empty sizes.
-  //
-  //   Case C — Dynamic linalg ops (GELU boundary tiles):
-  //     inferNovaVectorSizes → ValueBounds UB → masked vectorization.
-  //
-  //   Case D — tensor.pad with static result shape:
-  //     Vectorize with sizes from the static result shape.
-  // -------------------------------------------------------------------------
   SmallVector<Operation *> candidates;
   funcOp.walk([&](Operation *op) {
-    if (isa<linalg::LinalgOp>(op) || isa<tensor::PadOp>(op))
+    if (isa<linalg::LinalgOp, tensor::PadOp>(op))
       candidates.push_back(op);
   });
   std::reverse(candidates.begin(), candidates.end()); // bottom-up
 
   for (Operation *op : candidates) {
-    if (!op || op->getBlock() == nullptr)
-      continue;
-
+    if (!op || op->getBlock() == nullptr) continue;
     rewriter.setInsertionPoint(op);
 
-    // ── Case D: tensor.pad ────────────────────────────────────────────────
+    // Case D: tensor.pad
     if (auto padOp = dyn_cast<tensor::PadOp>(op)) {
       auto ty = padOp.getResultType();
-      if (!ty.hasStaticShape())
-        continue;
+      if (!ty.hasStaticShape()) continue;
       SmallVector<int64_t> vectorSizes(ty.getShape());
       int64_t flat = std::accumulate(vectorSizes.begin(), vectorSizes.end(),
                                      int64_t(1), std::multiplies<int64_t>{});
-      if (flat >= kMaxVectorSize)
-        continue;
+      if (flat >= kMaxVectorSize) continue;
       SmallVector<bool> scalableDims(vectorSizes.size(), false);
       FailureOr<linalg::VectorizationResult> result =
-          linalg::vectorize(rewriter, op, vectorSizes, scalableDims,
-                            /*vectorizeNDExtract=*/true);
+          linalg::vectorize(rewriter, op, vectorSizes, scalableDims, true);
       if (succeeded(result))
         rewriter.replaceOp(op, result->replacements);
       continue;
@@ -289,121 +610,89 @@ void NovaGenericVectorizationPass::runOnOperation() {
 
     auto linalgOp = cast<linalg::LinalgOp>(op);
 
-    // ── Case A: MMA contraction op ────────────────────────────────────────
+    // Case A: MMA contraction op
     if (isMmaContractionOp(op)) {
       if (!hasStaticShape(linalgOp)) {
-        op->emitWarning() << "nova-generic-vectorization: MMA op has "
-                             "dynamic shape — skipping";
+        op->emitWarning() << "nova-generic-vectorization: MMA op has dynamic shape — skipping";
         continue;
       }
-      if (failed(isWithinVectorSizeLimit(linalgOp)))
-        continue;
+      if (failed(isWithinVectorSizeLimit(linalgOp))) continue;
       if (failed(vectorizeMmaOp(rewriter, op))) {
-        op->emitError() << "nova-generic-vectorization: failed to "
-                           "vectorize MMA op";
+        op->emitError() << "nova-generic-vectorization: failed to vectorize MMA op";
         return signalPassFailure();
       }
       continue;
     }
-
-    // ── Case B: Static non-MMA linalg op ─────────────────────────────────
+    // Case B: Static non-MMA linalg op
     if (hasStaticShape(linalgOp)) {
-    if (failed(isWithinVectorSizeLimit(linalgOp))) continue;
+      if (failed(isWithinVectorSizeLimit(linalgOp))) continue;
 
-    // ── Global→shared promotion barrier ──────────────────────────────────
-    // Two categories of linalg ops must NOT be vectorized here:
-    //
-    //  (1) linalg.copy {nova.promote_to_workgroup}
-    //      This is the direct global→shared staging copy inserted by
-    //      PromoteMatmulOperands.  It must stay as linalg.copy so that a
-    //      future pass can pattern-match it and emit nvgpu.device_async_copy
-    //      (cp.async PTX).  Vectorizing it into vector.transfer_read/write
-    //      destroys the global→shared structural signature.
-    //
-    //  (2) Any linalg op whose result feeds a nova.promote_to_workgroup copy.
-    //      For the weight (B-matrix) operand, PromoteMatmulOperands inserts a
-    //      linalg.generic reshape (tensor<32x4> → tensor<1x32x4>) whose output
-    //      is the `ins` of the promote_to_workgroup linalg.copy.  If we
-    //      vectorize the generic here, the output lands in a tensor.empty()
-    //      that OneShotBufferize aliases in-place with the workgroup buffer
-    //      (because the copy's outs is the only consumer).  Both ins and outs
-    //      of the linalg.copy then resolve to the same workgroup memref —
-    //      turning the global→shared copy into a shared→shared self-copy and
-    //      silently losing the actual global load.
-    //
-    // Shared→shared and shared→thread copies (plain linalg.copy without
-    // nova.promote_to_workgroup, and not feeding one) are fine to vectorize —
-    // they become vector.transfer_read/write which lower to LDS instructions.
-    if (op->hasAttr("nova.promote_to_workgroup"))
-      continue;
-    bool feedsPromotionCopy = llvm::any_of(op->getUsers(), [](Operation *user) {
-      return user->hasAttr("nova.promote_to_workgroup");
-    });
-    if (feedsPromotionCopy)
-      continue;
+      // Skip global→shared promotion copies and ops feeding them.
+      // These must stay as linalg.copy so downstream passes can emit cp.async.
+      if (op->hasAttr("nova.promote_to_workgroup")) continue;
+      if (llvm::any_of(op->getUsers(), [](Operation *user) {
+            return user->hasAttr("nova.promote_to_workgroup");
+          }))
+        continue;
 
-    FailureOr<linalg::VectorizationResult> result =
-        linalg::vectorize(rewriter, op, {}, {},
-                          /*vectorizeNDExtract=*/true);
-    if (succeeded(result))
+      if (tryRewriteContiguousExtract(rewriter, linalgOp)) continue;
+      if (tryHoistLabelDrivenExtract(rewriter, linalgOp)) continue;
+
+      FailureOr<linalg::VectorizationResult> result =
+          linalg::vectorize(rewriter, op, {}, {}, /*vectorizeNDExtract=*/true);
+      if (succeeded(result))
         rewriter.replaceOp(op, result->replacements);
-    continue;
-}
-    // ── Case C: Dynamic linalg op — masked vectorization ─────────────────
+      continue;
+    }
+
+    // Case C: Dynamic linalg op — masked vectorization
     std::optional<nova::NovaVectorizationTileSizes> maybeSizes =
         nova::inferNovaVectorSizes(linalgOp);
-    if (!maybeSizes)
-      continue;
-    int64_t flat =
-        std::accumulate(maybeSizes->vectorSizes.begin(),
-                        maybeSizes->vectorSizes.end(),
-                        int64_t(1), std::multiplies<int64_t>{});
-    if (flat >= kMaxVectorSize)
-      continue;
+    if (!maybeSizes) continue;
+    int64_t flat = std::accumulate(maybeSizes->vectorSizes.begin(),
+                                   maybeSizes->vectorSizes.end(),
+                                   int64_t(1), std::multiplies<int64_t>{});
+    if (flat >= kMaxVectorSize) continue;
     FailureOr<linalg::VectorizationResult> result =
-        linalg::vectorize(rewriter, op,
-                          maybeSizes->vectorSizes,
-                          maybeSizes->vectorScalableFlags,
-                          /*vectorizeNDExtract=*/true);
+        linalg::vectorize(rewriter, op, maybeSizes->vectorSizes,
+                          maybeSizes->vectorScalableFlags, true);
     if (succeeded(result))
       rewriter.replaceOp(op, result->replacements);
   }
 
-  // -------------------------------------------------------------------------
   // Phase 2: Canonicalize to vector.contract.
-  // Run BEFORE layout transfer so contracts are in their final form when
-  // we attach nova.layout_* in Phase 2.5.
-  // -------------------------------------------------------------------------
+  // IMPORTANT: Run populateVectorReductionToContractPatterns FIRST in its own
+  // pass before populateVectorMultiReductionLoweringPatterns(InnerParallel).
+  // linalg::vectorize for linalg.matmul produces vector.multi_reduction. If both
+  // patterns compete in the same set, InnerParallel fires first and destroys the
+  // multi_reduction into extract/insert chains before the contract conversion runs.
+  // Phase 2a: multi_reduction → vector.contract (must be alone so it wins)
   {
     RewritePatternSet contractPatterns(ctx);
-    vector::populateVectorTransferPermutationMapLoweringPatterns(
-        contractPatterns);
-    vector::populateSinkVectorOpsPatterns(contractPatterns);
+    vector::populateVectorTransferPermutationMapLoweringPatterns(contractPatterns);
     vector::populateVectorReductionToContractPatterns(contractPatterns);
     if (failed(applyPatternsGreedily(funcOp, std::move(contractPatterns))))
       return signalPassFailure();
   }
-
-  // -------------------------------------------------------------------------
-  // Phase 2.5: Transfer parked nova.layout_* from scf.forall → vector.contract.
-  // Phase 2 is what actually emits vector.contract (from the outer-product
-  // decomposition linalg::vectorize produced).  Now that contracts exist,
-  // pull the attrs we parked on the enclosing forall and attach them.
-  // -------------------------------------------------------------------------
+  // Phase 2b: Lower any remaining multi_reductions (SIMT path that didn't become contracts)
+  {
+    RewritePatternSet simdPatterns(ctx);
+    vector::populateSinkVectorOpsPatterns(simdPatterns);
+    vector::populateVectorMultiReductionLoweringPatterns(
+        simdPatterns, vector::VectorMultiReductionLowering::InnerParallel);
+    if (failed(applyPatternsGreedily(funcOp, std::move(simdPatterns))))
+      return signalPassFailure();
+  }
+  // Phase 2.5: Transfer parked nova.layout_* from forall → contract.
   transferParkedLayoutAttrs(funcOp);
 
-  // -------------------------------------------------------------------------
   // Phase 3: Eliminate always-true vector.mask ops.
-  // -------------------------------------------------------------------------
   vector::eliminateVectorMasks(rewriter, funcOp, /*vscaleRange=*/std::nullopt);
 
-  // -------------------------------------------------------------------------
-  // Phase 4: Canonicalize mask predicate expressions.
-  // -------------------------------------------------------------------------
+  // Phase 4: Canonicalize mask predicates.
   {
     RewritePatternSet maskCanonPatterns(ctx);
-    memref::populateResolveRankedShapedTypeResultDimsPatterns(
-        maskCanonPatterns);
+    memref::populateResolveRankedShapedTypeResultDimsPatterns(maskCanonPatterns);
     tensor::DimOp::getCanonicalizationPatterns(maskCanonPatterns, ctx);
     vector::CreateMaskOp::getCanonicalizationPatterns(maskCanonPatterns, ctx);
     vector::ConstantMaskOp::getCanonicalizationPatterns(maskCanonPatterns, ctx);
@@ -411,14 +700,10 @@ void NovaGenericVectorizationPass::runOnOperation() {
     if (failed(applyPatternsGreedily(funcOp, std::move(maskCanonPatterns))))
       return signalPassFailure();
   }
-
-  // -------------------------------------------------------------------------
   // Phase 5: Lower vector.mask { transfer } to predicated form.
-  // -------------------------------------------------------------------------
   {
     RewritePatternSet maskLowerPatterns(ctx);
-    vector::populateVectorMaskLoweringPatternsForSideEffectingOps(
-        maskLowerPatterns);
+    vector::populateVectorMaskLoweringPatternsForSideEffectingOps(maskLowerPatterns);
     if (failed(applyPatternsGreedily(funcOp, std::move(maskLowerPatterns))))
       return signalPassFailure();
   }

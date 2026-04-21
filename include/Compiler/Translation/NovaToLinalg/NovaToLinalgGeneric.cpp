@@ -797,6 +797,7 @@ struct NovaSceForwardLowering : public OpConversionPattern<mlir::nova::SceOp> {
     for (int64_t i = 0; i < rank; ++i)
       if (i != lastDim) statsShape.push_back(logitsType.getDimSize(i));
     auto statsType = RankedTensorType::get(statsShape, elemType);
+    auto batchType = RankedTensorType::get(statsShape, elemType);
     int64_t batchRank = static_cast<int64_t>(statsShape.size());
 
     Value negInf = rewriter.create<arith::ConstantOp>(
@@ -806,6 +807,8 @@ struct NovaSceForwardLowering : public OpConversionPattern<mlir::nova::SceOp> {
         loc, rewriter.getZeroAttr(elemType));
     Value epsVal = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getFloatAttr(elemType, 1.0e-7f));
+    Value fOne   = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(elemType, 1.0f));
 
     Value maxEmpty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
     Value maxInit  = rewriter.create<linalg::FillOp>(loc, negInf, maxEmpty).result();
@@ -1016,7 +1019,6 @@ struct NovaSceBackwardLowering : public OpConversionPattern<mlir::nova::SceBackw
     return success();
   }
 };
-
 //===--------------------------------------------------------------------------------------------===//
 // Activation forward and backward lowerings: Sigmoid, Tanh, Gelu, Softmax
 //===--------------------------------------------------------------------------------------------===//
