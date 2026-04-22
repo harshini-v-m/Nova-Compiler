@@ -244,7 +244,7 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(createNovaGPUVectorDistributePass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
-    //  pm.addNestedPass<func::FuncOp>(createNovaGPUReduceBankConflictsPass());
+     pm.addNestedPass<func::FuncOp>(createNovaGPUReduceBankConflictsPass());
     // ── Step 8.5: Eliminate degenerate single-iteration foralls ────────────
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
     pm.addPass(createCanonicalizerPass());

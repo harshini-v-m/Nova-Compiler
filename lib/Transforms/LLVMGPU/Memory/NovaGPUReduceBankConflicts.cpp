@@ -117,6 +117,30 @@ struct NovaGPUReduceBankConflictsPass
       ArrayRef<int64_t> shape = memrefType.getShape();
       Type elemType = memrefType.getElementType();
 
+      // Only pad when the tile actually has a bank conflict to fix.  The
+      // canonical worst case is when the row stride in bytes is a multiple
+      // of 128 B (32 banks × 4 B): then column `c` of every row lands on
+      // the same bank and any warp-wide cross-row access collides 32-way.
+      // If the row stride is NOT a multiple of 128 B, rows already step
+      // through banks on their own and padding would burn SMEM for no
+      // benefit — so we skip.  Below 128 B a row occupies < 32 banks and
+      // no XOR can fix it either; padding is the only possible remedy but
+      // only becomes necessary once the tile is bigger than the current
+      // <64x8> = 32 B/row.  Mirrors the `rowBytes >= 128` viability check
+      // in NovaGPUSwizzleSharedMemoryPass.
+      unsigned elemBitsCheck = elemType.getIntOrFloatBitWidth();
+      if (elemBitsCheck == 0 || (elemBitsCheck % 8) != 0) continue;
+      int64_t elemBytesCheck = elemBitsCheck / 8;
+      int64_t rowBytes = shape.back() * elemBytesCheck;
+      if ((rowBytes % 128) != 0) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[nova-reduce-bank-conflicts] skipping alloc at "
+                   << alloc.getLoc()
+                   << ": row stride " << rowBytes
+                   << " B is not a multiple of 128 B (no conflict to fix)\n");
+        continue;
+      }
+
       // Compute padding such that the row stride stays a multiple of 16 bytes.
       //
       // Why 16 bytes?

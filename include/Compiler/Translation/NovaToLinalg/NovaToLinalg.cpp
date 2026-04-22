@@ -1232,11 +1232,11 @@ struct NovaScatterAddOpLowering
   }
 };
 
-struct NovaTransposeOpLowering : public OpConversionPattern<nova::TransposeOp> {
-  using OpConversionPattern<nova::TransposeOp>::OpConversionPattern;
+struct NovaTransposeOpLowering : public OpConversionPattern<mlir::nova::TransposeOp> {
+  using OpConversionPattern<mlir::nova::TransposeOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(nova::TransposeOp op, OpAdaptor adaptor,
+  matchAndRewrite(mlir::nova::TransposeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto resultType = llvm::dyn_cast<RankedTensorType>(op.getType());
     if (!resultType)
@@ -1268,20 +1268,50 @@ struct NovaTransposeOpLowering : public OpConversionPattern<nova::TransposeOp> {
         perms.push_back(i);
     }
 
-    Location loc = op.getLoc();
-    auto permutedInit = rewriter.create<tensor::EmptyOp>(
-        loc, resultShape, resultType.getElementType());
-
-    auto transposeOp = rewriter.replaceOpWithNewOp<linalg::TransposeOp>(
-        op, adaptor.getInput(), permutedInit, perms);
-
-    // Explicitly set the result type
-    transposeOp->getResult(0).setType(resultType);
-
+    Location loc = op.getLoc();  
+    auto inputType = cast<RankedTensorType>(adaptor.getInput().getType());  
+  
+    // Input map: identity — iterate over input's natural (row-major) layout  
+    // so that the global memory read is coalesced.  
+    auto inputMap = rewriter.getMultiDimIdentityMap(rank);  
+  
+    // Output map: inverse permutation of perms.  
+    // perms[i] = j means output_dim_i comes from input_dim_j.  
+    // inversePerms[j] = i means input_dim_j maps to output_dim_i.  
+    // The output map is (d0, d1, ...) -> (d_{inversePerms[0]}, d_{inversePerms[1]}, ...)  
+    SmallVector<int64_t> inversePerms(rank);  
+    for (int64_t i = 0; i < rank; ++i)  
+      inversePerms[perms[i]] = i;  
+  
+    SmallVector<AffineExpr> outputExprs;  
+    for (int64_t i = 0; i < rank; ++i)  
+      outputExprs.push_back(rewriter.getAffineDimExpr(inversePerms[i]));  
+    auto outputMap = AffineMap::get(rank, 0, outputExprs, rewriter.getContext());  
+  
+    SmallVector<AffineMap> indexingMaps = {inputMap, outputMap};  
+    SmallVector<utils::IteratorType> iteratorTypes(  
+        rank, utils::IteratorType::parallel);  
+  
+    // Output tensor has the transposed (result) shape.  
+    Value permutedInit = rewriter.create<tensor::EmptyOp>(  
+        loc, resultShape, resultType.getElementType());  
+  
+    // Create linalg.generic: body just yields the input element.  
+    auto genericOp = rewriter.create<linalg::GenericOp>(  
+    loc, /*resultTypes=*/TypeRange{resultType},  
+    /*inputs=*/ValueRange{adaptor.getInput()},   // ← wrap in ValueRange  
+    /*outputs=*/permutedInit,                     // ← now a Value, not EmptyOp  
+    SmallVector<AffineMap>{inputMap, outputMap},  
+    SmallVector<utils::IteratorType>(rank, utils::IteratorType::parallel),  
+    [&](OpBuilder &b, Location nl, ValueRange args) {  
+      b.create<linalg::YieldOp>(nl, args[0]);  
+    });  
+  
+rewriter.replaceOp(op, genericOp.getResults()); 
     return success();
+
   }
 };
-
 struct NovaToDeviceOpLowering : public OpConversionPattern<nova::ToDeviceOp> {
   using OpConversionPattern<nova::ToDeviceOp>::OpConversionPattern;
 
