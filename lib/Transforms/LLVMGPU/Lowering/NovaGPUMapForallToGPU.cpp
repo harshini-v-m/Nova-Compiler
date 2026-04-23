@@ -471,6 +471,43 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     rewriter.eraseOp(warpForall);
   }
 
+  // ---- ALGORITHM STEP 7.5: Explicitly sink ConstantLike ops ----
+  // Sometimes MLIR's default GpuKernelOutliningPass fails to sink complex
+  // types like vector constants, forcing them into function arguments which
+  // fails during LLVM lowering.
+  // Collect constants that are used inside the launch body but defined outside.
+  // Exclude the launchOp's own grid/block dimension operands — those constants
+  // must remain outside the launch (gpu.launch operands must dominate it).
+  SmallVector<Value> launchDimOperands(launchOp->operand_begin(),
+                                       launchOp->operand_end());
+  SmallVector<Operation*> constantsToSink;
+  launchOp.getBody().walk([&](Operation *op) {
+    for (OpOperand &operand : op->getOpOperands()) {
+      Operation *defOp = operand.get().getDefiningOp();
+      if (defOp && defOp->hasTrait<OpTrait::ConstantLike>() &&
+          !launchOp->isAncestor(defOp)) {
+        // Do not sink constants that are also used as gpu.launch dim operands —
+        // they must stay outside to satisfy SSA dominance of the launch op itself.
+        bool isLaunchDimOperand = llvm::is_contained(launchDimOperands,
+                                                     operand.get());
+        if (!isLaunchDimOperand)
+          constantsToSink.push_back(defOp);
+      }
+    }
+  });
+  llvm::sort(constantsToSink);
+  constantsToSink.erase(std::unique(constantsToSink.begin(), constantsToSink.end()), constantsToSink.end());
+
+  if (!constantsToSink.empty()) {
+    OpBuilder sinkBuilder = OpBuilder::atBlockBegin(&launchBody);
+    for (Operation *cst : constantsToSink) {
+      Operation *cloned = sinkBuilder.clone(*cst);
+      cst->replaceUsesWithIf(cloned, [&](OpOperand &use) {
+        return launchOp->isAncestor(use.getOwner());
+      });
+    }
+  }
+
   // ---- ALGORITHM STEP 8: Erase original block forall ----
   rewriter.eraseOp(blockForall);
   return success();

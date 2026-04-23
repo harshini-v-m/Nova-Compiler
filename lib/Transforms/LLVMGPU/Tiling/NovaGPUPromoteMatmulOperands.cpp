@@ -49,6 +49,9 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "nova-gpu-promote-matmul-operands"
 #include "mlir/Transforms/Passes.h"
 
 using namespace mlir;
@@ -292,18 +295,27 @@ struct NovaGPUPromoteMatmulOperandsPass
 
       builder.setInsertionPoint(op);
       unsigned numInputs = dpsOp.getNumDpsInputs();
-
+      SmallVector<int64_t> resultOperands;
+      int numPromoted = 0;
       for (int64_t idx : *promotedOperands) {
-  unsigned i = static_cast<unsigned>(idx);
-  if (i < numInputs) {
-    promoteOperandToShared(builder, op, i);
-  } else {
-    unsigned resultIdx = i - numInputs;
-    if (linalg::isaContractionOpInterface(dyn_cast<linalg::LinalgOp>(op)))
-      continue;
-    promoteResultToShared(builder, op, resultIdx);
-  }
-}
+        unsigned i = static_cast<unsigned>(idx);
+        if (i < numInputs) {
+          promoteOperandToShared(builder, op, i);
+          numPromoted++;
+        } else {
+          resultOperands.push_back(idx);
+        }
+      }
+
+      llvm::errs() << "[" DEBUG_TYPE "] Promoted " << numPromoted
+                   << " input operands for: " << op->getName() << "\n";
+
+      for (int64_t idx : resultOperands) {
+        unsigned resultIdx = idx - numInputs;
+        if (linalg::isaContractionOpInterface(dyn_cast<linalg::LinalgOp>(op)))
+          continue;
+        promoteResultToShared(builder, op, resultIdx);
+      }
 
       return WalkResult::advance();
     });

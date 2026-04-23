@@ -15,6 +15,9 @@
 using namespace mlir;
 #define GEN_PASS_DEF_CONVERTMEMREFTOGPU
 #include "Compiler/Transforms/Passes.h.inc"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "nova-convert-memref-to-gpu"
 
 namespace mlir {
 namespace nova {
@@ -81,7 +84,6 @@ public:
     return success();
   }
 };
-
 class ConvertMemrefOp : public OpRewritePattern<memref::CopyOp> {
 public:
   using OpRewritePattern<memref::CopyOp>::OpRewritePattern;
@@ -101,20 +103,26 @@ public:
     auto isIntMemSpace = [](MemRefType t, int64_t space) -> bool {
       if (auto intAttr = llvm::dyn_cast_or_null<IntegerAttr>(t.getMemorySpace()))
         return intAttr.getInt() == space;
+      if (space == 1 && !t.getMemorySpace())
+        return true;
       return false;
     };
 
     if (op->getParentOfType<gpu::GPUFuncOp>() &&
         isIntMemSpace(srcType, 1) &&
         isGpuAddrSpace(dstType)) {
+      llvm::errs() << "[" DEBUG_TYPE "] Converting memref.copy to nvgpu.device_async_copy\n";
       Location loc = op.getLoc();
       MLIRContext *ctx = rewriter.getContext();
       ArrayRef<int64_t> shape = dstType.getShape();
       int64_t rank = shape.size();
 
       // innerVec = innermost dim size = elements per cp.async instruction.
-      // deriveThreadTileSizes guarantees this equals maxVec (4 for f32).
       int64_t innerVec = shape[rank - 1];
+      int64_t elemBytes = dstType.getElementTypeBitWidth() / 8;
+      // bypassL1 (.cg cache-global) requires a 16-byte transfer; for smaller
+      // tiles (e.g. 1xf32 = 4 bytes) use the .ca (cache-all) variant instead.
+      bool useBypassL1 = (innerVec * elemBytes >= 16);
 
       Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
       Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
@@ -143,7 +151,7 @@ public:
           op.getSource(), srcIdx,
           rewriter.getIndexAttr(innerVec),
           /*srcElements=*/Value{},
-          /*bypassL1=*/rewriter.getUnitAttr()); // bypass L1 for streaming loads
+          /*bypassL1=*/useBypassL1 ? rewriter.getUnitAttr() : UnitAttr());
 
       // Commit and immediately wait (numGroups=0) — single-buffered for now.
       // For ping-pong: emit commit outside the loop and use waitGroup(1).

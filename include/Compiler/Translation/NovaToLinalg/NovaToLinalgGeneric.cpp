@@ -1596,26 +1596,44 @@ struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
     // 2. Prepare the fused 'outs' tensor (bias broadcasted)
     Value broadcastedBias = broadcastTensor(rewriter, loc, bias, currentResultType.getShape());
 
-    // 3. Create the linalg op
-    // For batch_matmul, all three operands (A, B, C) must be 3D.
-    // When we arrive here with rank==3 via the straight path (resultRank==3,
-    // no collapse), lhs is already 3D but rhs may still be the original 2D
-    // weight tensor (shape [K, N]).  Broadcast it to [batch, K, N] so that
-    // linalg.batch_matmul receives uniform 3D operands.
+    // 3. Create the linalg op.
+    // For the rank==3 case where B is 2D (shared weight across batch), emit a
+    // linalg.generic with a batch-shared B indexing map instead of broadcasting
+    // B to 3D — avoids a full 8x weight copy in memory.
+    Value matmulResult;
     if (currentResultType.getRank() == 3) {
       auto rhsType = cast<RankedTensorType>(rhs.getType());
       if (rhsType.getRank() == 2) {
-        int64_t batchDim = currentResultType.getShape()[0];
-        int64_t kDim     = rhsType.getShape()[0];
-        int64_t nDim     = rhsType.getShape()[1];
-        rhs = broadcastTensor(rewriter, loc, rhs, {batchDim, kDim, nDim});
+        // A: [B, M, K]  B: [K, N]  C: [B, M, N]
+        // Maps: A->(d0,d1,d2), B->(d2,d3), C->(d0,d1,d3), reduction over d2
+        MLIRContext *ctx = rewriter.getContext();
+        AffineMap aMap = AffineMap::getMultiDimIdentityMap(4, ctx);  // (d0,d1,d2,d3)->d0,d1,d2
+        aMap = aMap.getSubMap({0, 1, 2});
+        AffineMap bMap = AffineMap::get(4, 0,
+            {rewriter.getAffineDimExpr(2), rewriter.getAffineDimExpr(3)}, ctx);
+        AffineMap cMap = AffineMap::get(4, 0,
+            {rewriter.getAffineDimExpr(0), rewriter.getAffineDimExpr(1),
+             rewriter.getAffineDimExpr(3)}, ctx);
+        SmallVector<utils::IteratorType> iters = {
+            utils::IteratorType::parallel,   // d0 = batch
+            utils::IteratorType::parallel,   // d1 = M
+            utils::IteratorType::reduction,  // d2 = K
+            utils::IteratorType::parallel,   // d3 = N
+        };
+        matmulResult = rewriter.create<linalg::GenericOp>(
+            loc, currentResultType,
+            ValueRange{lhs, rhs}, ValueRange{broadcastedBias},
+            SmallVector<AffineMap>{aMap, bMap, cMap}, iters,
+            [&](OpBuilder &b, Location l, ValueRange args) {
+              Value mul = b.create<arith::MulFOp>(l, args[0], args[1]);
+              Value acc = b.create<arith::AddFOp>(l, mul, args[2]);
+              b.create<linalg::YieldOp>(l, acc);
+            }).getResult(0);
+      } else {
+        // B is already 3D (collapsed from higher rank path)
+        matmulResult = rewriter.create<linalg::BatchMatmulOp>(
+            loc, currentResultType, ValueRange{lhs, rhs}, broadcastedBias).getResult(0);
       }
-    }
-
-    Value matmulResult;
-    if (currentResultType.getRank() == 3) {
-      matmulResult = rewriter.create<linalg::BatchMatmulOp>(
-          loc, currentResultType, ValueRange{lhs, rhs}, broadcastedBias).getResult(0);
     } else {
       matmulResult = rewriter.create<linalg::MatmulOp>(
           loc, currentResultType, ValueRange{lhs, rhs}, broadcastedBias).getResult(0);
