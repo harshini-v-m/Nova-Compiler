@@ -55,6 +55,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -498,6 +499,12 @@ static bool hasNonAtomicWorkgroupStores(Operation *op) {
         found = true;
     });
   }
+  if (!found) {
+    op->walk([&](nvgpu::DeviceAsyncCopyOp asyncOp) {
+      if (isWorkgroupMemref(cast<MemRefType>(asyncOp.getDst().getType())))
+        found = true;
+    });
+  }
   return found;
 }
 
@@ -549,6 +556,12 @@ static bool hasWorkgroupLoads(Operation *op) {
   if (!found) {
     op->walk([&](vector::LoadOp loadOp) {
       if (isWorkgroupMemref(cast<MemRefType>(loadOp.getBase().getType())))
+        found = true;
+    });
+  }
+  if (!found) {
+    op->walk([&](nvgpu::DeviceAsyncCopyOp asyncOp) {
+      if (isWorkgroupMemref(cast<MemRefType>(asyncOp.getSrc().getType())))
         found = true;
     });
   }
@@ -607,6 +620,7 @@ struct NovaGPUInsertWorkgroupBarriersPass
     SmallVector<Operation *> barrierPoints;
     bool seenWorkgroupStore = false;
     bool seenNonAtomicStore = false;
+    bool seenWorkgroupLoadInBlock = false;
 
     for (Operation &op : block->getOperations()) {
       if (isa<scf::YieldOp, gpu::TerminatorOp>(op))
@@ -614,6 +628,9 @@ struct NovaGPUInsertWorkgroupBarriersPass
 
       bool hasLoads  = hasWorkgroupLoads(&op);
       bool hasStores = hasWorkgroupStores(&op);
+
+      if (hasLoads)
+        seenWorkgroupLoadInBlock = true;
 
       // Write→read transition: place barrier before the reading op so all
       // threads see completed stores before any thread proceeds to load.
@@ -658,7 +675,8 @@ struct NovaGPUInsertWorkgroupBarriersPass
     // before this iteration's non-atomic stores are globally visible.
     // Only needed inside a loop (scf.yield terminator). At gpu.launch level
     // (gpu.terminator) there is no next iteration, so no tail barrier needed.
-    if (seenNonAtomicStore && isa<scf::YieldOp>(block->getTerminator()))
+    if (seenNonAtomicStore && seenWorkgroupLoadInBlock &&
+        isa<scf::YieldOp>(block->getTerminator()))
       barrierPoints.push_back(block->getTerminator());
 
     // Insert in reverse order to preserve iterator validity.

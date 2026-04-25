@@ -235,30 +235,40 @@ namespace mlir::nova
 
 
     // -------------------------------------------------------------------------
-    // Step 4: Tile reduction (K) dimension   [AFTER PROMOTION]
-    //
-    // After K-tiling, the matmul operates on [wgM × kStep] and [kStep × wgN]
-    // slices. The promoted copies (from Step 3) are also tiled along K,
-    // so each K-iteration loads only kStep-sized data into shared memory.
-    // -------------------------------------------------------------------------
-    pm.addNestedPass<func::FuncOp>(
-        createNovaGPUApplyTilingLevelReductionPass());
-    pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-
-
-    // -------------------------------------------------------------------------
-    // Step 5: Subgroup (warp) tiling — BEFORE thread tiling
+    // Step 4: Subgroup (warp) tiling — BEFORE reduction tiling
     //
     // Splits the workgroup tile across warps via scf.forall + GPUWarpMappingAttr.
     // For MMA configs: each warp gets a subgroupTile-sized slice (e.g. 32×16).
     // For SIMT configs: subgroupTiles are all 0, pass is a no-op.
     //
-    // Must run BEFORE thread tiling so thread foralls are nested inside warp
-    // foralls. The zero-tile logic in ApplyTilingLevelThread detects
+    // ORDERING: must run BEFORE reduction tiling so the warp-forall encloses
+    // the subsequent scf.for K-loop. That way the matmul's DPS init flows as
+    // scf.forall shared_outs → scf.for iter_args → matmul outs, and after
+    // vectorization the accumulator becomes a vector<wgM/warpsM × wgN/warpsN>
+    // SSA value carried across K iterations in registers. If reduction tiling
+    // ran first, the warp-forall would end up INSIDE the scf.for body and the
+    // accumulator would be forced through a workgroup memref per K step.
+    //
+    // Must also run BEFORE thread tiling so thread foralls are nested inside
+    // warp foralls. The zero-tile logic in ApplyTilingLevelThread detects
     // isInsideWarpForall && mmaKind!=0 and zeros out thread tiles, deferring
     // intra-warp distribution to ConvertVectorToGPU(nvgpu).
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelSubgroupPass());
+    pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
+
+
+    // -------------------------------------------------------------------------
+    // Step 5: Tile reduction (K) dimension   [AFTER PROMOTION + SUBGROUP]
+    //
+    // After K-tiling, the matmul operates on [wgM × kStep] and [kStep × wgN]
+    // slices. The promoted copies (from Step 3) are also tiled along K,
+    // so each K-iteration loads only kStep-sized data into shared memory.
+    // Runs INSIDE the warp-forall created in Step 4 so the scf.for K-loop
+    // inherits the warp-forall's per-warp accumulator slice via iter_args.
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(
+        createNovaGPUApplyTilingLevelReductionPass());
     pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
  
 
@@ -513,23 +523,35 @@ namespace mlir::nova
     // Must run BEFORE NovaConvertSharedMemAllocs (alloc → memref.global) and
     // BEFORE MapForallToGPU (the scf.for users must still be visible).
     // -------------------------------------------------------------------------
-    pm.addNestedPass<func::FuncOp>(createNovaGPUMultiBufferingPass(/*numBuffers=*/2));
+    pm.addNestedPass<func::FuncOp>(createNovaGPUMultiBufferingPass(/*numBuffers=*/3));
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
 
-    pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
-    pm.addPass(createCanonicalizerPass());
-
-
-    // -------------------------------------------------------------------------
-    // Step 9: scf.forall → gpu.launch (C++ pass with dynamic block dims)
-    //
-    // Replaces the transform script (gpu_forall_to_launch.mlir) which
-    // hardcoded block_dims = [32, 32, 1]. This pass computes block dims
-    // from the actual thread-mapped forall iteration bounds.
-    // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUMapForallToGPUPass());
 
+    // -------------------------------------------------------------------------
+    // Step 9.0: gmem→smem vector.transfer pairs → nvgpu.device_async_copy +
+    // create_group + wait(0). Runs AFTER MapForallToGPU so async tokens
+    // are visible in the loop body (outside scf.forall).
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaGPUCreateAsyncCopiesPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    pm.addNestedPass<func::FuncOp>(createCSEPass());
+
+    // -------------------------------------------------------------------------
+    // Step 9.1: software-pipeline K-loops now that scf.forall is lowered.
+    // After MapForallToGPU the scf.forall → scf.if, so async copy tokens
+    // created inside the (now-flat) thread-predicate block are visible at the
+    // K-loop level. The pipeliner can correctly assign:
+    //   Stage 0 = nvgpu.device_async_copy + create_group + wait + barrier
+    //             (all inside the thread-predicated scf.if)
+    //   Stage 1 = compute
+    // Depth matches NovaGPUMultiBufferingPass(numBuffers=3) above so all three
+    // ring-buffer slots hold live data (2 cp.async groups in flight per thread).
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaGPUPipeliningPass(/*depth=*/3));
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    pm.addNestedPass<func::FuncOp>(createCSEPass());
 
     // -------------------------------------------------------------------------
     // Step 10: Lower remaining linalg → scf loops

@@ -205,6 +205,32 @@ void registerNovaGPUCoalesceWorkgroupBuffersPass();
 std::unique_ptr<Pass> createNovaGPUMultiBufferingPass(unsigned numBuffers = 2);
 void registerNovaGPUMultiBufferingPass();
 
+// Rewrites every gmem→smem `vector.transfer_read`/`vector.transfer_write` pair
+// into one or more `nvgpu.device_async_copy` ops, terminated by a
+// `nvgpu.device_async_create_group` + `nvgpu.device_async_wait` (numGroups
+// unset → wait-all). Preserves serial semantics; the downstream pipelining
+// pass replaces the wait-all with `wait(depth-1)` to actually overlap.
+//
+// Must run AFTER NovaGPUMultiBuffering (so the smem subviews carry the
+// stage dim) and BEFORE NovaGPUPipelining.
+//
+// Ported from IREE's `createAsyncGroups` in
+// compiler/src/iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUUtils.cpp.
+std::unique_ptr<Pass> createNovaGPUCreateAsyncCopiesPass();
+void registerNovaGPUCreateAsyncCopiesPass();
+
+// Software-pipelines K-loops that contain `nvgpu.device_async_copy`.
+// Time-shifts cp.async + deps to stage 0 and the compute to stage `depth-1`,
+// rewriting `wait` counts so depth-1 groups stay in flight per iteration.
+//
+// Wraps upstream `mlir::scf::pipelineForLoop`. Bails (leaves loop intact)
+// when the K-loop body contains region-bearing children — in that case the
+// cp.async ops still run via `wait(0)`, which is correct but un-overlapped.
+//
+// Ported from IREE's GPUPipelining.cpp (loadGlobalStage0 strategy).
+std::unique_ptr<Pass> createNovaGPUPipeliningPass(unsigned depth = 2);
+void registerNovaGPUPipeliningPass();
+
 std::unique_ptr<Pass> createNovaRepositionStorePass();
 void registerNovaRepositionStorePass();
 
@@ -296,6 +322,9 @@ void registerNovaFoldTransposeIntoConsumerPass();
 
 std::unique_ptr<Pass> createNovaStrideReductionPass();
 void registerNovaStrideReductionPass();
+
+std::unique_ptr<Pass> createNovaDirectReductionLoweringPass();
+void registerNovaDirectReductionLoweringPass();
 } // namespace nova
 } // namespace mlir
 

@@ -26,6 +26,16 @@ static bool isZeroFill(linalg::FillOp fillOp) {
 
 // Returns true if `op` is an elementwise add (all-parallel linalg.generic
 // whose body yields an arith.addf / arith.addi result).
+//
+// Only the 2-input non-inplace form is handled here: ins(%lhs, %rhs) outs(%empty).
+// The 1-input in-place form (ins(%rhs) outs(%lhs), emitted by NovaToLinalg for
+// `nova.add {in_place=true}`) is NOT handled. Swapping a writable-to_tensor
+// (arg3) into the matmul's DPS init breaks downstream bufferization —
+// promote + tile create alloc_tensors tied to that destination that the
+// GPU-aware bufferizer cannot materialize into a memref subview chain.
+// Handling the in-place matmul-accumulate pattern correctly requires either
+// rewriting earlier (at nova-level) or reshaping the destination handoff to
+// bufferization.materialize_in_destination — see planned follow-up.
 static bool isElementwiseAdd(linalg::GenericOp op) {
   if (op.getNumDpsInputs() != 2)
     return false;
@@ -90,6 +100,7 @@ struct FuseMatmulBiasIntoOuts : public OpRewritePattern<MatmulOpTy> {
       return failure();
 
     Value bias = addOp.getDpsInputOperand(biasIdx)->get();
+    AffineMap biasMap = addOp.getIndexingMapsArray()[biasIdx];
 
     auto matmulResultType = cast<RankedTensorType>(mmResult.getType());
     auto biasType = cast<RankedTensorType>(bias.getType());
@@ -110,7 +121,6 @@ struct FuseMatmulBiasIntoOuts : public OpRewritePattern<MatmulOpTy> {
       Value broadcastDest = fillOp.getOutputs()[0];
 
       int rank = matmulResultType.getRank();
-      AffineMap biasMap = addOp.getIndexingMapsArray()[biasIdx];
       AffineMap outMap  = rewriter.getMultiDimIdentityMap(rank);
 
       SmallVector<utils::IteratorType> iters(rank,

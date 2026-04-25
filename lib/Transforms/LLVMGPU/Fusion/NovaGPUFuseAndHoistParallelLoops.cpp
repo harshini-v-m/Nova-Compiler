@@ -103,6 +103,79 @@ static bool isThreadMappedForall(scf::ForallOp forall) {
   return forallHasMappingType<gpu::GPUThreadMappingAttr>(forall);
 }
 
+/// Returns true if the forall is warp-mapped (has GPUWarpMappingAttr).
+static bool isWarpMappedForall(scf::ForallOp forall) {
+  return forallHasMappingType<gpu::GPUWarpMappingAttr>(forall);
+}
+
+/// Returns true if the forall has either thread- or warp-level GPU mapping.
+/// FuseForalls uses this to allow register-resident fusion of matmul+epilogue
+/// chains where both ops end up in warp-mapped foralls. Fusion is only
+/// attempted when producer and consumer have the *same* mapping kind —
+/// see sameGpuMappingKind below.
+static bool isGpuMappedForall(scf::ForallOp forall) {
+  return isThreadMappedForall(forall) || isWarpMappedForall(forall);
+}
+
+static bool sameGpuMappingKind(scf::ForallOp a, scf::ForallOp b) {
+  return (isThreadMappedForall(a) && isThreadMappedForall(b)) ||
+         (isWarpMappedForall(a)   && isWarpMappedForall(b));
+}
+
+/// Values `a` (from consumer scope) and `b` (from producer scope) are
+/// "fuse-equivalent" under the per-dim producer→consumer IV mapping, plus a
+/// mapping between the producer's shared_outs region iter args and their
+/// corresponding forall result values.
+///
+/// Needed because FuseForalls's default subset-equivalence check compares
+/// Values by SSA identity: when both foralls compute their per-warp offset
+/// as `affine.apply<(d0) -> (d0 * 64)>(%IV)`, they produce *different* SSA
+/// values because each forall has its own IV, so the strict check rejects
+/// fusion even though the math is identical. Similarly, the producer writes
+/// into its own `%arg_outs` (a block arg of the producer body) while the
+/// consumer reads from the producer forall's *result* %P — semantically the
+/// same tensor but different SSA values. Both equivalences are needed for
+/// sibling-forall fusion (e.g. matmul warp-forall + epilogue warp-forall).
+/// Captured loop-invariants still match by SSA identity.
+static bool fuseEquivalent(Value a, Value b,
+                           ArrayRef<Value> producerIVs,
+                           ArrayRef<Value> consumerIVs,
+                           ArrayRef<Value> producerBodyOuts,
+                           ArrayRef<Value> producerForallResults) {
+  if (a == b) return true;
+  // IV remap: producer IV at position i ≡ consumer IV at same position.
+  for (auto [i, pIV] : llvm::enumerate(producerIVs)) {
+    if (b == pIV) return a == consumerIVs[i];
+  }
+  for (auto [i, cIV] : llvm::enumerate(consumerIVs)) {
+    if (a == cIV) return b == producerIVs[i];
+  }
+  // shared_outs remap: producer body's iter-arg ≡ producer forall's result
+  // when viewed from outside the producer. The consumer reads from the
+  // forall's result; the producer writes to its iter-arg — after fusion these
+  // refer to the same tensor.
+  for (auto [iterArg, result] :
+       llvm::zip_equal(producerBodyOuts, producerForallResults)) {
+    if ((a == result && b == iterArg) ||
+        (a == iterArg && b == result))
+      return true;
+  }
+  // affine.apply: same map with fuse-equivalent operands.
+  auto applyA = a.getDefiningOp<affine::AffineApplyOp>();
+  auto applyB = b.getDefiningOp<affine::AffineApplyOp>();
+  if (!applyA || !applyB) return false;
+  if (applyA.getAffineMap() != applyB.getAffineMap()) return false;
+  if (applyA.getOperands().size() != applyB.getOperands().size())
+    return false;
+  for (auto [oa, ob] :
+       llvm::zip_equal(applyA.getOperands(), applyB.getOperands())) {
+    if (!fuseEquivalent(oa, ob, producerIVs, consumerIVs,
+                        producerBodyOuts, producerForallResults))
+      return false;
+  }
+  return true;
+}
+
 /// Checks whether a forall's flat trip count equals `flatWorkgroupSize`.
 static bool tripCountMatchesWorkgroupSize(scf::ForallOp forallOp,
                                           int64_t flatWorkgroupSize) {
@@ -247,10 +320,12 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
       return rewriter.notifyMatchFailure(producerForall,
                                          "multi-result producer");
 
-    // Only fuse thread-mapped foralls.
-    if (!isThreadMappedForall(producerForall))
+    // Fuse foralls with GPU thread or warp mapping. Producer and consumer
+    // must have the same mapping kind (both thread or both warp) so each
+    // iteration in the producer maps 1:1 to an iteration in the consumer.
+    if (!isGpuMappedForall(producerForall))
       return rewriter.notifyMatchFailure(producerForall,
-                                         "producer is not thread-mapped");
+                                         "producer has no GPU mapping");
 
     // Both must be normalized.
     if (!isNormalized(producerForall))
@@ -273,10 +348,14 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
                                          "no consumer after chain");
 
     auto consumerForall = currUser->getParentOfType<scf::ForallOp>();
-    if (!consumerForall || !isThreadMappedForall(consumerForall))
+    if (!consumerForall || !isGpuMappedForall(consumerForall))
       return rewriter.notifyMatchFailure(
           producerForall,
-          "consumer not inside a thread-mapped forall");
+          "consumer not inside a GPU-mapped forall");
+    if (!sameGpuMappingKind(producerForall, consumerForall))
+      return rewriter.notifyMatchFailure(
+          producerForall,
+          "producer and consumer have different GPU mapping kinds");
 
     if (!isNormalized(consumerForall))
       return rewriter.notifyMatchFailure(consumerForall,
@@ -329,9 +408,19 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
     // fusion can create invalid IR when the producer and consumer distribute
     // their threads differently over shared dimensions (e.g., layer norm with
     // K-per-thread=4 fused into matmul with K-per-thread=16).
+    //
+    // Use an IV-aware equivalence fn so that two affine.apply ops built from
+    // the producer's and consumer's own IVs — but with the same map and
+    // positionally-matching IVs — count as equivalent. Needed when producer
+    // and consumer are sibling foralls (e.g. matmul warp-forall + bias-add
+    // warp-forall) that each compute their own warp offsets.
+    SmallVector<Value> producerIVs = producerForall.getInductionVars();
+    SmallVector<Value> consumerIVs = consumerForall.getInductionVars();
+    auto equivalenceFn = [&](Value v1, Value v2) {
+      return fuseEquivalent(v1, v2, producerIVs, consumerIVs);
+    };
     if (!cast<SubsetOpInterface>(*consumerSlice).operatesOnEquivalentSubset(
-            cast<SubsetOpInterface>(*producerInsert),
-            [](Value v1, Value v2) { return v1 == v2; }))
+            cast<SubsetOpInterface>(*producerInsert), equivalenceFn))
       return rewriter.notifyMatchFailure(
           producerForall,
           "producer insert and consumer extract operate on incompatible "

@@ -55,6 +55,10 @@ add_mlir_library(NovaLLVMGPUTransforms
   Memory/NovaGPUCoalesceWorkgroupBuffers.cpp
   # Multi-buffer workgroup allocs for cp.async software pipelining
   Memory/NovaGPUMultiBuffering.cpp
+  # Convert gmem→smem vector.transfer pairs to nvgpu.device_async_copy
+  Memory/NovaGPUCreateAsyncCopies.cpp
+  # Software-pipeline K-loops that contain nvgpu.device_async_copy
+  Memory/NovaGPUPipelining.cpp
   # Forward fill/copy operations
   Memory/NovaGPUFillCopyForwarding.cpp
   # Eliminate tensor.empty ops pre-bufferization
@@ -85,6 +89,9 @@ add_mlir_library(NovaLLVMGPUTransforms
   Lowering/NovaGPULowerBarrierRegion.cpp
   # Erase nova.fusion_barrier ops
   Lowering/NovaGPUEraseFusionBarriers.cpp
+
+# Direct reduction lowering (replaces SCFScalarize + WarpShuffle for reductions)
+  Loops/NovaDirectReductionLowering.cpp
 
 
 # ── Transpose ─────────────────────────────────────────────────────────────

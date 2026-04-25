@@ -48,14 +48,6 @@
 //          Simple elementwise ops (relu, bias_add, gelu) are handled directly.
 //          Row-reduction ops (layernorm) force tileK == K (full reduction dim)
 //          and reserve per-row mean+variance scratch space.
-//   [Fix7] tryPickMMASchedule: when doCPromotion=true causes smem overflow
-//          such that no valid MMA schedule exists (fitScheduleInSharedMemory
-//          returns nullopt), retry with doCPromotion=false.  The C tile
-//          (live bias) can be loaded directly from global memory into MMA
-//          accumulator fragment registers without a shared-memory staging
-//          buffer; it is read once per output tile so the bandwidth penalty
-//          is acceptable.  trySetMMAConfig omits operand 2 from promotedOps
-//          when this retry succeeds, so no smem copy is generated for bias.
 //===----------------------------------------------------------------------===//
 
 
@@ -159,8 +151,18 @@ struct GPUMMAHeuristicSeeds {
 struct GPUMMASchedule {
  NVMMAIntrinsicInfo intrinsic;
  int64_t wgM, wgN, wgK;
+ // Total warps per workgroup = subgroupCountM * subgroupCountN.
+ // Kept as (legacy) subgroupCount for downstream passes that still read it.
  int64_t subgroupCount;
- int64_t mnTileCountPerSubgroup;
+ int64_t subgroupCountM;              // warps splitting M within a workgroup
+ int64_t subgroupCountN;              // warps splitting N within a workgroup
+ // Per-warp MMA tile counts. For the legacy (1-D warp split) path these are
+ // equal to mnTileCountPerSubgroup. The 2-D warp grid path (VeryLarge
+ // balanced GEMMs targeting a matmul.cpp-style 128x128 tile) sets them
+ // independently.
+ int64_t mnTileCountPerSubgroup;      // legacy; = max(mTile, nTile)
+ int64_t mTileCountPerSubgroup;       // MMA tiles per warp along M
+ int64_t nTileCountPerSubgroup;       // MMA tiles per warp along N
  int64_t kTileCountPerSubgroup;
 };
 
@@ -540,7 +542,14 @@ getContractionHeuristicSeeds(const ContractProblem &problem,
    if (problem.inBitWidth <= 16)
      return GPUMMAHeuristicSeeds{4, 64, 4, 4,
                                  /*boostMNT=*/std::nullopt, /*util=*/0.80};
-   return GPUMMAHeuristicSeeds{4, 32, 4, 2,
+   // f32 / TF32: target a 128x128x8 workgroup tile with a 2x2 warp grid
+   // (matches eager sgemm and NovaToGpu direct-lowering). Keep K-tile
+   // small so the A+B SMEM footprint stays under 48 KB and
+   // fitScheduleInSharedMemory doesn't shrink the MN tile.
+   //   wgM = mSize*MNT*S = 16*4*4 = 256 → reshape to 2x2 warp grid → 128
+   //   wgN = nSize*MNT   = 8*4      =  32 → reshape doubles → 128
+   //   wgK = kSize*Ktiles= 8*1      =   8
+   return GPUMMAHeuristicSeeds{4, 8, 4, 1,
                                /*boostMNT=*/std::nullopt, /*util=*/0.80};
  }
  return std::nullopt;
@@ -621,19 +630,6 @@ static void adjustSeedsForTarget(GPUMMAHeuristicSeeds &seeds,
    return;
  }
 
-
- // [Fix] Handle K-dominated shapes (K > 2*N). For these shapes, large parallel
- // tiles backfire if MMA vectorization fails, leading to register explosion
- // in the fallback SIMD/SIMT path due to scattered accumulators.
- // We force a minimal M/N tile (MNT=1) to keep thread counts manageable.
- bool kDominatedForFallback = problem.kSize > 2 * problem.nSize;
- if (kDominatedForFallback) {
-   seeds.bestMNTileCountPerSubgroup = 1;
-   LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] K-dominated shape (K="
-                            << problem.kSize << " > 2*N=" << 2 * problem.nSize
-                            << "), forcing minimal M/N tile to protect fallback.\n");
-   return;
- }
 
  // Helper: reduce MNT until numWorkgroups >= wgpCount.
  auto fillCUs = [&]() {
@@ -869,8 +865,50 @@ getOptimalMMASchedule(const ContractProblem &problem,
  int64_t wgN = intrinsic.nSize * mnTileCount;
 
 
+ // Default: 1-D warp split — all warps along M, one warp wide in N.
+ int64_t subgroupCountM = subgroupCount;
+ int64_t subgroupCountN = 1;
+ int64_t mTileCount     = mnTileCount;
+ int64_t nTileCount     = mnTileCount;
+
+
+ // ── 2-D warp grid reshape (matmul.cpp-style 2x2) ─────────────────────────
+ // For Large/VeryLarge GEMMs with room on the N-side, redistribute the
+ // warp group from [S warps in M × 1 in N] into a balanced 2-D grid.
+ // Mirrors the eager/direct-lowering layout: 2 warps in M, 2 in N, each
+ // warp covering per-warp tile (wgM / 2) × (wgN / 2).
+ //
+ // Conditions:
+ //   * subgroupCount is even (>= 2)
+ //   * nTiles has headroom to double the N-side tile
+ //   * K is not dominant (column-heavy problems prefer the old split)
+ if ((problem.gemmSize == GemmSize::LargeGemm ||
+      problem.gemmSize == GemmSize::VeryLargeGemm) &&
+     subgroupCount >= 2 && (subgroupCount % 2) == 0 &&
+     nTiles >= mnTileCount * 2 &&
+     problem.kSize <= std::max(problem.mSize, problem.nSize)) {
+   subgroupCountM = subgroupCount / 2;
+   subgroupCountN = 2;
+   // Per-warp MMA tile counts preserve the per-warp footprint in M and
+   // double the per-warp footprint in N (new N-warp absorbs its share).
+   mTileCount = mnTileCount;
+   nTileCount = mnTileCount * 2;
+   // Clamp to available tiles so we don't over-cover.
+   mTileCount = std::min(mTileCount,
+                         std::max<int64_t>(mTiles / std::max<int64_t>(subgroupCountM, 1),
+                                           int64_t{1}));
+   nTileCount = std::min(nTileCount,
+                         std::max<int64_t>(nTiles / subgroupCountN, int64_t{1}));
+   wgM = intrinsic.mSize * mTileCount * subgroupCountM;
+   wgN = intrinsic.nSize * nTileCount * subgroupCountN;
+ }
+
+
  return GPUMMASchedule{intrinsic, wgM, wgN, wgK,
-                       subgroupCount, mnTileCount,
+                       subgroupCount,
+                       subgroupCountM, subgroupCountN,
+                       std::max(mTileCount, nTileCount),  // mnTileCount legacy
+                       mTileCount, nTileCount,
                        seeds.bestKTileCountPerSubgroup};
 }
 
@@ -897,20 +935,44 @@ fitScheduleInSharedMemory(GPUMMASchedule sched,
    if (smem <= maxSmem) return sched;
 
 
-   int64_t newMNT = sched.mnTileCountPerSubgroup / 2;
-   if (newMNT < 1) return std::nullopt;
+   // Halve whichever side has the larger per-warp MMA tile count first.
+   // Fall through to halving the other side when equal.
+   bool halveM = sched.mTileCountPerSubgroup >= sched.nTileCountPerSubgroup;
+   if (halveM && sched.mTileCountPerSubgroup <= 1)
+     halveM = false;
+   if (!halveM && sched.nTileCountPerSubgroup <= 1) {
+     if (sched.mTileCountPerSubgroup <= 1)
+       return std::nullopt;
+     halveM = true;
+   }
 
+   if (halveM) {
+     int64_t newMT = sched.mTileCountPerSubgroup / 2;
+     if (newMT < 1) return std::nullopt;
+     sched.mTileCountPerSubgroup = newMT;
+   } else {
+     int64_t newNT = sched.nTileCountPerSubgroup / 2;
+     if (newNT < 1) return std::nullopt;
+     sched.nTileCountPerSubgroup = newNT;
+   }
 
-   sched.mnTileCountPerSubgroup = newMNT;
-   sched.wgM = std::max(intrinsic.mSize * newMNT * sched.subgroupCount,
+   sched.wgM = std::max(intrinsic.mSize * sched.mTileCountPerSubgroup *
+                        sched.subgroupCountM,
                         intrinsic.mSize);
-   sched.wgN = std::max(intrinsic.nSize * newMNT, intrinsic.nSize);
+   sched.wgN = std::max(intrinsic.nSize * sched.nTileCountPerSubgroup *
+                        sched.subgroupCountN,
+                        intrinsic.nSize);
+   sched.mnTileCountPerSubgroup =
+       std::max(sched.mTileCountPerSubgroup, sched.nTileCountPerSubgroup);
 
 
    LLVM_DEBUG(llvm::dbgs()
               << "[nova-kernel-config] fitScheduleInSharedMemory: smem="
               << smem << " > limit=" << maxSmem
-              << " (incl. fused-op overhead), shrinking MNT to " << newMNT
+              << " (incl. fused-op overhead), shrinking "
+              << (halveM ? "M" : "N") << "-tile. New mT="
+              << sched.mTileCountPerSubgroup
+              << " nT=" << sched.nTileCountPerSubgroup
               << " wgM=" << sched.wgM << " wgN=" << sched.wgN << "\n");
  }
 }
@@ -945,31 +1007,39 @@ deduceMMASchedule(const ContractProblem &problem,
                                  /*canUpcastAcc=*/true, mustBeAligned)))
      continue;
 
+
    int64_t effectiveK = problem.kSize / splitReductionTripCnt;
+
 
    // [Fix6] If layernorm forces a full-K tile, enforce it here.
    if (fusedInfo.forcedTileK >= 0)
      effectiveK = fusedInfo.forcedTileK;
 
+
    if (mustBeAligned && effectiveK % intrinsic.kSize != 0)
      continue;
+
 
    GPUMMAHeuristicSeeds localSeeds = seeds;
    adjustSeedsForTarget(localSeeds, problem, intrinsic, target,
                         splitReductionTripCnt);
 
+
    GPUMMASchedule sched =
        getOptimalMMASchedule(problem, intrinsic, localSeeds, effectiveK);
+
 
    if (sched.wgM < intrinsic.mSize) continue;
    if (sched.wgN < intrinsic.nSize) continue;
    if (sched.wgK < intrinsic.kSize) continue;
+
 
    if (mustBeAligned) {
      if (problem.mSize % sched.wgM != 0) continue;
      if (problem.nSize % sched.wgN != 0) continue;
      if (effectiveK   % sched.wgK != 0) continue;
    }
+
 
    // [Fix6] Pass fusedInfo so fitScheduleInSharedMemory uses the real budget.
    std::optional<GPUMMASchedule> fitted =
@@ -1027,17 +1097,8 @@ getMmaSchedule(const NVIDIATargetInfo &target, ContractProblem &problem,
 
 
  for (const NVMMAIntrinsicInfo &mma : target.mmaIntrinsics) {
-   if (!mma.getDistributionMappingKind()) {
-     LLVM_DEBUG(llvm::dbgs() << "[nova-mma-diag]   intrinsic " << (int)mma.intrinsic
-                              << " SKIP: no distribution mapping\n");
-     continue;
-   }
-   if (mma.warpSize != targetSubgroupSize) {
-     LLVM_DEBUG(llvm::dbgs() << "[nova-mma-diag]   intrinsic " << (int)mma.intrinsic
-                              << " SKIP: warpSize " << mma.warpSize
-                              << " != subgroupSize " << targetSubgroupSize << "\n");
-     continue;
-   }
+   if (!mma.getDistributionMappingKind()) continue;
+   if (mma.warpSize != targetSubgroupSize) continue;
 
 
    auto [mSize, nSize, kSize] = mma.getMNKShape();
@@ -1045,40 +1106,19 @@ getMmaSchedule(const NVIDIATargetInfo &target, ContractProblem &problem,
 
 
    // Input types must match exactly.
-   if (aKind != problem.lhsKind || bKind != problem.rhsKind) {
-     LLVM_DEBUG(llvm::dbgs() << "[nova-mma-diag]   intrinsic " << (int)mma.intrinsic
-                              << " SKIP: type mismatch lhs=" << aKind
-                              << " vs problem.lhs=" << problem.lhsKind
-                              << " rhs=" << bKind
-                              << " vs problem.rhs=" << problem.rhsKind << "\n");
-     continue;
-   }
+   if (aKind != problem.lhsKind || bKind != problem.rhsKind) continue;
 
 
    // [Fix2] Accumulator: allow exact match OR wider accumulator (upcasting).
-   if (cKind != problem.accKind && cKind < problem.accKind) {
-     LLVM_DEBUG(llvm::dbgs() << "[nova-mma-diag]   intrinsic " << (int)mma.intrinsic
-                              << " SKIP: acc type cKind=" << cKind
-                              << " < problem.acc=" << problem.accKind << "\n");
-     continue;
-   }
+   // e.g., f16 problem (accKind=0) can use f32 accumulator intrinsic (cKind=2).
+   if (cKind != problem.accKind && cKind < problem.accKind) continue;
 
 
-   LLVM_DEBUG(llvm::dbgs() << "[nova-mma-diag]   intrinsic " << (int)mma.intrinsic
-                            << " ACCEPTED (" << mSize << "x" << nSize << "x" << kSize
-                            << ", lhs=" << aKind << " rhs=" << bKind
-                            << " acc=" << cKind << ")\n");
    intrinsics.push_back({mma.intrinsic, mSize, nSize, kSize,
                          mma.warpSize, aKind, bKind, cKind,
                          mma.distribution});
  }
- if (intrinsics.empty()) {
-   LLVM_DEBUG(llvm::dbgs() << "[nova-mma-diag]   getMmaSchedule: NO matching intrinsics "
-                            << "(lhsKind=" << problem.lhsKind
-                            << " rhsKind=" << problem.rhsKind
-                            << " accKind=" << problem.accKind << ")\n");
-   return std::nullopt;
- }
+ if (intrinsics.empty()) return std::nullopt;
 
 
  // Classify problem by arithmetic intensity.
@@ -1121,11 +1161,7 @@ getMmaSchedule(const NVIDIATargetInfo &target, ContractProblem &problem,
 //===----------------------------------------------------------------------===//
 
 
-// Returns the chosen schedule paired with the effective doCPromotion flag.
-// The effective flag may differ from the requested one when [Fix7] fires:
-// if doCPromotion=true causes smem overflow, we retry with false and return
-// false so that trySetMMAConfig knows not to stage the C tile in shared mem.
-static std::optional<std::pair<GPUMMASchedule, bool>>
+static std::optional<GPUMMASchedule>
 tryPickMMASchedule(linalg::LinalgOp op,
                   const NVIDIATargetInfo &target,
                   const MatmulDims &dims,
@@ -1134,7 +1170,6 @@ tryPickMMASchedule(linalg::LinalgOp op,
                   const FusedOpMemoryInfo &fusedInfo) {
  auto cd = mlir::linalg::inferContractionDims(op);
  bool isGemm = succeeded(cd) && cd->batch.empty();
-
 
 
  ContractProblem problem;
@@ -1154,38 +1189,15 @@ tryPickMMASchedule(linalg::LinalgOp op,
  if (auto sched = getMmaSchedule(target, problem, isGemm,
                                  /*mustBeAligned=*/true, doCPromotion,
                                  fusedInfo))
-   return std::make_pair(*sched, doCPromotion);
+   return sched;
 
 
  // Pass 2: unaligned retry — allows tiles that do not evenly divide M/N/K.
  LLVM_DEBUG(llvm::dbgs()
             << "[nova-kernel-config] Aligned pass failed, "
                "retrying without alignment requirement\n");
- if (auto sched = getMmaSchedule(target, problem, isGemm,
-                                 /*mustBeAligned=*/false, doCPromotion,
-                                 fusedInfo))
-   return std::make_pair(*sched, doCPromotion);
-
- // [Fix7] Passes 1 & 2 failed with doCPromotion=true (smem overflow from
- // the extra C tile).  Retry without C shared-memory staging: the bias
- // tensor is read once per output tile and can be loaded directly from
- // global memory into MMA accumulator fragment registers, so staging it in
- // shared memory is not required for correctness.
- if (doCPromotion) {
-   LLVM_DEBUG(llvm::dbgs()
-              << "[nova-kernel-config] MMA schedule failed with "
-                 "doCPromotion=true; retrying without C smem staging\n");
-   if (auto sched = getMmaSchedule(target, problem, isGemm,
-                                   /*mustBeAligned=*/true,
-                                   /*doCPromotion=*/false, fusedInfo))
-     return std::make_pair(*sched, /*effectiveDoCPromotion=*/false);
-   if (auto sched = getMmaSchedule(target, problem, isGemm,
-                                   /*mustBeAligned=*/false,
-                                   /*doCPromotion=*/false, fusedInfo))
-     return std::make_pair(*sched, /*effectiveDoCPromotion=*/false);
- }
-
- return std::nullopt;
+ return getMmaSchedule(target, problem, isGemm,
+                       /*mustBeAligned=*/false, doCPromotion, fusedInfo);
 }
 
 
@@ -1195,124 +1207,163 @@ tryPickMMASchedule(linalg::LinalgOp op,
 // [Fix5] threadTile = intrinsic size (one MMA slot per thread);
 //         subgroupTile = intrinsic * mnTileCount encodes multi-tile ownership.
 //===----------------------------------------------------------------------===//
-
-
 static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
-                                    const NVIDIATargetInfo &target,
-                                    const MatmulDims &dims,
-                                    int numLoops,
-                                    bool doCPromotion,
-                                    bool promotePrologueOperands,
-                                    const FusedOpMemoryInfo &fusedInfo) {
- Type lhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(0)->get());
- Type rhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(1)->get());
- Type accType = getElementTypeOrSelf(matmul.getDpsInitOperand(0)->get());
+                                     const NVIDIATargetInfo &target,
+                                     const MatmulDims &dims,
+                                     int numLoops,
+                                     bool doCPromotion,
+                                     bool promotePrologueOperands,
+                                     const FusedOpMemoryInfo &fusedInfo) {
+  Type lhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(0)->get());
+  Type rhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(1)->get());
+  Type accType = getElementTypeOrSelf(matmul.getDpsInitOperand(0)->get());
 
+  int32_t lhsKind = typeToElementKind(lhsType);
+  int32_t rhsKind = typeToElementKind(rhsType);
+  int32_t accKind = typeToElementKind(accType);
+  if (lhsKind < 0 || rhsKind < 0 || accKind < 0)
+    return failure();
 
- int32_t lhsKind = typeToElementKind(lhsType);
- int32_t rhsKind = typeToElementKind(rhsType);
- int32_t accKind = typeToElementKind(accType);
- if (lhsKind < 0 || rhsKind < 0 || accKind < 0)
-   return failure();
+  auto maybeSchedule = tryPickMMASchedule(matmul, target, dims,
+                                          lhsKind, rhsKind, accKind,
+                                          doCPromotion, fusedInfo);
+  if (!maybeSchedule)
+    return failure();
 
+  const GPUMMASchedule &sched = *maybeSchedule;
+  auto contractionDims = mlir::linalg::inferContractionDims(matmul);
 
- auto maybeSchedulePair = tryPickMMASchedule(matmul, target, dims,
-                                             lhsKind, rhsKind, accKind,
-                                             doCPromotion, fusedInfo);
- if (!maybeSchedulePair)
-   return failure();
+  SmallVector<int64_t> workgroupTiles(numLoops, 0);
+  SmallVector<int64_t> reductionTiles(numLoops, 0);
+  SmallVector<int64_t> threadTiles(numLoops, 0);
+  SmallVector<int64_t> subgroupTiles(numLoops, 0);
+  // Per-workgroup subgroup counts (warps within ONE workgroup tile).
+  // Read by NovaGPUConfigureTensorLayouts to build correct per-warp layouts.
+  // Separate from subgroupTiles (global = numWorkgroups × warpsPerWG).
+  SmallVector<int64_t> wgSubgroupTiles(numLoops, 0);
 
- const GPUMMASchedule &sched          = maybeSchedulePair->first;
- const bool effectiveDoCPromotion     = maybeSchedulePair->second;
- auto contractionDims = mlir::linalg::inferContractionDims(matmul);
+  // ── Batch and leading M/N/K dims: tile by 1 ──────────────────────────────
+  for (int64_t b : contractionDims->batch) {
+    workgroupTiles[b]   = 1;
+    threadTiles[b]      = 1;
+    subgroupTiles[b]    = 1;
+    wgSubgroupTiles[b]  = 1;
+  }
+  for (int64_t m : llvm::drop_end(contractionDims->m)) {
+    workgroupTiles[m]   = 1;
+    threadTiles[m]      = 1;
+    subgroupTiles[m]    = 1;
+    wgSubgroupTiles[m]  = 1;
+  }
+  for (int64_t n : llvm::drop_end(contractionDims->n)) {
+    workgroupTiles[n]   = 1;
+    threadTiles[n]      = 1;
+    subgroupTiles[n]    = 1;
+    wgSubgroupTiles[n]  = 1;
+  }
+  for (int64_t k : llvm::drop_end(contractionDims->k))
+    reductionTiles[k] = 1;
 
+  // ── Innermost M, N, K dims ───────────────────────────────────────────────
+  int mDim = contractionDims->m.back();
+  int nDim = contractionDims->n.back();
+  int kDim = contractionDims->k.back();
 
- SmallVector<int64_t> workgroupTiles(numLoops, 0);
- SmallVector<int64_t> reductionTiles(numLoops, 0);
- SmallVector<int64_t> threadTiles(numLoops, 0);
- SmallVector<int64_t> subgroupTiles(numLoops, 0);
+  workgroupTiles[mDim] = sched.wgM;
+  workgroupTiles[nDim] = sched.wgN;
+  reductionTiles[kDim] = sched.wgK;
 
+  // threadTiles for MMA M/N = 0: the Subgroup pass owns MMA tiling.
+  // The Thread pass checks anyNonZero and skips this op entirely.
+  // Copy/fill ops use derived_thread config (separate code path) and are
+  // unaffected by this zeroing.
+  threadTiles[mDim] = 0;
+  threadTiles[nDim] = 0;
 
- for (int64_t b : contractionDims->batch) {
-   workgroupTiles[b] = 1; threadTiles[b] = 1; subgroupTiles[b] = 1;
- }
- for (int64_t m : llvm::drop_end(contractionDims->m)) {
-   workgroupTiles[m] = 1; threadTiles[m] = 1; subgroupTiles[m] = 1;
- }
- for (int64_t n : llvm::drop_end(contractionDims->n)) {
-   workgroupTiles[n] = 1; threadTiles[n] = 1; subgroupTiles[n] = 1;
- }
- for (int64_t k : llvm::drop_end(contractionDims->k))
-   reductionTiles[k] = 1;
+  // ── Per-warp tile step ("subgroup" field) ────────────────────────────────
+  // = wgTile / warpsPerWG along each axis — what the Subgroup scf.forall
+  // iterates by. With a 2-D warp grid (matmul.cpp-style 2x2), both M and N
+  // are split across warps; the legacy 1-D split has subgroupCountN == 1.
+  subgroupTiles[mDim] = sched.wgM / sched.subgroupCountM;
+  subgroupTiles[nDim] = sched.wgN / sched.subgroupCountN;
+  subgroupTiles[kDim] = 0;           // K not distributed across subgroups
 
+  for (int64_t b : contractionDims->batch)
+    subgroupTiles[b] = workgroupTiles[b]; // one warp owns full batch dim
 
- workgroupTiles[contractionDims->m.back()] = sched.wgM;
- workgroupTiles[contractionDims->n.back()] = sched.wgN;
- reductionTiles[contractionDims->k.back()] = sched.wgK;
+  // ── Per-workgroup subgroup counts ("wg_subgroup" field) ──────────────────
+  // Number of warps along each axis within ONE workgroup tile.
+  // NovaGPUConfigureTensorLayouts uses this to compute per-warp
+  // batch_counts / sg_counts correctly from the wg-level tile bounds.
+  wgSubgroupTiles[mDim] = sched.subgroupCountM;
+  wgSubgroupTiles[nDim] = sched.subgroupCountN;
+  wgSubgroupTiles[kDim] = 0;                   // K not subgroup-distributed
 
+  for (int64_t b : contractionDims->batch)
+    wgSubgroupTiles[b] = 1; // one subgroup per batch dim within WG
 
- // [Fix5] threadTile = 0 for MMA contraction dims.
- //
- // mma.sync is a warp-cooperative instruction: all 32 lanes must execute it
- // together. Setting threadTile = mSize/nSize would create a per-thread
- // scf.forall that assigns one full 16×8 tile to a single thread — which is
- // architecturally incorrect (the hardware expects per-lane fragments, not
- // per-thread full tiles).
- //
- // With threadTile = 0, the thread tiling pass creates no thread forall for
- // the matmul. The op stays at subgroup (warp) granularity. After
- // vectorization, ConvertVectorToGPU handles the intra-warp lane distribution
- // automatically via nvgpu.mma.sync's implicit per-lane fragment semantics.
- threadTiles[contractionDims->m.back()] = 0;
- threadTiles[contractionDims->n.back()] = 0;
+  // ── Promoted operands ────────────────────────────────────────────────────
+  // A and B always go through shared (cooperative loads + reuse across K).
+  // C-promotion (index 2) costs wgM*wgN*4 bytes of shared and forces the
+  // accumulator out of registers. Only do it when:
+  //   (a) doCPromotion  — true matmul_accumulate (read-modify-write of a
+  //       live C buffer): cooperative load saves N global reads.
+  //   (b) the downstream consumer has a reduction iterator (softmax,
+  //       layernorm, etc.): epilogue genuinely reuses the value cooperatively.
+  // For elementwise epilogues (relu, gelu, bias_add) the consumer reads each
+  // element exactly once; staging C in shared is pure overhead and blows the
+  // 48 KB SRAM budget for 128x128 f32 tiles.
+  bool epilogueBenefitsFromShared = false;
+  if (promotePrologueOperands) {
+    for (Value result : matmul->getResults()) {
+      for (Operation *user : result.getUsers()) {
+        auto userLinalg = dyn_cast<linalg::LinalgOp>(user);
+        if (!userLinalg) continue;
+        if (llvm::any_of(userLinalg.getIteratorTypesArray(),
+                         linalg::isReductionIterator)) {
+          epilogueBenefitsFromShared = true;
+          break;
+        }
+      }
+      if (epilogueBenefitsFromShared) break;
+    }
+  }
+  SmallVector<int64_t> promotedOps = {0, 1};
+  if (doCPromotion || epilogueBenefitsFromShared)
+    promotedOps.push_back(2);
 
+  // ── Padding ──────────────────────────────────────────────────────────────
+  SmallVector<int64_t> padding =
+      computePaddingSizes(matmul, workgroupTiles, reductionTiles);
 
- // subgroupTile = intrinsic × mnTileCount encodes how many MMA tiles each
- // subgroup (warp) owns. The backend pipelines these for register-level ILP.
- subgroupTiles[contractionDims->m.back()] =
-     sched.intrinsic.mSize * sched.mnTileCountPerSubgroup;
- subgroupTiles[contractionDims->n.back()] =
-     sched.intrinsic.nSize * sched.mnTileCountPerSubgroup;
+  // ── Write config ─────────────────────────────────────────────────────────
+  MLIRContext *ctx = matmul.getContext();
+  setMatmulLoweringConfigAttrs(matmul.getOperation(), ctx,
+                               workgroupTiles, reductionTiles,
+                               threadTiles, subgroupTiles,
+                               static_cast<int32_t>(sched.intrinsic.intrinsic),
+                               promotedOps, padding,
+                               wgSubgroupTiles);
 
-
- SmallVector<int64_t> padding =
-     computePaddingSizes(matmul, workgroupTiles, reductionTiles);
-
-
- // [Fix1] Build promoted operand list.
- // Always promote A and B (operands 0 and 1) into shared memory.
- // Also promote C (operand 2 / init) when C promotion is needed due to:
- //   - live accumulator buffer (effectiveDoCPromotion), OR
- //   - prologue ops that feed non-matmul data into the kernel.
- // Note: effectiveDoCPromotion may be false even when doCPromotion=true if
- // [Fix7] fired — in that case the bias is loaded directly from global mem
- // into MMA fragment registers without a shared-memory staging buffer.
- SmallVector<int64_t> promotedOps = {0, 1};
- if (effectiveDoCPromotion || promotePrologueOperands)
-   promotedOps.push_back(2);
-
-
- MLIRContext *ctx = matmul.getContext();
- setMatmulLoweringConfigAttrs(matmul.getOperation(), ctx,
-                              workgroupTiles, reductionTiles,
-                              threadTiles, subgroupTiles,
-                              static_cast<int32_t>(sched.intrinsic.intrinsic),
-                              promotedOps, padding);
-
-
- LLVM_DEBUG(llvm::dbgs()
-            << "[nova-kernel-config] MMA config: wgM=" << sched.wgM
-            << " wgN=" << sched.wgN << " wgK=" << sched.wgK
-            << " subgroups=" << sched.subgroupCount
-            << " mnTile=" << sched.mnTileCountPerSubgroup
-            << " doCPromo=" << effectiveDoCPromotion
-            << " (requested=" << doCPromotion << ")"
-            << " promoProlog=" << promotePrologueOperands
-            << " fusedOpOverhead="
-            << fusedInfo.extraSmemBytes(sched.wgM, sched.wgK) << "\n");
- return success();
+  LLVM_DEBUG(llvm::dbgs()
+             << "[nova-kernel-config] MMA config:"
+             << " wgM=" << sched.wgM
+             << " wgN=" << sched.wgN
+             << " wgK=" << sched.wgK
+             << " warpGrid=" << sched.subgroupCountM
+             << "x" << sched.subgroupCountN
+             << " mTilePerWarp=" << sched.mTileCountPerSubgroup
+             << " nTilePerWarp=" << sched.nTileCountPerSubgroup
+             << " sgStepM=" << subgroupTiles[mDim]
+             << " sgStepN=" << subgroupTiles[nDim]
+             << " wgSgM=" << wgSubgroupTiles[mDim]
+             << " wgSgN=" << wgSubgroupTiles[nDim]
+             << " doCPromo=" << doCPromotion
+             << " promoProlog=" << promotePrologueOperands
+             << " fusedOverhead="
+             << fusedInfo.extraSmemBytes(sched.wgM, sched.wgK) << "\n");
+  return success();
 }
-
 
 //===----------------------------------------------------------------------===//
 // setSimtConfig — SIMT fallback, fused-op-aware [Fix6]
@@ -1326,13 +1377,6 @@ static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
                                   int numLoops,
                                   const NVIDIATargetInfo &target,
                                   const FusedOpMemoryInfo &fusedInfo) {
- // Matvec (M=1 or N=1) should use the reduction pipeline, not SIMT
- // contraction tiling.  Returning failure here lets the caller fall through
- // to setDefaultConfig, which handles 1D accumulation via
- // vector.multi_reduction → FMA that ConvertVectorToLLVM lowers correctly.
- if (dims.M == 1 || dims.N == 1)
-   return failure();
-
  // Phase 1: find the best-aligned tile from the table.
  const SimtTilePair *chosen = nullptr;
  for (const auto &entry : kSimtTable) {
@@ -1369,10 +1413,14 @@ static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
    while (tileK > 1 && dims.K % tileK != 0) tileK >>= 1;
 
 
- // [Fix6] Phase 2: shrink tileM until A+B+fused overhead fits maxSmem.
- // Use f32 (4 bytes/elem) conservatively since type info is not threaded here.
+ // [Fix-P1-4] Target at most half of maxSmem per block so at least 2 blocks
+ // fit per SM, doubling warp slots available for latency hiding (occupancy
+ // goes from ~17% to ~33% on sm_86 with 48KB shared memory).
  constexpr int32_t kF32Kind = 2;
- int64_t maxSmem = target.maxWorkgroupMemBytes;
+ int64_t maxSmem = target.maxWorkgroupMemBytes / 2;
+
+ // [Fix6] Phase 2: shrink tileM (then tileK) until A+B+fused overhead fits
+ // maxSmem. Use f32 (4 bytes/elem) conservatively.
  while (tileM > 1) {
    int64_t smem = computeSharedMemory(tileM, tileN, tileK,
                                       kF32Kind, kF32Kind,
@@ -1385,20 +1433,32 @@ static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
               << " > " << maxSmem << "), shrinking tileM to " << tileM
               << "\n");
  }
-
-
- // [Fix] Handle K-dominated shapes in SIMT fallback.
- if (dims.K > 2 * dims.N) {
-  LLVM_DEBUG(llvm::dbgs()
-             << "[nova-kernel-config] K-dominated shape (" << dims.K
-             << " > 2*N=" << 2 * dims.N
-             << ") in SIMT fallback, limiting threads to 32.\n");
-  wgX = 32;
-  wgY = 1;
+ // If tileM is already 1 and smem is still over budget, halve tileK.
+ // This keeps the occupancy budget (maxSmem/2) respected even for wide K.
+ if (fusedInfo.forcedTileK < 0) {
+   while (tileK > 1) {
+     int64_t smem = computeSharedMemory(tileM, tileN, tileK,
+                                        kF32Kind, kF32Kind,
+                                        /*doCPromotion=*/false, fusedInfo);
+     if (smem <= maxSmem) break;
+     tileK /= 2;
+     LLVM_DEBUG(llvm::dbgs()
+                << "[nova-kernel-config] SIMT smem still too large (" << smem
+                << " > " << maxSmem << "), shrinking tileK to " << tileK
+                << "\n");
+   }
  }
 
- int64_t threadTileM = std::max<int64_t>(1, tileM / wgX);
- int64_t threadTileN = std::max<int64_t>(1, tileN / wgY);
+ // [Fix-P0-1] Cap per-thread output tile to 4×4 = 16 accumulators maximum.
+ // The SIMT table entries can produce threadTileM=8, threadTileN=8 (64
+ // accumulators) for shapes like [128,64] which overflows the 255-register
+ // budget and spills 24KB of local memory per thread, destroying performance.
+ // 4×4 stays well within 64 live registers and eliminates all local mem spill.
+ static constexpr int64_t kMaxThreadTile = 4;
+ int64_t threadTileM = std::min(kMaxThreadTile,
+                                std::max<int64_t>(1, tileM / wgX));
+ int64_t threadTileN = std::min(kMaxThreadTile,
+                                std::max<int64_t>(1, tileN / wgY));
 
 
  auto contractionDims = mlir::linalg::inferContractionDims(matmul);
@@ -1459,20 +1519,23 @@ static LogicalResult setSimtConfig(linalg::LinalgOp matmul,
 
 LogicalResult setContractConfig(linalg::LinalgOp op,
                                const NVIDIATargetInfo &target) {
- if (!isTrueContraction(op)) return failure();
- if (op.getNumParallelLoops() < 2) return failure();
+ if (!linalg::isaContractionOpInterface(op)) return failure();
+ if (op.getNumParallelLoops() < 2)            return failure();
 
- // Reject ops where all indexing maps are permutations (no broadcast).
- // Those should go through the reduction pipeline, not contract.
- if (llvm::any_of(op.getIndexingMapsArray(),
+
+ // Reject ops where ALL indexing maps are permutations (pure permutation ops
+ // have no contraction structure and should go through the reduction pipeline).
+ // Using any_of was wrong: standard linalg.matmul has a RHS map that is a
+ // permutation of its two operand dims, which would incorrectly reject it.
+ if (llvm::all_of(op.getIndexingMapsArray(),
                   [](AffineMap m) { return m.isPermutation(); }))
    return failure();
 
- MatmulDims dims = inferMatmulDims(op);
- if (!dims.valid()) return failure();
 
- // Matvec (M=1 or N=1): skip both contraction and SIMT paths.
+ MatmulDims dims = inferMatmulDims(op);
+ if (!dims.valid())          return failure();
  if (dims.M == 1 || dims.N == 1) return failure();
+
 
  // Send very skinny matmuls to the vector reduction pipeline.
  FailureOr<mlir::linalg::ContractionDimensions> contractionDims =
@@ -1491,6 +1554,8 @@ LogicalResult setContractConfig(linalg::LinalgOp op,
 
 
  // [Fix6] Analyse fused leading op and derive shared memory requirements.
+ // Simple elementwise ops (gelu, bias_add) are handled inline.
+ // Row-reduction ops (layernorm) force tileK = fullK and reserve scratch.
  FusedOpMemoryInfo fusedInfo = analyzeFusedLeadingOp(op, dims);
 
 
@@ -1542,6 +1607,7 @@ LogicalResult setContractConfig(linalg::LinalgOp op,
      return success();
  }
 
+
  // SIMT fallback — pass target + fusedInfo so smem budget is respected.
  return setSimtConfig(op, dims, numLoops, target, fusedInfo);
 }
@@ -1578,19 +1644,7 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
  SmallVector<int64_t> subgroupTiles(numLoops, 0);
 
 
- int64_t localWorkgroupThreads = kTargetThreadsPerBlock;
- int64_t totalN = 1;
- for (unsigned d : parallelDims) totalN *= loopBounds[d];
- int64_t totalK = 1;
- for (unsigned d : reductionDims) totalK *= loopBounds[d];
-
- if (totalK > 2 * totalN && !reductionDims.empty()) {
-  localWorkgroupThreads = 64;
-  LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] K-dominated reduction (K="
-                          << totalK << " > 2*N=" << 2 * totalN
-                          << "), limiting threads to 64 to protect fallback.\n");
- }
- int64_t kWorkgroupThreads = localWorkgroupThreads;
+ constexpr int64_t kWorkgroupThreads = kTargetThreadsPerBlock;
  constexpr int64_t kVectorSize = 4;
 
 
@@ -1634,41 +1688,25 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
 
  } else if (!reductionDims.empty() && parallelDims.size() >= 2 &&
             reductionDims.back() == (unsigned)(numLoops - 1)) {
-    // Row-reduction: tile inner parallel dim; reduction is sequential.
-    unsigned innerParallelDim = parallelDims.back();
-    int64_t innerSize = loopBounds[innerParallelDim];
-    int64_t innerTile = std::min(innerSize, (int64_t)kWorkgroupThreads);
-    while (innerTile > 1 && innerSize % innerTile != 0) innerTile /= 2;
-    workgroupTiles[innerParallelDim] = innerTile;
-    threadTiles[innerParallelDim]   = 1;
-    // Distribute remaining thread budget to outer parallel dims (inward→outward),
-    // mirroring the general-purpose else branch below.  Without this, a
-    // [par, par, red] op with innerTile=64 only uses 64/256 threads.
-    {
-      int64_t remainingBudget = kWorkgroupThreads / innerTile;
-      for (int i = (int)parallelDims.size() - 2; i >= 0; --i) {
-        unsigned dim = parallelDims[i];
-        int64_t dimSize = loopBounds[dim];
-        if (remainingBudget > 1 && dimSize > 1) {
-          int64_t tile = std::min(dimSize, remainingBudget);
-          while (tile > 1 && dimSize % tile != 0) tile /= 2;
-          workgroupTiles[dim] = tile;
-          threadTiles[dim]    = 1;
-          remainingBudget    /= tile;
-        } else {
-          workgroupTiles[dim] = 1;
-          threadTiles[dim]    = 0;
-        }
-      }
-    }
-    // DO NOT set threadTiles on reduction dims.
-    for (unsigned dim : reductionDims) {
-      int64_t bound = loopBounds[dim];
-      reductionTiles[dim] = (bound % 4 == 0) ? 4 :
-                            (bound % 2 == 0) ? 2 : 1;
-    }
+   // Row-reduction: tile inner parallel dim; reduction is sequential.
+   unsigned innerParallelDim = parallelDims.back();
+   int64_t innerSize = loopBounds[innerParallelDim];
+   int64_t innerTile = std::min(innerSize, (int64_t)kWorkgroupThreads);
+   while (innerTile > 1 && innerSize % innerTile != 0) innerTile /= 2;
+   workgroupTiles[innerParallelDim] = innerTile;
+   threadTiles[innerParallelDim]    = 1;
+   for (unsigned dim : parallelDims)
+     if (dim != innerParallelDim)
+       workgroupTiles[dim] = 1;
+   // DO NOT set threadTiles on reduction dims.
+   for (unsigned dim : reductionDims) {
+     int64_t bound = loopBounds[dim];
+     reductionTiles[dim] = (bound % 4 == 0) ? 4 :
+                           (bound % 2 == 0) ? 2 : 1;
+   }
 
-  } else {
+
+ } else {
    // Has parallel dims — distribute across workgroup.
    unsigned innerParallelDim = parallelDims.back();
    int64_t innerSize = loopBounds[innerParallelDim];
@@ -1776,10 +1814,32 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
 //===----------------------------------------------------------------------===//
 
 
+namespace {
+bool isTrueContractionLocal(Operation *op) {
+ if (isa<linalg::BatchMatmulOp, linalg::MatmulOp, linalg::MatvecOp,
+         linalg::VecmatOp, linalg::BatchMatvecOp>(op))
+   return true;
+ auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+ if (!linalgOp || !linalg::isaContractionOpInterface(linalgOp)) return false;
+ auto indexMaps = linalgOp.getIndexingMapsArray();
+ if (indexMaps.size() < 3) return false;
+ auto iterTypes = linalgOp.getIteratorTypesArray();
+ unsigned numLoops = iterTypes.size();
+ for (unsigned i = 0; i < numLoops; ++i) {
+   if (iterTypes[i] != utils::IteratorType::parallel) continue;
+   bool inInput0 = indexMaps[0].isFunctionOfDim(i);
+   bool inInput1 = indexMaps[1].isFunctionOfDim(i);
+   if (inInput0 != inInput1) return true;
+ }
+ return false;
+}
+} // namespace
+
+
 static bool isRootOp(Operation *op) {
  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
  if (!linalgOp) return false;
- if (isTrueContraction(op)) return true;
+ if (isTrueContractionLocal(op)) return true;
  for (auto iterType : linalgOp.getIteratorTypesArray())
    if (iterType != utils::IteratorType::parallel) return true;
  return false;
@@ -1831,6 +1891,127 @@ static bool isPrologue(Operation *op) {
 
 
 //===----------------------------------------------------------------------===//
+// Project producer tiles onto epilogue iteration space
+//
+// Given a parallel epilogue consuming a producer's result, re-project the
+// producer's workgroup / subgroup / wg_subgroup tiles onto the epilogue's
+// loop dims so that subgroup tiling places the epilogue into a warp-forall
+// with the SAME warp grid as the matmul. Without this, the epilogue has no
+// lowering_config, falls through to GreedilyDistributeToThreads, and ends
+// up in a thread-mapped forall that FuseForalls cannot merge with the
+// matmul's warp-mapped forall.
+//
+// Projection: for each producer loop dim p with tile t > 0, find the result
+// position that p appears in via the producer's output indexing map, then
+// follow the consumer's input map (for the operand reading the producer's
+// result) to find the consumer loop dim carrying that position, and set
+// consumerTile[that dim] = t.
+//
+// Returns true on success (epilogue now has a config). Returns false when
+// the projection cannot be computed (no tile producer, non-identity
+// projected maps, dynamic loops, etc.) so the caller falls back.
+//===----------------------------------------------------------------------===//
+static bool inheritConfigFromProducer(linalg::LinalgOp epilogue) {
+  // Find a producer input operand whose defining op has a lowering_config.
+  linalg::LinalgOp producer;
+  OpOperand *epilogueInputFromProducer = nullptr;
+  for (OpOperand &use : epilogue->getOpOperands()) {
+    Operation *defOp = use.get().getDefiningOp();
+    if (!defOp) continue;
+    auto defLinalg = dyn_cast<linalg::LinalgOp>(defOp);
+    if (!defLinalg || !getLoweringConfig(defOp)) continue;
+    producer = defLinalg;
+    epilogueInputFromProducer = &use;
+    break;
+  }
+  if (!producer) return false;
+
+  DictionaryAttr producerCfg = getLoweringConfig(producer.getOperation());
+  SmallVector<int64_t> producerWgTiles =
+      getLoweringConfigTileSizes(producerCfg, kWorkgroupKey);
+  SmallVector<int64_t> producerSgTiles =
+      getLoweringConfigTileSizes(producerCfg, kSubgroupKey);
+  SmallVector<int64_t> producerWgSgTiles =
+      getLoweringConfigTileSizes(producerCfg, kWgSubgroupKey);
+  if (producerWgTiles.empty()) return false;
+
+  // Producer's output indexing map: maps producer loops → result positions.
+  AffineMap producerOutMap =
+      producer.getMatchingIndexingMap(producer.getDpsInitOperand(0));
+  // Consumer's input map for the operand reading the producer's result.
+  AffineMap consumerInMap =
+      epilogue.getMatchingIndexingMap(epilogueInputFromProducer);
+  if (!producerOutMap.isProjectedPermutation() ||
+      !consumerInMap.isProjectedPermutation())
+    return false;
+  if (producerOutMap.getNumResults() != consumerInMap.getNumResults())
+    return false;
+
+  unsigned numConsumerLoops = epilogue.getNumLoops();
+  SmallVector<int64_t> consumerWg(numConsumerLoops, 0);
+  SmallVector<int64_t> consumerSg(numConsumerLoops, 0);
+  SmallVector<int64_t> consumerWgSg(numConsumerLoops, 0);
+
+  for (unsigned p = 0; p < producerWgTiles.size(); ++p) {
+    int64_t wgT  = producerWgTiles[p];
+    int64_t sgT  = p < producerSgTiles.size()   ? producerSgTiles[p]   : 0;
+    int64_t wgSg = p < producerWgSgTiles.size() ? producerWgSgTiles[p] : 0;
+    if (wgT == 0 && sgT == 0 && wgSg == 0) continue;
+
+    // Find result position where producer dim p appears.
+    std::optional<unsigned> outPos;
+    for (unsigned r = 0; r < producerOutMap.getNumResults(); ++r) {
+      auto dimExpr = dyn_cast<AffineDimExpr>(producerOutMap.getResult(r));
+      if (dimExpr && dimExpr.getPosition() == p) { outPos = r; break; }
+    }
+    if (!outPos) continue; // reduction dim of the producer; skip
+
+    // Follow consumer input map to the consumer loop dim.
+    auto consumerDimExpr =
+        dyn_cast<AffineDimExpr>(consumerInMap.getResult(*outPos));
+    if (!consumerDimExpr) return false;
+    unsigned c = consumerDimExpr.getPosition();
+    if (c >= numConsumerLoops) return false;
+    consumerWg[c]   = wgT;
+    consumerSg[c]   = sgT;
+    consumerWgSg[c] = wgSg;
+  }
+
+  // Stamp the inherited config. Reduction tiles stay 0 (epilogue is parallel
+  // only). Thread tiles stay 0 — the epilogue stays at warp granularity so
+  // it can fuse with the matmul's warp-forall; the thread-tiling pass will
+  // skip ops with all-zero thread tiles and an MMA-marked parent.
+  MLIRContext *ctx = epilogue.getContext();
+  SmallVector<int64_t> reductionTiles(numConsumerLoops, 0);
+  SmallVector<int64_t> threadTiles(numConsumerLoops, 0);
+  // Mark this config with the producer's mma_kind so downstream passes that
+  // key off mma_kind (e.g. thread-tile zero-handling) treat the epilogue
+  // consistently with the matmul.
+  int32_t mmaKindValue = getMmaKindRaw(producerCfg);
+
+  setMatmulLoweringConfigAttrs(epilogue.getOperation(), ctx,
+                               consumerWg, reductionTiles,
+                               threadTiles, consumerSg,
+                               mmaKindValue,
+                               /*promotedOperands=*/{},
+                               /*paddingSizes=*/{},
+                               consumerWgSg);
+
+  LLVM_DEBUG(llvm::dbgs()
+             << "[nova-kernel-config] Stamping epilogue subgroup config from "
+                "producer matmul: "
+             << epilogue->getName() << " wg=[";
+             llvm::interleaveComma(consumerWg, llvm::dbgs());
+             llvm::dbgs() << "] sg=[";
+             llvm::interleaveComma(consumerSg, llvm::dbgs());
+             llvm::dbgs() << "] wg_sg=[";
+             llvm::interleaveComma(consumerWgSg, llvm::dbgs());
+             llvm::dbgs() << "]\n");
+  return true;
+}
+
+
+//===----------------------------------------------------------------------===//
 // initNovaGPULaunchConfig — Main entry point
 //===----------------------------------------------------------------------===//
 
@@ -1843,8 +2024,14 @@ void initNovaGPULaunchConfig(mlir::func::FuncOp funcOp,
 
 
    if (isEpilogue(op.getOperation())) {
-     LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] Skipping epilogue: "
-                              << op->getName() << "\n");
+     // Inherit the producer matmul's subgroup config so the epilogue ends up
+     // in a warp-mapped forall that FuseForalls can merge with the matmul.
+     // This keeps the matmul accumulator register-resident across the fused
+     // chain (no workgroup memref for the intermediate result).
+     if (inheritConfigFromProducer(op)) return;
+     LLVM_DEBUG(llvm::dbgs() << "[nova-kernel-config] Skipping epilogue (no "
+                                "producer config to inherit): "
+                             << op->getName() << "\n");
      return;
    }
    if (isPrologue(op.getOperation())) {
@@ -1854,17 +2041,10 @@ void initNovaGPULaunchConfig(mlir::func::FuncOp funcOp,
    }
 
 
-   // Use isTrueContraction instead of linalg::isaContractionOpInterface so
-   // that matmul-like linalg.generic ops (e.g. C += A*B accumulate patterns,
-   // transposed layouts, or attention score accumulation ops) are not
-   // silently dropped into setDefaultConfig with mma_kind=NONE. Without this,
-   // those ops never reach the MMA selection path and are forced onto the
-   // SIMT/FMA path even when their shapes are MMA-compatible. setContractConfig
-   // still calls isTrueContraction internally as its first guard, so this
-   // only widens the set of candidates; it does not weaken the check.
-   if (isTrueContraction(op.getOperation())) {
+   if (linalg::isaContractionOpInterface(op)) {
      if (succeeded(setContractConfig(op, target))) return;
    }
+
 
    (void)setDefaultConfig(op, target);
  });
@@ -1872,4 +2052,3 @@ void initNovaGPULaunchConfig(mlir::func::FuncOp funcOp,
 
 
 } // namespace mlir::nova
-
