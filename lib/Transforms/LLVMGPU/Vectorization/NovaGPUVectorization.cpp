@@ -703,29 +703,18 @@ struct NovaGPUVectorizeMemrefCopyPass
   }
 };
 
-//===----------------------------------------------------------------------===//
-// NovaGPUVectorDistributePass
-//
-// Distributes warp-level vector ops across the 32 threads of a CUDA warp using
-// the vector.warp_execute_on_lane_0 wrapper pattern, then lowers it to an
-// scf.if guarded by gpu.lane_id == 0 with explicit __shfl_sync distribution.
-//
-// Pipeline position: AFTER GenericVectorization (SIMD vectors exist),
-//                    BEFORE bufferization (still tensor form so warp ops can
-//                    be cleanly outlined per thread).
-//
-// Strategy:
-//   1. Wrap each vector.transfer_read/write pair that operates on a warp tile
-//      inside vector.warp_execute_on_lane_0 with the correct warp size (32).
-//   2. Apply populateWarpExecuteOnLane0OpToScfForPattern to lower the wrapper
-//      to a lane-0 branch with warp shuffles for accumulator distribution.
-//   3. Canonicalize to fold identity broadcasts.
-//===----------------------------------------------------------------------===//
+// NovaGPUVectorDistributePass was moved to NovaGPUVectorDistribute.cpp.
+// It is now the IREE-port pattern-based distribution engine that consumes
+// nova_vector_ext.to_layout anchors via DistributionPattern / distributeVectorOps.
+// DO NOT redefine the pass struct here — duplicate getArgument() strings cause
+// a runtime pass registration collision.
 
-struct NovaGPUVectorDistributePass
-    : public PassWrapper<NovaGPUVectorDistributePass,
+#if 0 // REMOVED — kept only for reference; DO NOT compile
+
+struct NovaGPUVectorDistributePass_REMOVED
+    : public PassWrapper<NovaGPUVectorDistributePass_REMOVED,
                          OperationPass<>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUVectorDistributePass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUVectorDistributePass_REMOVED)
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect,
@@ -1205,13 +1194,14 @@ struct NovaGPUVectorDistributePass
   }
 
   StringRef getArgument() const override {
-    return "nova-gpu-vector-distribute";
+    return "nova-gpu-vector-distribute-REMOVED";
   }
   StringRef getDescription() const override {
-    return "Distribute warp-level vector ops across 32 threads using "
-           "gpu.warp_execute_on_lane_0 and XOR-butterfly warp shuffles (SIMD-to-SIMT).";
+    return "REMOVED — see NovaGPUVectorDistribute.cpp";
   }
 };
+
+#endif // REMOVED
 
 //===----------------------------------------------------------------------===//
 // NovaGPUUnrollToIntrinsicsPass

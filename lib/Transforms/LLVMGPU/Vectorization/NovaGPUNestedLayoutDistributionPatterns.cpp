@@ -391,9 +391,26 @@ struct DistributeTransferRead final
     : OpDistributionPattern<vector::TransferReadOp> {
   using OpDistributionPattern::OpDistributionPattern;
 
-  DistributeTransferRead(MLIRContext *ctx, Value threadId, int64_t subgroupSize)
-      : OpDistributionPattern(ctx), threadId(threadId),
+  DistributeTransferRead(MLIRContext *ctx,
+                          const llvm::DenseMap<Block *, Value> &threadIdMap,
+                          int64_t subgroupSize)
+      : OpDistributionPattern(ctx), threadIdMap(threadIdMap),
         subgroupSize(subgroupSize) {}
+
+  // Walk up from op to find the enclosing warp forall body block.
+  Value getThreadId(Operation *op) const {
+    Block *blk = op->getBlock();
+    while (blk) {
+      auto it = threadIdMap.find(blk);
+      if (it != threadIdMap.end())
+        return it->second;
+      Operation *parent = blk->getParentOp();
+      if (!parent)
+        break;
+      blk = parent->getBlock();
+    }
+    return {};
+  }
 
   LogicalResult matchAndRewrite(vector::TransferReadOp readOp,
                                 DistributionSignature &signature,
@@ -403,6 +420,10 @@ struct DistributeTransferRead final
       return rewriter.notifyMatchFailure(readOp, "non-nested layout");
     if (!isa<MemRefType>(readOp.getBase().getType()))
       return rewriter.notifyMatchFailure(readOp, "distribution expects memrefs");
+
+    Value threadId = getThreadId(readOp);
+    if (!threadId)
+      return rewriter.notifyMatchFailure(readOp, "no thread id for this forall");
 
     VectorValue mask    = readOp.getMask();
     NestedLayoutAttr maskLayout;
@@ -468,7 +489,7 @@ struct DistributeTransferRead final
     return success();
   }
 
-  Value   threadId;
+  const llvm::DenseMap<Block *, Value> &threadIdMap;
   int64_t subgroupSize;
 };
 
@@ -480,18 +501,36 @@ struct DistributeTransferWrite final
     : OpDistributionPattern<vector::TransferWriteOp> {
   using OpDistributionPattern::OpDistributionPattern;
 
-  DistributeTransferWrite(MLIRContext *ctx, Value threadId, int64_t subgroupSize,
+  DistributeTransferWrite(MLIRContext *ctx,
+                           const llvm::DenseMap<Block *, Value> &threadIdMap,
+                           int64_t subgroupSize,
                            ArrayRef<int64_t> workgroupSize)
-      : OpDistributionPattern(ctx), threadId(threadId),
+      : OpDistributionPattern(ctx), threadIdMap(threadIdMap),
         subgroupSize(subgroupSize) {
     if (!workgroupSize.empty())
       numThreads = std::accumulate(workgroupSize.begin(), workgroupSize.end(),
                                     int64_t(1), std::multiplies<int64_t>());
   }
 
+  // Walk up from op to find the enclosing warp forall body block.
+  Value getThreadId(Operation *op) const {
+    Block *blk = op->getBlock();
+    while (blk) {
+      auto it = threadIdMap.find(blk);
+      if (it != threadIdMap.end())
+        return it->second;
+      Operation *parent = blk->getParentOp();
+      if (!parent)
+        break;
+      blk = parent->getBlock();
+    }
+    return {};
+  }
+
   /// Returns a boolean Value that is true only for threads that should write
   /// (avoids duplicate writes when broadcast dims exist).
   FailureOr<Value> getNoOverlapCondition(OpBuilder &b, Location loc,
+                                          Value threadId,
                                           NestedLayoutAttr layout) const {
     ArrayRef<int64_t> threadTile    = layout.getThreadTile();
     ArrayRef<int64_t> threadStrides = layout.getThreadStrides();
@@ -506,10 +545,6 @@ struct DistributeTransferWrite final
     SmallVector<size_t> dimToResult;
     if (failed(basisFromSizesStrides(concatTiles, concatStrides, basis, dimToResult)))
       return failure();
-    // basisFromSizesStrides produces 1-indexed dimToResult values: index 0 is
-    // always the overflow slot that AffineDelinearizeIndexOp inserts as the
-    // outermost (hasOuterBound=true) term. No manual index adjustment needed
-    // regardless of whether numThreads is prepended.
     if (numThreads.has_value()) {
       int64_t outer = numThreads.value() /
                       std::accumulate(basis.begin(), basis.end(),
@@ -519,7 +554,6 @@ struct DistributeTransferWrite final
     SmallVector<Value> delinearized;
     b.createOrFold<affine::AffineDelinearizeIndexOp>(
         delinearized, loc, threadId, basis, numThreads.has_value());
-    // arith::ConstantIntOp(value=1, width=1) → i1 true; avoids TypedAttr overload.
     Value cond = b.create<arith::ConstantIntOp>(loc, 1, /*width=*/1);
     for (auto [i, v] : llvm::enumerate(delinearized)) {
       if (llvm::is_contained(dimToResult, i))
@@ -541,6 +575,10 @@ struct DistributeTransferWrite final
     if (!isa<MemRefType>(writeOp.getBase().getType()))
       return rewriter.notifyMatchFailure(writeOp, "distribution expects memrefs");
 
+    Value threadId = getThreadId(writeOp);
+    if (!threadId)
+      return rewriter.notifyMatchFailure(writeOp, "no thread id for this forall");
+
     VectorValue mask    = writeOp.getMask();
     NestedLayoutAttr maskLayout;
     if (mask) {
@@ -561,7 +599,7 @@ struct DistributeTransferWrite final
       return rewriter.notifyMatchFailure(writeOp, "failed to compute thread ids");
 
     Location loc = writeOp.getLoc();
-    FailureOr<Value> doWrite = getNoOverlapCondition(rewriter, loc, layout);
+    FailureOr<Value> doWrite = getNoOverlapCondition(rewriter, loc, threadId, layout);
     if (failed(doWrite))
       return rewriter.notifyMatchFailure(writeOp, "failed no-overlap condition");
 
@@ -601,7 +639,7 @@ struct DistributeTransferWrite final
     return success();
   }
 
-  Value   threadId;
+  const llvm::DenseMap<Block *, Value> &threadIdMap;
   int64_t subgroupSize;
   std::optional<int64_t> numThreads;
 };
@@ -1250,11 +1288,12 @@ struct NVIDIADistributeContract final
 //===----------------------------------------------------------------------===//
 
 void populateNovaGPUDistributeNestedLayoutAttrPatterns(
-    RewritePatternSet &patterns, Value threadId, int64_t subgroupSize,
+    RewritePatternSet &patterns,
+    const llvm::DenseMap<Block *, Value> &threadIdMap, int64_t subgroupSize,
     ArrayRef<int64_t> workgroupSize, int64_t maxBitsPerShuffle) {
-  patterns.add<DistributeTransferRead>(patterns.getContext(), threadId,
+  patterns.add<DistributeTransferRead>(patterns.getContext(), threadIdMap,
                                         subgroupSize);
-  patterns.add<DistributeTransferWrite>(patterns.getContext(), threadId,
+  patterns.add<DistributeTransferWrite>(patterns.getContext(), threadIdMap,
                                          subgroupSize, workgroupSize);
   patterns.add<DistributeBroadcast, DistributeShapeCast>(patterns.getContext());
   patterns.add<DistributeMultiReduction>(patterns.getContext(), subgroupSize,

@@ -10,21 +10,20 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/Support/Debug.h"
-
-#define DEBUG_TYPE "nova-gpu-bufferization"
+#include "mlir/Transforms/Passes.h"
 
 using namespace mlir;
 
 namespace mlir::nova {
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers shared by allocation fn and barrier pass
 // ---------------------------------------------------------------------------
 
 static bool isWorkgroupMemref(MemRefType t) {
@@ -33,18 +32,16 @@ static bool isWorkgroupMemref(MemRefType t) {
          space.getValue() == gpu::GPUDialect::getWorkgroupAddressSpace();
 }
 
-static bool isBlockLevelForall(scf::ForallOp forallOp) {
-  auto mappingAttr = forallOp.getMapping();
-  if (!mappingAttr)
-    return false;
-  for (Attribute attr : mappingAttr->getValue())
-    if (auto gpuAttr = dyn_cast<gpu::GPUBlockMappingAttr>(attr))
-      return true;
+static bool isBlockLevelForall(scf::ForallOp op) {
+  auto mapping = op.getMapping();
+  if (!mapping) return false;
+  for (Attribute attr : mapping->getValue())
+    if (isa<gpu::GPUBlockMappingAttr>(attr)) return true;
   return false;
 }
 
 // ---------------------------------------------------------------------------
-// GPU allocation function (unchanged from original)
+// GPU allocation function
 // ---------------------------------------------------------------------------
 static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
                                                         Location loc,
@@ -52,8 +49,12 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
                                                         ValueRange dynamicSizes,
                                                         unsigned alignment) {
   Attribute memSpace = memRefType.getMemorySpace();
-  if (memSpace && !isa<gpu::AddressSpaceAttr>(memSpace))
-    return failure();
+
+  // NovaVectorizeVectorExtOpsPass emits alloc_tensor with memory_space as
+  // IntegerAttr (e.g. 1 : i64) rather than gpu::AddressSpaceAttr. These are
+  // thread-local temporaries — treat as untagged → private alloca.
+  if (memSpace && isa<IntegerAttr>(memSpace))
+    memSpace = nullptr;
 
   auto privateSpace = gpu::AddressSpaceAttr::get(
       builder.getContext(), gpu::GPUDialect::getPrivateAddressSpace());
@@ -62,20 +63,7 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
 
   if (memSpace && cast<gpu::AddressSpaceAttr>(memSpace).getValue() ==
                       gpu::GPUDialect::getWorkgroupAddressSpace()) {
-    bool insideBlockKernel = false;
-    Operation *check = builder.getInsertionBlock()->getParentOp();
-    while (check) {
-      if (auto forallOp = dyn_cast<scf::ForallOp>(check))
-        if (isBlockLevelForall(forallOp)) { insideBlockKernel = true; break; }
-      if (isa<gpu::LaunchOp>(check)) { insideBlockKernel = true; break; }
-      check = check->getParentOp();
-    }
-    if (!insideBlockKernel) {
-      auto globalType = MemRefType::get(memRefType.getShape(),
-                                        memRefType.getElementType());
-      return memref::AllocOp::create(builder, loc, globalType, dynamicSizes)
-          .getResult();
-    }
+    // Hoist above any enclosing scf.for to avoid per-iteration reallocation.
     auto allocType = MemRefType::get(memRefType.getShape(),
                                      memRefType.getElementType(),
                                      AffineMap(), wkgpSpace);
@@ -84,168 +72,79 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
     Operation *cur = builder.getInsertionBlock()->getParentOp();
     while (cur) {
       if (isa<gpu::LaunchOp>(cur)) break;
-      if (auto forallOp = dyn_cast<scf::ForallOp>(cur))
-        if (isBlockLevelForall(forallOp)) break;
+      if (auto fa = dyn_cast<scf::ForallOp>(cur))
+        if (isBlockLevelForall(fa)) break;
       if (isa<scf::ForOp>(cur)) hoistTarget = cur;
       cur = cur->getParentOp();
     }
-    if (hoistTarget) builder.setInsertionPoint(hoistTarget);
+    if (hoistTarget)
+      builder.setInsertionPoint(hoistTarget);
     return memref::AllocOp::create(builder, loc, allocType, dynamicSizes)
         .getResult();
   }
 
-  if (memSpace) {
-    bool insideKernel = false;
-    Operation *insertionParent = builder.getInsertionBlock()->getParentOp();
-    while (insertionParent) {
-      if (auto forallOp = dyn_cast<scf::ForallOp>(insertionParent))
-        if (isBlockLevelForall(forallOp)) { insideKernel = true; break; }
-      if (isa<gpu::LaunchOp>(insertionParent)) { insideKernel = true; break; }
-      insertionParent = insertionParent->getParentOp();
-    }
-    if (!insideKernel) {
-      auto globalType = MemRefType::get(memRefType.getShape(),
-                                        memRefType.getElementType());
-      return memref::AllocOp::create(builder, loc, globalType, dynamicSizes)
-          .getResult();
-    }
-    auto allocType = MemRefType::get(memRefType.getShape(),
-                                     memRefType.getElementType(),
-                                     AffineMap(), privateSpace);
-    if (!dynamicSizes.empty()) {
-      SmallVector<int64_t> staticShape;
-      for (int d = 0; d < memRefType.getRank(); ++d)
-        staticShape.push_back(memRefType.isDynamicDim(d) ? 4
-                                                         : memRefType.getDimSize(d));
-      auto staticAllocType = MemRefType::get(staticShape,
-                                             memRefType.getElementType(),
-                                             AffineMap(), privateSpace);
-      SmallVector<Value> emptyDynamicSizes;
-      return memref::AllocaOp::create(builder, loc, staticAllocType,
-                                      emptyDynamicSizes).getResult();
-    }
-    return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
-        .getResult();
-  }
-
-  // No memory space → default to PRIVATE (thread-local).
-  // After NovaGPUInferMemorySpacePass, every alloc_tensor is tagged.
-  // Untagged allocations here are bufferizer-created temporaries (iter_arg
-  // copies, scf.if staging) which are thread-local by construction.
-  // Matches IREE's gpuRequireMemSpaceAllocationFn default behavior.
-  {
-    auto allocType =
-        MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
-                        AffineMap(), privateSpace);
-
-    // Check if we are inside a kernel (scf.forall).
-    bool insideKernel = false;
-    Operation *insertionParent = builder.getInsertionBlock()->getParentOp();
-    while (insertionParent) {
-      if (isa<scf::ForallOp>(insertionParent)) {
-        insideKernel = true;
-        break;
-      }
-      insertionParent = insertionParent->getParentOp();
-    }
-
-    if (insideKernel) {
-      return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
-          .getResult();
-    }
-
-    // At function scope (outside all foralls) — emit plain alloc without
-    // address space. This becomes a host-side buffer passed to kernels,
-    // later converted to gpu.alloc by ConvertMemRefToGpu.
-    return memref::AllocOp::create(builder, loc, memRefType, dynamicSizes)
-        .getResult();
-  }
+  // Private or untagged → per-thread register alloca.
+  auto allocType = MemRefType::get(memRefType.getShape(),
+                                   memRefType.getElementType(),
+                                   AffineMap(), privateSpace);
+  return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
+      .getResult();
 }
 
-static Value maybeSubviewToMatchDest(OpBuilder &builder, Location loc,
-                                     Value from, Value to) {
-  auto fromType = cast<MemRefType>(from.getType());
-  auto toType   = cast<MemRefType>(to.getType());
-  if (fromType.getRank() != toType.getRank() || fromType.getRank() == 0)
-    return from;
-  int rank = fromType.getRank();
-  bool needsSubview = false;
-  SmallVector<OpFoldResult> offsets(rank, builder.getIndexAttr(0));
-  SmallVector<OpFoldResult> strides(rank, builder.getIndexAttr(1));
-  SmallVector<OpFoldResult> sizes;
-  for (int i = 0; i < rank; ++i) {
-    if (!fromType.isDynamicDim(i) && toType.isDynamicDim(i)) {
-      sizes.push_back(builder.getIndexAttr(fromType.getDimSize(i)));
-      needsSubview = true;
-    } else if (!fromType.isDynamicDim(i)) {
-      sizes.push_back(builder.getIndexAttr(fromType.getDimSize(i)));
-    } else {
-      sizes.push_back(builder.create<memref::DimOp>(loc, from, i).getResult());
-    }
-  }
-  if (needsSubview)
-    return builder.create<memref::SubViewOp>(loc, from, offsets, sizes, strides);
-  return from;
-}
-
-static bool isSameMemoryRegion(Value a, Value b) {
-  if (a == b) return true;
-  auto aSV = a.getDefiningOp<memref::SubViewOp>();
-  auto bSV = b.getDefiningOp<memref::SubViewOp>();
-  if (!aSV || !bSV) return false;
-  if (!isSameMemoryRegion(aSV.getSource(), bSV.getSource())) return false;
-  if (aSV.getStaticOffsets() != bSV.getStaticOffsets()) return false;
-  if (aSV.getStaticSizes()   != bSV.getStaticSizes())   return false;
-  if (aSV.getStaticStrides() != bSV.getStaticStrides()) return false;
-  if (aSV.getOffsets() != bSV.getOffsets()) return false;
-  if (aSV.getSizes()   != bSV.getSizes())   return false;
-  if (aSV.getStrides() != bSV.getStrides()) return false;
-  return true;
-}
-
-static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
-                               Value to) {
-  if (isSameMemoryRegion(from, to)) return success();
-  auto fromType = cast<MemRefType>(from.getType());
-  auto toType   = cast<MemRefType>(to.getType());
-  bool fromIsGlobal    = !fromType.getMemorySpace();
-  bool toIsWorkgroup   = isWorkgroupMemref(toType);
-  bool fromIsWorkgroup = isWorkgroupMemref(fromType);
+// ---------------------------------------------------------------------------
+// GPU copy function
+// ---------------------------------------------------------------------------
+static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc,
+                               Value from, Value to) {
   Operation *parent = builder.getInsertionBlock()->getParentOp();
   bool insideForall = false;
   while (parent) {
     if (isa<scf::ForallOp>(parent)) { insideForall = true; break; }
     parent = parent->getParentOp();
   }
-  if (fromIsGlobal && toIsWorkgroup) {
-    from = maybeSubviewToMatchDest(builder, loc, from, to);
-    memref::CopyOp::create(builder, loc, from, to);
-    return success();
-  }
-  if (fromIsWorkgroup && toIsWorkgroup) {
-    if (insideForall) {
-      from = maybeSubviewToMatchDest(builder, loc, from, to);
-      linalg::CopyOp::create(builder, loc, from, to);
-    } else {
-      memref::CopyOp::create(builder, loc, from, to);
-    }
-    return success();
-  }
+
   if (insideForall) {
+    auto fromType = cast<MemRefType>(from.getType());
     if (fromType.getRank() == 0) {
-      bool isDefinedOutside = true;
-      if (Operation *defOp = from.getDefiningOp())
-        if (parent->isAncestor(defOp)) isDefinedOutside = false;
+      // Rank-0: load from source (hoisted outside forall if defined there).
+      bool definedOutside = true;
+      if (Operation *def = from.getDefiningOp())
+        if (parent->isAncestor(def)) definedOutside = false;
       if (auto arg = dyn_cast<BlockArgument>(from))
         if (parent->isAncestor(arg.getOwner()->getParentOp()))
-          isDefinedOutside = false;
-      if (isDefinedOutside) {
+          definedOutside = false;
+      if (definedOutside) {
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(parent);
         Value scalar = builder.create<memref::LoadOp>(loc, from);
+        builder.setInsertionPointAfter(parent);
         builder.create<memref::StoreOp>(loc, scalar, to);
         return success();
       }
     }
-    from = maybeSubviewToMatchDest(builder, loc, from, to);
+
+    // Fix shape mismatch: static alloca source vs dynamic subview dest.
+    auto toType = cast<MemRefType>(to.getType());
+    if (fromType.getRank() == toType.getRank() && fromType.getRank() > 0) {
+      int rank = fromType.getRank();
+      bool needsSubview = false;
+      SmallVector<OpFoldResult> offsets(rank, builder.getIndexAttr(0));
+      SmallVector<OpFoldResult> strides(rank, builder.getIndexAttr(1));
+      SmallVector<OpFoldResult> sizes;
+      for (int i = 0; i < rank; ++i) {
+        if (!fromType.isDynamicDim(i) && toType.isDynamicDim(i)) {
+          sizes.push_back(builder.create<memref::DimOp>(loc, to, i).getResult());
+          needsSubview = true;
+        } else if (!fromType.isDynamicDim(i)) {
+          sizes.push_back(builder.getIndexAttr(fromType.getDimSize(i)));
+        } else {
+          sizes.push_back(builder.create<memref::DimOp>(loc, from, i).getResult());
+        }
+      }
+      if (needsSubview)
+        from = builder.create<memref::SubViewOp>(loc, from, offsets, sizes, strides);
+    }
+
     linalg::CopyOp::create(builder, loc, from, to);
   } else {
     memref::CopyOp::create(builder, loc, from, to);
@@ -254,68 +153,58 @@ static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc, Value from,
 }
 
 // ---------------------------------------------------------------------------
-// Bufferize pass (unchanged)
+// Pass
 // ---------------------------------------------------------------------------
 struct NovaGPUComprehensiveBufferizePass
     : public PassWrapper<NovaGPUComprehensiveBufferizePass,
                          OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
-      NovaGPUComprehensiveBufferizePass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUComprehensiveBufferizePass)
+
   NovaGPUComprehensiveBufferizePass() = default;
-  NovaGPUComprehensiveBufferizePass(
-      const NovaGPUComprehensiveBufferizePass &) = default;
+  NovaGPUComprehensiveBufferizePass(const NovaGPUComprehensiveBufferizePass &) = default;
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<affine::AffineDialect, bufferization::BufferizationDialect,
                     gpu::GPUDialect, linalg::LinalgDialect,
                     memref::MemRefDialect, nova::NovaDialect, scf::SCFDialect>();
   }
+
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
+
+    // Erase nova.fusion_barrier — tiling identity with no bufferized form.
     IRRewriter rewriter(moduleOp.getContext());
     SmallVector<FusionBarrierOp> fusionBarriers;
     moduleOp.walk([&](FusionBarrierOp b) { fusionBarriers.push_back(b); });
-    for (FusionBarrierOp b : fusionBarriers) rewriter.replaceOp(b, b.getSource());
-    SmallVector<ValueBarrierOp> valueBarriers;
-    moduleOp.walk([&](ValueBarrierOp b) { valueBarriers.push_back(b); });
-    for (ValueBarrierOp b : valueBarriers) rewriter.replaceOp(b, b.getInputs());
+    for (FusionBarrierOp b : fusionBarriers)
+      rewriter.replaceOp(b, b.getSource());
+
+    // nova.value_barrier bufferizes to gpu::BarrierOp via
+    // ValueBarrierOpBufferizationInterface (NovaGPUBufferizationInterfaces.cpp).
+
     bufferization::OneShotBufferizationOptions opts;
     opts.allocationFn = gpuRequireMemSpaceAllocationFn;
-    opts.memCpyFn     = gpuCopyFn;
+    opts.memCpyFn = gpuCopyFn;
     opts.bufferizeFunctionBoundaries = true;
     opts.setFunctionBoundaryTypeConversion(
         bufferization::LayoutMapOption::IdentityLayoutMap);
     opts.checkParallelRegions = false;
+    opts.allowReturnAllocsFromLoops = true;
+    opts.allowUnknownOps = true;
+
     bufferization::BufferizationState bufState;
     if (failed(bufferization::runOneShotBufferize(moduleOp, opts, bufState))) {
       moduleOp.emitOpError("GPU-aware bufferization failed");
       return signalPassFailure();
     }
-    SmallVector<linalg::CopyOp> deadCopies, liveCopies;
-    moduleOp.walk([&](linalg::CopyOp copyOp) {
-      if (copyOp.getInputs().size() != 1 || copyOp.getOutputs().size() != 1)
-        return;
-      if (isSameMemoryRegion(copyOp.getInputs()[0], copyOp.getOutputs()[0]))
-        deadCopies.push_back(copyOp);
-      else
-        liveCopies.push_back(copyOp);
-    });
-    for (linalg::CopyOp dead : deadCopies) dead.erase();
-    for (linalg::CopyOp copyOp : liveCopies) {
-      if (!copyOp->hasAttr("nova.promote_to_workgroup")) continue;
-      OpBuilder b(copyOp);
-      Value src = copyOp.getInputs()[0];
-      Value dst = copyOp.getOutputs()[0];
-      auto srcType = cast<MemRefType>(src.getType());
-      auto dstType = cast<MemRefType>(dst.getType());
-      if (srcType.getNumDynamicDims() > dstType.getNumDynamicDims())
-        src = maybeSubviewToMatchDest(b, copyOp.getLoc(), src, dst);
-      memref::CopyOp::create(b, copyOp.getLoc(), src, dst);
-      copyOp.erase();
-    }
   }
-  StringRef getArgument() const override { return "nova-gpu-comprehensive-bufferize"; }
+
+  StringRef getArgument() const override {
+    return "nova-gpu-comprehensive-bufferize";
+  }
   StringRef getDescription() const override {
-    return "GPU-aware OneShotBufferize with allocation routing and copy lowering.";
+    return "Erases nova.fusion_barrier then runs OneShotBufferize with "
+           "GPU-aware allocation and copy functions.";
   }
 };
 
@@ -326,8 +215,32 @@ void registerNovaGPUComprehensiveBufferizePass() {
   PassRegistration<NovaGPUComprehensiveBufferizePass>();
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline helpers
+// ---------------------------------------------------------------------------
+void addNovaPostBufferizationPasses(OpPassManager &pm) {
+  pm.addNestedPass<func::FuncOp>(memref::createResolveShapedTypeResultDimsPass());
+  // Fold subview chains first so that identical subviews become the same SSA
+  // value. dropEquivalentBufferResults can only eliminate a copy when src and
+  // dst are provably the same Value — running CSE before it ensures subviews
+  // computed with the same base+offsets collapse to one SSA value first.
+  pm.addPass(memref::createFoldMemRefAliasOpsPass());
+  pm.addPass(createCSEPass());
+  pm.addPass(bufferization::createDropEquivalentBufferResultsPass());
+  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+}
+
+void addNovaComprehensiveBufferizePasses(OpPassManager &pm) {
+  pm.addNestedPass<func::FuncOp>(createNovaEliminateEmptyTensorsPass());
+  pm.addNestedPass<func::FuncOp>(bufferization::createEmptyTensorToAllocTensorPass());
+  pm.addNestedPass<func::FuncOp>(createNovaGPUInferMemorySpacePass());
+  pm.addPass(createNovaGPUComprehensiveBufferizePass());
+  addNovaPostBufferizationPasses(pm);
+}
+
 //===----------------------------------------------------------------------===//
-// §1  Memory-space helpers
+// Workgroup barrier insertion
 //===----------------------------------------------------------------------===//
 
 static bool isWorkgroupValue(Value v) {
@@ -342,12 +255,10 @@ static bool isKernelLocalStaging(Value v) {
   while (auto sv = base.getDefiningOp<memref::SubViewOp>())
     base = sv.getSource();
   if (!base.getDefiningOp<memref::AllocOp>()) return false;
-  Operation *defOp = base.getDefiningOp();
-  Operation *parent = defOp ? defOp->getParentOp() : nullptr;
-  while (parent) {
-    if (isa<gpu::LaunchOp>(parent)) return true;
-    if (isa<func::FuncOp>(parent)) return false;
-    parent = parent->getParentOp();
+  for (Operation *p = base.getDefiningOp()->getParentOp(); p;
+       p = p->getParentOp()) {
+    if (isa<gpu::LaunchOp>(p)) return true;
+    if (isa<func::FuncOp>(p)) return false;
   }
   return false;
 }
@@ -406,207 +317,121 @@ static bool hasWorkgroupLoads(Operation *op) {
   return found;
 }
 
-static bool hasNonAtomicWorkgroupStores(Operation *op) {
-  return hasWorkgroupStores(op);
-}
-
 static bool isSimplePerThreadCopy(scf::ForOp forOp) {
-  Block *body = forOp.getBody();
-  unsigned loadCount = 0, storeCount = 0, otherCount = 0;
-  for (Operation &op : *body) {
+  unsigned loads = 0, stores = 0, other = 0;
+  for (Operation &op : *forOp.getBody()) {
     if (isa<scf::YieldOp>(op)) continue;
-    if (auto load = dyn_cast<memref::LoadOp>(op)) {
-      if (isWorkgroupValue(load.getMemref())) ++loadCount; else ++otherCount;
-      continue;
-    }
-    if (auto store = dyn_cast<memref::StoreOp>(op)) {
-      if (isWorkgroupValue(store.getMemref())) ++storeCount; else ++otherCount;
-      continue;
-    }
-    ++otherCount;
+    if (auto r = dyn_cast<memref::LoadOp>(op))
+      { (isWorkgroupValue(r.getMemref()) ? loads : other)++; continue; }
+    if (auto w = dyn_cast<memref::StoreOp>(op))
+      { (isWorkgroupValue(w.getMemref()) ? stores : other)++; continue; }
+    other++;
   }
-  return loadCount == 1 && storeCount == 1 && otherCount == 0;
+  return loads == 1 && stores == 1 && other == 0;
 }
 
-static Operation *getOutermostIfAncestor(Operation *op) {
-  Operation *outermostIf = nullptr;
-  Operation *cur = op->getParentOp();
-  while (cur) {
-    if (isa<gpu::LaunchOp, func::FuncOp>(cur)) break;
-    if (isa<scf::IfOp>(cur)) outermostIf = cur;
-    cur = cur->getParentOp();
-  }
-  return outermostIf;
-}
-
-static Operation *hoistPastIfOps(Operation *op) {
-  if (Operation *outerIf = getOutermostIfAncestor(op))
-    return outerIf;
-  return op;
-}
-
-/// Returns true if the block is the body of a scf.for that is NOT inside
-/// any scf.if (i.e. the loop itself is at unconditional scope).
 static bool isUnconditionalForBody(Block *block) {
   auto parentFor = dyn_cast_or_null<scf::ForOp>(block->getParentOp());
   if (!parentFor) return false;
-  // Check the for-loop is not inside any scf.if.
-  Operation *ancestor = parentFor->getParentOp();
-  while (ancestor) {
-    if (isa<scf::IfOp>(ancestor)) return false;
-    if (isa<gpu::LaunchOp, func::FuncOp>(ancestor)) break;
-    ancestor = ancestor->getParentOp();
+  for (Operation *cur = parentFor->getParentOp(); cur; cur = cur->getParentOp()) {
+    if (isa<scf::IfOp>(cur)) return false;
+    if (isa<gpu::LaunchOp, func::FuncOp>(cur)) break;
   }
   return true;
 }
 
-
 static void insertBarriersInBlock(OpBuilder &builder, Block *block) {
+  auto isConstIdx = [](Value v) {
+    if (auto cst = v.getDefiningOp<arith::ConstantOp>())
+      return isa<IntegerAttr>(cst.getValue());
+    return v.getDefiningOp<arith::ConstantIndexOp>() != nullptr;
+  };
+
   SmallVector<Operation *> barrierPoints;
 
-
+  // If this for-body opens with stores before any loads, barrier at top.
   if (isUnconditionalForBody(block)) {
-    // Scan forward to find if the block has workgroup stores before any
-    // workgroup loads (ignoring terminators and existing barriers).
-    bool hasStoresBeforeLoads = false;
-    for (Operation &op : block->getOperations()) {
-      if (isa<scf::YieldOp, gpu::TerminatorOp>(op)) break;
-      if (isa<NVVM::Barrier0Op, gpu::BarrierOp>(op)) break; // already fenced
-      if (hasWorkgroupLoads(&op)) break;  // loads come first, no need for loop-top barrier
-      if (hasWorkgroupStores(&op)) { hasStoresBeforeLoads = true; break; }
-    }
-    if (hasStoresBeforeLoads) {
-      // Insert before the first non-terminator op in the block.
-      Operation *firstOp = &block->front();
-
-      barrierPoints.push_back(firstOp);
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[" DEBUG_TYPE "] loop-top read→write barrier at: "
-                 << firstOp->getName() << "\n");
+    for (Operation &op : *block) {
+      if (isa<scf::YieldOp, gpu::TerminatorOp, NVVM::Barrier0Op, gpu::BarrierOp>(op))
+        break;
+      if (hasWorkgroupLoads(&op)) break;
+      if (hasWorkgroupStores(&op)) { barrierPoints.push_back(&block->front()); break; }
     }
   }
 
-  // ── Barrier #2: write→read transition analysis ───────────────────────────
-  bool seenWorkgroupStore = false;
-  bool seenNonAtomicStore = false;
-
-  for (Operation &op : block->getOperations()) {
+  bool seenStore = false, seenNonAtomicStore = false;
+  for (Operation &op : *block) {
     if (isa<scf::YieldOp, gpu::TerminatorOp>(op)) continue;
-
-    // An existing barrier resets the seen-store flag.
     if (isa<NVVM::Barrier0Op, gpu::BarrierOp>(op)) {
-      seenWorkgroupStore = false;
-      seenNonAtomicStore = false;
+      seenStore = seenNonAtomicStore = false;
       continue;
     }
-
-    bool hasLoads  = hasWorkgroupLoads(&op);
-    bool hasStores = hasWorkgroupStores(&op);
-
-    // Write→read transition: insert barrier before the reader.
-    // Hoist past any enclosing scf.if so the barrier is at unconditional scope.
-    if (seenWorkgroupStore && hasLoads) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[" DEBUG_TYPE "] write→read transition before: "
-                 << op.getName() << "\n");
-      Operation *insertionTarget = hoistPastIfOps(&op);
-      // Avoid duplicating a point already recorded (e.g. multiple transitions
-      // that collapse to the same outer if-block after hoisting).
-      if (barrierPoints.empty() || barrierPoints.back() != insertionTarget)
-        barrierPoints.push_back(insertionTarget);
-      seenWorkgroupStore = false;
-      seenNonAtomicStore = false;
+    if (seenStore && hasWorkgroupLoads(&op)) {
+      // Hoist barrier past any enclosing scf.if.
+      Operation *target = &op;
+      for (Operation *cur = op.getParentOp(); cur; cur = cur->getParentOp()) {
+        if (isa<gpu::LaunchOp, func::FuncOp>(cur)) break;
+        if (isa<scf::IfOp>(cur)) { target = cur; break; }
+      }
+      if (barrierPoints.empty() || barrierPoints.back() != target)
+        barrierPoints.push_back(target);
+      seenStore = seenNonAtomicStore = false;
     }
+    if (hasWorkgroupStores(&op))
+      seenStore = seenNonAtomicStore = true;
 
-    if (hasStores) {
-      seenWorkgroupStore = true;
-      if (hasNonAtomicWorkgroupStores(&op))
-        seenNonAtomicStore = true;
-    }
-
-    // Recurse into scf.for bodies (uniform — all threads execute every iter).
+    // Recurse into uniform for/forall.
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      auto isConstIdx = [](Value v) -> bool {
-        if (auto cst = v.getDefiningOp<arith::ConstantOp>())
-          return isa<IntegerAttr>(cst.getValue());
-        return v.getDefiningOp<arith::ConstantIndexOp>() != nullptr;
-      };
-      bool uniformBounds = isConstIdx(forOp.getLowerBound()) &&
-                           isConstIdx(forOp.getUpperBound()) &&
-                           isConstIdx(forOp.getStep());
-      if (uniformBounds && !isSimplePerThreadCopy(forOp))
+      bool uniform = isConstIdx(forOp.getLowerBound()) &&
+                     isConstIdx(forOp.getUpperBound()) &&
+                     isConstIdx(forOp.getStep());
+      if (uniform && !isSimplePerThreadCopy(forOp))
         insertBarriersInBlock(builder, forOp.getBody());
     }
-
-    // Recurse into scf.forall bodies (uniform — all threads execute).
     if (auto forallOp = dyn_cast<scf::ForallOp>(op)) {
-      auto isConstIdx = [](Value v) -> bool {
-        if (auto cst = v.getDefiningOp<arith::ConstantOp>())
-          return isa<IntegerAttr>(cst.getValue());
-        return v.getDefiningOp<arith::ConstantIndexOp>() != nullptr;
-      };
-      bool uniformBounds = true;
+      bool uniform = true;
       for (Value ub : forallOp.getUpperBound(builder))
-        if (!isConstIdx(ub)) { uniformBounds = false; break; }
-      if (uniformBounds)
-        for (Block &innerBlock : forallOp.getRegion())
-          insertBarriersInBlock(builder, &innerBlock);
+        if (!isConstIdx(ub)) { uniform = false; break; }
+      if (uniform)
+        for (Block &inner : forallOp.getRegion())
+          insertBarriersInBlock(builder, &inner);
     }
-
   }
 
+  // Trailing stores in a uniform for-loop need a barrier before yield.
   if (seenNonAtomicStore && isa<scf::YieldOp>(block->getTerminator())) {
-    bool safeToInsert = false;
     if (auto parentFor = dyn_cast_or_null<scf::ForOp>(block->getParentOp())) {
       if (!isSimplePerThreadCopy(parentFor)) {
-        auto isConst = [](Value v) {
-          return v.getDefiningOp<arith::ConstantIndexOp>() != nullptr ||
-                 (v.getDefiningOp<arith::ConstantOp>() &&
-                  isa<IntegerAttr>(v.getDefiningOp<arith::ConstantOp>()
-                                   ->getAttrOfType<Attribute>("value")));
-        };
-        bool uniformBounds = isConst(parentFor.getLowerBound()) &&
-                             isConst(parentFor.getUpperBound()) &&
-                             isConst(parentFor.getStep());
-        // Only safe if the for-loop is NOT inside a scf.if.
+        bool uniform = isConstIdx(parentFor.getLowerBound()) &&
+                       isConstIdx(parentFor.getUpperBound()) &&
+                       isConstIdx(parentFor.getStep());
         bool insideIf = false;
-        Operation *ancestor = parentFor->getParentOp();
-        while (ancestor) {
-          if (isa<scf::IfOp>(ancestor)) { insideIf = true; break; }
-          if (isa<gpu::LaunchOp, func::FuncOp>(ancestor)) break;
-          ancestor = ancestor->getParentOp();
+        for (Operation *cur = parentFor->getParentOp(); cur;
+             cur = cur->getParentOp()) {
+          if (isa<scf::IfOp>(cur)) { insideIf = true; break; }
+          if (isa<gpu::LaunchOp, func::FuncOp>(cur)) break;
         }
-        safeToInsert = uniformBounds && !insideIf;
+        bool alreadyHasTopBarrier =
+            !barrierPoints.empty() && barrierPoints.front() == &block->front();
+        if (uniform && !insideIf && !alreadyHasTopBarrier)
+          barrierPoints.push_back(block->getTerminator());
       }
-    }
-    if (safeToInsert) {
-
-      bool alreadyHasLoopTopBarrier =
-          !barrierPoints.empty() && barrierPoints.front() == &block->front();
-      if (!alreadyHasLoopTopBarrier)
-        barrierPoints.push_back(block->getTerminator());
     }
   }
 
-  // Insert barriers in reverse order to preserve iterator validity.
   for (Operation *pt : llvm::reverse(barrierPoints)) {
     builder.setInsertionPoint(pt);
     builder.create<NVVM::Barrier0Op>(pt->getLoc());
   }
 }
 
-//===----------------------------------------------------------------------===//
-// §4  Pass
-//===----------------------------------------------------------------------===//
-
 struct NovaGPUInsertWorkgroupBarriersPass
     : public PassWrapper<NovaGPUInsertWorkgroupBarriersPass,
                          OperationPass<func::FuncOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
-      NovaGPUInsertWorkgroupBarriersPass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUInsertWorkgroupBarriersPass)
+
   NovaGPUInsertWorkgroupBarriersPass() = default;
-  NovaGPUInsertWorkgroupBarriersPass(
-      const NovaGPUInsertWorkgroupBarriersPass &) = default;
+  NovaGPUInsertWorkgroupBarriersPass(const NovaGPUInsertWorkgroupBarriersPass &) = default;
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect,
@@ -617,10 +442,8 @@ struct NovaGPUInsertWorkgroupBarriersPass
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
     OpBuilder builder(funcOp.getContext());
-
     funcOp.walk([&](gpu::LaunchOp launchOp) {
-      Region &launchRegion = launchOp.getBody();
-      for (Block &block : launchRegion)
+      for (Block &block : launchOp.getBody())
         insertBarriersInBlock(builder, &block);
     });
   }
@@ -629,23 +452,14 @@ struct NovaGPUInsertWorkgroupBarriersPass
     return "nova-gpu-insert-workgroup-barriers";
   }
   StringRef getDescription() const override {
-    return "Inserts nvvm.barrier0 at workgroup memory transition points inside "
-           "gpu.launch bodies. Two barriers per K-loop iteration: barrier #1 "
-           "at loop-top (read→write, protects previous iter's smem reads) and "
-           "barrier #2 at write→read transitions (protects smem writes before "
-           "compute reads). All barriers placed at unconditional scope — never "
-           "inside scf.if — preventing bar.sync deadlocks.";
+    return "Inserts nvvm.barrier0 at workgroup memory write→read transitions "
+           "inside gpu.launch bodies.";
   }
 };
-
-//===----------------------------------------------------------------------===//
-// Public API
-//===----------------------------------------------------------------------===//
 
 std::unique_ptr<Pass> createNovaGPUInsertWorkgroupBarriersPass() {
   return std::make_unique<NovaGPUInsertWorkgroupBarriersPass>();
 }
-
 void registerNovaGPUInsertWorkgroupBarriersPass() {
   PassRegistration<NovaGPUInsertWorkgroupBarriersPass>();
 }

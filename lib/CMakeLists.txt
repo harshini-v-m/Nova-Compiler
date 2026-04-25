@@ -10,6 +10,7 @@ add_subdirectory(API)
 install(
     TARGETS 
         MLIRNova
+        MLIRNovaVectorExt
         CompilerTransforms
         NovaPipelines
         MLIRAffineTransformPasses

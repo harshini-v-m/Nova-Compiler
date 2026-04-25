@@ -28,6 +28,7 @@ target_link_libraries(nova-opt PRIVATE
   NovaPipelines
   CompilerTransforms
   NovaLLVMGPUTransforms
+  MLIRNovaVectorExt
 
   # Core dialects that we know exist and are needed
   MLIRAffineDialect

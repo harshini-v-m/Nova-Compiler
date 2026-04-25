@@ -153,6 +153,7 @@ NovaCompilerAPI::NovaCompilerAPI() {
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::vector::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::nova::registerNovaValueBarrierBufferizationInterface(registry);
 
   // Register BufferDeallocationOpInterface external models
   mlir::arith::registerBufferDeallocationOpInterfaceExternalModels(registry);

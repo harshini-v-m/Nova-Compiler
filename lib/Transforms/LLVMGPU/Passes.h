@@ -275,6 +275,24 @@ void registerNovaGPUVectorDistributePass();
 
 std::unique_ptr<Pass> createNovaStrideReductionPass();
 void registerNovaStrideReductionPass();
+
+/// Converts tensor-semantic nova_vector_ext.to_layout ops to vector-semantic
+/// by wrapping each with vector.transfer_read + to_layout + transfer_write.
+/// Must run BEFORE GenericVectorization and BEFORE bufferization so that
+/// OneShotBufferize never sees tensor-semantic to_layout ops (which have no
+/// BufferizableOpInterface and would be conservatively wrapped with
+/// bufferization.to_tensor / to_buffer, surviving into LLVM).
+std::unique_ptr<Pass> createNovaVectorizeVectorExtOpsPass();
+void registerNovaVectorizeVectorExtOpsPass();
+
+// Pipeline helpers — declared here so Passes.cpp and external callers can use them.
+void addNovaPostBufferizationPasses(OpPassManager &pm);
+void addNovaComprehensiveBufferizePasses(OpPassManager &pm);
+
+// Registers BufferizableOpInterface external model on nova::ValueBarrierOp.
+// Must be called during dialect registry setup (before any bufferization pass runs).
+void registerNovaValueBarrierBufferizationInterface(mlir::DialectRegistry &registry);
+
 } // namespace nova
 } // namespace mlir
 

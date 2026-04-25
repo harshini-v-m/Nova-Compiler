@@ -671,43 +671,75 @@ struct NovaGPUHoistVectorExtractInsertSlicePass
     // ------------------------------------------------------------------
     linalg::hoistRedundantVectorTransfers(funcOp);
     SmallVector<std::pair<vector::TransferReadOp, scf::ForallOp>> sinkWork;
-funcOp.walk([&](vector::TransferReadOp readOp) {
-  auto vType = readOp.getVectorType();
-  int64_t numElements = vType.getNumElements();
-  if (numElements <= 32)
-    return; // Small reads are fine to hoist
+    funcOp.walk([&](vector::TransferReadOp readOp) {
+      if (readOp.getVectorType().getNumElements() <= 32)
+        return;
 
-  // Check if the next op is a warp-mapped forall
-  Operation *nextOp = readOp->getNextNode();
-  if (!nextOp)
-    return;
-  auto forallOp = dyn_cast<scf::ForallOp>(nextOp);
-  if (!forallOp)
-    return;
+      // Compute the forward slice of this read (includes to_layout, contract, etc.)
+      SetVector<Operation *> fwdSlice;
+      getForwardSlice(readOp.getOperation(), &fwdSlice);
 
-  // Check if it's warp-mapped
-  auto mapping = forallOp.getMappingAttr();
-  if (!mapping || mapping.getValue().empty())
-    return;
-  bool isWarpMapped = llvm::all_of(mapping.getValue(), [](Attribute a) {
-    return isa<gpu::GPUWarpMappingAttr>(a);
-  });
-  if (!isWarpMapped)
-    return;
+      // Find the warp-mapped forall that consumes this read's chain.
+      // We can't rely on nextNode — to_layout may sit between the read and the forall.
+      scf::ForallOp targetForall = nullptr;
+      for (Operation *sliceOp : fwdSlice) {
+        for (Operation *user : sliceOp->getUsers()) {
+          Operation *cur = user->getParentOp();
+          while (cur) {
+            auto fa = dyn_cast<scf::ForallOp>(cur);
+            if (!fa) { cur = cur->getParentOp(); continue; }
+            auto mapping = fa.getMappingAttr();
+            if (!mapping || mapping.getValue().empty()) { cur = cur->getParentOp(); continue; }
+            bool isWarpMapped = llvm::all_of(mapping.getValue(), [](Attribute a) {
+              return isa<gpu::GPUWarpMappingAttr>(a);
+            });
+            if (isWarpMapped) { targetForall = fa; goto found; }
+            break;
+          }
+        }
+      }
+      found:
+      if (!targetForall)
+        return;
 
-  // Check all uses are inside the forall
-  bool allUsesInside = llvm::all_of(readOp->getUsers(), [&](Operation *user) {
-    return forallOp->isProperAncestor(user);
-  });
-  if (!allUsesInside)
-    return;
+      // Only sink if the read was hoisted out (currently outside the forall).
+      if (targetForall->isProperAncestor(readOp))
+        return;
 
-  sinkWork.emplace_back(readOp, forallOp);
-});
+      // Verify every terminal user of the forward slice is inside the forall
+      // (intermediate ops in the slice that feed each other are also OK).
+      bool allTerminalUsersInside = llvm::all_of(fwdSlice, [&](Operation *sliceOp) {
+        return llvm::all_of(sliceOp->getUsers(), [&](Operation *user) {
+          return targetForall->isProperAncestor(user) || fwdSlice.contains(user);
+        });
+      });
+      if (!allTerminalUsersInside)
+        return;
 
-for (auto &[readOp, forallOp] : sinkWork) {
-  readOp->moveBefore(&forallOp.getBody()->front());
-}
+      sinkWork.emplace_back(readOp, targetForall);
+    });
+
+    // Sink readOp and its entire forward slice back inside the warp forall.
+    // IMPORTANT: moveBefore(&front()) prepends — repeated calls reverse order.
+    // Instead, move each op after the previous one to preserve topological order.
+    for (auto &[readOp, forallOp] : sinkWork) {
+      SetVector<Operation *> fwdSlice;
+      getForwardSlice(readOp.getOperation(), &fwdSlice);
+
+      // Collect ops to sink in topological order: readOp first, then fwdSlice.
+      SmallVector<Operation *> toSink;
+      toSink.push_back(readOp.getOperation());
+      for (Operation *op : fwdSlice) {
+        if (!forallOp->isProperAncestor(op))
+          toSink.push_back(op);
+      }
+
+      // Move the first op to the forall's front, then each subsequent op
+      // immediately after the previous one — preserving def-before-use order.
+      toSink[0]->moveBefore(&forallOp.getBody()->front());
+      for (size_t i = 1; i < toSink.size(); ++i)
+        toSink[i]->moveAfter(toSink[i - 1]);
+    }
 
 LLVM_DEBUG(llvm::dbgs()
            << "[nova-hoist-slice] after sinking large reads back into warp foralls\n");

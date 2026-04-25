@@ -32,6 +32,7 @@
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -47,7 +48,8 @@ namespace mlir::nova {
 // NovaGPUDistributionPatterns.cpp and NovaGPUNestedLayoutDistributionPatterns.cpp.
 void populateNovaGPUDistributionPatterns(RewritePatternSet &patterns);
 void populateNovaGPUDistributeNestedLayoutAttrPatterns(
-    RewritePatternSet &patterns, Value threadId, int64_t subgroupSize,
+    RewritePatternSet &patterns,
+    const llvm::DenseMap<Block *, Value> &threadIdMap, int64_t subgroupSize,
     ArrayRef<int64_t> workgroupSize, int64_t maxBitsPerShuffle = 32);
 
 namespace {
@@ -59,33 +61,29 @@ namespace {
 
 class NovaContractionVectorLayoutOptions : public VectorLayoutOptions {
 public:
-  NovaContractionVectorLayoutOptions(Operation *root, Value threadId,
-                                      int64_t subgroupSize,
-                                      ArrayRef<int64_t> workgroupSize,
-                                      int64_t maxBitsPerShuffle = 32,
-                                      bool fullConversion = true)
-      : VectorLayoutOptions(root, fullConversion), threadId(threadId),
+  NovaContractionVectorLayoutOptions(
+      Operation *root, const llvm::DenseMap<Block *, Value> &threadIdMap,
+      int64_t subgroupSize, ArrayRef<int64_t> workgroupSize,
+      int64_t maxBitsPerShuffle = 32, bool fullConversion = true)
+      : VectorLayoutOptions(root, fullConversion), threadIdMap(threadIdMap),
         subgroupSize(subgroupSize),
         workgroupSize(workgroupSize.begin(), workgroupSize.end()),
         maxBitsPerShuffle(maxBitsPerShuffle) {}
 
-  /// Return null layout for any rank-0 vector (scalars); skip everything else.
-  /// The engine will skip ops with null layouts.
   VectorLayoutInterface getDefaultLayout(VectorType type) const override {
     return {};
   }
 
-  /// Build the full pattern set for this pass.
   RewritePatternSet getPatterns(MLIRContext *ctx) const {
     RewritePatternSet patterns(ctx);
     populateNovaGPUDistributionPatterns(patterns);
     populateNovaGPUDistributeNestedLayoutAttrPatterns(
-        patterns, threadId, subgroupSize, workgroupSize, maxBitsPerShuffle);
+        patterns, threadIdMap, subgroupSize, workgroupSize, maxBitsPerShuffle);
     return patterns;
   }
 
 private:
-  Value              threadId;
+  const llvm::DenseMap<Block *, Value> &threadIdMap;
   int64_t            subgroupSize;
   SmallVector<int64_t> workgroupSize;
   int64_t            maxBitsPerShuffle;
@@ -121,60 +119,48 @@ struct NovaGPUVectorDistributePass
     MLIRContext *ctx     = &getContext();
 
     // -----------------------------------------------------------------------
-    // Step 1: Read workgroup_size from the function attribute.
-    // KernelConfig sets  workgroup_size = [totalThreads, 1, 1]  or
-    //                    workgroup_size = [x, y, z]
-    // We need them in [x, y, z] order as a DenseI64ArrayAttr.
-    // -----------------------------------------------------------------------
-    SmallVector<int64_t, 3> workgroupSize = {1, 1, 1};
-    if (auto attr = funcOp->getAttrOfType<DenseI64ArrayAttr>("workgroup_size"))
-      workgroupSize = llvm::to_vector(attr.asArrayRef());
-
-    // -----------------------------------------------------------------------
-    // Step 2: Create gpu.thread_id ops at the function entry block.
-    // We need [x, y, z] (gpu.Dimension ordering) to linearize.
-    // -----------------------------------------------------------------------
-    OpBuilder builder(funcOp);
-    Block &entryBlock = funcOp.getBody().front();
-    builder.setInsertionPointToStart(&entryBlock);
-    Location loc = funcOp.getLoc();
-
-    Value tidX = gpu::ThreadIdOp::create(builder, loc, builder.getIndexType(),
-                                          gpu::Dimension::x);
-    Value tidY = gpu::ThreadIdOp::create(builder, loc, builder.getIndexType(),
-                                          gpu::Dimension::y);
-    Value tidZ = gpu::ThreadIdOp::create(builder, loc, builder.getIndexType(),
-                                          gpu::Dimension::z);
-
-    // -----------------------------------------------------------------------
-    // Step 3: Linearize thread ID.
-    //   linear = tidX + wgX * (tidY + wgY * tidZ)
-    // We use affine::AffineLinearizeIndexOp (multi-index → linear).
-    // Order must match: [z, y, x] with sizes [wgZ, wgY, wgX] (most-major first).
-    // -----------------------------------------------------------------------
-    SmallVector<Value, 3> tidVec  = {tidZ, tidY, tidX};
-    SmallVector<int64_t, 3> wgSizes = {workgroupSize[2], workgroupSize[1],
-                                        workgroupSize[0]};
-    // Remove leading 1-sized dims to keep the index clean.
-    while (tidVec.size() > 1 && wgSizes.front() == 1) {
-      tidVec.erase(tidVec.begin());
-      wgSizes.erase(wgSizes.begin());
-    }
-
-    Value linearThreadId;
-    if (tidVec.size() == 1) {
-      linearThreadId = tidVec[0];
-    } else {
-      linearThreadId = affine::AffineLinearizeIndexOp::create(
-          builder, loc, tidVec, wgSizes, /*disjoint=*/true);
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 4: Read subgroup_size (default 32).
+    // Step 1: Determine workgroup_size (total threads per workgroup).
+    //
+    // Preferred source: "workgroup_size" DenseI64ArrayAttr on the function,
+    // set by KernelConfig as [totalThreads, 1, 1] or [x, y, z].
+    //
+    // Fallback (Nova pipeline): KernelConfig does not write workgroup_size.
+    // Derive totalThreads from NestedLayoutAttr anchors on to_layout ops:
+    //   totalThreads = subgroupTile_product × subgroupSize × threadTile_product
+    // This matches the number of threads the layout assigns to one workgroup tile.
+    // The derived value is placed in workgroupSize[0] so the linearization and
+    // numThreads computation in DistributeTransferWrite work correctly.
     // -----------------------------------------------------------------------
     int64_t subgroupSize = 32;
     if (auto attr = funcOp->getAttrOfType<IntegerAttr>("subgroup_size"))
       subgroupSize = attr.getInt();
+
+    SmallVector<int64_t, 3> workgroupSize = {1, 1, 1};
+    if (auto attr = funcOp->getAttrOfType<DenseI64ArrayAttr>("workgroup_size")) {
+      workgroupSize = llvm::to_vector(attr.asArrayRef());
+    } else {
+      // Scan to_layout ops and take the max totalThreads across all layouts
+      // (different layouts encode different sub-tiles; the warp-mapped to_layout
+      // gives the true per-workgroup thread count).
+      int64_t maxThreads = 1;
+      funcOp.walk([&](vec_ext::ToLayoutOp toLayout) {
+        auto layout = dyn_cast<vec_ext::NestedLayoutAttr>(toLayout.getLayout());
+        if (!layout)
+          return;
+        int64_t sgProd = 1;
+        for (int64_t s : layout.getSubgroupTile())
+          sgProd *= (s > 0 ? s : 1);
+        int64_t tProd = 1;
+        for (int64_t t : layout.getThreadTile())
+          tProd *= (t > 0 ? t : 1);
+        // Total threads per workgroup = numWarps * warpSize.
+        // threadTile is a spatial mapping, not a thread multiplier.
+        (void)tProd;
+        int64_t total = sgProd * subgroupSize;
+        maxThreads = std::max(maxThreads, total);
+      });
+      workgroupSize[0] = maxThreads;
+    }
 
     LLVM_DEBUG(llvm::dbgs()
                << "[VectorDistribute] workgroup_size=[" << workgroupSize[0]
@@ -182,46 +168,7 @@ struct NovaGPUVectorDistributePass
                << "] subgroup_size=" << subgroupSize << "\n");
 
     // -----------------------------------------------------------------------
-    // Step 5: Build options + patterns.
-    // -----------------------------------------------------------------------
-    // fullConversion=true: matches IREE's default. Any vec_ext::ToLayoutOp that
-    // survives VectorDistribute un-consumed causes an immediate pass failure,
-    // surfacing pattern gaps early rather than silently emitting undistributed IR.
-    //
-    // Which ops carry to_layout anchors at this point:
-    //   • MMA contractions: ConfigureTensorLayouts stamps to_layout on all three
-    //     operands + result with a NestedLayoutAttr encoding subgroup/thread/elt
-    //     layout. DistributeContract + DistributeElementwise consume these.
-    //   • Standalone reductions (flag-gated): setGPULoweringConfigLayout stamps
-    //     to_layout on operand + result. DistributeMultiReduction consumes them
-    //     via inter-thread butterfly (gpu.subgroup_reduce).
-    //   • Elementwise/activation ops fused inside an MMA or reduction dispatch:
-    //     NO to_layout anchor of their own; layout is propagated from their
-    //     annotated predecessor by DistributeElementwise.
-    //   • SIMT contractions (mmaKind == 0): ConfigureTensorLayouts explicitly
-    //     skips them (returns success() with no annotation). SIMT dispatches
-    //     never reach this pass — KernelConfig routes them to
-    //     addGPUTileAndFusePassPipeline instead.
-    //   • Standalone elementwise / transpose dispatches: also routed to
-    //     addGPUTileAndFusePassPipeline by KernelConfig; no to_layout anchors.
-    //
-    // Net result: for any function that reaches this pass, every to_layout op
-    // belongs to an MMA or reduction dispatch and must be consumed. fullConversion=
-    // true enforces this invariant.
-    NovaContractionVectorLayoutOptions options(funcOp, linearThreadId,
-                                               subgroupSize, workgroupSize,
-                                               /*maxBitsPerShuffle=*/32,
-                                               /*fullConversion=*/true);
-    RewritePatternSet patterns = options.getPatterns(ctx);
-
-    // -----------------------------------------------------------------------
     // Step 5.5: Propagate nova.gpu.mma from result to_layout → vector.contract.
-    //
-    // ConfigureTensorLayouts sets mma_kind on the result to_layout op (which
-    // survives vectorization). GenericVectorization destroys the linalg op so
-    // nova.gpu.mma is lost from the vector.contract. Recover it here by walking
-    // every to_layout whose mma_kind is set and stamping nova.gpu.mma on the
-    // defining vector.contract.
     // -----------------------------------------------------------------------
     funcOp.walk([&](vec_ext::ToLayoutOp toLayout) {
       auto mmaKindAttr = toLayout.getMmaKind();
@@ -236,8 +183,63 @@ struct NovaGPUVectorDistributePass
     });
 
     // -----------------------------------------------------------------------
-    // Step 6: Run distribution.
+    // Step 6: Build a per-warp-forall thread ID map, then distribute.
+    //
+    // gpu.thread_id must live inside each warp forall body so that
+    // MapForallToGPU (which runs later) splices it into the gpu.launch body.
+    // If thread_id were created at function scope, GpuKernelOutliningPass
+    // would capture it as a kernel argument — always 0 on the host side.
+    //
+    // We cannot call distributeVectorOps(warpForall, ...) because
+    // applyPatternsGreedily requires an IsolatedFromAbove root (only funcOp
+    // qualifies). Instead:
+    //   1. Walk every warp forall; insert gpu.thread_id + linearize once at
+    //      the start of each body and record body→linearThreadId in a map.
+    //   2. Pass the map to the patterns; each pattern walks up from its op to
+    //      find the nearest enclosing warp forall body and looks up the right
+    //      thread ID.
+    //   3. Call distributeVectorOps(funcOp, ...) as normal.
     // -----------------------------------------------------------------------
+    llvm::DenseMap<Block *, Value> threadIdMap;
+
+    funcOp.walk([&](scf::ForallOp forallOp) {
+      auto mapping = forallOp.getMappingAttr();
+      if (!mapping || mapping.empty() ||
+          !isa<gpu::GPUWarpMappingAttr>(mapping.getValue().front()))
+        return;
+
+      OpBuilder builder(ctx);
+      builder.setInsertionPointToStart(forallOp.getBody());
+      Location loc = forallOp.getLoc();
+
+      Value tidX = gpu::ThreadIdOp::create(builder, loc, builder.getIndexType(),
+                                            gpu::Dimension::x);
+      Value tidY = gpu::ThreadIdOp::create(builder, loc, builder.getIndexType(),
+                                            gpu::Dimension::y);
+      Value tidZ = gpu::ThreadIdOp::create(builder, loc, builder.getIndexType(),
+                                            gpu::Dimension::z);
+      SmallVector<Value, 3> tidVec    = {tidZ, tidY, tidX};
+      SmallVector<int64_t, 3> wgSizes = {workgroupSize[2], workgroupSize[1],
+                                          workgroupSize[0]};
+      while (tidVec.size() > 1 && wgSizes.front() == 1) {
+        tidVec.erase(tidVec.begin());
+        wgSizes.erase(wgSizes.begin());
+      }
+      Value linearThreadId;
+      if (tidVec.size() == 1) {
+        linearThreadId = tidVec[0];
+      } else {
+        linearThreadId = affine::AffineLinearizeIndexOp::create(
+            builder, loc, tidVec, wgSizes, /*disjoint=*/true);
+      }
+      threadIdMap[forallOp.getBody()] = linearThreadId;
+    });
+
+    NovaContractionVectorLayoutOptions options(funcOp, threadIdMap,
+                                               subgroupSize, workgroupSize,
+                                               /*maxBitsPerShuffle=*/32,
+                                               /*fullConversion=*/true);
+    RewritePatternSet patterns = options.getPatterns(ctx);
     if (failed(distributeVectorOps(funcOp, patterns, options)))
       return signalPassFailure();
   }

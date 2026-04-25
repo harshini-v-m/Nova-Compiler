@@ -68,6 +68,13 @@
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Transforms/DialectConversion.h"
+// Forward-declare pass factories defined in MLIRNovaVectorExt library.
+namespace mlir::nova {
+std::unique_ptr<mlir::Pass> createNovaVectorExtFoldUnitExtentDimsPass();
+void registerNovaVectorExtFoldUnitExtentDimsPass();
+std::unique_ptr<mlir::Pass> createNovaVectorizeVectorExtOpsPass();
+void registerNovaVectorizeVectorExtOpsPass();
+} // namespace mlir::nova
 
 using namespace mlir;
 
@@ -150,9 +157,18 @@ namespace mlir::nova
         createNovaConfigTrackingCanonicalizerPass());
     pm.addPass(createCSEPass());
 
+    // Fold unit dims first so ConfigureTensorLayouts wraps already-rank-reduced
+    // tensors. If ConfigureTensorLayouts ran first, FoldUnitExtentDims would
+    // insert extract_slice + empty + insert_slice around to_layout ops,
+    // breaking the shared_outs alias chain needed for in-place bufferization.
+    pm.addNestedPass<func::FuncOp>(
+        createNovaVectorExtFoldUnitExtentDimsPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
     pm.addNestedPass<func::FuncOp>(
         createNovaGPUConfigureTensorLayoutsPass());
-
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
 
     // ── Step 6: Normalize loop bounds ──────────────────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
@@ -167,13 +183,11 @@ namespace mlir::nova
     // ── Step 6.75: Lower barrier regions ───────────────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaGPULowerBarrierRegionPass());
 
-    // ── Step 7: Post-tiling linalg cleanup ─────────────────────────────────
-    // sm_80+: keep named contraction ops for the vector.contract path.
-    // GenericVectorization (Stage 18) vectorizes them directly to
-    // vector.contract. Generalizing here would route them through
-    // vector.multi_reduction instead, losing the MMA path.
-    // pre-sm_80: generalize first for the SIMT outer-product path.
-    pm.addPass(createLinalgElementwiseOpFusionPass());
+    pm.addPass(createLinalgGeneralizeNamedOpsPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+
+    pm.addNestedPass<func::FuncOp>(createNovaVectorizeVectorExtOpsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
@@ -196,8 +210,6 @@ namespace mlir::nova
 
     // ── Step 8: GPU-aware bufferization (tensor → memref) ──────────────────
     addNovaGPUBufferizePasses(pm);
-    pm.addNestedPass<mlir::func::FuncOp>(
-        mlir::createConvertBufferizationToMemRefPass());
 
     pm.addNestedPass<func::FuncOp>(createNovaGPUVectorDistributePass());
     pm.addPass(createCanonicalizerPass());
@@ -207,10 +219,6 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
     pm.addPass(createCanonicalizerPass());
 
-    // ── Fill-copy forwarding and buffer coalescing ──────────────────────────
-    pm.addNestedPass<func::FuncOp>(createNovaGPUFillCopyForwardingPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
 
 
     // ── Step 9: scf.forall → gpu.launch ────────────────────────────────────
@@ -477,9 +485,10 @@ namespace mlir::nova
     registerNovaGPUMapForallToGPUPass();
     registerNovaGPULowerMemorySpacePass();
     registerNovaWarpShuffleReductionPass();
-    registerNovaGPUFillCopyForwardingPass();
     registerNovaGPUCoalesceWorkgroupBuffersPass();
     registerNovaGPUConfigureTensorLayoutsPass();
+    registerNovaVectorExtFoldUnitExtentDimsPass();
+    registerNovaVectorizeVectorExtOpsPass();
     registerNovaGPUVectorAllocPass();
     registerNovaGPUCombineValueSemanticBarriersPass();
     registerNovaGPUVectorDistributePass();
@@ -509,17 +518,7 @@ namespace mlir::nova
 
   void addNovaGPUBufferizePasses(OpPassManager &pm)
   {
-    pm.addNestedPass<func::FuncOp>(createNovaEliminateEmptyTensorsPass());
-    pm.addNestedPass<func::FuncOp>(
-        bufferization::createEmptyTensorToAllocTensorPass());
-    pm.addNestedPass<func::FuncOp>(createNovaGPUInferMemorySpacePass());
-    pm.addPass(createNovaGPUComprehensiveBufferizePass());
-    pm.addNestedPass<func::FuncOp>(
-        memref::createResolveShapedTypeResultDimsPass());
-    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-    pm.addNestedPass<func::FuncOp>(createCSEPass());
-    bufferization::BufferDeallocationPipelineOptions deallocOpts;
-    bufferization::buildBufferDeallocationPipeline(pm, deallocOpts);
+    addNovaComprehensiveBufferizePasses(pm);
   }
 
 } // namespace mlir::nova

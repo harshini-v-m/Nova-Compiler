@@ -11,9 +11,9 @@
 //      b. Fall back to SIMT tile table (8 entries from IREE).
 //      Thread tiles = intrinsic tile shape (one MMA per thread slot).
 //      Subgroup tiles = intrinsic * mnTileCountPerSubgroup.
-//      C promotion = true when accumulator buffer is live (matmul_accumulate)
-//                    OR when prologue ops feed non-matmul operands into the
-//                    kernel (promotePrologueOperands).
+//      C promotion = true only when accumulator carries live data from a
+//                    prior kernel (readingExistingAccBuffer). Epilogue users
+//                    do not trigger C promotion — C stays in registers.
 //
 //   2. Default (setDefaultConfig): For reductions and elementwise ops.
 //      Mirrors IREE's setRootDefaultConfig:
@@ -30,8 +30,6 @@
 //      Non-root ops (prologues, epilogues, fills) fuse into their root.
 //
 // Fix log:
-//   [Fix1] promotePrologueOperands now propagated to setMatmulLoweringConfigAttrs
-//          instead of being computed and silently discarded.
 //   [Fix2] Accumulator upcasting allowed at getMmaSchedule filter stage so
 //          f16-problem + f32-accumulator intrinsics are not rejected too early.
 //   [Fix3] sortMMAIntrinsics now breaks volume ties by preferring mma.sync over
@@ -45,9 +43,9 @@
 //   [Fix6] FusedOpMemoryInfo: fused leading op shared memory cost is now
 //          analysed and subtracted from the available smem budget before tile
 //          selection, so MMA/SIMT tile sizes are shrunk to fit the real limit.
-//          Simple elementwise ops (relu, bias_add, gelu) are handled directly.
-//          Row-reduction ops (layernorm) force tileK == K (full reduction dim)
-//          and reserve per-row mean+variance scratch space.
+//          Simple elementwise ops (relu, bias_add, gelu) need no extra SMEM
+//          (evaluated in registers). Row-reduction ops (layernorm) force
+//          tileK == K and reserve per-row mean+variance scratch space.
 //===----------------------------------------------------------------------===//
 
 
@@ -151,8 +149,18 @@ struct GPUMMAHeuristicSeeds {
 struct GPUMMASchedule {
  NVMMAIntrinsicInfo intrinsic;
  int64_t wgM, wgN, wgK;
+ // Total warps per workgroup = subgroupCountM * subgroupCountN.
+ // Kept as (legacy) subgroupCount for downstream passes that still read it.
  int64_t subgroupCount;
- int64_t mnTileCountPerSubgroup;
+ int64_t subgroupCountM;              // warps splitting M within a workgroup
+ int64_t subgroupCountN;              // warps splitting N within a workgroup
+ // Per-warp MMA tile counts. For the legacy (1-D warp split) path these are
+ // equal to mnTileCountPerSubgroup. The 2-D warp grid path (VeryLarge
+ // balanced GEMMs targeting a matmul.cpp-style 128x128 tile) sets them
+ // independently.
+ int64_t mnTileCountPerSubgroup;      // legacy; = max(mTile, nTile)
+ int64_t mTileCountPerSubgroup;       // MMA tiles per warp along M
+ int64_t nTileCountPerSubgroup;       // MMA tiles per warp along N
  int64_t kTileCountPerSubgroup;
 };
 
@@ -371,20 +379,8 @@ static bool isTransposedRhs(linalg::LinalgOp op,
 
 
 //===----------------------------------------------------------------------===//
-// checkUserHaveNewOperands / readingExistingAccBuffer
+// readingExistingAccBuffer
 //===----------------------------------------------------------------------===//
-
-
-bool checkUserHaveNewOperands(linalg::LinalgOp op) {
- // Returns true when any user of any result of `op` is itself a LinalgOp.
- // Fixed: removed the dead inner loop that dereferenced a null linalgop
- // after a failed cast.
- for (auto result : op->getResults())
-   for (Operation *user : result.getUsers())
-     if (dyn_cast<linalg::LinalgOp>(user))
-       return true;
- return false;
-}
 
 
 bool readingExistingAccBuffer(linalg::LinalgOp op) {
@@ -402,19 +398,17 @@ bool readingExistingAccBuffer(linalg::LinalgOp op) {
 
 
 //===----------------------------------------------------------------------===//
-// [Fix6] analyzeFusedLeadingOp
+// analyzeFusedLeadingOp
 //
 // Walks producers of the matmul's LHS (operand 0). Classifies what kind of
 // fused leading op is present and returns the corresponding memory info.
 //
-// Currently handled:
-//   - nova.layer_norm  → row-reduction, forces tileK = fullK,
-//                        reserves 8 bytes/row mean+var scratch
-//   - nova.gelu        → elementwise, extra f32 input tile copy
-//   - nova.add (bias)  → elementwise, extra f32 input tile copy
-//   - anything else    → treated as generic elementwise (conservative)
+//   - Row-reduction ops (layernorm): forces tileK = fullK, reserves 8 bytes/row
+//     mean+var scratch, stages input tile (4 bytes/elem extra SMEM).
+//   - Pure-parallel ops (gelu, bias_add, relu): evaluated in registers while
+//     loading the A tile — no extra SMEM beyond the A tile itself.
 //
-// Only looks one level up the def chain. Deeper chains can be added later.
+// Only looks one level up the def chain.
 //===----------------------------------------------------------------------===//
 
 
@@ -532,7 +526,14 @@ getContractionHeuristicSeeds(const ContractProblem &problem,
    if (problem.inBitWidth <= 16)
      return GPUMMAHeuristicSeeds{4, 64, 4, 4,
                                  /*boostMNT=*/std::nullopt, /*util=*/0.80};
-   return GPUMMAHeuristicSeeds{4, 32, 4, 2,
+   // f32 / TF32: target a 128x128x8 workgroup tile with a 2x2 warp grid
+   // (matches eager sgemm and NovaToGpu direct-lowering). Keep K-tile
+   // small so the A+B SMEM footprint stays under 48 KB and
+   // fitScheduleInSharedMemory doesn't shrink the MN tile.
+   //   wgM = mSize*MNT*S = 16*4*4 = 256 → reshape to 2x2 warp grid → 128
+   //   wgN = nSize*MNT   = 8*4      =  32 → reshape doubles → 128
+   //   wgK = kSize*Ktiles= 8*1      =   8
+   return GPUMMAHeuristicSeeds{4, 8, 4, 1,
                                /*boostMNT=*/std::nullopt, /*util=*/0.80};
  }
  return std::nullopt;
@@ -848,8 +849,50 @@ getOptimalMMASchedule(const ContractProblem &problem,
  int64_t wgN = intrinsic.nSize * mnTileCount;
 
 
+ // Default: 1-D warp split — all warps along M, one warp wide in N.
+ int64_t subgroupCountM = subgroupCount;
+ int64_t subgroupCountN = 1;
+ int64_t mTileCount     = mnTileCount;
+ int64_t nTileCount     = mnTileCount;
+
+
+ // ── 2-D warp grid reshape (matmul.cpp-style 2x2) ─────────────────────────
+ // For Large/VeryLarge GEMMs with room on the N-side, redistribute the
+ // warp group from [S warps in M × 1 in N] into a balanced 2-D grid.
+ // Mirrors the eager/direct-lowering layout: 2 warps in M, 2 in N, each
+ // warp covering per-warp tile (wgM / 2) × (wgN / 2).
+ //
+ // Conditions:
+ //   * subgroupCount is even (>= 2)
+ //   * nTiles has headroom to double the N-side tile
+ //   * K is not dominant (column-heavy problems prefer the old split)
+ if ((problem.gemmSize == GemmSize::LargeGemm ||
+      problem.gemmSize == GemmSize::VeryLargeGemm) &&
+     subgroupCount >= 2 && (subgroupCount % 2) == 0 &&
+     nTiles >= mnTileCount * 2 &&
+     problem.kSize <= std::max(problem.mSize, problem.nSize)) {
+   subgroupCountM = subgroupCount / 2;
+   subgroupCountN = 2;
+   // Per-warp MMA tile counts preserve the per-warp footprint in M and
+   // double the per-warp footprint in N (new N-warp absorbs its share).
+   mTileCount = mnTileCount;
+   nTileCount = mnTileCount * 2;
+   // Clamp to available tiles so we don't over-cover.
+   mTileCount = std::min(mTileCount,
+                         std::max<int64_t>(mTiles / std::max<int64_t>(subgroupCountM, 1),
+                                           int64_t{1}));
+   nTileCount = std::min(nTileCount,
+                         std::max<int64_t>(nTiles / subgroupCountN, int64_t{1}));
+   wgM = intrinsic.mSize * mTileCount * subgroupCountM;
+   wgN = intrinsic.nSize * nTileCount * subgroupCountN;
+ }
+
+
  return GPUMMASchedule{intrinsic, wgM, wgN, wgK,
-                       subgroupCount, mnTileCount,
+                       subgroupCount,
+                       subgroupCountM, subgroupCountN,
+                       std::max(mTileCount, nTileCount),  // mnTileCount legacy
+                       mTileCount, nTileCount,
                        seeds.bestKTileCountPerSubgroup};
 }
 
@@ -876,20 +919,44 @@ fitScheduleInSharedMemory(GPUMMASchedule sched,
    if (smem <= maxSmem) return sched;
 
 
-   int64_t newMNT = sched.mnTileCountPerSubgroup / 2;
-   if (newMNT < 1) return std::nullopt;
+   // Halve whichever side has the larger per-warp MMA tile count first.
+   // Fall through to halving the other side when equal.
+   bool halveM = sched.mTileCountPerSubgroup >= sched.nTileCountPerSubgroup;
+   if (halveM && sched.mTileCountPerSubgroup <= 1)
+     halveM = false;
+   if (!halveM && sched.nTileCountPerSubgroup <= 1) {
+     if (sched.mTileCountPerSubgroup <= 1)
+       return std::nullopt;
+     halveM = true;
+   }
 
+   if (halveM) {
+     int64_t newMT = sched.mTileCountPerSubgroup / 2;
+     if (newMT < 1) return std::nullopt;
+     sched.mTileCountPerSubgroup = newMT;
+   } else {
+     int64_t newNT = sched.nTileCountPerSubgroup / 2;
+     if (newNT < 1) return std::nullopt;
+     sched.nTileCountPerSubgroup = newNT;
+   }
 
-   sched.mnTileCountPerSubgroup = newMNT;
-   sched.wgM = std::max(intrinsic.mSize * newMNT * sched.subgroupCount,
+   sched.wgM = std::max(intrinsic.mSize * sched.mTileCountPerSubgroup *
+                        sched.subgroupCountM,
                         intrinsic.mSize);
-   sched.wgN = std::max(intrinsic.nSize * newMNT, intrinsic.nSize);
+   sched.wgN = std::max(intrinsic.nSize * sched.nTileCountPerSubgroup *
+                        sched.subgroupCountN,
+                        intrinsic.nSize);
+   sched.mnTileCountPerSubgroup =
+       std::max(sched.mTileCountPerSubgroup, sched.nTileCountPerSubgroup);
 
 
    LLVM_DEBUG(llvm::dbgs()
               << "[nova-kernel-config] fitScheduleInSharedMemory: smem="
               << smem << " > limit=" << maxSmem
-              << " (incl. fused-op overhead), shrinking MNT to " << newMNT
+              << " (incl. fused-op overhead), shrinking "
+              << (halveM ? "M" : "N") << "-tile. New mT="
+              << sched.mTileCountPerSubgroup
+              << " nT=" << sched.nTileCountPerSubgroup
               << " wgM=" << sched.wgM << " wgN=" << sched.wgN << "\n");
  }
 }
@@ -1119,8 +1186,7 @@ tryPickMMASchedule(linalg::LinalgOp op,
 
 
 //===----------------------------------------------------------------------===//
-// setContractConfig (MMA path)
-// [Fix1] promotePrologueOperands now propagated to promoted operand list.
+// trySetMMAConfig
 // [Fix5] threadTile = intrinsic size (one MMA slot per thread);
 //         subgroupTile = intrinsic * mnTileCount encodes multi-tile ownership.
 //===----------------------------------------------------------------------===//
@@ -1129,7 +1195,6 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
                                      const MatmulDims &dims,
                                      int numLoops,
                                      bool doCPromotion,
-                                     bool promotePrologueOperands,
                                      const FusedOpMemoryInfo &fusedInfo) {
   Type lhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(0)->get());
   Type rhsType = getElementTypeOrSelf(matmul.getDpsInputOperand(1)->get());
@@ -1198,29 +1263,33 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   threadTiles[nDim] = 0;
 
   // ── Per-warp tile step ("subgroup" field) ────────────────────────────────
-  // = wgTile / warpsPerWG — what the Subgroup scf.forall iterates by.
-  // The Subgroup tiling pass reads this key directly as the forall step size.
-  subgroupTiles[mDim] = sched.wgM / sched.subgroupCount; // e.g. 64/4 = 16
-  subgroupTiles[nDim] = sched.wgN;   // N not split across warps (wgSg_N=1)
+  // = wgTile / warpsPerWG along each axis — what the Subgroup scf.forall
+  // iterates by. With a 2-D warp grid (matmul.cpp-style 2x2), both M and N
+  // are split across warps; the legacy 1-D split has subgroupCountN == 1.
+  subgroupTiles[mDim] = sched.wgM / sched.subgroupCountM;
+  subgroupTiles[nDim] = sched.wgN / sched.subgroupCountN;
   subgroupTiles[kDim] = 0;           // K not distributed across subgroups
 
   for (int64_t b : contractionDims->batch)
     subgroupTiles[b] = workgroupTiles[b]; // one warp owns full batch dim
 
   // ── Per-workgroup subgroup counts ("wg_subgroup" field) ──────────────────
-  // = subgroupCountPerWG only (within one workgroup tile).
+  // Number of warps along each axis within ONE workgroup tile.
   // NovaGPUConfigureTensorLayouts uses this to compute per-warp
   // batch_counts / sg_counts correctly from the wg-level tile bounds.
-  wgSubgroupTiles[mDim] = sched.subgroupCount; // warps tiling M within WG
-  wgSubgroupTiles[nDim] = 1;                   // N not split across warps
+  wgSubgroupTiles[mDim] = sched.subgroupCountM;
+  wgSubgroupTiles[nDim] = sched.subgroupCountN;
   wgSubgroupTiles[kDim] = 0;                   // K not subgroup-distributed
 
   for (int64_t b : contractionDims->batch)
     wgSubgroupTiles[b] = 1; // one subgroup per batch dim within WG
 
   // ── Promoted operands ────────────────────────────────────────────────────
+  // C (operand 2) goes to SMEM only when it carries live data from a prior
+  // kernel. Each warp owns a disjoint subslice of C and accumulates in registers,
+  // so epilogue users are not a reason to stage C through SMEM.
   SmallVector<int64_t> promotedOps = {0, 1};
-  if (doCPromotion || promotePrologueOperands)
+  if (doCPromotion)
     promotedOps.push_back(2);
 
   // ── Padding ──────────────────────────────────────────────────────────────
@@ -1241,13 +1310,15 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
              << " wgM=" << sched.wgM
              << " wgN=" << sched.wgN
              << " wgK=" << sched.wgK
-             << " subgroupCount=" << sched.subgroupCount
-             << " mnTilePerSubgroup=" << sched.mnTileCountPerSubgroup
+             << " warpGrid=" << sched.subgroupCountM
+             << "x" << sched.subgroupCountN
+             << " mTilePerWarp=" << sched.mTileCountPerSubgroup
+             << " nTilePerWarp=" << sched.nTileCountPerSubgroup
              << " sgStepM=" << subgroupTiles[mDim]
              << " sgStepN=" << subgroupTiles[nDim]
              << " wgSgM=" << wgSubgroupTiles[mDim]
+             << " wgSgN=" << wgSubgroupTiles[nDim]
              << " doCPromo=" << doCPromotion
-             << " promoProlog=" << promotePrologueOperands
              << " fusedOverhead="
              << fusedInfo.extraSmemBytes(sched.wgM, sched.wgK) << "\n");
   return success();
@@ -1441,15 +1512,8 @@ LogicalResult setContractConfig(linalg::LinalgOp op,
  }
 
 
- // [Fix6] Analyse fused leading op and derive shared memory requirements.
- // Simple elementwise ops (gelu, bias_add) are handled inline.
- // Row-reduction ops (layernorm) force tileK = fullK and reserve scratch.
  FusedOpMemoryInfo fusedInfo = analyzeFusedLeadingOp(op, dims);
-
-
- // [Fix1] Compute both promotion flags here and pass them downstream.
- bool promotePrologueOperands = checkUserHaveNewOperands(op);
- bool doCPromotion             = readingExistingAccBuffer(op);
+ bool doCPromotion = readingExistingAccBuffer(op);
 
 
  int numLoops = op.getNumLoops();
@@ -1488,10 +1552,8 @@ LogicalResult setContractConfig(linalg::LinalgOp op,
 
  // MMA path.
  if (!target.mmaIntrinsics.empty()) {
-   // [Fix1] Pass both flags into trySetMMAConfig.
    if (succeeded(trySetMMAConfig(op, target, dims, numLoops,
-                                 doCPromotion, promotePrologueOperands,
-                                 fusedInfo)))
+                                 doCPromotion, fusedInfo)))
      return success();
  }
 

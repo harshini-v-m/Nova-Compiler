@@ -348,4 +348,110 @@ void setMatmulLoweringConfigAttrs(Operation *op,
   setLoweringConfig(op, configDict);
 }
 
+
+//===----------------------------------------------------------------------===//
+// MMA single-subgroup layout table
+//
+// PTX ISA data for each Nova MMA intrinsic.
+// Operand index: 0=LHS(A), 1=RHS(B), 2=ACC(C/D)
+//
+// Each entry: outer={outerDim, innerDim}, thread={outerDim, innerDim},
+//             tstrides={outerDim, innerDim}, element={outerDim, innerDim}
+//
+// For mma.sync m16n8k16 / m16n8k8: outerDim=M, innerDim=K for LHS; K/N for RHS; M/N for ACC.
+// Sources: PTX ISA, NVIDIA CUDA Programming Guide,
+//          IREE IREEGPUAttrs.cpp getSingleSubgroupLayout().
+//===----------------------------------------------------------------------===//
+
+NovaMMASingleSubgroupLayout getNovaSubgroupLayout(int32_t mmaKind,
+                                                  int operandIndex) {
+  using V = NVMMAIntrinsicValues;
+  auto kind = static_cast<V>(mmaKind);
+
+  switch (kind) {
+  // ── mma.sync m16n8k16 (F16 and BF16 — identical thread layout) ───────────
+  case V::MMA_SYNC_F16_16x8x16:
+  case V::MMA_SYNC_BF16_16x8x16:
+    switch (operandIndex) {
+    case 0: // LHS A [M=16, K=16]
+      return {/*outer=*/{2, 2}, /*thread=*/{8, 4}, /*tstrides=*/{4, 1},
+              /*element=*/{1, 2}};
+    case 1: // RHS B [K=16, N=8]
+      return {/*outer=*/{2, 1}, /*thread=*/{4, 8}, /*tstrides=*/{1, 4},
+              /*element=*/{2, 1}};
+    case 2: // ACC C [M=16, N=8]
+      return {/*outer=*/{2, 1}, /*thread=*/{8, 4}, /*tstrides=*/{4, 1},
+              /*element=*/{1, 2}};
+    default: return {};
+    }
+
+  // ── mma.sync m16n8k8 (TF32) ──────────────────────────────────────────────
+  case V::MMA_SYNC_TF32_16x8x8:
+    switch (operandIndex) {
+    case 0: // LHS A [M=16, K=8]
+      return {/*outer=*/{2, 1}, /*thread=*/{8, 4}, /*tstrides=*/{4, 1},
+              /*element=*/{1, 2}};
+    case 1: // RHS B [K=8, N=8]
+      return {/*outer=*/{1, 1}, /*thread=*/{4, 8}, /*tstrides=*/{1, 4},
+              /*element=*/{2, 1}};
+    case 2: // ACC C [M=16, N=8]
+      return {/*outer=*/{2, 1}, /*thread=*/{8, 4}, /*tstrides=*/{4, 1},
+              /*element=*/{1, 2}};
+    default: return {};
+    }
+
+  // ── wmma m16n16k16 (Volta/Turing F16/F32) ────────────────────────────────
+  case V::WMMA_F32_16x16x16:
+  case V::WMMA_F16_16x16x16:
+    switch (operandIndex) {
+    case 0: // LHS A [M=16, K=16]
+      return {/*outer=*/{1, 1}, /*thread=*/{16, 2}, /*tstrides=*/{2, 1},
+              /*element=*/{1, 8}};
+    case 1: // RHS B [K=16, N=16]
+      return {/*outer=*/{1, 1}, /*thread=*/{2, 16}, /*tstrides=*/{1, 2},
+              /*element=*/{8, 1}};
+    case 2: // ACC C [M=16, N=16]
+      return {/*outer=*/{1, 1}, /*thread=*/{8, 4}, /*tstrides=*/{4, 1},
+              /*element=*/{2, 4}};
+    default: return {};
+    }
+
+  // ── wmma m16n16k8 (Volta/Turing TF32) ────────────────────────────────────
+  case V::WMMA_TF32_16x16x8:
+    switch (operandIndex) {
+    case 0: // LHS A [M=16, K=8]
+      return {/*outer=*/{1, 1}, /*thread=*/{16, 1}, /*tstrides=*/{1, 0},
+              /*element=*/{1, 8}};
+    case 1: // RHS B [K=8, N=16]
+      return {/*outer=*/{1, 1}, /*thread=*/{1, 16}, /*tstrides=*/{0, 1},
+              /*element=*/{8, 1}};
+    case 2: // ACC C [M=16, N=16]
+      return {/*outer=*/{1, 1}, /*thread=*/{8, 4}, /*tstrides=*/{4, 1},
+              /*element=*/{2, 4}};
+    default: return {};
+    }
+
+  default:
+    return {};
+  }
+}
+
+NovaMNKShape getNovaMMKShape(int32_t mmaKind) {
+  using V = NVMMAIntrinsicValues;
+  switch (static_cast<V>(mmaKind)) {
+  case V::MMA_SYNC_F16_16x8x16:
+  case V::MMA_SYNC_BF16_16x8x16:
+    return {16, 8, 16};
+  case V::MMA_SYNC_TF32_16x8x8:
+    return {16, 8, 8};
+  case V::WMMA_F32_16x16x16:
+  case V::WMMA_F16_16x16x16:
+    return {16, 16, 16};
+  case V::WMMA_TF32_16x16x8:
+    return {16, 16, 8};
+  default:
+    return {0, 0, 0};
+  }
+}
+
 } // namespace mlir::nova

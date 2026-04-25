@@ -37,6 +37,13 @@ struct VectorContractOpInfo {
   std::pair<int, int> getOperandKIndex() const;
   std::pair<int, int> getResultMNIndex() const;
 
+  // Convenience accessors — return the iteration-space M/N/K dimension indices
+  // from contractionDims (same as contractionDims.m/n/k, exposed for callers
+  // that only have VectorContractOpInfo and not a linalg::LinalgOp).
+  ArrayRef<unsigned> getMDims() const { return contractionDims.m; }
+  ArrayRef<unsigned> getNDims() const { return contractionDims.n; }
+  ArrayRef<unsigned> getKDims() const { return contractionDims.k; }
+
   static FailureOr<VectorContractOpInfo>
   inferFromIndexingMaps(ArrayRef<AffineMap> maps);
 };

@@ -146,11 +146,9 @@ static void promoteOperandToShared(OpBuilder &builder,
     auto thTiles = getLoweringConfigTileSizes(parentConfig, kThreadKey);
     auto sgTiles = getLoweringConfigTileSizes(parentConfig, kSubgroupKey);
 
-    // Detect MMA config: all thread tiles are 0, subgroup tiles are non-zero.
-    bool isMMA = !thTiles.empty() &&
-                 llvm::all_of(thTiles, [](int64_t t) { return t == 0; }) &&
-                 !sgTiles.empty() &&
-                 llvm::any_of(sgTiles, [](int64_t t) { return t > 0; });
+    // Detect MMA config via mma_kind attribute directly — the heuristic of
+    // checking all thread tiles == 0 fails when batch dims have thread=1.
+    bool isMMA = (getMmaKindRaw(parentConfig) != 0);
 
     if (isMMA && wgTiles.size() == sgTiles.size()) {
       // MMA path: total threads = numWarps × warpSize (32 for NVIDIA).

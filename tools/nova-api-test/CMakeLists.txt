@@ -18,6 +18,7 @@ target_link_libraries(nova-api-test PRIVATE
   NovaPipelines
   CompilerTransforms
   NovaCompilerAPI
+  MLIRNovaVectorExt
 
   # Core dialects that we know exist and are needed
   MLIRAffineDialect

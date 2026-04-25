@@ -111,11 +111,23 @@ public:
     if (op->getParentOfType<gpu::GPUFuncOp>() &&
         isIntMemSpace(srcType, 1) &&
         isGpuAddrSpace(dstType)) {
-      llvm::errs() << "[" DEBUG_TYPE "] Converting memref.copy to nvgpu.device_async_copy\n";
       Location loc = op.getLoc();
       MLIRContext *ctx = rewriter.getContext();
       ArrayRef<int64_t> shape = dstType.getShape();
       int64_t rank = shape.size();
+
+      // cp.async requires rank ≥ 1. For rank-0 (scalar) copies, fall back to
+      // a plain load + store — the PTX assembler has no scalar cp.async form.
+      if (rank == 0) {
+        Value scalar = rewriter.create<memref::LoadOp>(loc, op.getSource(),
+                                                       ValueRange{});
+        rewriter.create<memref::StoreOp>(loc, scalar, op.getTarget(),
+                                        ValueRange{});
+        rewriter.eraseOp(op);
+        return success();
+      }
+
+      llvm::errs() << "[" DEBUG_TYPE "] Converting memref.copy to nvgpu.device_async_copy\n";
 
       // innerVec = innermost dim size = elements per cp.async instruction.
       int64_t innerVec = shape[rank - 1];

@@ -1593,10 +1593,19 @@ struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
       rhs = rewriter.create<tensor::CollapseShapeOp>(loc, rank3RhsType, rhs, rhsReassociation);
     }
 
-    // 2. Prepare the fused 'outs' tensor (bias broadcasted)
-    Value broadcastedBias = broadcastTensor(rewriter, loc, bias, currentResultType.getShape());
+    // 2. Zero-filled local accumulator — bias is NOT the matmul outs.
+    //    Using bias as outs aliases the C tile to the output global buffer via
+    //    the block forall shared_outs chain, causing bufferization to carry it
+    //    as a global-memory iter_arg across the K-loop. Zero init keeps C
+    //    register-resident throughout the K-loop; bias is added as an epilogue.
+    Value emptyAcc = rewriter.create<tensor::EmptyOp>(
+        loc, currentResultType.getShape(), currentResultType.getElementType());
+    Value zeroCst = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(currentResultType.getElementType(), 0.0));
+    Value zeroAcc = rewriter.create<linalg::FillOp>(
+        loc, ValueRange{zeroCst}, ValueRange{emptyAcc}).getResult(0);
 
-    // 3. Create the linalg op.
+    // 3. Matmul with zero init as outs.
     // For the rank==3 case where B is 2D (shared weight across batch), emit a
     // linalg.generic with a batch-shared B indexing map instead of broadcasting
     // B to 3D — avoids a full 8x weight copy in memory.
@@ -1607,7 +1616,7 @@ struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
         // A: [B, M, K]  B: [K, N]  C: [B, M, N]
         // Maps: A->(d0,d1,d2), B->(d2,d3), C->(d0,d1,d3), reduction over d2
         MLIRContext *ctx = rewriter.getContext();
-        AffineMap aMap = AffineMap::getMultiDimIdentityMap(4, ctx);  // (d0,d1,d2,d3)->d0,d1,d2
+        AffineMap aMap = AffineMap::getMultiDimIdentityMap(4, ctx);
         aMap = aMap.getSubMap({0, 1, 2});
         AffineMap bMap = AffineMap::get(4, 0,
             {rewriter.getAffineDimExpr(2), rewriter.getAffineDimExpr(3)}, ctx);
@@ -1622,7 +1631,7 @@ struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
         };
         matmulResult = rewriter.create<linalg::GenericOp>(
             loc, currentResultType,
-            ValueRange{lhs, rhs}, ValueRange{broadcastedBias},
+            ValueRange{lhs, rhs}, ValueRange{zeroAcc},
             SmallVector<AffineMap>{aMap, bMap, cMap}, iters,
             [&](OpBuilder &b, Location l, ValueRange args) {
               Value mul = b.create<arith::MulFOp>(l, args[0], args[1]);
@@ -1632,14 +1641,57 @@ struct NovaLinearOpLowering : public OpConversionPattern<nova::LinearOp> {
       } else {
         // B is already 3D (collapsed from higher rank path)
         matmulResult = rewriter.create<linalg::BatchMatmulOp>(
-            loc, currentResultType, ValueRange{lhs, rhs}, broadcastedBias).getResult(0);
+            loc, currentResultType, ValueRange{lhs, rhs}, zeroAcc).getResult(0);
       }
     } else {
       matmulResult = rewriter.create<linalg::MatmulOp>(
-          loc, currentResultType, ValueRange{lhs, rhs}, broadcastedBias).getResult(0);
+          loc, currentResultType, ValueRange{lhs, rhs}, zeroAcc).getResult(0);
     }
 
-    // 4. Expand back if we collapsed
+    // 4. Bias epilogue — separate linalg.generic after matmul.
+    //    ins: (matmul_result, bias)  outs: fresh empty tensor
+    //    bias[d_{rank-1}] broadcasts across all other dims.
+    {
+      MLIRContext *ctx = rewriter.getContext();
+      int64_t rank = currentResultType.getRank();
+
+      // Flatten bias to 1D if needed so the broadcast map is always rank-1.
+      Value biasOperand = bias;
+      auto biasRankedType = cast<RankedTensorType>(bias.getType());
+      if (biasRankedType.getRank() != 1) {
+        ReassociationIndices allDims;
+        for (int64_t i = 0; i < biasRankedType.getRank(); ++i)
+          allDims.push_back(i);
+        SmallVector<ReassociationIndices> reassoc{allDims};
+        auto flatBiasType = RankedTensorType::get(
+            {biasRankedType.getNumElements()},
+            biasRankedType.getElementType());
+        biasOperand = rewriter.create<tensor::CollapseShapeOp>(
+            loc, flatBiasType, bias, reassoc);
+      }
+
+      AffineMap identMap = AffineMap::getMultiDimIdentityMap(rank, ctx);
+      AffineMap biasMap  = AffineMap::get(
+          rank, 0, {rewriter.getAffineDimExpr(rank - 1)}, ctx);
+      SmallVector<utils::IteratorType> epilogueIters(rank,
+          utils::IteratorType::parallel);
+
+      Value epilogueEmpty = rewriter.create<tensor::EmptyOp>(
+          loc, currentResultType.getShape(), currentResultType.getElementType());
+
+      matmulResult = rewriter.create<linalg::GenericOp>(
+          loc, currentResultType,
+          ValueRange{matmulResult, biasOperand},
+          ValueRange{epilogueEmpty},
+          SmallVector<AffineMap>{identMap, biasMap, identMap},
+          epilogueIters,
+          [&](OpBuilder &b, Location l, ValueRange args) {
+            Value sum = b.create<arith::AddFOp>(l, args[0], args[1]);
+            b.create<linalg::YieldOp>(l, sum);
+          }).getResult(0);
+    }
+
+    // 5. Expand back if we collapsed
     if (resultRank > 3) {
       SmallVector<ReassociationIndices> resultReassociation;
       ReassociationIndices expandedBatchIndices;

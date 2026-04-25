@@ -48,6 +48,7 @@ add_mlir_library(NovaLLVMGPUTransforms
 
   # ── Memory ────────────────────────────────────────────────────────────────
   # GPU-aware comprehensive bufferization
+  Memory/NovaGPUBufferizationInterfaces.cpp
   Memory/NovaGPUBufferize.cpp
   # Infer shared vs. private memory spaces
   Memory/NovaGPUInferMemorySpace.cpp
@@ -55,8 +56,7 @@ add_mlir_library(NovaLLVMGPUTransforms
   Memory/NovaConvertSharedMemAllocs.cpp
   # Coalesce workgroup allocs with non-overlapping live ranges
   Memory/NovaGPUCoalesceWorkgroupBuffers.cpp
-  # Forward fill/copy operations
-  Memory/NovaGPUFillCopyForwarding.cpp
+
   # Eliminate tensor.empty ops pre-bufferization
   Memory/NovaEliminateEmptyTensors.cpp
   Memory/NovaRepositionStore.cpp
@@ -102,7 +102,19 @@ add_mlir_library(NovaLLVMGPUTransforms
   
   Vectorization/NovaGPUVectorAlloc.cpp
   Vectorization/NovaGPUCombineValueSemanticBarriers.cpp
+
+  # Vector utility ops (VectorContractOpInfo etc.)
+  Vectorization/NovaVectorOpUtils.cpp
+  # Layout propagation analysis (seeds from to_layout anchors, fixpoint)
+  Vectorization/NovaVectorLayoutAnalysis.cpp
+  # Basic distribution patterns (constants, poison, elementwise, scf.for, etc.)
+  Vectorization/NovaGPUDistributionPatterns.cpp
+  # NestedLayoutAttr-driven patterns (transfer_read/write, contract, reduction, etc.)
+  Vectorization/NovaGPUNestedLayoutDistributionPatterns.cpp
+  # Distribution engine (signature propagation, worklist driver, to_simd/to_simt)
   Vectorization/NovaGPUVectorDistribution.cpp
+  # Pass driver (reads workgroup_size, linearizes thread id, calls distributeVectorOps)
+  Vectorization/NovaGPUVectorDistribute.cpp
 
   DEPENDS
   MLIRNovaOpsIncGen
@@ -145,6 +157,7 @@ add_mlir_library(NovaLLVMGPUTransforms
   MLIRNVGPUDialect
   MLIRNVVMDialect
   MLIRNVGPUToNVVM
+  MLIRNovaVectorExt
   
   # IREE Dependencies (Using existing Nova linkage/vendored paths if available, otherwise adapting)
   # For now, assuming we implement simplified versions or link against IREE libraries if setup.

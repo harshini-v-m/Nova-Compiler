@@ -171,6 +171,46 @@ void setMatmulLoweringConfigAttrs(Operation *op,
 /// scf.forall (defense-in-depth against stale configs at thread tiling).
 void removeLoweringConfig(Operation *op);
 
+
+//===----------------------------------------------------------------------===//
+// MMA single-subgroup layout structs
+//
+// Used by NovaGPUConfigureTensorLayouts to build NestedLayoutAttr.
+// Each struct describes the per-MMA-tile thread distribution for ONE operand.
+//
+// outer   : outer unroll factor per (outerDim, innerDim) — usually 1
+// thread  : threads along (outerDim, innerDim) within one MMA tile
+// tstrides: row-major strides to linearize the warp lane → dim index
+// element : contiguous elements each thread owns on (outerDim, innerDim)
+//===----------------------------------------------------------------------===//
+
+struct NovaMMASingleSubgroupLayout {
+  std::array<int64_t, 2> outer;
+  std::array<int64_t, 2> thread;
+  std::array<int64_t, 2> tstrides;
+  std::array<int64_t, 2> element;
+
+  bool empty() const { return thread[0] == 0 && thread[1] == 0; }
+};
+
+struct NovaMNKShape {
+  int64_t m;
+  int64_t n;
+  int64_t k;
+};
+
+/// Returns the per-operand single-subgroup thread layout for the given MMA
+/// intrinsic (mmaKind) and operand index (0=LHS, 1=RHS, 2=ACC).
+/// The layout covers two dimensions: (outerDim, innerDim) where
+///   operand 0: outerDim=M, innerDim=K
+///   operand 1: outerDim=K, innerDim=N
+///   operand 2: outerDim=M, innerDim=N
+NovaMMASingleSubgroupLayout getNovaSubgroupLayout(int32_t mmaKind,
+                                                  int operandIndex);
+
+/// Returns the (M, N, K) tile shape for the given MMA intrinsic.
+NovaMNKShape getNovaMMKShape(int32_t mmaKind);
+
 } // namespace mlir::nova
 
 #endif // NOVA_TRANSFORMS_LLVMGPU_NOVAGPULOWERINGCONFIGUTILS_H_
