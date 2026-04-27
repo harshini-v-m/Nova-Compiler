@@ -542,14 +542,16 @@ getContractionHeuristicSeeds(const ContractProblem &problem,
    if (problem.inBitWidth <= 16)
      return GPUMMAHeuristicSeeds{4, 64, 4, 4,
                                  /*boostMNT=*/std::nullopt, /*util=*/0.80};
-   // f32 / TF32: target a 128x128x8 workgroup tile with a 2x2 warp grid
-   // (matches eager sgemm and NovaToGpu direct-lowering). Keep K-tile
-   // small so the A+B SMEM footprint stays under 48 KB and
-   // fitScheduleInSharedMemory doesn't shrink the MN tile.
+   // f32 / TF32: target a 128x128x16 workgroup tile with a 2x2 warp grid.
+   // kStep=16 (bestKTileCount=2) doubles the compute per memory load vs
+   // kStep=8, pushing the compute/copy ratio from 0.11 → 0.47 and giving
+   // the depth-3 pipeline enough MMA work to hide cp.async latency.
+   // Shared memory: 128×16×4 × 2 tiles × 3 buffers = 49,152 bytes (≤48 KB
+   // default carveout; dynamic smem allocation already handles this).
    //   wgM = mSize*MNT*S = 16*4*4 = 256 → reshape to 2x2 warp grid → 128
    //   wgN = nSize*MNT   = 8*4      =  32 → reshape doubles → 128
-   //   wgK = kSize*Ktiles= 8*1      =   8
-   return GPUMMAHeuristicSeeds{4, 8, 4, 1,
+   //   wgK = kSize*Ktiles= 8*2      =  16
+   return GPUMMAHeuristicSeeds{4, 8, 2, 1,
                                /*boostMNT=*/std::nullopt, /*util=*/0.80};
  }
  return std::nullopt;
@@ -1305,14 +1307,21 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
   // ── Promoted operands ────────────────────────────────────────────────────
   // A and B always go through shared (cooperative loads + reuse across K).
   // C-promotion (index 2) costs wgM*wgN*4 bytes of shared and forces the
-  // accumulator out of registers. Only do it when:
-  //   (a) doCPromotion  — true matmul_accumulate (read-modify-write of a
-  //       live C buffer): cooperative load saves N global reads.
-  //   (b) the downstream consumer has a reduction iterator (softmax,
-  //       layernorm, etc.): epilogue genuinely reuses the value cooperatively.
-  // For elementwise epilogues (relu, gelu, bias_add) the consumer reads each
-  // element exactly once; staging C in shared is pure overhead and blows the
-  // 48 KB SRAM budget for 128x128 f32 tiles.
+  // accumulator out of registers.
+  //
+  // For the MMA path, C accumulation is ALWAYS register-based: each thread
+  // owns exclusive MMA fragment slots and there is no inter-thread sharing of
+  // C elements. Promoting C to shared memory is therefore never needed for
+  // correctness and is only overhead that can overflow the smem budget (a
+  // 128×128×f32 C tile = 64 KB already exceeds the 48 KB default carve-out,
+  // and 64 KB + A/B tiles exceeds the sm_86 extended limit of ~97 KB).
+  //
+  // doCPromotion is intentionally NOT used here: a live-accumulator matmul
+  // (C += A×B) reads the existing C per-thread from global to registers and
+  // writes back from registers to global — no shared memory required.
+  //
+  // C-promotion is kept only when the downstream epilogue op has a reduction
+  // iterator (softmax, layernorm): those genuinely need cross-thread C sharing.
   bool epilogueBenefitsFromShared = false;
   if (promotePrologueOperands) {
     for (Value result : matmul->getResults()) {
@@ -1329,7 +1338,7 @@ static LogicalResult trySetMMAConfig(linalg::LinalgOp matmul,
     }
   }
   SmallVector<int64_t> promotedOps = {0, 1};
-  if (doCPromotion || epilogueBenefitsFromShared)
+  if (epilogueBenefitsFromShared)
     promotedOps.push_back(2);
 
   // ── Padding ──────────────────────────────────────────────────────────────

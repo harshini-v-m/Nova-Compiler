@@ -28,7 +28,9 @@
 #include "Passes.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/Support/Debug.h"
@@ -190,7 +192,8 @@ struct NovaGPUInferMemorySpacePass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<bufferization::BufferizationDialect, gpu::GPUDialect,
-                    scf::SCFDialect>();
+                    linalg::LinalgDialect, scf::SCFDialect,
+                    tensor::TensorDialect>();
   }
 
   void runOnOperation() override {
@@ -235,6 +238,25 @@ struct NovaGPUInferMemorySpacePass
                           "bufferization.alloc_tensor ops");
       return signalPassFailure();
     }
+
+    // Step 3: C-tile private-memory accumulation — DISABLED.
+    //
+    // Redirecting the C-tile fill to a private alloc_tensor is only correct
+    // when VectorDistribute runs AFTER bufferization (IREE's approach).  In
+    // our pipeline VectorDistribute runs BEFORE bufferization, so bufferization
+    // creates a full 32x32 memref.alloca per thread.  After ConvertVectorToGPU
+    // each warp lane writes only its 2-element MMA fragment to the alloca; the
+    // other 1008 positions stay zero.  All 32 lanes then race to copy their
+    // mostly-zero alloca to the same 32x32 global tile → all-zero output.
+    //
+    // Without Step 3, OneShotBufferize in-place bufferizes the C iter_arg
+    // chain directly to the global output memref.  The K-loop accumulates via
+    // DRAM on each iteration (performance-limited), but results are correct.
+    // RedirectTrivialMemrefIterArgsPass in Passes.cpp removes the trivial
+    // memref iter_arg before pipelining so scf::pipelineForLoop cannot drop it.
+    //
+    // TODO: move VectorDistribute to post-bufferization (like IREE) to enable
+    // per-lane register accumulation, then re-enable Step 3.
   }
 
   StringRef getArgument() const override {

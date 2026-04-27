@@ -416,8 +416,13 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
     // warp-forall) that each compute their own warp offsets.
     SmallVector<Value> producerIVs = producerForall.getInductionVars();
     SmallVector<Value> consumerIVs = consumerForall.getInductionVars();
+    SmallVector<Value> producerBodyOuts(producerForall.getRegionIterArgs().begin(),
+                                        producerForall.getRegionIterArgs().end());
+    SmallVector<Value> producerForallResults(producerForall.getResults().begin(),
+                                             producerForall.getResults().end());
     auto equivalenceFn = [&](Value v1, Value v2) {
-      return fuseEquivalent(v1, v2, producerIVs, consumerIVs);
+      return fuseEquivalent(v1, v2, producerIVs, consumerIVs,
+                            producerBodyOuts, producerForallResults);
     };
     if (!cast<SubsetOpInterface>(*consumerSlice).operatesOnEquivalentSubset(
             cast<SubsetOpInterface>(*producerInsert), equivalenceFn))
@@ -471,6 +476,24 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
     if (!emptyOp)
       return rewriter.notifyMatchFailure(
           producerForall, "producer dest is not tensor.empty");
+
+    // Guard: skip barrier-path fusion when the shared buffer would exceed the
+    // conservative 32 KB smem budget reserved for intermediate tiles.
+    // A 128×128×f32 C-tile = 64 KB; fusing it pushes main_kernel over the
+    // sm_86 extended-smem limit of ~97 KB when added to A+B double-buffered
+    // tiles (~36 KB). Let the matmul write to global memory instead.
+    {
+      auto tensorTy = dyn_cast<RankedTensorType>(emptyOp.getResult().getType());
+      if (tensorTy && tensorTy.hasStaticShape()) {
+        int64_t elemBits = tensorTy.getElementTypeBitWidth();
+        int64_t byteSize = (tensorTy.getNumElements() * elemBits + 7) / 8;
+        static constexpr int64_t kMaxFusionSmemBytes = 32 * 1024; // 32 KB
+        if (byteSize > kMaxFusionSmemBytes)
+          return rewriter.notifyMatchFailure(
+              producerForall,
+              "shared-mem buffer too large for barrier-path fusion");
+      }
+    }
 
     rewriter.setInsertionPointToStart(consumerForall.getBody());
     Attribute sharedMemAddrSpace = gpu::AddressSpaceAttr::get(

@@ -11,6 +11,11 @@
 //     (address-space 3 has no malloc). Bufferization emits memref.alloc;
 //     this pass converts those to the static declaration form that PTX expects.
 //
+//     A per-kernel shared memory budget (kSharedMemBudgetBytes, default 48KB)
+//     is enforced. If an allocation would exceed the remaining budget, it is
+//     left unconverted (as memref.alloc) and no further allocations in that
+//     kernel are promoted to shared memory.
+//
 //   DropGPUMemoryDeallocOp:
 //     Erases all memref.dealloc ops inside GPU modules. GPU shared memory is
 //     static and freed automatically when the kernel terminates. Without this,
@@ -66,10 +71,27 @@ namespace {
 // CORE LOGIC — converts memref.alloc with workgroup address space into a
 // module-level memref.global declaration + memref.get_global.
 //
+// Enforces a per-kernel shared memory budget (kSharedMemBudgetBytes). If an
+// allocation would exceed the remaining budget for its parent kernel, it is
+// left unconverted and promotion stops for that kernel. Allocations in other
+// kernels are unaffected.
+//
 // Ported from IREE's ConvertSharedMemAllocOp (ConvertToLLVM.cpp:152–203).
 //===----------------------------------------------------------------------===//
 struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
   using OpRewritePattern::OpRewritePattern;
+
+  // GPU / MEMORY SENSITIVE — Shared memory budget per kernel.
+  // Total shared memory per SM is typically 48 KB (some GPUs allow up to 96 KB
+  // with dynamic config via cudaFuncSetAttribute). We conservatively cap at
+  // 48 KB. Raise this constant if your target GPU is configured for 96 KB.
+  static constexpr uint64_t kSharedMemBudgetBytes = 48 * 1024;
+
+  // Tracks bytes committed so far, keyed by the parent gpu.func operation.
+  // Mutable because matchAndRewrite is const. Using a DenseMap means each
+  // kernel gets its own independent budget — an over-budget alloc in kernel A
+  // does not prevent promotion in kernel B.
+  mutable llvm::DenseMap<Operation *, uint64_t> usedBytesPerKernel;
 
   LogicalResult matchAndRewrite(memref::AllocOp allocOp,
                                 PatternRewriter &rewriter) const override {
@@ -83,6 +105,45 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
     if (ShapedType::isDynamicShape(shape))
       return failure();
 
+    // GPU / MEMORY SENSITIVE — Compute the byte size of this allocation.
+    // Used for budget accounting before committing to the conversion.
+    Type elType = allocOp.getType().getElementType();
+    uint64_t elementBits = 0;
+    if (auto shapedEl = dyn_cast<ShapedType>(elType)) {
+      elementBits =
+          shapedEl.getNumElements() * shapedEl.getElementTypeBitWidth();
+    } else if (elType.isIndex()) {
+      elementBits = 64; // 64-bit index type
+    } else {
+      elementBits = elType.getIntOrFloatBitWidth();
+    }
+
+    uint64_t numElements = 1;
+    for (int64_t dim : shape)
+      numElements *= static_cast<uint64_t>(dim);
+
+    // Round element size up to at least 1 byte.
+    uint64_t elementBytes = std::max<uint64_t>(elementBits / 8, 1);
+    uint64_t allocBytes = numElements * elementBytes;
+
+    // BUDGET CHECK — enforce per-kernel shared memory limit.
+    // If this alloc would push the kernel over budget, leave it unconverted
+    // (return failure so the greedy driver does not retry it). All subsequent
+    // allocs in the same kernel will also fail this check and remain as-is,
+    // because usedBytesPerKernel[funcOp] stays at its over-budget value.
+    // Allocs in other kernels use their own independent counter and are
+    // unaffected.
+    auto funcOp = allocOp->getParentOfType<mlir::FunctionOpInterface>();
+    uint64_t &usedBytes = usedBytesPerKernel[funcOp.getOperation()];
+
+    if (usedBytes + allocBytes > kSharedMemBudgetBytes) {
+      // Leave this alloc (and all subsequent ones in this kernel) unconverted.
+      return failure();
+    }
+
+    // Commit the bytes to this kernel's budget before performing the rewrite.
+    usedBytes += allocBytes;
+
     // GPU / MEMORY SENSITIVE — Alignment computation.
     // The PTX ISA requires that shared memory buffers are aligned to at least
     // the size of one element.  Under-alignment causes memory access exceptions
@@ -92,7 +153,6 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
     if (std::optional<uint64_t> alignmentInfo = allocOp.getAlignment()) {
       alignment = alignmentInfo.value();
     } else {
-      Type elType = allocOp.getType().getElementType();
       if (auto shapeType = dyn_cast<ShapedType>(elType)) {
         alignment =
             shapeType.getNumElements() * shapeType.getElementTypeBitWidth() / 8;
@@ -111,7 +171,6 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
     // subclass), so walking up to the parent plain ModuleOp would escape the
     // gpu.module and place the global in the wrong scope.
     MemRefType allocType = allocOp.getType();
-    auto funcOp = allocOp->getParentOfType<mlir::FunctionOpInterface>();
     Operation *symbolTableOp =
         SymbolTable::getNearestSymbolTable(funcOp->getParentOp());
     SymbolTable symbolTable(symbolTableOp);
@@ -196,7 +255,9 @@ struct NovaConvertSharedMemAllocsPass
   }
   StringRef getDescription() const override {
     return "Converts workgroup memref.alloc to memref.global and drops "
-           "workgroup memref.dealloc ops for GPU shared memory lowering";
+           "workgroup memref.dealloc ops for GPU shared memory lowering. "
+           "Allocs that exceed the per-kernel 48KB shared memory budget are "
+           "left unconverted.";
   }
 };
 
@@ -220,56 +281,67 @@ struct NovaGPULowerMemorySpacePass
                          OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPULowerMemorySpacePass)
 
+  bool lowerWorkgroup = false;
+
   NovaGPULowerMemorySpacePass() = default;
-  NovaGPULowerMemorySpacePass(const NovaGPULowerMemorySpacePass &) = default;
+  explicit NovaGPULowerMemorySpacePass(bool lowerWorkgroup)
+      : lowerWorkgroup(lowerWorkgroup) {}
+  NovaGPULowerMemorySpacePass(const NovaGPULowerMemorySpacePass &p)
+      : PassWrapper(p), lowerWorkgroup(p.lowerWorkgroup) {}
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<memref::MemRefDialect, gpu::GPUDialect>();
   }
 
-  void runOnOperation() override {
-    MLIRContext *ctx = &getContext();
-    Operation *op = getOperation();
+void runOnOperation() override {
+  MLIRContext *ctx = &getContext();
+  Operation *op = getOperation();
 
-    AttrTypeReplacer replacer;
+  AttrTypeReplacer replacer;
 
-    // Map #gpu.address_space<private> → IntegerAttr(64, 0) (generic AS).
-    // Workgroup and global are left as-is for downstream passes.
-    replacer.addReplacement(
-        [&](gpu::AddressSpaceAttr attr) -> std::optional<Attribute> {
-          if (attr.getValue() == gpu::AddressSpace::Private)
-            return IntegerAttr::get(IntegerType::get(ctx, 64), /*generic=*/0);
-          return std::nullopt;
-        });
-
-    // Also remap the MemRefType itself so structural type equality is maintained
-    // after replacing the address-space attribute inside it.
-    replacer.addReplacement([&](MemRefType type) -> std::optional<Type> {
-      auto space =
-          dyn_cast_if_present<gpu::AddressSpaceAttr>(type.getMemorySpace());
-      if (!space)
+  replacer.addReplacement(
+      [&](gpu::AddressSpaceAttr attr) -> std::optional<Attribute> {
+        if (attr.getValue() == gpu::AddressSpace::Private)
+          return IntegerAttr::get(IntegerType::get(ctx, 64), 0);
+        if (lowerWorkgroup &&
+            attr.getValue() == gpu::AddressSpace::Workgroup)
+          return IntegerAttr::get(IntegerType::get(ctx, 64), 3);
         return std::nullopt;
+      });
 
-      unsigned as = 0;
-      if (space.getValue() == gpu::AddressSpace::Private)
-        as = 0;
-      else if (space.getValue() == gpu::AddressSpace::Workgroup)
-        as = 3;
-      else if (space.getValue() == gpu::AddressSpace::Global)
-        as = 1;
-      else
-        return std::nullopt;
+  replacer.addReplacement([&](MemRefType type) -> std::optional<Type> {
+    auto space =
+        dyn_cast_if_present<gpu::AddressSpaceAttr>(type.getMemorySpace());
+    if (!space)
+      return std::nullopt;
 
-      return MemRefType::get(type.getShape(), type.getElementType(),
-                             type.getLayout(),
-                             IntegerAttr::get(IntegerType::get(ctx, 64), as));
-    });
+    unsigned as = 0;
+    if (space.getValue() == gpu::AddressSpace::Private)
+      as = 0;
+    else if (space.getValue() == gpu::AddressSpace::Global)
+      as = 1;
+    // else if (space.getValue() == gpu::AddressSpace::Workgroup)
+    //   as = 3;
+    else
+      return std::nullopt;
 
-    replacer.recursivelyReplaceElementsIn(op, /*replaceAttrs=*/true,
+    return MemRefType::get(type.getShape(), type.getElementType(),
+                           type.getLayout(),
+                           IntegerAttr::get(IntegerType::get(ctx, 64), as));
+  });
+
+  // Walk the IR manually so we can skip gpu.dynamic_shared_memory ops.
+  // That op's verifier requires its result type to carry gpu::AddressSpaceAttr
+  // (not integer AS 3), so rewriting it here would invalidate the op.
+  op->walk([&](Operation *innerOp) {
+    if (isa<gpu::DynamicSharedMemoryOp>(innerOp))
+      return WalkResult::skip();
+    replacer.recursivelyReplaceElementsIn(innerOp, /*replaceAttrs=*/true,
                                           /*replaceLocs=*/false,
                                           /*replaceTypes=*/true);
-  }
-
+    return WalkResult::advance();
+  });
+}
   StringRef getArgument() const override {
     return "nova-gpu-lower-memory-space";
   }
@@ -300,6 +372,10 @@ std::unique_ptr<Pass> createNovaConvertSharedMemAllocsPass() {
 
 std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass() {
   return std::make_unique<NovaGPULowerMemorySpacePass>();
+}
+
+std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass(bool lowerWorkgroup) {
+  return std::make_unique<NovaGPULowerMemorySpacePass>(lowerWorkgroup);
 }
 
 void registerNovaConvertSharedMemAllocsPass() {

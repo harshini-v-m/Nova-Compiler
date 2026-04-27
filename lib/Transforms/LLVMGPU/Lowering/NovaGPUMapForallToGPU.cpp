@@ -22,6 +22,7 @@
 #include "Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/Support/Debug.h"
@@ -52,6 +53,9 @@ static bool hasWarpMapping(scf::ForallOp forall) {
          isa<gpu::GPUWarpMappingAttr>(mapping.getValue().front());
 }
 
+static constexpr int64_t kWarpSize = 32;
+
+
 /// Maps MappingId 0→x, 1→y, 2→z for 3D (non-linear) mappings.
 static gpu::Dimension mappingIdToDim(int64_t id) {
   switch (id) {
@@ -80,6 +84,115 @@ static bool isLinearBlockMapping(scf::ForallOp forall) {
       return true;
   }
   return false;
+}
+
+// ===== Dynamic shared memory materialisation ================================
+
+/// True when `t` carries #gpu.address_space<workgroup>.
+static bool hasWorkgroupAddressSpace(MemRefType t) {
+  auto as = dyn_cast_if_present<gpu::AddressSpaceAttr>(t.getMemorySpace());
+  return as && as.getValue() == gpu::GPUDialect::getWorkgroupAddressSpace();
+}
+
+/// Replace every workgroup `memref.alloc` in `launch.getBody()` with a
+/// `memref.view` over a single `gpu.dynamic_shared_memory` buffer; sum the
+/// aligned byte sizes and plug that into `launch.dynamicSharedMemorySize`.
+///
+/// Safe no-op if the body contains no workgroup allocs.
+///
+/// Rationale: the static `memref.global` path
+/// (NovaConvertSharedMemAllocsPass) caps shared memory at 48 KB on sm_86/89.
+/// Dynamic shared memory via `gpu.dynamic_shared_memory` is required to
+/// exceed that limit (cudaFuncSetAttribute is set by the runtime wrapper).
+/// For the matmul tile (128x128 with 3-stage multibuffering this is ~24 KB)
+/// dynamic SMEM is already below 48 KB, so this change is numerically a
+/// no-op for the matmul workload — it just replaces the static globals with
+/// a single dynamic region.
+static void materializeDynamicSharedMemory(gpu::LaunchOp launch) {
+  MLIRContext *ctx = launch.getContext();
+  Block &body = launch.getBody().front();
+  Location loc = launch.getLoc();
+
+  // Collect workgroup allocs (preserving program order).
+  SmallVector<memref::AllocOp> wgAllocs;
+  for (Operation &op : body) {
+    if (auto alloc = dyn_cast<memref::AllocOp>(&op)) {
+      auto mrTy = alloc.getType();
+      if (hasWorkgroupAddressSpace(mrTy) && mrTy.hasStaticShape())
+        wgAllocs.push_back(alloc);
+    }
+  }
+  if (wgAllocs.empty())
+    return;
+
+  // Compute per-alloc byte size (rounded up to 16 B for cp.async.cg alignment)
+  // and the cumulative offset table.
+  SmallVector<int64_t> byteOffsets(wgAllocs.size(), 0);
+  SmallVector<int64_t> byteSizes(wgAllocs.size(), 0);
+  int64_t running = 0;
+  for (auto [i, alloc] : llvm::enumerate(wgAllocs)) {
+    MemRefType ty = alloc.getType();
+    int64_t elemBits = ty.getElementTypeBitWidth();
+    int64_t elems    = ty.getNumElements();
+    int64_t bytes    = (elems * elemBits + 7) / 8;
+    // Round up to 16-byte boundary.
+    bytes = llvm::alignTo(bytes, (int64_t)16);
+    byteOffsets[i] = running;
+    byteSizes[i]   = bytes;
+    running += bytes;
+  }
+  int64_t totalBytes = running;
+
+  // Temporary: dump smem alloc breakdown so we can trace the source of large allocs.
+  llvm::errs() << "[smem-debug] kernel smem=" << totalBytes << " bytes from "
+               << wgAllocs.size() << " alloc(s):\n";
+  for (auto [i, alloc] : llvm::enumerate(wgAllocs)) {
+    llvm::errs() << "  [" << i << "] " << alloc.getType() << " = " << byteSizes[i] << " bytes\n";
+  }
+
+  // ── Attach dynamic_shared_memory_size to the gpu.launch op ───────────────
+  OpBuilder hostBuilder(launch);
+  Value dynSmemSize = hostBuilder.create<arith::ConstantIntOp>(
+      loc, /*value=*/totalBytes, /*bitwidth=*/32);
+  launch.getDynamicSharedMemorySizeMutable().assign(dynSmemSize);
+
+  // ── Emit a single gpu.dynamic_shared_memory at top of the launch body ───
+  OpBuilder inBody(ctx);
+  inBody.setInsertionPointToStart(&body);
+  auto workgroupAS = gpu::AddressSpaceAttr::get(
+      ctx, gpu::GPUDialect::getWorkgroupAddressSpace());
+  auto i8DynTy = MemRefType::get(
+      {ShapedType::kDynamic}, inBody.getIntegerType(8),
+      MemRefLayoutAttrInterface{}, workgroupAS);
+  Value dynBase =
+      inBody.create<gpu::DynamicSharedMemoryOp>(loc, i8DynTy).getResult();
+
+  // ── Replace each alloc with a memref.view ───────────────────────────────
+  for (auto [i, alloc] : llvm::enumerate(wgAllocs)) {
+    OpBuilder b(alloc);
+    Value offset = b.create<arith::ConstantIndexOp>(loc, byteOffsets[i]);
+    // `memref.view` requires result memref to have identity layout and 0
+    // offset — the alloc already satisfies both (no layout attr).
+    MemRefType viewTy = alloc.getType();
+    auto view = b.create<memref::ViewOp>(
+        loc, viewTy, dynBase, offset, /*sizes=*/ValueRange{});
+    alloc.getResult().replaceAllUsesWith(view.getResult());
+    alloc.erase();
+  }
+
+  // ── Drop any matching memref.dealloc ops (shared memory auto-frees) ──────
+  SmallVector<memref::DeallocOp> staleDeallocs;
+  body.walk([&](memref::DeallocOp d) {
+    auto mrTy = dyn_cast<MemRefType>(d.getMemref().getType());
+    if (mrTy && hasWorkgroupAddressSpace(mrTy))
+      staleDeallocs.push_back(d);
+  });
+  for (memref::DeallocOp d : staleDeallocs)
+    d.erase();
+
+  LLVM_DEBUG(llvm::dbgs() << "[nova-gpu-map-forall] dynamic SMEM: "
+                          << wgAllocs.size() << " alloc(s), "
+                          << totalBytes << " bytes total\n");
 }
 
 // ===== Core conversion =====================================================
@@ -133,6 +246,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   SmallVector<scf::ForallOp> warpForalls;
   SmallVector<scf::ForallOp> threadForalls;
 
+  // Collect thread-mapped foralls and accumulate their bounds into blockDims.
   auto walkResult = blockForall.walk([&](scf::ForallOp inner) {
     if (inner == blockForall)
       return WalkResult::advance();
@@ -195,9 +309,8 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     return WalkResult::advance();
   });
 
-  if (walkResult.wasInterrupted()) {
+  if (walkResult.wasInterrupted())
     return failure();
-  }
 
   // ---- ALGORITHM STEP 3: Clamp block dims to CUDA's 1024-thread limit ----
   //
@@ -287,52 +400,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   auto insertPt = launchBody.without_terminator().end();
   launchBody.getOperations().splice(insertPt, forallBody->getOperations());
 
-  // ---- ALGORITHM STEP 7a: Convert warp foralls inside the launch body ----
-  //
-  // Warp foralls use GPUWarpMappingAttr (linear). Each warp forall IV is
-  // replaced by: warpId = threadIdx.x / 32, then decomposed into per-dim
-  // warp indices. Warp foralls are processed FIRST because they are outer
-  // (thread foralls are nested inside them for SIMT ops, or absent for MMA).
-  for (auto warpForall : warpForalls) {
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPoint(warpForall);
-    auto warpMapping = warpForall.getMappingAttr().getValue();
-    auto warpUBs = warpForall.getMixedUpperBound();
-
-    // warpId = threadIdx.x / 32
-    auto tidX = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-    Value warpId = rewriter.create<arith::DivUIOp>(loc, tidX, cstIdx(32));
-
-    // Decompose warpId into per-dim warp IVs (linear warp mapping).
-    SmallVector<std::pair<int64_t, unsigned>> dimOrder;
-    for (auto [idx, attr] : llvm::enumerate(warpMapping)) {
-      auto wAttr = cast<gpu::GPUWarpMappingAttr>(attr);
-      dimOrder.emplace_back(wAttr.getRelativeIndex(), idx);
-    }
-    llvm::sort(dimOrder,
-               [](auto &a, auto &b) { return a.first < b.first; });
-
-    int64_t stride = 1;
-    for (auto [linearDimIdx, forallIvIdx] : dimOrder) {
-      int64_t bound = *getConstantIntValue(warpUBs[forallIvIdx]);
-      Value strideVal = cstIdx(stride);
-      Value div = rewriter.create<arith::DivUIOp>(loc, warpId, strideVal);
-      Value boundVal = cstIdx(bound);
-      Value iv = rewriter.create<arith::RemUIOp>(loc, div, boundVal);
-      warpForall.getInductionVar(forallIvIdx).replaceAllUsesWith(iv);
-      stride *= bound;
-    }
-
-    // Splice warp forall body into parent, erase the forall shell.
-    rewriter.eraseOp(warpForall.getTerminator());
-    Block *warpBody = warpForall.getBody();
-    Block *parentBlock = warpForall->getBlock();
-    parentBlock->getOperations().splice(Block::iterator(warpForall),
-                                        warpBody->getOperations());
-    rewriter.eraseOp(warpForall);
-  }
-
-  // ---- ALGORITHM STEP 7b: Convert thread foralls inside the launch body ----
+  // ---- ALGORITHM STEP 7a: Convert thread foralls inside the launch body ----
   for (auto threadForall : threadForalls) {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(threadForall);
@@ -449,8 +517,80 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     }
   }
 
+  // ---- ALGORITHM STEP 7b: Convert warp foralls → warp_id = threadIdx.x/32 ----
+  // After the Subgroup tiling pass, MMA ops live inside #gpu.warp foralls.
+  // One warp forall iteration corresponds to one warp: the IV is the warp
+  // index, so we replace it with threadIdx.x / kWarpSize.
+  for (auto warpForall : warpForalls) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(warpForall);
+    auto warpUBs = warpForall.getMixedUpperBound();
+
+    // Compute total warp count (product of all forall upper bounds).
+    int64_t totalWarps = 1;
+    for (auto ub : warpUBs)
+      totalWarps *= *getConstantIntValue(ub);
+
+    // warp_id = threadIdx.x / kWarpSize
+    auto tidX    = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+    Value warpSz = cstIdx(kWarpSize);
+    Value warpId = rewriter.create<arith::DivUIOp>(loc, tidX, warpSz);
+
+    // Decompose linear warp_id into per-dim IVs, mirroring the linear thread
+    // mapping case. Sort by relativeIndex ascending (fastest-varying first)
+    // so stride accumulates correctly.
+    auto warpMapping = warpForall.getMappingAttr().getValue();
+    SmallVector<std::pair<int64_t, unsigned>> dimOrder;
+    for (auto [idx, attr] : llvm::enumerate(warpMapping)) {
+      auto warpAttr = cast<gpu::GPUWarpMappingAttr>(attr);
+      dimOrder.emplace_back(warpAttr.getRelativeIndex(), idx);
+    }
+    llvm::sort(dimOrder,
+               [](auto &a, auto &b) { return a.first < b.first; });
+
+    int64_t stride = 1;
+    for (auto [linearDimIdx, forallIvIdx] : dimOrder) {
+      int64_t bound = *getConstantIntValue(warpUBs[forallIvIdx]);
+      Value strideVal = cstIdx(stride);
+      Value div = rewriter.create<arith::DivUIOp>(loc, warpId, strideVal);
+      Value boundVal = cstIdx(bound);
+      Value iv = rewriter.create<arith::RemUIOp>(loc, div, boundVal);
+      warpForall.getInductionVar(forallIvIdx).replaceAllUsesWith(iv);
+      stride *= bound;
+    }
+
+    // Erase in_parallel terminator then move or predicate the body.
+    rewriter.eraseOp(warpForall.getTerminator());
+    Block *warpBody = warpForall.getBody();
+
+    int64_t activeThreads = totalWarps * kWarpSize;
+    if (activeThreads < blockDims[0]) {
+      // Some threads have no warp work — guard with scf.if.
+      Value pred = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ult, tidX, cstIdx(activeThreads));
+      auto ifOp =
+          rewriter.create<scf::IfOp>(loc, pred, /*withElseRegion=*/false);
+      ifOp.thenBlock()->getOperations().splice(
+          ifOp.thenBlock()->begin(), warpBody->getOperations());
+    } else {
+      // All threads are active — splice directly without predication.
+      Block *parent = warpForall->getBlock();
+      parent->getOperations().splice(Block::iterator(warpForall),
+                                     warpBody->getOperations());
+    }
+    rewriter.eraseOp(warpForall);
+  }
+
   // ---- ALGORITHM STEP 8: Erase original block forall ----
   rewriter.eraseOp(blockForall);
+
+  // ---- ALGORITHM STEP 9: Materialise workgroup allocs as dynamic SMEM ----
+  // This replaces the two per-tile `memref.alloc(workgroup)` ops (A and B
+  // SMEM tiles, each multi-buffered) with a single `gpu.dynamic_shared_memory`
+  // buffer plus per-tile `memref.view`s. After this, no static workgroup
+  // allocs remain inside the launch body — NovaConvertSharedMemAllocsPass
+  // becomes a no-op for matmul.
+  materializeDynamicSharedMemory(launchOp);
   return success();
 }
 

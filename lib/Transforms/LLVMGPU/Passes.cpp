@@ -235,40 +235,30 @@ namespace mlir::nova
 
 
     // -------------------------------------------------------------------------
-    // Step 4: Subgroup (warp) tiling — BEFORE reduction tiling
+    // Step 4: Tile reduction (K) dimension   [AFTER PROMOTION]
+    //
+    // After K-tiling, the matmul operates on [wgM × kStep] and [kStep × wgN]
+    // slices. The promoted copies (from Step 3) are also tiled along K,
+    // so each K-iteration loads only kStep-sized data into shared memory.
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(
+        createNovaGPUApplyTilingLevelReductionPass());
+    pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
+
+
+    // -------------------------------------------------------------------------
+    // Step 5: Subgroup (warp) tiling — BEFORE thread tiling
     //
     // Splits the workgroup tile across warps via scf.forall + GPUWarpMappingAttr.
     // For MMA configs: each warp gets a subgroupTile-sized slice (e.g. 32×16).
     // For SIMT configs: subgroupTiles are all 0, pass is a no-op.
     //
-    // ORDERING: must run BEFORE reduction tiling so the warp-forall encloses
-    // the subsequent scf.for K-loop. That way the matmul's DPS init flows as
-    // scf.forall shared_outs → scf.for iter_args → matmul outs, and after
-    // vectorization the accumulator becomes a vector<wgM/warpsM × wgN/warpsN>
-    // SSA value carried across K iterations in registers. If reduction tiling
-    // ran first, the warp-forall would end up INSIDE the scf.for body and the
-    // accumulator would be forced through a workgroup memref per K step.
-    //
-    // Must also run BEFORE thread tiling so thread foralls are nested inside
-    // warp foralls. The zero-tile logic in ApplyTilingLevelThread detects
+    // Must run BEFORE thread tiling so thread foralls are nested inside warp
+    // foralls. The zero-tile logic in ApplyTilingLevelThread detects
     // isInsideWarpForall && mmaKind!=0 and zeros out thread tiles, deferring
     // intra-warp distribution to ConvertVectorToGPU(nvgpu).
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUApplyTilingLevelSubgroupPass());
-    pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
-
-
-    // -------------------------------------------------------------------------
-    // Step 5: Tile reduction (K) dimension   [AFTER PROMOTION + SUBGROUP]
-    //
-    // After K-tiling, the matmul operates on [wgM × kStep] and [kStep × wgN]
-    // slices. The promoted copies (from Step 3) are also tiled along K,
-    // so each K-iteration loads only kStep-sized data into shared memory.
-    // Runs INSIDE the warp-forall created in Step 4 so the scf.for K-loop
-    // inherits the warp-forall's per-warp accumulator slice via iter_args.
-    // -------------------------------------------------------------------------
-    pm.addNestedPass<func::FuncOp>(
-        createNovaGPUApplyTilingLevelReductionPass());
     pm.addNestedPass<func::FuncOp>(createNovaConfigTrackingCanonicalizerPass());
  
 
@@ -523,6 +513,11 @@ namespace mlir::nova
     // Must run BEFORE NovaConvertSharedMemAllocs (alloc → memref.global) and
     // BEFORE MapForallToGPU (the scf.for users must still be visible).
     // -------------------------------------------------------------------------
+    // numBuffers=2 (double-buffering): kStep=16 tiles require
+    // 2 × (128×16 + 16×128) × 4 bytes = 32 KB smem, safely within the
+    // 48 KB default carveout. Raising to numBuffers=3 would push smem
+    // to 48 KB for the tiles alone; any bank-conflict padding overflows
+    // cuFuncSetAttribute on RTX 3060 (sm_86, max 99 KB optin limit).
     pm.addNestedPass<func::FuncOp>(createNovaGPUMultiBufferingPass(/*numBuffers=*/3));
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
@@ -546,8 +541,8 @@ namespace mlir::nova
     //   Stage 0 = nvgpu.device_async_copy + create_group + wait + barrier
     //             (all inside the thread-predicated scf.if)
     //   Stage 1 = compute
-    // Depth matches NovaGPUMultiBufferingPass(numBuffers=3) above so all three
-    // ring-buffer slots hold live data (2 cp.async groups in flight per thread).
+    // depth=2 matches numBuffers=2: one cp.async group in flight per thread
+    // while the previous group's data is consumed by the MMA compute.
     // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUPipeliningPass(/*depth=*/3));
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
@@ -985,29 +980,6 @@ namespace mlir::nova
         };
         return std::make_unique<GpuHardwareMappingPass>();
       }());
-
-      // DEBUG: Dump full IR before ConvertVectorToGPU to diagnose unmatched contracts.
-      // gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
-      //   struct DumpBeforeVectorToGPUPass
-      //       : public PassWrapper<DumpBeforeVectorToGPUPass,
-      //                            OperationPass<gpu::GPUFuncOp>> {
-      //     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DumpBeforeVectorToGPUPass)
-      //     void runOnOperation() override {
-      //       auto funcOp = getOperation();
-      //       bool hasContracts = false;
-      //       funcOp.walk([&](vector::ContractionOp) { hasContracts = true; });
-      //       if (hasContracts) {
-      //         llvm::errs() << "\n===== IR BEFORE ConvertVectorToGPU =====\n";
-      //         funcOp.print(llvm::errs(), OpPrintingFlags().useLocalScope());
-      //         llvm::errs() << "\n===== END IR DUMP =====\n\n";
-      //       }
-      //     }
-      //     StringRef getArgument() const override {
-      //       return "nova-dump-before-vector-to-gpu";
-      //     }
-      //   };
-      //   return std::make_unique<DumpBeforeVectorToGPUPass>();
-      // }());
 
       // 35b. vector.contract → nvgpu.mma.sync.
       gpuHwPm.addNestedPass<gpu::GPUFuncOp>(
@@ -1454,7 +1426,10 @@ namespace mlir::nova
     registerNovaGPUFillCopyForwardingPass();
     registerNovaGPUCoalesceWorkgroupBuffersPass();
     registerNovaGPUMultiBufferingPass();
+    registerNovaGPUCreateAsyncCopiesPass();
+    registerNovaGPUPipeliningPass();
     registerNovaStrideReductionPass();
+    registerNovaDirectReductionLoweringPass();
 
     // Register the full optimized pipeline as a named pipeline so it can be
     // invoked from mlir-opt with --nova-gpu-optimized-pipeline.
