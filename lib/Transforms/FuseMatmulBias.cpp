@@ -1,4 +1,5 @@
 #include "Compiler/Transforms/FuseMatmulBias.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -24,7 +25,12 @@ static bool isZeroFill(linalg::FillOp fillOp) {
 }
 
 static bool isElementwiseAdd(linalg::GenericOp op) {
-  if (op.getNumDpsInputs() != 2)
+  // Accept both ins(%a, %b) outs(%c) and ins(%a) outs(%b) forms —
+  // the in-place form reads the accumulator via the outs block arg.
+  int numIns = op.getNumDpsInputs();
+  if (numIns != 1 && numIns != 2)
+    return false;
+  if (op.getNumDpsInits() != 1)
     return false;
   if (op.getNumParallelLoops() != op.getNumLoops())
     return false;
@@ -95,28 +101,46 @@ static LogicalResult fuseMatmulBias(Operation *matmulOp,
   if (!fillOp || !isZeroFill(fillOp))
     return failure();
 
-  // 2. Matmul must have exactly one use.
-  if (!matmulOp->hasOneUse())
-    return failure();
-
-  // 3. That single use must be an elementwise add (bias add).
-  auto addOp = dyn_cast<linalg::GenericOp>(*matmulOp->user_begin());
-  if (!addOp || !isElementwiseAdd(addOp))
-    return failure();
-
-  // 4. Find which add input is bias (not the matmul result).
-  int biasIdx = -1;
-  for (int i = 0; i < 2; ++i) {
-    if (addOp.getDpsInputOperand(i)->get() != mmResult)
-      biasIdx = i;
+  // 2. Find the elementwise add consumer — ignore materialize_in_destination
+  //    uses, which are write-back bookkeeping and not real data consumers.
+  linalg::GenericOp addOp;
+  for (Operation *user : matmulOp->getUsers()) {
+    if (isa<bufferization::MaterializeInDestinationOp>(user))
+      continue;
+    auto candidate = dyn_cast<linalg::GenericOp>(user);
+    if (!candidate || !isElementwiseAdd(candidate))
+      return failure();
+    if (addOp)
+      return failure(); // more than one non-materialize consumer
+    addOp = candidate;
   }
-  if (biasIdx < 0)
+  if (!addOp)
     return failure();
 
-  Value bias = addOp.getDpsInputOperand(biasIdx)->get();
+  // 4. Find the bias tensor.
+  //    Two forms are supported:
+  //      (a) ins(%matmul, %bias) outs(%dest)  — bias is a DPS input
+  //      (b) ins(%matmul)        outs(%bias)  — bias is the DPS init (in-place add)
   auto matmulResultType = cast<RankedTensorType>(mmResult.getType());
-  auto biasType = cast<RankedTensorType>(bias.getType());
   Location loc = matmulOp->getLoc();
+  Value bias;
+  if (addOp.getNumDpsInputs() == 2) {
+    int biasIdx = -1;
+    for (int i = 0; i < 2; ++i) {
+      if (addOp.getDpsInputOperand(i)->get() != mmResult)
+        biasIdx = i;
+    }
+    if (biasIdx < 0)
+      return failure();
+    bias = addOp.getDpsInputOperand(biasIdx)->get();
+  } else {
+    // 1-input in-place form: ins(%matmul) outs(%accumulator)
+    // The matmul result must be the single input.
+    if (addOp.getDpsInputOperand(0)->get() != mmResult)
+      return failure();
+    bias = addOp.getDpsInitOperand(0)->get();
+  }
+  auto biasType = cast<RankedTensorType>(bias.getType());
 
   // 5. Build bias-initialised outs for the matmul.
   Value newOuts;
@@ -125,7 +149,16 @@ static LogicalResult fuseMatmulBias(Operation *matmulOp,
   } else {
     Value broadcastDest = fillOp.getOutputs()[0];
     int rank = matmulResultType.getRank();
-    AffineMap biasMap = addOp.getIndexingMapsArray()[biasIdx];
+    // For the 2-input form use the bias indexing map; for in-place use identity.
+    AffineMap biasMap;
+    if (addOp.getNumDpsInputs() == 2) {
+      int biasMapIdx = 0;
+      for (int i = 0; i < 2; ++i)
+        if (addOp.getDpsInputOperand(i)->get() == bias) { biasMapIdx = i; break; }
+      biasMap = addOp.getIndexingMapsArray()[biasMapIdx];
+    } else {
+      biasMap = rewriter.getMultiDimIdentityMap(rank);
+    }
     AffineMap outMap  = rewriter.getMultiDimIdentityMap(rank);
     SmallVector<utils::IteratorType> iters(rank, utils::IteratorType::parallel);
     newOuts = rewriter
@@ -139,14 +172,22 @@ static LogicalResult fuseMatmulBias(Operation *matmulOp,
                   .getResult(0);
   }
 
-  // 6. Swap matmul outs from zero-fill to bias-initialised tensor.
+  // 6. Ensure newOuts is defined before the matmul (SSA dominance).
+  //    In the in-place form, bias comes from bufferization.to_tensor %arg3
+  //    which is originally placed after the matmul in the IR. Move it up.
+  if (Operation *newOutsOp = newOuts.getDefiningOp()) {
+    if (!newOutsOp->isBeforeInBlock(matmulOp))
+      rewriter.moveOpBefore(newOutsOp, matmulOp);
+  }
+
+  // 7. Swap matmul outs from zero-fill to bias-initialised tensor.
   rewriter.modifyOpInPlace(matmulOp, [&]() {
     auto dpsIface = cast<DestinationStyleOpInterface>(matmulOp);
     matmulOp->setOperand(
         dpsIface.getDpsInitOperand(0)->getOperandNumber(), newOuts);
   });
 
-  // 7. Replace the add op — matmul result now includes the bias.
+  // 8. Replace the add op — matmul result now includes the bias.
   rewriter.replaceOp(addOp, mmResult);
   return success();
 }

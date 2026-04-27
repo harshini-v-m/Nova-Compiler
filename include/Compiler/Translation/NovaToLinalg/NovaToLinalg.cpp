@@ -1909,7 +1909,6 @@ lowerWithLinalgGeneric(nova::ReduceOp op, PatternRewriter &rewriter,
   rewriter.replaceOp(op, reduced);
   return success();
 }
-
 static LogicalResult
 lowerFullReduceMeanToSCF(nova::ReduceOp op, PatternRewriter &rewriter,
                          Location loc, Value input, RankedTensorType inputType,

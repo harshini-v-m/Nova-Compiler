@@ -381,9 +381,11 @@ static LogicalResult setGPULoweringConfigLayout(linalg::LinalgOp linalgOp,
   SmallVector<int64_t> batchCounts = bounds;
   SmallVector<int64_t> outerTile(rank, 1);
 
+  SmallVector<int64_t> elementTile(rank, 1);
+
   MLIRContext *ctx = rewriter.getContext();
   auto layout = NestedLayoutAttr::get(ctx, numSubgroups, batchCounts, outerTile,
-                                      numThreads, threadTile, subgroupStrides,
+                                      numThreads, elementTile, subgroupStrides,
                                       threadStrides);
 
   SmallVector<bool> promoted(linalgOp->getNumOperands(), false);
@@ -463,36 +465,13 @@ struct NovaGPUConfigureTensorLayoutsPass
 
       if (mmaKind != 0 && linalg::isaContractionOpInterface(candidate)) {
         result = setContractionAnchor(candidate, config, rewriter);
-      } else if (mmaKind == 0 && linalg::isaContractionOpInterface(candidate)) {
-        // SIMT contraction: distributed by thread tiling; no layout anchor.
-        result = success();
-      } else if (isDerivedThreadConfig(config)) {
-        // If the copy is already inside a thread-mapped forall, the forall
-        // itself distributes one thread per slice — adding a to_layout anchor
-        // would double-distribute and produce a degenerate zero-stride layout.
-        bool insideThreadForall = false;
-        if (auto parentForall =
-                candidate->getParentOfType<scf::ForallOp>()) {
-          if (auto mapping = parentForall.getMappingAttr()) {
-            for (Attribute attr : mapping) {
-              if (isa<gpu::GPUThreadMappingAttr>(attr)) {
-                insideThreadForall = true;
-                break;
-              }
-            }
-          }
-        }
-        if (insideThreadForall) {
-          result = success();
-        } else {
-          int64_t totalThreads = getTargetThreadCount(config);
-          if (totalThreads == 0)
-            totalThreads = 256;
-          result = setDerivedThreadConfigLayout(candidate, config,
-                                                totalThreads, rewriter);
-        }
       } else {
-        result = setGPULoweringConfigLayout(candidate, config, rewriter);
+        // Non-MMA ops: layout annotation and vector distribution for these
+        // paths are not yet fully implemented. Skip them — they are handled
+        // by thread-tiling forall mapping instead.
+        // TODO: implement setDerivedThreadConfigLayout / setGPULoweringConfigLayout
+        //       for copy, fill, and elementwise ops when needed.
+        result = success();
       }
 
       if (failed(result)) {

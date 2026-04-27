@@ -674,12 +674,17 @@ void NovaGenericVectorizationPass::runOnOperation() {
     if (failed(applyPatternsGreedily(funcOp, std::move(contractPatterns))))
       return signalPassFailure();
   }
-  // Phase 2b: Lower any remaining multi_reductions (SIMT path that didn't become contracts)
+  // Phase 2b: Lower any remaining multi_reductions (SIMT path that didn't become contracts).
+  // Use InnerReduction so full scalar reductions (all dims are reduction, no
+  // parallel dim) lower to vector.reduction on 1-D slices instead of
+  // scalarizing into N individual vector.extract + arith.addf ops.
+  // InnerParallel is wrong here: when there are no parallel dims it has
+  // nothing to keep "inner parallel" and falls back to element-by-element extraction.
   {
     RewritePatternSet simdPatterns(ctx);
     vector::populateSinkVectorOpsPatterns(simdPatterns);
     vector::populateVectorMultiReductionLoweringPatterns(
-        simdPatterns, vector::VectorMultiReductionLowering::InnerParallel);
+        simdPatterns, vector::VectorMultiReductionLowering::InnerReduction);
     if (failed(applyPatternsGreedily(funcOp, std::move(simdPatterns))))
       return signalPassFailure();
   }

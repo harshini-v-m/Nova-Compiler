@@ -1009,19 +1009,24 @@ def Nova_ReshapeOp : Op<Nova_Dialect, "reshape", [Pure]> {
 def LayerNormOp :Op<Nova_Dialect,"layer_norm",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary ="Layer norm operation y = (x - E[x]) / sqrt(Var[x] + eps) * gamma + beta";
   let arguments = (ins Nova_Tensor:$input, Nova_Tensor:$gamma, Nova_Tensor:$beta);
-  let results=(outs Nova_Tensor:$output);
+  // output: normalised tensor; mean_sum / var_sum: raw row sums cached for
+  // the backward pass so it never recomputes them from x.
+  let results=(outs Nova_Tensor:$output, Nova_Tensor:$mean_sum, Nova_Tensor:$var_sum);
   //let hasVerifier=1;
-    let assemblyFormat = [{
-    $input `,` $gamma `,` $beta attr-dict `:` type($input) `,` type($gamma) `,` type($beta) 
+  let assemblyFormat = [{
+    $input `,` $gamma `,` $beta attr-dict `:` type($input) `,` type($gamma) `,` type($beta)
   }];
 }
 def LayerNormBackwardOp :Op<Nova_Dialect,"layer_norm_backward",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
-  let summary ="Layer norm backward has calculating gradient for gamma,beta and input";
-  let arguments = (ins Nova_Tensor:$grad_y, Nova_Tensor:$x,  Nova_Tensor:$gamma);
+  let summary ="Layer norm backward calculating gradient for gamma, beta and input";
+  // mean_sum / var_sum are the cached row sums from the forward LayerNormOp.
+  let arguments = (ins Nova_Tensor:$grad_y, Nova_Tensor:$x, Nova_Tensor:$gamma,
+                       Nova_Tensor:$mean_sum, Nova_Tensor:$var_sum);
   let results=(outs Nova_Tensor:$grad_x, Nova_Tensor:$grad_gamma, Nova_Tensor:$grad_beta);
   //let hasVerifier=1;
-    let assemblyFormat = [{
-    $grad_y `,` $x `,`  $gamma attr-dict `:` type($grad_y) `,` type($x) `,` type($gamma) 
+  let assemblyFormat = [{
+    $grad_y `,` $x `,` $gamma `,` $mean_sum `,` $var_sum attr-dict `:`
+    type($grad_y) `,` type($x) `,` type($gamma) `,` type($mean_sum) `,` type($var_sum)
   }];
 }
 def LinearOp :Op<Nova_Dialect,"linear",[Pure,DeclareOpInterfaceMethods<InferTypeOpInterface>]> {

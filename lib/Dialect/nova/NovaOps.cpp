@@ -2010,7 +2010,6 @@ OpFoldResult ScatterAddOp::fold(FoldAdaptor adaptor) { return nullptr; }
 
 
 //MLP OPERATIONS
-
 LogicalResult LayerNormOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
@@ -2021,8 +2020,17 @@ LogicalResult LayerNormOp::inferReturnTypes(
   if (!inputType || !gammaType || !betaType)
     return failure();
 
+  // result 0: normalised output — same shape/dtype as input
   inferredReturnTypes.push_back(RankedTensorType::get(
       inputType.getShape(), inputType.getElementType()));
+
+  // results 1 & 2: mean_sum and var_sum — shape is input shape with the last
+  // (feature) dimension removed, same element type as input.
+  SmallVector<int64_t> statsShape(inputType.getShape().begin(),
+                                  inputType.getShape().end() - 1);
+  auto statsType = RankedTensorType::get(statsShape, inputType.getElementType());
+  inferredReturnTypes.push_back(statsType); // mean_sum
+  inferredReturnTypes.push_back(statsType); // var_sum
   return success();
 }
 LogicalResult LayerNormBackwardOp::inferReturnTypes(

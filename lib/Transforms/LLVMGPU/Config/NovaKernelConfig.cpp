@@ -1738,15 +1738,62 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
      computePaddingSizes(op, workgroupTiles, reductionTiles);
 
 
- // Promote input operands whose indexing maps have fewer dims than the loop
- // count (i.e., they are broadcast inputs that need tiled staging).
+ // Promote input operands that need tiled staging in workgroup shared memory.
+ //
+ // Budget: use at most half of the target's shared memory per block (matching
+ // the occupancy constraint in setSimtConfig). Divide by the element size
+ // derived from the op's element type so this works for f16/bf16/f32/f64.
+ //
+ // Decision per operand (inputs only, in index order):
+ //   1. Broadcast inputs (map rank < loop count) — always promote; they are
+ //      small by definition and must be staged for correctness.
+ //   2. Full-rank inputs — compute the tile footprint from workgroup/reduction
+ //      tiles. Promote if the cumulative promoted bytes stay within budget.
+ //      Skip operands whose map contains non-dim expressions (e.g. constants
+ //      or affine offsets) — those can't be straightforwardly staged.
  SmallVector<int64_t> promotedOps;
  auto linalgOp = cast<linalg::LinalgOp>(op.getOperation());
  auto maps = linalgOp.getIndexingMapsArray();
  unsigned numInputs = linalgOp.getNumDpsInputs();
- for (unsigned i = 0; i < numInputs; ++i)
-   if (maps[i].getNumResults() < (unsigned)numLoops)
+
+ // Derive element size in bytes from the op's element type.
+ int64_t elemBytes = 4; // default f32
+ if (auto shaped = dyn_cast<ShapedType>(op->getOperand(0).getType()))
+   if (auto floatTy = dyn_cast<FloatType>(shaped.getElementType()))
+     elemBytes = (floatTy.getWidth() + 7) / 8;
+
+ // Half of the target SMEM budget — same fraction setSimtConfig uses.
+ const int64_t smemBudget = target.maxWorkgroupMemBytes / 2;
+ int64_t smemUsed = 0;
+
+ // Tile footprint for one operand. Returns -1 if the map contains non-dim
+ // expressions (non-trivial affine), signalling that promotion is unsafe.
+ auto getTileBytes = [&](AffineMap map) -> int64_t {
+   int64_t vol = 1;
+   for (unsigned r = 0; r < map.getNumResults(); ++r) {
+     auto dimExpr = dyn_cast<AffineDimExpr>(map.getResult(r));
+     if (!dimExpr)
+       return -1; // non-trivial map — cannot stage
+     unsigned d = dimExpr.getPosition();
+     int64_t t = workgroupTiles[d] > 0 ? workgroupTiles[d]
+               : reductionTiles[d] > 0 ? reductionTiles[d] : 1;
+     vol *= t;
+   }
+   return vol * elemBytes;
+ };
+
+ for (unsigned i = 0; i < numInputs; ++i) {
+   if (maps[i].getNumResults() < (unsigned)numLoops) {
+     // Broadcast input — always promote regardless of budget.
      promotedOps.push_back(i);
+   } else {
+     int64_t tileBytes = getTileBytes(maps[i]);
+     if (tileBytes > 0 && smemUsed + tileBytes <= smemBudget) {
+       promotedOps.push_back(i);
+       smemUsed += tileBytes;
+     }
+   }
+ }
 
 
  MLIRContext *ctx = op.getContext();

@@ -168,6 +168,20 @@ struct NovaGPUVectorDistributePass
                << "] subgroup_size=" << subgroupSize << "\n");
 
     // -----------------------------------------------------------------------
+    // Step 5.0: Skip the pass entirely if there are no MMA to_layout anchors.
+    // Non-MMA ops (fills, copies, elementwise) are distributed by thread-tiling
+    // forall mapping. Vector distribution for non-MMA paths is not yet built.
+    // TODO: enable non-MMA distribution when the patterns are complete.
+    // -----------------------------------------------------------------------
+    bool hasMMALayout = false;
+    funcOp.walk([&](vec_ext::ToLayoutOp toLayout) {
+      if (toLayout.getMmaKind())
+        hasMMALayout = true;
+    });
+    if (!hasMMALayout)
+      return;
+
+    // -----------------------------------------------------------------------
     // Step 5.5: Propagate nova.gpu.mma from result to_layout → vector.contract.
     // -----------------------------------------------------------------------
     funcOp.walk([&](vec_ext::ToLayoutOp toLayout) {

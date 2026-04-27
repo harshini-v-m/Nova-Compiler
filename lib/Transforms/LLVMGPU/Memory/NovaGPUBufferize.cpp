@@ -2,6 +2,7 @@
 #include "Compiler/Dialect/nova/NovaOps.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Transforms.h"
@@ -83,11 +84,26 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
         .getResult();
   }
 
-  // Private or untagged → per-thread register alloca.
-  auto allocType = MemRefType::get(memRefType.getShape(),
-                                   memRefType.getElementType(),
-                                   AffineMap(), privateSpace);
-  return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
+  // Private or untagged: only use alloca (private address space) when we are
+  // actually inside a GPU kernel (scf.forall). At function scope these are
+  // inter-kernel staging buffers — emit plain heap alloc with no address space
+  // so they become CPU-visible managed allocations, not host stack frames.
+  bool insideKernel = false;
+  for (Operation *p = builder.getInsertionBlock()->getParentOp(); p;
+       p = p->getParentOp()) {
+    if (isa<scf::ForallOp>(p)) { insideKernel = true; break; }
+  }
+
+  if (insideKernel) {
+    auto allocType = MemRefType::get(memRefType.getShape(),
+                                     memRefType.getElementType(),
+                                     AffineMap(), privateSpace);
+    return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
+        .getResult();
+  }
+
+  // Function scope → plain heap alloc, no address space tag.
+  return memref::AllocOp::create(builder, loc, memRefType, dynamicSizes)
       .getResult();
 }
 
@@ -113,7 +129,16 @@ static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc,
       if (auto arg = dyn_cast<BlockArgument>(from))
         if (parent->isAncestor(arg.getOwner()->getParentOp()))
           definedOutside = false;
-      if (definedOutside) {
+      // Also check that `to` is not defined inside the forall — if it is,
+      // placing the store after the forall would violate dominance.
+      bool toDefinedOutside = true;
+      if (Operation *toDef = to.getDefiningOp())
+        if (parent->isAncestor(toDef)) toDefinedOutside = false;
+      if (auto toArg = dyn_cast<BlockArgument>(to))
+        if (parent->isAncestor(toArg.getOwner()->getParentOp()))
+          toDefinedOutside = false;
+
+      if (definedOutside && toDefinedOutside) {
         OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPoint(parent);
         Value scalar = builder.create<memref::LoadOp>(loc, from);
@@ -227,6 +252,8 @@ void addNovaPostBufferizationPasses(OpPassManager &pm) {
   pm.addPass(memref::createFoldMemRefAliasOpsPass());
   pm.addPass(createCSEPass());
   pm.addPass(bufferization::createDropEquivalentBufferResultsPass());
+  bufferization::BufferDeallocationPipelineOptions deallocOpts;
+  bufferization::buildBufferDeallocationPipeline(pm, deallocOpts);
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 }
