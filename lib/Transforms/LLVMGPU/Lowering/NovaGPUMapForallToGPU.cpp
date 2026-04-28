@@ -21,7 +21,9 @@
 
 #include "Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/Support/Debug.h"
@@ -201,6 +203,22 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
 
   if (walkResult.wasInterrupted())
     return failure();
+
+  // ---- ALGORITHM STEP 2b: Fall back to workgroup_size attr when no thread foralls ----
+  //
+  // VectorDistribute emits gpu.thread_id directly (no thread-mapped foralls),
+  // so threadForalls may be empty and blockDims stays (1,1,1). Read the
+  // authoritative workgroup_size = array<i64: 128, 1, 1> from the parent
+  // func.func attribute instead.
+  if (threadForalls.empty()) {
+    if (auto funcOp = blockForall->getParentOfType<func::FuncOp>()) {
+      if (auto wsAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("workgroup_size")) {
+        auto ws = wsAttr.asArrayRef();
+        for (size_t i = 0; i < ws.size() && i < 3; ++i)
+          blockDims[i] = ws[i];
+      }
+    }
+  }
 
   // ---- ALGORITHM STEP 3: Clamp block dims to CUDA's 1024-thread limit ----
   //
@@ -471,45 +489,9 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     rewriter.eraseOp(warpForall);
   }
 
-  // ---- ALGORITHM STEP 7.5: Explicitly sink ConstantLike ops ----
-  // Sometimes MLIR's default GpuKernelOutliningPass fails to sink complex
-  // types like vector constants, forcing them into function arguments which
-  // fails during LLVM lowering.
-  // Collect constants that are used inside the launch body but defined outside.
-  // Exclude the launchOp's own grid/block dimension operands — those constants
-  // must remain outside the launch (gpu.launch operands must dominate it).
-  SmallVector<Value> launchDimOperands(launchOp->operand_begin(),
-                                       launchOp->operand_end());
-  SmallVector<Operation*> constantsToSink;
-  launchOp.getBody().walk([&](Operation *op) {
-    for (OpOperand &operand : op->getOpOperands()) {
-      Operation *defOp = operand.get().getDefiningOp();
-      if (defOp && defOp->hasTrait<OpTrait::ConstantLike>() &&
-          !launchOp->isAncestor(defOp)) {
-        // Do not sink constants that are also used as gpu.launch dim operands —
-        // they must stay outside to satisfy SSA dominance of the launch op itself.
-        bool isLaunchDimOperand = llvm::is_contained(launchDimOperands,
-                                                     operand.get());
-        if (!isLaunchDimOperand)
-          constantsToSink.push_back(defOp);
-      }
-    }
-  });
-  llvm::sort(constantsToSink);
-  constantsToSink.erase(std::unique(constantsToSink.begin(), constantsToSink.end()), constantsToSink.end());
-
-  if (!constantsToSink.empty()) {
-    OpBuilder sinkBuilder = OpBuilder::atBlockBegin(&launchBody);
-    for (Operation *cst : constantsToSink) {
-      Operation *cloned = sinkBuilder.clone(*cst);
-      cst->replaceUsesWithIf(cloned, [&](OpOperand &use) {
-        return launchOp->isAncestor(use.getOwner());
-      });
-    }
-  }
-
   // ---- ALGORITHM STEP 8: Erase original block forall ----
   rewriter.eraseOp(blockForall);
+
   return success();
 }
 
@@ -521,7 +503,8 @@ struct NovaGPUMapForallToGPUPass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NovaGPUMapForallToGPUPass)
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect>();
+    registry.insert<gpu::GPUDialect, scf::SCFDialect, arith::ArithDialect,
+                    memref::MemRefDialect, func::FuncDialect>();
   }
 
   void runOnOperation() override {
@@ -541,6 +524,116 @@ struct NovaGPUMapForallToGPUPass
         return;
       }
     }
+
+    // ---- Post-conversion: rescue stranded device-only ops ----
+    //
+    // After all foralls are converted to gpu.launch, several op kinds remain at
+    // function scope because Nova's pipeline ran VectorDistribute and
+    // HoistStaticAllocations on the mixed host+device func.func *before*
+    // MapForallToGPU drew the host/device boundary:
+    //
+    //   (a) ConstantLike ops (arith.constant dense<...> vector types, ub.poison)
+    //       shared across multiple launches. Each launch that uses such a
+    //       constant would capture it as a kernel argument after outlining.
+    //       Dense vector constants (vector<AxBxf32>) are illegal PTX kernel
+    //       parameters and cause CUDA_ERROR_INVALID_PTX / CUDA param budget
+    //       overflow. Fix: clone into every gpu.launch body that uses them and
+    //       erase the original if no host-scope uses remain.
+    //
+    //   (b) memref.alloc with #gpu.address_space<workgroup> hoisted out of
+    //       foralls by HoistStaticAllocations. Move into the launch that uses it.
+    //
+    //   (c) memref.dealloc of workgroup allocs — erase (workgroup memory is
+    //       statically sized per block; there is no runtime free).
+    //
+    //   (d) gpu.thread_id emitted by VectorDistribute before any gpu.launch
+    //       existed. Move into each launch body that uses it.
+    //
+    // For (a): clone per-launch (not move) because the same constant may be
+    // shared by multiple launches. After cloning into all users the original is
+    // erased only when no uses remain outside any launch body.
+
+    Block *funcBody = &funcOp.getBody().front();
+
+    auto isWorkgroupMemref = [](Type ty) -> bool {
+      auto memTy = dyn_cast<MemRefType>(ty);
+      if (!memTy) return false;
+      auto sp = dyn_cast_or_null<gpu::AddressSpaceAttr>(memTy.getMemorySpace());
+      return sp && sp.getValue() == gpu::AddressSpace::Workgroup;
+    };
+
+    // Collect all gpu.launch ops now present in the function.
+    SmallVector<gpu::LaunchOp> launches;
+    funcOp.walk([&](gpu::LaunchOp launch) { launches.push_back(launch); });
+
+    // (a) Clone ConstantLike and gpu.thread_id ops into each launch that uses them.
+    // Snapshot the function-scope ops first; we mutate the block while iterating.
+    SmallVector<Operation *> funcScopeOps;
+    for (Operation &op : *funcBody)
+      funcScopeOps.push_back(&op);
+
+    for (Operation *op : funcScopeOps) {
+      if (!op->hasTrait<OpTrait::ConstantLike>() && !isa<gpu::ThreadIdOp>(op))
+        continue;
+
+      for (gpu::LaunchOp launch : launches) {
+        Region &launchRegion = launch.getBody();
+
+        // Collect operands of this op that are used inside this launch.
+        bool hasUseInLaunch = false;
+        for (Value result : op->getResults())
+          for (Operation *user : result.getUsers())
+            if (launchRegion.isAncestor(user->getParentRegion())) {
+              hasUseInLaunch = true;
+              break;
+            }
+        if (!hasUseInLaunch)
+          continue;
+
+        // Clone at the start of the launch body and replace uses inside it.
+        OpBuilder b(&launch.getBody().front(),
+                    launch.getBody().front().begin());
+        Operation *cloned = b.clone(*op);
+        for (auto [origRes, clonedRes] :
+             llvm::zip(op->getResults(), cloned->getResults()))
+          origRes.replaceUsesWithIf(clonedRes, [&](OpOperand &use) {
+            return launchRegion.isAncestor(use.getOwner()->getParentRegion());
+          });
+      }
+
+      // Erase the original if all uses have been replaced (no host-scope users).
+      if (op->use_empty())
+        rewriter.eraseOp(op);
+    }
+
+    // (b) Move workgroup allocs into their launch body; (c) erase deallocs.
+    SmallVector<Operation *> toErase;
+    for (Operation &op : *funcBody) {
+      if (auto allocOp = dyn_cast<memref::AllocOp>(op)) {
+        if (!isWorkgroupMemref(allocOp.getType()))
+          continue;
+        // Find the launch that uses this alloc and move into it.
+        for (gpu::LaunchOp launch : launches) {
+          Region &launchRegion = launch.getBody();
+          bool usedHere = false;
+          for (Operation *user : allocOp->getUsers())
+            if (launchRegion.isAncestor(user->getParentRegion())) {
+              usedHere = true;
+              break;
+            }
+          if (usedHere) {
+            allocOp->moveBefore(&launch.getBody().front(),
+                                launch.getBody().front().begin());
+            break;
+          }
+        }
+      } else if (auto deallocOp = dyn_cast<memref::DeallocOp>(op)) {
+        if (isWorkgroupMemref(deallocOp.getMemref().getType()))
+          toErase.push_back(&op);
+      }
+    }
+    for (Operation *op : toErase)
+      rewriter.eraseOp(op);
   }
 
   StringRef getArgument() const override {

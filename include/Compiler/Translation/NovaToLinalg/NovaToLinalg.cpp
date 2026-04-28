@@ -183,6 +183,11 @@ public:
           b.create<linalg::YieldOp>(loc, inner);
         });
 
+    // Propagate in_place intent so OneShotBufferize can alias the output
+    // buffer without inserting a defensive copy when lhs has a single use.
+    if (isInPlace)
+      linalgOp->setAttr("nova.in_place", rewriter.getUnitAttr());
+
     rewriter.replaceOp(op, linalgOp->getResults());
     return success();
   }

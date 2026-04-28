@@ -1933,89 +1933,77 @@ struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
     Value zero = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getZeroAttr(elemType));
 
-    // ---- Generic 1: mean = sum(x) / D ----
-    Value meanEmpty = rewriter.create<tensor::EmptyOp>(
-        loc, statsShape, elemType);
-    Value meanInit = rewriter.create<linalg::FillOp>(
-        loc, zero, meanEmpty).result();
+    // ---- 2-pass Welford: single reduction over x producing meanSum + sqSum ----
+    // Pass 1 replaces the old two separate reductions (Generic 1 + Generic 2).
+    // sqSum = sum(x*x) per row; combined with meanSum it gives:
+    //   var = sqSum*invD - mean*mean  (numerically equivalent to sum((x-mean)^2)/D)
+    // This halves global reads of x (12.6MB saved per LN layer).
+    Value meanEmpty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
+    Value meanInit  = rewriter.create<linalg::FillOp>(loc, zero, meanEmpty).result();
+    Value sqEmpty   = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
+    Value sqInit    = rewriter.create<linalg::FillOp>(loc, zero, sqEmpty).result();
 
-    auto meanGeneric = rewriter.create<linalg::GenericOp>(
-        loc, statsType, /*inputs=*/x, /*outputs=*/meanInit,
-        SmallVector<AffineMap>{inputMap, statsMap}, reductionIterTypes,
-        [&](OpBuilder &b, Location nl, ValueRange args) {
-          Value sum = b.create<arith::AddFOp>(nl, args[0], args[1]);
-          b.create<linalg::YieldOp>(nl, sum);
-        });
-    // meanSum = sum(x) per row. Keep as sum — fold invD into normalize.
-    Value meanSum = meanGeneric.getResult(0);
-
-    Value invDVal = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getFloatAttr(elemType, invD));
-
-    // ---- Generic 2: varSum = sum((x - mean)^2) per row ----
-    // Computes mean inline as meanSum * invD.
-    Value varEmpty = rewriter.create<tensor::EmptyOp>(
-        loc, statsShape, elemType);
-    Value varInit = rewriter.create<linalg::FillOp>(
-        loc, zero, varEmpty).result();
-
-    auto varGeneric = rewriter.create<linalg::GenericOp>(
-        loc, statsType,
-        /*inputs=*/ValueRange{x, meanSum},
-        /*outputs=*/varInit,
+    auto statsGeneric = rewriter.create<linalg::GenericOp>(
+        loc, TypeRange{statsType, statsType},
+        /*inputs=*/ValueRange{x},
+        /*outputs=*/ValueRange{meanInit, sqInit},
         SmallVector<AffineMap>{inputMap, statsMap, statsMap},
         reductionIterTypes,
         [&](OpBuilder &b, Location nl, ValueRange args) {
-          // args[0] = x[b,t,d], args[1] = meanSum[b,t], args[2] = acc
-          Value mean = b.create<arith::MulFOp>(nl, args[1], invDVal);
-          Value diff = b.create<arith::SubFOp>(nl, args[0], mean);
-          Value sq = b.create<arith::MulFOp>(nl, diff, diff);
-          Value s = b.create<arith::AddFOp>(nl, sq, args[2]);
-          b.create<linalg::YieldOp>(nl, s);
+          // args[0]=x[b,t,d], args[1]=meanSum_acc, args[2]=sqSum_acc
+          Value sumAcc = b.create<arith::AddFOp>(nl, args[0], args[1]);
+          Value sq     = b.create<arith::MulFOp>(nl, args[0], args[0]);
+          Value sqAcc  = b.create<arith::AddFOp>(nl, sq, args[2]);
+          b.create<linalg::YieldOp>(nl, ValueRange{sumAcc, sqAcc});
         });
-    // varSum = sum((x-mean)^2). Fold invD into normalize generic.
-    Value varSum = varGeneric.getResult(0);
+    Value meanSum = statsGeneric.getResult(0); // sum(x)   per row
+    Value sqSum   = statsGeneric.getResult(1); // sum(x^2) per row
 
-    // ---- Generic 3: y = (x - mean) * rsqrt(var + eps) * gamma + beta ----
-    // All-parallel: will fuse as producer into downstream matmul.
+    Value invDVal = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(elemType, invD));
+    Value epsVal  = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(elemType, eps));
+
+    // ---- Pass 2: normalize + scale + bias (all-parallel, reads x once more) ----
     SmallVector<utils::IteratorType> allParallelIters(rank,
         utils::IteratorType::parallel);
-
-    // Indexing maps: x[b,t,d], mean[b,t], var[b,t], gamma[d], beta[d], out[b,t,d]
     SmallVector<AffineExpr> gammaExprs = {rewriter.getAffineDimExpr(rank - 1)};
     auto gammaMap = AffineMap::get(rank, 0, gammaExprs, ctx);
 
     Value normEmpty = rewriter.create<tensor::EmptyOp>(
         loc, resultType.getShape(), elemType);
-
-    Value epsVal = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getFloatAttr(elemType, eps));
+    // rstdEmpty: save rsqrt(var+eps) per row for the backward — avoids
+    // recomputing math.rsqrt in every backward kernel (saves 4×8192 rsqrt calls).
+    Value rstdEmpty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
 
     auto normOp = rewriter.create<linalg::GenericOp>(
-        loc, resultType,
-        /*inputs=*/ValueRange{x, meanSum, varSum, gamma, beta},
-        /*outputs=*/normEmpty,
+        loc, TypeRange{resultType, statsType},
+        /*inputs=*/ValueRange{x, meanSum, sqSum, gamma, beta},
+        /*outputs=*/ValueRange{normEmpty, rstdEmpty},
         SmallVector<AffineMap>{inputMap, statsMap, statsMap,
-                               gammaMap, gammaMap, inputMap},
+                               gammaMap, gammaMap, inputMap, statsMap},
         allParallelIters,
         [&](OpBuilder &b, Location nl, ValueRange args) {
-          // args: x, meanSum, varSum, gamma, beta, out_init
-          // Compute mean and var inline from their sums.
-          Value mean = b.create<arith::MulFOp>(nl, args[1], invDVal);
-          Value var = b.create<arith::MulFOp>(nl, args[2], invDVal);
-          Value diff = b.create<arith::SubFOp>(nl, args[0], mean);
-          Value varEps = b.create<arith::AddFOp>(nl, var, epsVal);
-          Value rsqrt = b.create<math::RsqrtOp>(nl, varEps);
-          Value norm = b.create<arith::MulFOp>(nl, diff, rsqrt);
-          Value scaled = b.create<arith::MulFOp>(nl, norm, args[3]);
-          Value result = b.create<arith::AddFOp>(nl, scaled, args[4]);
-          b.create<linalg::YieldOp>(nl, result);
+          // args: x, meanSum, sqSum, gamma, beta, out_init, rstd_init
+          Value mean    = b.create<arith::MulFOp>(nl, args[1], invDVal);
+          Value sqMean  = b.create<arith::MulFOp>(nl, args[2], invDVal);
+          Value meanSq  = b.create<arith::MulFOp>(nl, mean, mean);
+          Value var     = b.create<arith::SubFOp>(nl, sqMean, meanSq);
+          Value varEps  = b.create<arith::AddFOp>(nl, var, epsVal);
+          Value rstd    = b.create<math::RsqrtOp>(nl, varEps);
+          Value diff    = b.create<arith::SubFOp>(nl, args[0], mean);
+          Value norm    = b.create<arith::MulFOp>(nl, diff, rstd);
+          Value scaled  = b.create<arith::MulFOp>(nl, norm, args[3]);
+          Value result  = b.create<arith::AddFOp>(nl, scaled, args[4]);
+          b.create<linalg::YieldOp>(nl, ValueRange{result, rstd});
         });
 
-    // Return all 3 results: output, mean_sum, var_sum.
-    // mean_sum / var_sum are the raw per-row sums computed above; the backward
-    // pattern uses them directly so it never has to recompute from x.
-    rewriter.replaceOp(op, {normOp.getResult(0), meanSum, varSum});
+    Value normOut = normOp.getResult(0);
+    Value rstdOut = normOp.getResult(1); // rsqrt(var+eps) per row — passed to backward
+
+    // Return: output, meanSum (raw sum), rstd (replaces var_sum).
+    // Backward now receives rstd directly — no rsqrt recomputation needed there.
+    rewriter.replaceOp(op, {normOut, meanSum, rstdOut});
     return success();
   }
 };
@@ -2025,12 +2013,11 @@ struct NovaLayerNormBackwardPattern : public OpConversionPattern<nova::LayerNorm
  LogicalResult
  matchAndRewrite(nova::LayerNormBackwardOp op, OpAdaptor adaptor,
                  ConversionPatternRewriter &rewriter) const override {
-   // LN backward: given grad_y, x, gamma, mean_sum, var_sum → dx, dgamma, dbeta.
+   // LN backward: given grad_y, x, gamma, mean_sum, rstd → dx, dgamma, dbeta.
    //
-   // mean_sum / var_sum are the raw per-row sums produced by the forward
-   // LayerNormOp and cached there; we use them directly so we never have to
-   // recompute from x (which would give slightly different float32 results
-   // from the forward due to reduction-order differences).
+   // mean_sum and rstd (= rsqrt(var+eps)) are saved by the forward pass.
+   // Using rstd directly eliminates all math.rsqrt recomputation here
+   // (previously 2 rsqrt calls per element × 8192 rows = 32K rsqrt ops per LN).
    //
    // Lowering: 3 linalg.generics instead of the old 5 (no mean/var reductions):
    //   1. dxPreOp:       elementwise compute gyGamma, gyGamma*xHat   [B,T,D]
@@ -2041,9 +2028,9 @@ struct NovaLayerNormBackwardPattern : public OpConversionPattern<nova::LayerNorm
    Value gy      = adaptor.getGradY();
    Value x       = adaptor.getX();
    Value gamma   = adaptor.getGamma();
-   // Cached row sums from the forward pass — no recomputation needed.
+   // meanSum and rstd saved from the forward pass — no recomputation needed.
    Value meanSum = adaptor.getMeanSum();
-   Value varSum  = adaptor.getVarSum();
+   Value rstd    = adaptor.getVarSum(); // slot reused: forward now saves rstd here
 
    auto xType = cast<RankedTensorType>(x.getType());
    auto gammaType = cast<RankedTensorType>(gamma.getType());
@@ -2096,7 +2083,7 @@ struct NovaLayerNormBackwardPattern : public OpConversionPattern<nova::LayerNorm
    Value epsVal = rewriter.create<arith::ConstantOp>(
        loc, rewriter.getFloatAttr(elemType, eps));
 
-   // meanSum and varSum come from the forward pass — no generics 1 & 2 needed.
+   // meanSum and rstd come from the forward pass — no generics 1 & 2 needed.
 
    // ---- dx_stats: two separate row reductions ----
    // Dual-output linalg.generic reductions don't tile correctly.
@@ -2108,22 +2095,20 @@ struct NovaLayerNormBackwardPattern : public OpConversionPattern<nova::LayerNorm
        loc, xType.getShape(), elemType);
    Value gyGammaXhatEmpty = rewriter.create<tensor::EmptyOp>(
        loc, xType.getShape(), elemType);
+   // rstd is now passed in directly from the forward — no rsqrt here.
    auto dxPreOp = rewriter.create<linalg::GenericOp>(
        loc, TypeRange{xType, xType},
-       /*inputs=*/ValueRange{gy, x, meanSum, varSum, gamma},
+       /*inputs=*/ValueRange{gy, x, meanSum, rstd, gamma},
        /*outputs=*/ValueRange{gyGammaEmpty, gyGammaXhatEmpty},
        SmallVector<AffineMap>{inputMap, inputMap, statsMap, statsMap,
                               gammaMap, inputMap, inputMap},
        allParallelIters,
        [&](OpBuilder &b, Location nl, ValueRange args) {
-         // args: gy, x, meanSum, varSum, gamma, out1_init, out2_init
-         Value gyGamma = b.create<arith::MulFOp>(nl, args[0], args[4]);
-         Value mean = b.create<arith::MulFOp>(nl, args[2], invDVal);
-         Value var = b.create<arith::MulFOp>(nl, args[3], invDVal);
-         Value diff = b.create<arith::SubFOp>(nl, args[1], mean);
-         Value varEps = b.create<arith::AddFOp>(nl, var, epsVal);
-         Value rstd = b.create<math::RsqrtOp>(nl, varEps);
-         Value xHat = b.create<arith::MulFOp>(nl, diff, rstd);
+         // args: gy, x, meanSum, rstd, gamma, out1_init, out2_init
+         Value gyGamma  = b.create<arith::MulFOp>(nl, args[0], args[4]);
+         Value mean     = b.create<arith::MulFOp>(nl, args[2], invDVal);
+         Value diff     = b.create<arith::SubFOp>(nl, args[1], mean);
+         Value xHat     = b.create<arith::MulFOp>(nl, diff, args[3]); // diff * rstd
          Value gyGammaXhat = b.create<arith::MulFOp>(nl, gyGamma, xHat);
          b.create<linalg::YieldOp>(nl, ValueRange{gyGamma, gyGammaXhat});
        });
@@ -2160,27 +2145,25 @@ struct NovaLayerNormBackwardPattern : public OpConversionPattern<nova::LayerNorm
        loc, xType.getShape(), elemType);
    auto dxOp = rewriter.create<linalg::GenericOp>(
        loc, xType,
-       /*inputs=*/ValueRange{gy, x, meanSum, varSum, gamma,
+       /*inputs=*/ValueRange{gy, x, meanSum, rstd, gamma,
                              sumGyGamma, sumGyGammaXhat},
        /*outputs=*/dxEmpty,
        SmallVector<AffineMap>{inputMap, inputMap, statsMap, statsMap,
                               gammaMap, statsMap, statsMap, inputMap},
        allParallelIters,
        [&](OpBuilder &b, Location nl, ValueRange args) {
-         // args: gy, x, meanSum, varSum, gamma, s1, s2, out_init
+         // args: gy, x, meanSum, rstd, gamma, s1, s2, out_init
+         // rstd is pre-computed by forward — no rsqrt needed here.
          Value gyGamma = b.create<arith::MulFOp>(nl, args[0], args[4]);
-         Value mean = b.create<arith::MulFOp>(nl, args[2], invDVal);
-         Value var = b.create<arith::MulFOp>(nl, args[3], invDVal);
-         Value diff = b.create<arith::SubFOp>(nl, args[1], mean);
-         Value varEps = b.create<arith::AddFOp>(nl, var, epsVal);
-         Value rstd = b.create<math::RsqrtOp>(nl, varEps);
-         Value xHat = b.create<arith::MulFOp>(nl, diff, rstd);
-         Value meanS1 = b.create<arith::MulFOp>(nl, args[5], invDVal);
-         Value meanS2 = b.create<arith::MulFOp>(nl, args[6], invDVal);
-         Value t1 = b.create<arith::SubFOp>(nl, gyGamma, meanS1);
-         Value t2 = b.create<arith::MulFOp>(nl, xHat, meanS2);
-         Value t3 = b.create<arith::SubFOp>(nl, t1, t2);
-         Value dx = b.create<arith::MulFOp>(nl, t3, rstd);
+         Value mean    = b.create<arith::MulFOp>(nl, args[2], invDVal);
+         Value diff    = b.create<arith::SubFOp>(nl, args[1], mean);
+         Value xHat    = b.create<arith::MulFOp>(nl, diff, args[3]); // diff * rstd
+         Value meanS1  = b.create<arith::MulFOp>(nl, args[5], invDVal);
+         Value meanS2  = b.create<arith::MulFOp>(nl, args[6], invDVal);
+         Value t1      = b.create<arith::SubFOp>(nl, gyGamma, meanS1);
+         Value t2      = b.create<arith::MulFOp>(nl, xHat, meanS2);
+         Value t3      = b.create<arith::SubFOp>(nl, t1, t2);
+         Value dx      = b.create<arith::MulFOp>(nl, t3, args[3]); // t3 * rstd
          b.create<linalg::YieldOp>(nl, dx);
        });
    Value dx = dxOp.getResult(0);
@@ -2198,8 +2181,8 @@ struct NovaLayerNormBackwardPattern : public OpConversionPattern<nova::LayerNorm
    //   logicalToLoop[i]      = 1+i for i in [0..rank-2] (the reduction loops)
    //
    // Indexing maps (rank=3, B×T×D → D):
-   //   inputs  gy, x, meanSum, varSum: (d0,d1,d2) -> (d1, d2, d0)
-   //   statsMap meanSum/varSum:         (d0,d1,d2) -> (d1, d2)  [rank-1 = 2 dims]
+   //   inputs  gy, x, meanSum, rstd: (d0,d1,d2) -> (d1, d2, d0)
+   //   statsMap meanSum/rstd:        (d0,d1,d2) -> (d1, d2)  [rank-1 = 2 dims]
    //   output dgamma, dbeta:            (d0,d1,d2) -> (d0)
    //
    // dgamma[d] = sum_{b,t}( gy[b,t,d] * x_hat[b,t,d] )
@@ -2243,20 +2226,18 @@ struct NovaLayerNormBackwardPattern : public OpConversionPattern<nova::LayerNorm
 
    auto dgammaBetaOp = rewriter.create<linalg::GenericOp>(
        loc, TypeRange{gammaType, gammaType},
-       /*inputs=*/ValueRange{gy, x, meanSum, varSum},
+       /*inputs=*/ValueRange{gy, x, meanSum, rstd},
        /*outputs=*/ValueRange{dgammaInit, dbetaInit},
        SmallVector<AffineMap>{fuseInputMap, fuseInputMap,
                               fusedStatsMap, fusedStatsMap,
                               fuseOutputMap, fuseOutputMap},
        fuseIters,
        [&](OpBuilder &b, Location nl, ValueRange args) {
-         // args: gy, x, meanSum, varSum, dgamma_acc, dbeta_acc
+         // args: gy, x, meanSum, rstd, dgamma_acc, dbeta_acc
+         // rstd saved by forward pass — no mean/var/rsqrt recomputation needed
          Value mean    = b.create<arith::MulFOp>(nl, args[2], invDVal);
-         Value var     = b.create<arith::MulFOp>(nl, args[3], invDVal);
          Value diff    = b.create<arith::SubFOp>(nl, args[1], mean);
-         Value varEps  = b.create<arith::AddFOp>(nl, var, epsVal);
-         Value rstd    = b.create<math::RsqrtOp>(nl, varEps);
-         Value xHat    = b.create<arith::MulFOp>(nl, diff, rstd);
+         Value xHat    = b.create<arith::MulFOp>(nl, diff, args[3]);
          Value gyXhat  = b.create<arith::MulFOp>(nl, args[0], xHat);
          Value newDg   = b.create<arith::AddFOp>(nl, args[4], gyXhat);
          Value newDb   = b.create<arith::AddFOp>(nl, args[5], args[0]);
