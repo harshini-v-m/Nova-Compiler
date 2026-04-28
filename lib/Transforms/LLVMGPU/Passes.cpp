@@ -513,23 +513,56 @@ namespace mlir::nova
     // Must run BEFORE NovaConvertSharedMemAllocs (alloc → memref.global) and
     // BEFORE MapForallToGPU (the scf.for users must still be visible).
     // -------------------------------------------------------------------------
-    pm.addNestedPass<func::FuncOp>(createNovaGPUMultiBufferingPass(/*numBuffers=*/2));
+    pm.addNestedPass<func::FuncOp>(createNovaGPUMultiBufferingPass(/*numBuffers=*/3));
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
 
-    pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
-    pm.addPass(createCanonicalizerPass());
-
-
-    // -------------------------------------------------------------------------
-    // Step 9: scf.forall → gpu.launch (C++ pass with dynamic block dims)
-    //
-    // Replaces the transform script (gpu_forall_to_launch.mlir) which
-    // hardcoded block_dims = [32, 32, 1]. This pass computes block dims
-    // from the actual thread-mapped forall iteration bounds.
-    // -------------------------------------------------------------------------
     pm.addNestedPass<func::FuncOp>(createNovaGPUMapForallToGPUPass());
 
+    // -------------------------------------------------------------------------
+    // Step 8.5: Hoist matmul C accumulator transfer_read/transfer_write out
+    // of the K-loop.  After MapForallToGPU the warp scf.forall has been
+    // flattened to thread-id-gated index math, so the C read/write live as
+    // direct children of the K scf.for hitting a loop-invariant memref
+    // subview at loop-invariant indices — exactly the pattern upstream
+    // linalg::hoistRedundantVectorTransfers handles.  Without this, every
+    // K-iteration round-trips the accumulator to global memory (ld.global +
+    // st.global per inner mma fragment).
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaGPUHoistAccumulatorPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    pm.addNestedPass<func::FuncOp>(createCSEPass());
+
+    // -------------------------------------------------------------------------
+    // Step 9.0: gmem→smem vector.transfer pairs → nvgpu.device_async_copy +
+    // create_group + wait(0). Runs AFTER MapForallToGPU so async tokens
+    // are visible in the loop body (outside scf.forall).
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaGPUCreateAsyncCopiesPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    pm.addNestedPass<func::FuncOp>(createCSEPass());
+
+    // -------------------------------------------------------------------------
+    // Step 9.1: software-pipeline K-loops now that scf.forall is lowered.
+    // After MapForallToGPU the scf.forall → scf.if, so async copy tokens
+    // created inside the (now-flat) thread-predicate block are visible at the
+    // K-loop level. The pipeliner can correctly assign:
+    //   Stage 0 = nvgpu.device_async_copy + create_group + wait + barrier
+    //             (all inside the thread-predicated scf.if)
+    //   Stage 1 = compute
+    // Depth matches NovaGPUMultiBufferingPass(numBuffers=3) above so all three
+    // ring-buffer slots hold live data (2 cp.async groups in flight per thread).
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(createNovaGPUPipeliningPass(/*depth=*/3));
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    pm.addNestedPass<func::FuncOp>(createCSEPass());
+
+    // Replace each gpu.launch's workgroup memref.allocs with a single
+    // gpu.dynamic_shared_memory + memref.views. Runs *after* async-copy and
+    // pipelining so those passes still see plain workgroup allocs.
+    pm.addNestedPass<func::FuncOp>(
+        createNovaGPUMaterializeDynamicSharedMemPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
 
     // -------------------------------------------------------------------------
     // Step 10: Lower remaining linalg → scf loops
@@ -1427,11 +1460,13 @@ namespace mlir::nova
     registerNovaEliminateEmptyTensorsPass();
     registerNovaConvertSharedMemAllocsPass();
     registerNovaGPUMapForallToGPUPass();
+    registerNovaGPUHoistAccumulatorPass();
     registerNovaGPULowerMemorySpacePass();
     registerNovaWarpShuffleReductionPass();
     registerNovaGPUFillCopyForwardingPass();
     registerNovaGPUCoalesceWorkgroupBuffersPass();
     registerNovaGPUMultiBufferingPass();
+    registerNovaGPUMaterializeDynamicSharedMemPass();
     registerNovaStrideReductionPass();
 
     // Register the full optimized pipeline as a named pipeline so it can be

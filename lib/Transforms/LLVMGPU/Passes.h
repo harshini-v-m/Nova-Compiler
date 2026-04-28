@@ -165,12 +165,23 @@ void registerNovaConvertSharedMemAllocsPass();
 std::unique_ptr<Pass> createNovaGPUMapForallToGPUPass();
 void registerNovaGPUMapForallToGPUPass();
 
+// Hoists the matmul C accumulator's vector.transfer_read/transfer_write pair
+// out of the K-loop after MapForallToGPU has flattened the warp scf.forall.
+// Without this, bufferization aliased the C iter_arg with a global memref
+// subview and every K-iteration became a load/mma/store round trip to HBM.
+// Runs upstream linalg::hoistRedundantVectorTransfers on each scf.for in the
+// function — must run AFTER MapForallToGPU (so warp foralls are flat scf.if
+// blocks, no longer hiding the read/write inside a parallel region) and
+// BEFORE CreateAsyncCopies / Pipelining / MaterializeDynamicSharedMem.
+std::unique_ptr<Pass> createNovaGPUHoistAccumulatorPass();
+void registerNovaGPUHoistAccumulatorPass();
+
 // Converts #gpu.address_space attributes on memref types to integer address
 // spaces appropriate for NVVM/LLVM lowering.
 // private → generic address space 0 (avoids LLVM LSR ScalarEvolution issues
 // with non-default address spaces on NVPTX).
 // Must run inside gpu.module BEFORE finalizeMemRefToLLVMConversionPass.
-std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass();
+std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass(bool lowerWorkgroup = false);
 void registerNovaGPULowerMemorySpacePass();
 
 
@@ -190,8 +201,16 @@ void registerNovaWarpShuffleReductionPass();
 std::unique_ptr<Pass> createNovaGPUFillCopyForwardingPass();
 void registerNovaGPUFillCopyForwardingPass();
 
-std::unique_ptr<Pass> createNovaGPUCoalesceWorkgroupBuffersPass();
+std::unique_ptr<Pass> createNovaGPUCoalesceWorkgroupBuffersPass(int64_t maxBytes = 0);
 void registerNovaGPUCoalesceWorkgroupBuffersPass();
+
+// Replaces every static-shape workgroup `memref.alloc` inside each gpu.launch
+// in the function with a `memref.view` over a single
+// `gpu.dynamic_shared_memory` buffer, and stamps the launch's
+// `dynamicSharedMemorySize` operand with the cumulative aligned byte size.
+// Must run AFTER NovaGPUCreateAsyncCopies and NovaGPUPipelining.
+std::unique_ptr<Pass> createNovaGPUMaterializeDynamicSharedMemPass();
+void registerNovaGPUMaterializeDynamicSharedMemPass();
 
 // Multi-buffers every workgroup-memory `memref.alloc` used inside an `scf.for`
 // loop. Rewrites `memref<TxS, #shared>` → `memref<N x TxS, #shared>` and indexes
@@ -204,6 +223,32 @@ void registerNovaGPUCoalesceWorkgroupBuffersPass();
 // Ported from IREE's GPUMultiBuffering.cpp.
 std::unique_ptr<Pass> createNovaGPUMultiBufferingPass(unsigned numBuffers = 2);
 void registerNovaGPUMultiBufferingPass();
+
+// Rewrites every gmem→smem `vector.transfer_read`/`vector.transfer_write` pair
+// into one or more `nvgpu.device_async_copy` ops, terminated by a
+// `nvgpu.device_async_create_group` + `nvgpu.device_async_wait` (numGroups
+// unset → wait-all). Preserves serial semantics; the downstream pipelining
+// pass replaces the wait-all with `wait(depth-1)` to actually overlap.
+//
+// Must run AFTER NovaGPUMultiBuffering (so the smem subviews carry the
+// stage dim) and BEFORE NovaGPUPipelining.
+//
+// Ported from IREE's `createAsyncGroups` in
+// compiler/src/iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUUtils.cpp.
+std::unique_ptr<Pass> createNovaGPUCreateAsyncCopiesPass();
+void registerNovaGPUCreateAsyncCopiesPass();
+
+// Software-pipelines K-loops that contain `nvgpu.device_async_copy`.
+// Time-shifts cp.async + deps to stage 0 and the compute to stage `depth-1`,
+// rewriting `wait` counts so depth-1 groups stay in flight per iteration.
+//
+// Wraps upstream `mlir::scf::pipelineForLoop`. Bails (leaves loop intact)
+// when the K-loop body contains region-bearing children — in that case the
+// cp.async ops still run via `wait(0)`, which is correct but un-overlapped.
+//
+// Ported from IREE's GPUPipelining.cpp (loadGlobalStage0 strategy).
+std::unique_ptr<Pass> createNovaGPUPipeliningPass(unsigned depth = 2);
+void registerNovaGPUPipeliningPass();
 
 std::unique_ptr<Pass> createNovaRepositionStorePass();
 void registerNovaRepositionStorePass();
@@ -296,6 +341,9 @@ void registerNovaFoldTransposeIntoConsumerPass();
 
 std::unique_ptr<Pass> createNovaStrideReductionPass();
 void registerNovaStrideReductionPass();
+
+std::unique_ptr<Pass> createNovaDirectReductionLoweringPass();
+void registerNovaDirectReductionLoweringPass();
 } // namespace nova
 } // namespace mlir
 

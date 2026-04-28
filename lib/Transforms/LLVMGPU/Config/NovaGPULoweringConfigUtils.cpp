@@ -253,12 +253,15 @@ void setMatmulLoweringConfigAttrs(Operation *op,
                                   ArrayRef<int64_t> subgroupTiles,
                                   int32_t mmaKindValue,
                                   ArrayRef<int64_t> promotedOperands,
-                                  ArrayRef<int64_t> paddingSizes) {
+                                  ArrayRef<int64_t> paddingSizes,
+                                  ArrayRef<int64_t> wgSubgroupTiles) {
   SmallVector<NamedAttribute> attrs;
   setLoweringConfigTileSizes(ctx, attrs, kWorkgroupKey, workgroupTiles);
   setLoweringConfigTileSizes(ctx, attrs, kReductionKey, reductionTiles);
   setLoweringConfigTileSizes(ctx, attrs, kThreadKey, threadTiles);
   setLoweringConfigTileSizes(ctx, attrs, kSubgroupKey, subgroupTiles);
+  if (!wgSubgroupTiles.empty())
+    setLoweringConfigTileSizes(ctx, attrs, kWgSubgroupKey, wgSubgroupTiles);
   setMmaKindRaw(ctx, attrs, mmaKindValue);
   appendPromotedOperandsList(ctx, attrs, promotedOperands);
   if (!paddingSizes.empty())

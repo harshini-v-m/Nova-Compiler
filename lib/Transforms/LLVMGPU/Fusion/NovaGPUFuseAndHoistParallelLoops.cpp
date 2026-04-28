@@ -103,6 +103,31 @@ static bool isThreadMappedForall(scf::ForallOp forall) {
   return forallHasMappingType<gpu::GPUThreadMappingAttr>(forall);
 }
 
+/// Returns true if the forall is warp-mapped (has GPUWarpMappingAttr).
+static bool isWarpMappedForall(scf::ForallOp forall) {
+  return forallHasMappingType<gpu::GPUWarpMappingAttr>(forall);
+}
+
+/// Returns true if the forall has either thread- or warp-level GPU mapping.
+/// FuseForalls uses this to allow register-resident fusion of matmul+epilogue
+/// chains where both ops end up in warp-mapped foralls. Fusion is only
+/// attempted when producer and consumer have the *same* mapping kind —
+/// see sameGpuMappingKind below.
+static bool isGpuMappedForall(scf::ForallOp forall) {
+  return isThreadMappedForall(forall) || isWarpMappedForall(forall);
+}
+
+static bool sameGpuMappingKind(scf::ForallOp a, scf::ForallOp b) {
+  return (isThreadMappedForall(a) && isThreadMappedForall(b)) ||
+         (isWarpMappedForall(a)   && isWarpMappedForall(b));
+}
+
+// (fuseEquivalent helper removed — making FuseForalls fire for sibling
+//  warp-foralls also needs the fast-path inlining to map producer's
+//  shared_outs through to the consumer's destination, not just to the
+//  producer's tensor.empty init. That's a deeper rewrite — out of scope
+//  for the current change.)
+
 /// Checks whether a forall's flat trip count equals `flatWorkgroupSize`.
 static bool tripCountMatchesWorkgroupSize(scf::ForallOp forallOp,
                                           int64_t flatWorkgroupSize) {
@@ -247,10 +272,12 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
       return rewriter.notifyMatchFailure(producerForall,
                                          "multi-result producer");
 
-    // Only fuse thread-mapped foralls.
-    if (!isThreadMappedForall(producerForall))
+    // Fuse foralls with GPU thread or warp mapping. Producer and consumer
+    // must have the same mapping kind (both thread or both warp) so each
+    // iteration in the producer maps 1:1 to an iteration in the consumer.
+    if (!isGpuMappedForall(producerForall))
       return rewriter.notifyMatchFailure(producerForall,
-                                         "producer is not thread-mapped");
+                                         "producer has no GPU mapping");
 
     // Both must be normalized.
     if (!isNormalized(producerForall))
@@ -273,10 +300,14 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
                                          "no consumer after chain");
 
     auto consumerForall = currUser->getParentOfType<scf::ForallOp>();
-    if (!consumerForall || !isThreadMappedForall(consumerForall))
+    if (!consumerForall || !isGpuMappedForall(consumerForall))
       return rewriter.notifyMatchFailure(
           producerForall,
-          "consumer not inside a thread-mapped forall");
+          "consumer not inside a GPU-mapped forall");
+    if (!sameGpuMappingKind(producerForall, consumerForall))
+      return rewriter.notifyMatchFailure(
+          producerForall,
+          "producer and consumer have different GPU mapping kinds");
 
     if (!isNormalized(consumerForall))
       return rewriter.notifyMatchFailure(consumerForall,

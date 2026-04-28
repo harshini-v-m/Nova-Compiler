@@ -22,6 +22,7 @@
 #include "Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/Support/Debug.h"
@@ -51,6 +52,9 @@ static bool hasWarpMapping(scf::ForallOp forall) {
   return mapping && !mapping.empty() &&
          isa<gpu::GPUWarpMappingAttr>(mapping.getValue().front());
 }
+
+static constexpr int64_t kWarpSize = 32;
+
 
 /// Maps MappingId 0→x, 1→y, 2→z for 3D (non-linear) mappings.
 static gpu::Dimension mappingIdToDim(int64_t id) {
@@ -133,6 +137,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   SmallVector<scf::ForallOp> warpForalls;
   SmallVector<scf::ForallOp> threadForalls;
 
+  // Collect thread-mapped foralls and accumulate their bounds into blockDims.
   auto walkResult = blockForall.walk([&](scf::ForallOp inner) {
     if (inner == blockForall)
       return WalkResult::advance();
@@ -195,9 +200,8 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
     return WalkResult::advance();
   });
 
-  if (walkResult.wasInterrupted()) {
+  if (walkResult.wasInterrupted())
     return failure();
-  }
 
   // ---- ALGORITHM STEP 3: Clamp block dims to CUDA's 1024-thread limit ----
   //
@@ -287,52 +291,7 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   auto insertPt = launchBody.without_terminator().end();
   launchBody.getOperations().splice(insertPt, forallBody->getOperations());
 
-  // ---- ALGORITHM STEP 7a: Convert warp foralls inside the launch body ----
-  //
-  // Warp foralls use GPUWarpMappingAttr (linear). Each warp forall IV is
-  // replaced by: warpId = threadIdx.x / 32, then decomposed into per-dim
-  // warp indices. Warp foralls are processed FIRST because they are outer
-  // (thread foralls are nested inside them for SIMT ops, or absent for MMA).
-  for (auto warpForall : warpForalls) {
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPoint(warpForall);
-    auto warpMapping = warpForall.getMappingAttr().getValue();
-    auto warpUBs = warpForall.getMixedUpperBound();
-
-    // warpId = threadIdx.x / 32
-    auto tidX = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
-    Value warpId = rewriter.create<arith::DivUIOp>(loc, tidX, cstIdx(32));
-
-    // Decompose warpId into per-dim warp IVs (linear warp mapping).
-    SmallVector<std::pair<int64_t, unsigned>> dimOrder;
-    for (auto [idx, attr] : llvm::enumerate(warpMapping)) {
-      auto wAttr = cast<gpu::GPUWarpMappingAttr>(attr);
-      dimOrder.emplace_back(wAttr.getRelativeIndex(), idx);
-    }
-    llvm::sort(dimOrder,
-               [](auto &a, auto &b) { return a.first < b.first; });
-
-    int64_t stride = 1;
-    for (auto [linearDimIdx, forallIvIdx] : dimOrder) {
-      int64_t bound = *getConstantIntValue(warpUBs[forallIvIdx]);
-      Value strideVal = cstIdx(stride);
-      Value div = rewriter.create<arith::DivUIOp>(loc, warpId, strideVal);
-      Value boundVal = cstIdx(bound);
-      Value iv = rewriter.create<arith::RemUIOp>(loc, div, boundVal);
-      warpForall.getInductionVar(forallIvIdx).replaceAllUsesWith(iv);
-      stride *= bound;
-    }
-
-    // Splice warp forall body into parent, erase the forall shell.
-    rewriter.eraseOp(warpForall.getTerminator());
-    Block *warpBody = warpForall.getBody();
-    Block *parentBlock = warpForall->getBlock();
-    parentBlock->getOperations().splice(Block::iterator(warpForall),
-                                        warpBody->getOperations());
-    rewriter.eraseOp(warpForall);
-  }
-
-  // ---- ALGORITHM STEP 7b: Convert thread foralls inside the launch body ----
+  // ---- ALGORITHM STEP 7a: Convert thread foralls inside the launch body ----
   for (auto threadForall : threadForalls) {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(threadForall);
@@ -447,6 +406,70 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
       }
       rewriter.eraseOp(threadForall);
     }
+  }
+
+  // ---- ALGORITHM STEP 7b: Convert warp foralls → warp_id = threadIdx.x/32 ----
+  // After the Subgroup tiling pass, MMA ops live inside #gpu.warp foralls.
+  // One warp forall iteration corresponds to one warp: the IV is the warp
+  // index, so we replace it with threadIdx.x / kWarpSize.
+  for (auto warpForall : warpForalls) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(warpForall);
+    auto warpUBs = warpForall.getMixedUpperBound();
+
+    // Compute total warp count (product of all forall upper bounds).
+    int64_t totalWarps = 1;
+    for (auto ub : warpUBs)
+      totalWarps *= *getConstantIntValue(ub);
+
+    // warp_id = threadIdx.x / kWarpSize
+    auto tidX    = rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x);
+    Value warpSz = cstIdx(kWarpSize);
+    Value warpId = rewriter.create<arith::DivUIOp>(loc, tidX, warpSz);
+
+    // Decompose linear warp_id into per-dim IVs, mirroring the linear thread
+    // mapping case. Sort by relativeIndex ascending (fastest-varying first)
+    // so stride accumulates correctly.
+    auto warpMapping = warpForall.getMappingAttr().getValue();
+    SmallVector<std::pair<int64_t, unsigned>> dimOrder;
+    for (auto [idx, attr] : llvm::enumerate(warpMapping)) {
+      auto warpAttr = cast<gpu::GPUWarpMappingAttr>(attr);
+      dimOrder.emplace_back(warpAttr.getRelativeIndex(), idx);
+    }
+    llvm::sort(dimOrder,
+               [](auto &a, auto &b) { return a.first < b.first; });
+
+    int64_t stride = 1;
+    for (auto [linearDimIdx, forallIvIdx] : dimOrder) {
+      int64_t bound = *getConstantIntValue(warpUBs[forallIvIdx]);
+      Value strideVal = cstIdx(stride);
+      Value div = rewriter.create<arith::DivUIOp>(loc, warpId, strideVal);
+      Value boundVal = cstIdx(bound);
+      Value iv = rewriter.create<arith::RemUIOp>(loc, div, boundVal);
+      warpForall.getInductionVar(forallIvIdx).replaceAllUsesWith(iv);
+      stride *= bound;
+    }
+
+    // Erase in_parallel terminator then move or predicate the body.
+    rewriter.eraseOp(warpForall.getTerminator());
+    Block *warpBody = warpForall.getBody();
+
+    int64_t activeThreads = totalWarps * kWarpSize;
+    if (activeThreads < blockDims[0]) {
+      // Some threads have no warp work — guard with scf.if.
+      Value pred = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ult, tidX, cstIdx(activeThreads));
+      auto ifOp =
+          rewriter.create<scf::IfOp>(loc, pred, /*withElseRegion=*/false);
+      ifOp.thenBlock()->getOperations().splice(
+          ifOp.thenBlock()->begin(), warpBody->getOperations());
+    } else {
+      // All threads are active — splice directly without predication.
+      Block *parent = warpForall->getBlock();
+      parent->getOperations().splice(Block::iterator(warpForall),
+                                     warpBody->getOperations());
+    }
+    rewriter.eraseOp(warpForall);
   }
 
   // ---- ALGORITHM STEP 8: Erase original block forall ----

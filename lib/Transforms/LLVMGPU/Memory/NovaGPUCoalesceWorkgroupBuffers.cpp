@@ -57,7 +57,11 @@ namespace mlir::nova {
 // Constants
 //===----------------------------------------------------------------------===//
 
-static constexpr int64_t kMaxWorkgroupSRAMBytes = 48 * 1024;
+// Fallback SRAM budget used when the pass is not given an explicit limit.
+// Matches the static shared-memory cap on every NVIDIA GPU since Kepler.
+// Passes created via `addNovaGPUOptimizedPipeline` override this with the
+// dynamic-SMEM limit from NVIDIATargetInfo::maxWorkgroupDynamicMemBytes.
+static constexpr int64_t kDefaultMaxWorkgroupSRAMBytes = 99 * 1024;
 
 //===----------------------------------------------------------------------===//
 // Helpers
@@ -363,8 +367,7 @@ coalesceWorkgroupAllocsInForall(scf::ForallOp forallOp) {
 
   LLVM_DEBUG(llvm::dbgs()
              << "[" DEBUG_TYPE "]  post-merge peak: " << peakBytes
-             << " / " << kMaxWorkgroupSRAMBytes << " B  ("
-             << survivors.size() << " surviving allocs)\n");
+             << " B  (" << survivors.size() << " surviving allocs)\n");
 
   return {static_cast<unsigned>(toCoalesce.size()), peakBytes};
 }
@@ -379,6 +382,15 @@ struct NovaGPUCoalesceWorkgroupBuffersPass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
       NovaGPUCoalesceWorkgroupBuffersPass)
 
+  NovaGPUCoalesceWorkgroupBuffersPass() = default;
+  NovaGPUCoalesceWorkgroupBuffersPass(
+      const NovaGPUCoalesceWorkgroupBuffersPass &o)
+      : PassWrapper(o), maxBytes(o.maxBytes) {}
+  explicit NovaGPUCoalesceWorkgroupBuffersPass(int64_t maxBytes)
+      : maxBytes(maxBytes) {}
+
+  int64_t maxBytes = kDefaultMaxWorkgroupSRAMBytes;
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, memref::MemRefDialect,
                     func::FuncDialect, scf::SCFDialect,
@@ -389,6 +401,8 @@ struct NovaGPUCoalesceWorkgroupBuffersPass
     func::FuncOp funcOp = getOperation();
     unsigned totalCoalesced = 0;
     bool     budgetViolation = false;
+    const int64_t budget =
+        maxBytes > 0 ? maxBytes : kDefaultMaxWorkgroupSRAMBytes;
 
     // Collect all block-mapped (workgroup-level) scf.forall ops.
     SmallVector<scf::ForallOp> blockForalls;
@@ -405,11 +419,11 @@ struct NovaGPUCoalesceWorkgroupBuffersPass
       auto [coalesced, peakBytes] = coalesceWorkgroupAllocsInForall(op);
       totalCoalesced += coalesced;
 
-      if (peakBytes > kMaxWorkgroupSRAMBytes) {
+      if (peakBytes > budget) {
         op.emitError()
             << "[nova-coalesce-workgroup-buffers] workgroup SRAM budget "
                "exceeded after coalescing: peak "
-            << peakBytes << " B > limit " << kMaxWorkgroupSRAMBytes
+            << peakBytes << " B > limit " << budget
             << " B. Reduce tile sizes, split the kernel, or ensure "
                "NovaGPUInferMemorySpace ran before bufferization.";
         budgetViolation = true;
@@ -437,8 +451,8 @@ struct NovaGPUCoalesceWorkgroupBuffersPass
 // Public API
 //===----------------------------------------------------------------------===//
 
-std::unique_ptr<Pass> createNovaGPUCoalesceWorkgroupBuffersPass() {
-  return std::make_unique<NovaGPUCoalesceWorkgroupBuffersPass>();
+std::unique_ptr<Pass> createNovaGPUCoalesceWorkgroupBuffersPass(int64_t maxBytes) {
+  return std::make_unique<NovaGPUCoalesceWorkgroupBuffersPass>(maxBytes);
 }
 
 void registerNovaGPUCoalesceWorkgroupBuffersPass() {

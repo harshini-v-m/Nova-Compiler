@@ -962,7 +962,9 @@ struct NovaGPUVectorizeMemrefCopyPass
         return;
       rewriter.setInsertionPoint(copyOp);
       rewriter.create<memref::AssumeAlignmentOp>(copyOp.getLoc(), src, 16);
-      (void)linalg::vectorize(rewriter, copyOp);
+      auto res = linalg::vectorize(rewriter, copyOp);
+      if (succeeded(res))
+        rewriter.replaceOp(copyOp, res->replacements);
     });
 
     // Lower reductions via InnerReduction + ReductionToContract (same as

@@ -55,6 +55,12 @@ add_mlir_library(NovaLLVMGPUTransforms
   Memory/NovaGPUCoalesceWorkgroupBuffers.cpp
   # Multi-buffer workgroup allocs for cp.async software pipelining
   Memory/NovaGPUMultiBuffering.cpp
+  # Convert gmem→smem vector.transfer pairs to nvgpu.device_async_copy
+  Memory/NovaGPUCreateAsyncCopies.cpp
+  # Software-pipeline K-loops that contain nvgpu.device_async_copy
+  Memory/NovaGPUPipelining.cpp
+  # Materialize workgroup memref.alloc → gpu.dynamic_shared_memory + memref.view
+  Memory/NovaGPUMaterializeDynamicSharedMem.cpp
   # Forward fill/copy operations
   Memory/NovaGPUFillCopyForwarding.cpp
   # Eliminate tensor.empty ops pre-bufferization
@@ -77,6 +83,8 @@ add_mlir_library(NovaLLVMGPUTransforms
   Loops/NovaWarpShuffleReduction.cpp
   # Stride-32 parallelization for single-thread reductions
   Loops/NovaStrideReduction.cpp
+  # Hoist matmul C accumulator out of K-loop (post-MapForallToGPU)
+  Loops/NovaGPUHoistAccumulator.cpp
 
   # ── Lowering ──────────────────────────────────────────────────────────────
   # Convert scf.forall → gpu.launch with dynamic block dims
@@ -85,6 +93,9 @@ add_mlir_library(NovaLLVMGPUTransforms
   Lowering/NovaGPULowerBarrierRegion.cpp
   # Erase nova.fusion_barrier ops
   Lowering/NovaGPUEraseFusionBarriers.cpp
+
+# Direct reduction lowering (replaces SCFScalarize + WarpShuffle for reductions)
+  Loops/NovaDirectReductionLowering.cpp
 
 
 # ── Transpose ─────────────────────────────────────────────────────────────

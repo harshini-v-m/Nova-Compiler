@@ -25,9 +25,20 @@ static bool isZeroFill(linalg::FillOp fillOp) {
 }
 
 // Returns true if `op` is an elementwise add (all-parallel linalg.generic
-// whose body yields an arith.addf / arith.addi result).
+// whose body yields an arith.addf / arith.addi result). Accepts both:
+//   - 2-input non-inplace form: ins(%lhs, %rhs) outs(%empty)
+//     body computes addf(%lhs_elem, %rhs_elem), writes to %empty.
+//   - 1-input in-place form:    ins(%rhs) outs(%lhs)
+//     body computes addf(%rhs_elem, %lhs_elem), writes to %lhs.
+// The in-place form is what `nova.add {in_place=true}` lowers to (see
+// NovaToLinalg.cpp) and represents the matmul-accumulate pattern
+// `%dest += %matmul`, which we want to fold into the matmul's DPS init.
 static bool isElementwiseAdd(linalg::GenericOp op) {
-  if (op.getNumDpsInputs() != 2)
+  unsigned numIns  = op.getNumDpsInputs();
+  unsigned numOuts = op.getNumDpsInits();
+  bool shapeOk = (numIns == 2 && numOuts == 1) ||
+                 (numIns == 1 && numOuts == 1);
+  if (!shapeOk)
     return false;
   if (op.getNumParallelLoops() != op.getNumLoops())
     return false;
@@ -79,17 +90,32 @@ struct FuseMatmulBiasIntoOuts : public OpRewritePattern<MatmulOpTy> {
     if (!addOp || !isElementwiseAdd(addOp))
       return failure();
 
-    // 4. Identify which add input is the matmul result and which is the bias.
+    // 4. Identify the bias operand and its indexing map.
+    //   (a) 2-input form: ins(%lhs, %rhs) outs(%empty). Bias is whichever
+    //       input ISN'T the matmul result.
+    //   (b) 1-input in-place form: ins(%rhs=matmul) outs(%dest). Bias IS
+    //       the dest — we accumulate matmul into dest.
     Value mmResult = matmulOp.getResult(0);
-    int biasIdx = -1;
-    for (int i = 0; i < 2; ++i) {
-      if (addOp.getDpsInputOperand(i)->get() != mmResult)
-        biasIdx = i;
+    Value bias;
+    AffineMap biasMap;
+    if (addOp.getNumDpsInputs() == 2) {
+      int biasIdx = -1;
+      for (int i = 0; i < 2; ++i) {
+        if (addOp.getDpsInputOperand(i)->get() != mmResult)
+          biasIdx = i;
+      }
+      if (biasIdx < 0)
+        return failure();
+      bias    = addOp.getDpsInputOperand(biasIdx)->get();
+      biasMap = addOp.getIndexingMapsArray()[biasIdx];
+    } else {
+      // 1-input in-place form.
+      if (addOp.getDpsInputOperand(0)->get() != mmResult)
+        return failure();
+      OpOperand *destOperand = addOp.getDpsInitOperand(0);
+      bias    = destOperand->get();
+      biasMap = addOp.getMatchingIndexingMap(destOperand);
     }
-    if (biasIdx < 0)
-      return failure();
-
-    Value bias = addOp.getDpsInputOperand(biasIdx)->get();
 
     auto matmulResultType = cast<RankedTensorType>(mmResult.getType());
     auto biasType = cast<RankedTensorType>(bias.getType());
@@ -110,7 +136,6 @@ struct FuseMatmulBiasIntoOuts : public OpRewritePattern<MatmulOpTy> {
       Value broadcastDest = fillOp.getOutputs()[0];
 
       int rank = matmulResultType.getRank();
-      AffineMap biasMap = addOp.getIndexingMapsArray()[biasIdx];
       AffineMap outMap  = rewriter.getMultiDimIdentityMap(rank);
 
       SmallVector<utils::IteratorType> iters(rank,
@@ -130,6 +155,14 @@ struct FuseMatmulBiasIntoOuts : public OpRewritePattern<MatmulOpTy> {
     // 6. Swap the matmul's outs from zero-fill to bias-initialised tensor.
     //    The matmul op itself is unchanged — it still computes C = A@B + C_init,
     //    but now C_init carries the bias instead of zeros.
+    //
+    //    For the in-place form, the bias is defined AFTER the matmul in
+    //    source order (it's the destination of the add op below the matmul,
+    //    typically a `bufferization.to_tensor %arg writable`). Move the
+    //    matmul down to the add op's position so its new outs operand
+    //    dominates it. Safe because the matmul has exactly one use (the
+    //    add) and nothing between them reads its result.
+    rewriter.moveOpBefore(matmulOp, addOp);
     rewriter.modifyOpInPlace(matmulOp, [&]() {
       matmulOp->setOperand(
           matmulOp.getDpsInitOperand(0)->getOperandNumber(), newOuts);

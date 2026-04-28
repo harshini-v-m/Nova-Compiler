@@ -14,11 +14,15 @@
 
 // CHECK-LABEL: func.func @promotion_test
 // CHECK:       scf.forall
-// CHECK:         bufferization.alloc_tensor() {memory_space = #gpu.address_space<workgroup>}
-// CHECK:         linalg.copy
-// CHECK:         nova.fusion_barrier
+// The strategy for this matrix size promotes both input operands (A and B).
+// Each input gets: tensor.empty dest + linalg.copy with nova.promote_to_workgroup.
+// That marker lets InferMemorySpace unconditionally classify the destination as
+// workgroup memory, bypassing isCrossThreadAccess (which misses the pattern where
+// the matmul reads the copy result as an input rather than a DPS init).
 // CHECK:         tensor.empty
-// CHECK:         linalg.copy
+// CHECK:         linalg.copy{{.*}}nova.promote_to_workgroup
+// CHECK:         tensor.empty
+// CHECK:         linalg.copy{{.*}}nova.promote_to_workgroup
 // CHECK:         linalg.matmul
 // CHECK:         scf.forall.in_parallel
 
