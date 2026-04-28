@@ -31,6 +31,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -310,6 +311,164 @@ static Value tryFixCapturedValueStore(Value storeVal, gpu::LaunchOp launchOp) {
   return contribution;
 }
 
+/// Recursively hoist `val`'s defining op (and all its transitive dependencies
+/// that are defined inside `forOp`'s body) to the insertion point of `builder`
+/// (expected to be just before `forOp`).  `mapping` is updated so that old
+/// in-loop results map to their newly-hoisted counterparts.
+///
+/// Returns false if `val` (or any dependency) is the loop IV or an iter_arg —
+/// those values change per-iteration and cannot be hoisted.
+static bool hoistOutOfLoop(Value val, scf::ForOp forOp, OpBuilder &builder,
+                            IRMapping &mapping,
+                            llvm::DenseSet<Value> &visited) {
+  if (visited.count(val)) return true;
+  visited.insert(val);
+
+  // Already remapped — nothing to do.
+  if (mapping.contains(val)) return true;
+
+  // Loop induction variable — not hoistable.
+  if (val == forOp.getInductionVar()) return false;
+
+  // Any block argument of the loop body (iter_args) — not hoistable.
+  if (auto barg = dyn_cast<BlockArgument>(val))
+    if (barg.getOwner() == forOp.getBody()) return false;
+
+  Operation *defOp = val.getDefiningOp();
+  // Defined outside the loop body (or a constant) — available as-is.
+  if (!defOp || defOp->getBlock() != forOp.getBody()) return true;
+
+  // Recursively hoist each operand first.
+  for (Value operand : defOp->getOperands())
+    if (!hoistOutOfLoop(operand, forOp, builder, mapping, visited))
+      return false;
+
+  // All operands are now available outside the loop — clone this op before it.
+  builder.clone(*defOp, mapping);
+  // `builder.clone` updates `mapping` with defOp->results → cloned results.
+  return true;
+}
+
+/// Matches the MMA C-accumulator pattern that bufferization emits inside
+/// a K-loop: vector.transfer_read from the same global memref that is written
+/// back via vector.transfer_write, with loop-invariant indices.
+static bool matchVectorTransferPattern(scf::ForOp forOp,
+                                        vector::TransferReadOp &outRead,
+                                        vector::TransferWriteOp &outWrite) {
+  Block *loopBody = forOp.getBody();
+  auto &bodyOps = loopBody->getOperations();
+  if (bodyOps.empty())
+    return false;
+
+  // Returns true if `mem` is a shared/workgroup memory memref.
+  // Handles both legacy IntegerAttr(3) and gpu::AddressSpaceAttr(workgroup).
+  auto isSharedMemory = [](MemRefType memTy) -> bool {
+    Attribute space = memTy.getMemorySpace();
+    if (!space) return false;
+    if (auto ia = dyn_cast<IntegerAttr>(space)) {
+      // GPU dialect integer encoding: workgroup=1; NVVM encoding: shared=3.
+      // Both appear as IntegerAttr depending on when the address space was
+      // lowered. Global memory has no space attr (null) or gpu::AddressSpace::Global.
+      int64_t v = ia.getInt();
+      return v == 1 || v == 3;
+    }
+    // gpu::AddressSpaceAttr wraps an enum that can be Global, Workgroup, or
+    // Private. The type name "address_space" is shared by ALL three variants —
+    // only check for "workgroup" to avoid false-positives on Global/Private.
+    return space.getAbstractAttribute().getName().contains("workgroup");
+  };
+
+  // Find the last vector.transfer_write in the loop body that targets
+  // global memory — this is the MMA C-accumulator writeback.
+  // After CreateAsyncCopies, all gmem→smem writes are device_async_copy;
+  // the only remaining transfer_write to global is the C accumulator.
+  vector::TransferWriteOp writeOp;
+  for (auto &op : llvm::reverse(bodyOps)) {
+    if (auto w = dyn_cast<vector::TransferWriteOp>(op)) {
+      if (auto memTy = dyn_cast<MemRefType>(w.getBase().getType()))
+        if (isSharedMemory(memTy)) continue; // skip shared memory writes
+      writeOp = w;
+      break;
+    }
+  }
+  if (!writeOp) {
+    llvm::errs() << "[scalarize-dbg]   FAIL: no global transfer_write found\n";
+    return false;
+  }
+  llvm::errs() << "[scalarize-dbg]   writeOp base=" << writeOp.getBase()
+               << " vectype=" << writeOp.getVector().getType() << "\n";
+
+  // Find a matching vector.transfer_read from the same source and indices.
+  vector::TransferReadOp readOp;
+  unsigned nReadsChecked = 0;
+  for (auto &op : bodyOps) {
+    auto r = dyn_cast<vector::TransferReadOp>(op);
+    if (!r) continue;
+    ++nReadsChecked;
+    llvm::errs() << "[scalarize-dbg]   read #" << nReadsChecked
+                 << " base=" << r.getBase()
+                 << " sameBase=" << (r.getBase() == writeOp.getBase())
+                 << " vectype=" << r.getType() << "\n";
+    if (r.getBase() != writeOp.getBase()) continue;
+    if (r.getIndices().size() != writeOp.getIndices().size()) {
+      llvm::errs() << "[scalarize-dbg]   SKIP: index count mismatch\n";
+      continue;
+    }
+    if (r.getType() != writeOp.getVector().getType()) {
+      llvm::errs() << "[scalarize-dbg]   SKIP: vector type mismatch\n";
+      continue;
+    }
+    bool indicesMatch = llvm::all_of(
+        llvm::zip(r.getIndices(), writeOp.getIndices()),
+        [](auto pair) { return std::get<0>(pair) == std::get<1>(pair); });
+    if (indicesMatch) { readOp = r; break; }
+    llvm::errs() << "[scalarize-dbg]   SKIP: indices differ\n";
+  }
+  if (!readOp) {
+    llvm::errs() << "[scalarize-dbg]   FAIL: no matching transfer_read (checked "
+                 << nReadsChecked << " direct reads)\n";
+    return false;
+  }
+
+  // Reject only direct induction-variable dependencies.
+  // Loop-invariant indices that happen to be computed inside the loop body
+  // (e.g. address arithmetic placed there by tiling after MapForallToGPU)
+  // are handled by hoistOutOfLoop in vectorScalarizeLoop — do not reject
+  // them here.  Only the loop IV itself is definitely non-hoistable.
+  Value loopIV = forOp.getInductionVar();
+  for (Value idx : readOp.getIndices()) {
+    if (idx == loopIV) {
+      llvm::errs() << "[scalarize-dbg]   FAIL: index is loop IV\n";
+      return false;
+    }
+  }
+
+  // Only scalarize per-MMA-tile fragments that fit in registers.
+  // Warp-level vectors (e.g. 64×32 = 2048) cause LLVM to spill the entire
+  // accumulator to local memory, making performance far worse than global memory.
+  // Per-MMA-tile fragments after Step 35a fold patterns are ≤128 elements
+  // (16×8 for TF32 mma.sync). Block-level tiles (128×128 = 16384) excluded.
+  auto vecTy = readOp.getVectorType();
+  if (vecTy.getNumElements() > 512) {
+    llvm::errs() << "[scalarize-dbg]   FAIL: vector too large ("
+                 << vecTy.getNumElements() << " > 512)\n";
+    return false;
+  }
+
+  // Only match K-loops that contain tensor-core compute.
+  // At Step 9.05, the MMA is still vector.contract (nvgpu.mma.sync is not
+  // generated until Step 35b, inside the gpu.GPUModuleOp). Check for
+  // vector::ContractionOp which is what UnrollToIntrinsics produces here.
+  bool hasMmaContract = false;
+  forOp.walk([&](vector::ContractionOp) { hasMmaContract = true; });
+  if (!hasMmaContract)
+    return false;
+
+  outRead  = readOp;
+  outWrite = writeOp;
+  return true;
+}
+
 // PERFORMANCE CRITICAL — scf.for accumulator scalarization.
 // Converts:
 //   scf.for %i = ... {
@@ -330,6 +489,49 @@ struct SCFScalarizeAccumulatorPass
 
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
+
+    // ALGORITHM STEP 0: Hoist vector.transfer_read/write C-accumulator pairs
+    // out of scf.for K-loops into register-held iter_args.  This eliminates
+    // global-memory read/write for the MMA C-tile on every K-iteration and is
+    // the primary fix for the ~28× throughput regression caused by bufferization
+    // turning the C tensor iter_arg into per-iteration ld.global/st.global.
+    SmallVector<scf::ForOp> vectorLoops;
+    funcOp.walk([&](scf::ForOp forOp) {
+      // DEBUG: log what's in every scf.for at this pass invocation.
+      unsigned nWrites = 0, nReads = 0, nMma = 0, nContract = 0;
+      forOp.walk([&](Operation *op) {
+        if (isa<vector::TransferWriteOp>(op)) ++nWrites;
+        if (isa<vector::TransferReadOp>(op)) ++nReads;
+        if (op->getName().getStringRef().contains("mma.sync")) ++nMma;
+        if (isa<vector::ContractionOp>(op)) ++nContract;
+      });
+      llvm::errs() << "[scalarize-dbg] scf.for: "
+                   << nWrites << " transfer_writes, "
+                   << nReads  << " transfer_reads, "
+                   << nMma    << " mma.sync, "
+                   << nContract << " vector.contract\n";
+      if (nWrites > 0) {
+        forOp.walk([](vector::TransferWriteOp w) {
+          auto memTy = dyn_cast<MemRefType>(w.getBase().getType());
+          int space = -1;
+          if (memTy) {
+            if (auto ia = dyn_cast_or_null<IntegerAttr>(memTy.getMemorySpace()))
+              space = (int)ia.getInt();
+            else if (!memTy.getMemorySpace())
+              space = 0;
+          }
+          llvm::errs() << "  transfer_write → memspace=" << space
+                       << " vectype=" << w.getVector().getType() << "\n";
+        });
+      }
+      vector::TransferReadOp read;
+      vector::TransferWriteOp write;
+      if (matchVectorTransferPattern(forOp, read, write))
+        vectorLoops.push_back(forOp);
+    });
+    llvm::errs() << "[scalarize-dbg] vectorLoops matched: " << vectorLoops.size() << "\n";
+    for (auto forOp : vectorLoops)
+      vectorScalarizeLoop(forOp);
 
     // ALGORITHM STEP 1: Scalarize loop-carried accumulator load/store pairs
     // inside scf.for loops. Process into a snapshot list first to avoid
@@ -455,6 +657,90 @@ struct SCFScalarizeAccumulatorPass
                                   targetMemref, zero);
       }
     }
+  }
+
+  // Hoist the vector.transfer_read/write C-accumulator pair out of the K-loop
+  // into a register-held iter_arg, eliminating global-memory C traffic on every
+  // K-iteration. The read happens once before the loop, the MMA result is
+  // carried in register via scf.for iter_arg, and the write happens once after.
+  void vectorScalarizeLoop(scf::ForOp forOp) {
+    vector::TransferReadOp readOp;
+    vector::TransferWriteOp writeOp;
+    if (!matchVectorTransferPattern(forOp, readOp, writeOp))
+      return;
+
+    auto &bodyOps = forOp.getBody()->getOperations();
+    OpBuilder builder(forOp);
+    Location loc = forOp.getLoc();
+
+    // Hoist the read's source and indices out of the loop body.
+    // After bufferization + tiling, the C tile subview (source of the read)
+    // may be defined inside the K-loop body even though it is loop-invariant.
+    // Cloning the read before the loop with an emptyMapping would leave a
+    // dangling reference to the in-loop subview after forOp.erase().
+    IRMapping hoistMapping;
+    llvm::DenseSet<Value> visited;
+    auto tryHoist = [&](Value v) -> bool {
+      return hoistOutOfLoop(v, forOp, builder, hoistMapping, visited);
+    };
+    if (!tryHoist(readOp.getBase())) return; // IV dep — abort
+    for (Value idx : readOp.getIndices())
+      if (!tryHoist(idx)) return;
+    // Padding value of the read (typically a zero constant).
+    if (!tryHoist(readOp.getPadding())) return;
+
+    // Clone the read before the loop using the hoisted operands.
+    Value initVal =
+        builder.clone(*readOp.getOperation(), hoistMapping)->getResult(0);
+
+    // Build new scf.for with the C fragment appended as a register iter_arg.
+    SmallVector<Value> iterArgs = forOp.getInitArgs();
+    iterArgs.push_back(initVal);
+    auto newForOp = builder.create<scf::ForOp>(
+        loc, forOp.getLowerBound(), forOp.getUpperBound(),
+        forOp.getStep(), iterArgs);
+
+    IRMapping mapping;
+    mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+    for (unsigned i = 0; i < forOp.getNumRegionIterArgs(); ++i)
+      mapping.map(forOp.getRegionIterArg(i), newForOp.getRegionIterArg(i));
+
+    // Old transfer_read result → new iter_arg (C lives in register).
+    Value newIterArg = newForOp.getRegionIterArgs().back();
+    mapping.map(readOp.getResult(), newIterArg);
+
+    builder.setInsertionPointToStart(newForOp.getBody());
+
+    Value yieldValue;
+    for (auto &op : bodyOps) {
+      if (&op == readOp.getOperation()) {
+        // Replaced by iter_arg — skip.
+      } else if (&op == writeOp.getOperation()) {
+        // Capture the MMA result to yield instead of writing to global memory.
+        yieldValue = mapping.lookupOrDefault(writeOp.getVector());
+      } else if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
+        SmallVector<Value> yields;
+        for (Value v : yieldOp.getOperands())
+          yields.push_back(mapping.lookupOrDefault(v));
+        if (yieldValue)
+          yields.push_back(yieldValue);
+        builder.create<scf::YieldOp>(loc, yields);
+      } else {
+        builder.clone(op, mapping);
+      }
+    }
+
+    // Write the final accumulated C value back once after the loop.
+    // hoistMapping already contains the hoisted source/indices from above;
+    // add the final accumulated vector to complete the write operands.
+    builder.setInsertionPointAfter(newForOp);
+    hoistMapping.map(writeOp.getVector(), newForOp.getResults().back());
+    builder.clone(*writeOp.getOperation(), hoistMapping);
+
+    // Replace old loop results and erase.
+    for (unsigned i = 0; i < forOp.getNumResults(); ++i)
+      forOp.getResult(i).replaceAllUsesWith(newForOp.getResult(i));
+    forOp.erase();
   }
 
   void scalarizeLoop(scf::ForOp forOp) {

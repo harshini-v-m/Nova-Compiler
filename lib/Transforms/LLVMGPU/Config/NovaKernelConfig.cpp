@@ -551,7 +551,7 @@ getContractionHeuristicSeeds(const ContractProblem &problem,
    //   wgM = mSize*MNT*S = 16*4*4 = 256 → reshape to 2x2 warp grid → 128
    //   wgN = nSize*MNT   = 8*4      =  32 → reshape doubles → 128
    //   wgK = kSize*Ktiles= 8*2      =  16
-   return GPUMMAHeuristicSeeds{4, 8, 2, 1,
+   return GPUMMAHeuristicSeeds{4, 8, 4, 1,
                                /*boostMNT=*/std::nullopt, /*util=*/0.80};
  }
  return std::nullopt;

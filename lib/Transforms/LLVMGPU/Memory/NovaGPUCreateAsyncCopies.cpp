@@ -310,6 +310,12 @@ struct NovaGPUCreateAsyncCopiesPass
         if (failed(convertPairToAsync(tw, tr, pairTokens, builder)))
           continue;
 
+        // Tag every cp.async op as Stage 0 so the pipeliner moves them
+        // to the prologue (same stage as the create_group commit).
+        for (Value tok : pairTokens)
+          if (auto copyOp = tok.getDefiningOp<nvgpu::DeviceAsyncCopyOp>())
+            copyOp->setAttr("__pipelining_first_stage__", builder.getUnitAttr());
+
         erasedWrites.push_back(tw);
         erasedReads.push_back(tr);
         tokens.append(pairTokens);
@@ -320,18 +326,33 @@ struct NovaGPUCreateAsyncCopiesPass
         if (auto ifOp = lastOp->getParentOfType<scf::IfOp>())
           lastOp = ifOp;
 
-        builder.setInsertionPointAfter(lastOp);  // Bug #2 fix
+        builder.setInsertionPointAfter(lastOp);
 
+        // Keep ValueRange{} (no explicit token operands). In PTX,
+        // cp.async.commit_group always commits all currently-pending cp.async
+        // operations from the calling thread — including those inside the
+        // scf.if predicated block above — regardless of the MLIR operand list.
+        // Passing the actual tokens would cause a dominance violation because
+        // the tokens are defined inside the scf.if block and cannot be
+        // referenced outside it.
         auto grp = builder.create<nvgpu::DeviceAsyncCreateGroupOp>(
-          candidates[i].getLoc(), tokenTy, ValueRange{});
+            candidates[i].getLoc(), tokenTy, ValueRange{});
 
-        // Tag the commit as Stage 0 so it moves to prologue with copies.
+        // Stage 0 marker: pipeliner places copies + commit in the prologue.
         grp->setAttr("__pipelining_first_stage__", builder.getUnitAttr());
 
+        // wait(0) gives serial semantics; the pipelining pass rewrites
+        // numGroups → depth-1 to actually overlap copies with compute.
         builder.create<nvgpu::DeviceAsyncWaitOp>(
             candidates[i].getLoc(), grp.getResult(), /*numGroups=*/nullptr);
         builder.create<gpu::BarrierOp>(candidates[i].getLoc());
-        
+
+        // Mark the parent K-loop so the pipeliner can identify it.
+        // IREE's pipelining pass uses kPipeliningLoopMarker (__pipelining_K_loop__)
+        // to select which scf.for loops to software-pipeline.
+        if (loop)
+          loop->setAttr("__pipelining_K_loop__", builder.getUnitAttr());
+
         numGroups++;
         numCopies += tokens.size();
       }

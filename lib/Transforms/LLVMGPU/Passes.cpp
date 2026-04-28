@@ -72,6 +72,9 @@
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
@@ -534,6 +537,29 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(createCSEPass());
 
     // -------------------------------------------------------------------------
+    // Step 9.05: MMA C-accumulator register scalarization.
+    // Hoists vector.transfer_read/write for the MMA C-tile (global memory)
+    // out of the K-loop into a register-held scf.for iter_arg.
+    //
+    // Must run AFTER MapForallToGPU: vectors are now per-thread fragments
+    // (4–128 floats), small enough to live in registers without spilling.
+    // Running BEFORE MapForallToGPU (at forall/tile level) would match
+    // full-tile vectors (e.g. 128×128×4B = 64KB) that LLVM spills to local
+    // memory, making performance far worse than the original global-memory path.
+    //
+    // Must run AFTER CreateAsyncCopies: gmem→smem transfers are now
+    // nvgpu.device_async_copy, so the only remaining vector.transfer_write is
+    // the C accumulator — the pattern match is unambiguous.
+    //
+    // Must run BEFORE Pipelining: the pipeliner restructures the K-loop
+    // iter_args, making the accumulator pattern harder to match.
+    // -------------------------------------------------------------------------
+    pm.addNestedPass<func::FuncOp>(
+        mlir::nova::createSCFScalarizeAccumulatorPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    pm.addNestedPass<func::FuncOp>(createCSEPass());
+
+    // -------------------------------------------------------------------------
     // Step 9.1: software-pipeline K-loops now that scf.forall is lowered.
     // After MapForallToGPU the scf.forall → scf.if, so async copy tokens
     // created inside the (now-flat) thread-predicate block are visible at the
@@ -981,6 +1007,271 @@ namespace mlir::nova
         return std::make_unique<GpuHardwareMappingPass>();
       }());
 
+      // 35a.5: Scalarize MMA C-accumulator into register iter_args.
+      //
+      // After GpuHardwareMappingPass, FoldInsertStridedSliceIntoTransferWrite
+      // has decomposed the warp-level C write (e.g. vector<64x32xf32>) into
+      // 16 individual per-MMA-tile writes (vector<16x8xf32>, 128 elements
+      // each). Correspondingly, FoldExtractStridedSliceFromTransferRead +
+      // SplitTransferReadExtract decomposed the warp-level C read into 16
+      // individual reads from global memory.
+      //
+      // Without this pass: every K-iteration issues 16 ld.global + 16
+      // st.global for the C tiles (320 K-iterations × 32 floats × 16 tiles =
+      // 163,840 global memory round-trips per warp). With this pass: each
+      // tile is read ONCE before the loop (iter_arg init), held in registers,
+      // and written ONCE after the loop — 320× reduction in global C traffic.
+      //
+      // Matching uses data-flow: write ← contract ← (via acc) ← read.
+      // This avoids SSA-equality index matching that breaks when FoldPatterns
+      // create separate arith.addi ops for the same constant offset.
+      //
+      // Must run AFTER GpuHardwareMappingPass (so C is per-MMA-tile size) and
+      // BEFORE ConvertVectorToGPU (which replaces contracts → mma.sync +
+      // stores, erasing the transfer_read/write C pattern we match on).
+      gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
+        struct CAccumulatorScalarizePass
+            : public PassWrapper<CAccumulatorScalarizePass,
+                                 OperationPass<gpu::GPUFuncOp>> {
+          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CAccumulatorScalarizePass)
+
+          void runOnOperation() override {
+            gpu::GPUFuncOp funcOp = getOperation();
+
+            // Returns true if memref lives in workgroup (shared) memory.
+            // Handles both gpu::AddressSpaceAttr<Workgroup> and IntegerAttr(3)
+            // (NVVM shared). Explicitly rejects IntegerAttr(1) which is NVVM
+            // global memory (NOT workgroup despite gpu-dialect enum value 1).
+            auto isShared = [](MemRefType t) -> bool {
+              Attribute space = t.getMemorySpace();
+              if (!space) return false;
+              if (auto ia = dyn_cast<IntegerAttr>(space))
+                return ia.getInt() == 3; // NVVM: 3=shared; 1=global
+              if (auto ga = dyn_cast<gpu::AddressSpaceAttr>(space))
+                return ga.getValue() == gpu::GPUDialect::getWorkgroupAddressSpace();
+              return false;
+            };
+
+            SmallVector<scf::ForOp> kLoops;
+            funcOp.walk([&](scf::ForOp forOp) {
+              // A K-loop must contain vector.contract (MMA compute).
+              bool hasMma = false;
+              forOp.walk([&](vector::ContractionOp) { hasMma = true; });
+              if (!hasMma) return;
+              kLoops.push_back(forOp);
+            });
+
+            llvm::errs() << "[c-scalarize] " << funcOp.getName()
+                         << ": " << kLoops.size() << " K-loop(s)\n";
+            for (scf::ForOp forOp : kLoops)
+              scalarizeKLoop(forOp, isShared);
+          }
+
+          // Recursively hoist val's defining op outside forOp.
+          // Returns false if val depends on the loop IV (not hoistable).
+          //
+          // Handles ops that live in nested blocks (e.g. scf.if then-block):
+          // we walk up the parent-block chain to determine whether the op is
+          // anywhere inside forOp. If it is, we recursively hoist its deps
+          // and clone it before the loop. If it is outside forOp (defined
+          // before the loop, e.g. function arg or constant) we use it as-is.
+          static bool hoistDep(Value val, scf::ForOp forOp, OpBuilder &builder,
+                               IRMapping &mapping,
+                               llvm::DenseSet<Value> &visited) {
+            if (visited.count(val)) return true;
+            visited.insert(val);
+            if (mapping.contains(val)) return true;
+            if (val == forOp.getInductionVar()) return false;
+            if (auto ba = dyn_cast<BlockArgument>(val)) {
+              // Block args of forOp.getBody() are iter_args/IV — not hoistable.
+              if (ba.getOwner() == forOp.getBody()) return false;
+              // Block args of nested blocks (e.g. scf.if) are not hoistable
+              // unless they happen to be outside the loop entirely.
+              Block *b = ba.getOwner();
+              while (b) {
+                if (b == forOp.getBody()) return false;
+                Operation *p = b->getParentOp();
+                if (!p) break;
+                b = p->getBlock();
+              }
+              return true; // outside forOp
+            }
+            Operation *def = val.getDefiningOp();
+            if (!def) return true;
+            // Check whether def is inside forOp (directly or in a nested block).
+            bool insideForOp = false;
+            Block *b = def->getBlock();
+            while (b) {
+              if (b == forOp.getBody()) { insideForOp = true; break; }
+              Operation *p = b->getParentOp();
+              if (!p) break;
+              b = p->getBlock();
+            }
+            if (!insideForOp) return true; // defined before the loop, use as-is
+            // Op is inside forOp. Recursively hoist operands then clone it.
+            for (Value operand : def->getOperands())
+              if (!hoistDep(operand, forOp, builder, mapping, visited))
+                return false;
+            builder.clone(*def, mapping);
+            return true;
+          }
+
+          // Collect C pairs from a block's op list via data-flow matching:
+          //   write.vector ← contract ← contract.acc ← read (both global)
+          void collectCPairs(Block::OpListType &ops,
+                             function_ref<bool(MemRefType)> isShared,
+                             SmallVector<vector::TransferReadOp> &reads,
+                             SmallVector<vector::TransferWriteOp> &writes) {
+            for (auto &op : ops) {
+              auto writeOp = dyn_cast<vector::TransferWriteOp>(op);
+              if (!writeOp) continue;
+              auto wMemTy = dyn_cast<MemRefType>(writeOp.getBase().getType());
+              if (!wMemTy || isShared(wMemTy)) continue;
+              if (writeOp.getVectorType().getNumElements() > 512) continue;
+              auto contract =
+                  writeOp.getVector().getDefiningOp<vector::ContractionOp>();
+              if (!contract) continue;
+              auto readOp =
+                  contract.getAcc().getDefiningOp<vector::TransferReadOp>();
+              if (!readOp) continue;
+              auto rMemTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+              if (!rMemTy || isShared(rMemTy)) continue;
+              if (readOp.getVectorType() != writeOp.getVectorType()) continue;
+              reads.push_back(readOp);
+              writes.push_back(writeOp);
+            }
+          }
+
+          // Scalarizes all global C read/write pairs in the K-loop.
+          //
+          // Case A (backward kernel): pairs are at the TOP LEVEL of the K-loop
+          //   body. Straightforward iter_arg promotion.
+          //
+          // Case B (forward kernel, software-pipelined): pairs are inside a
+          //   scf.if at the top level of the K-loop body.  The scf.if is the
+          //   pipeline guard (true when the pipeline stage is in-bounds).
+          //   We transform the scf.if to YIELD the updated C values, add them
+          //   as K-loop iter_args, and write the final tiles once after the loop.
+          void scalarizeKLoop(scf::ForOp forOp,
+                              function_ref<bool(MemRefType)> isShared) {
+            Block *body = forOp.getBody();
+            auto &bodyOps = body->getOperations();
+
+            SmallVector<vector::TransferReadOp>  pairReads;
+            SmallVector<vector::TransferWriteOp> pairWrites;
+
+            // Case A: pairs at the top level of the K-loop body.
+            collectCPairs(bodyOps, isShared, pairReads, pairWrites);
+
+            if (pairReads.empty()) return;
+
+            llvm::DenseSet<Operation *> pairReadSet, pairWriteSet;
+            for (auto r : pairReads) pairReadSet.insert(r.getOperation());
+            for (auto w : pairWrites) pairWriteSet.insert(w.getOperation());
+
+            llvm::errs() << "[c-scalarize] K-loop: scalarizing "
+                         << pairReads.size() << " C tile(s) of type "
+                         << pairReads[0].getVectorType() << "\n";
+
+            OpBuilder builder(forOp);
+            Location loc = forOp.getLoc();
+
+            // Hoist reads' operands before the K-loop and emit the one-time init
+            // load for each C tile.
+            SmallVector<Value> initVals;
+            for (unsigned i = 0; i < pairReads.size(); ++i) {
+              auto readOp = pairReads[i];
+              IRMapping hoistMap;
+              llvm::DenseSet<Value> visited;
+              auto tryHoist = [&](Value v) -> bool {
+                return hoistDep(v, forOp, builder, hoistMap, visited);
+              };
+              bool ok = tryHoist(readOp.getBase());
+              for (Value idx : readOp.getIndices())
+                ok = ok && tryHoist(idx);
+              ok = ok && tryHoist(readOp.getPadding());
+              if (!ok) {
+                llvm::errs() << "[c-scalarize] ABORT: IV-dependent index in pair "
+                             << i << "\n";
+                return;
+              }
+              initVals.push_back(
+                  builder.clone(*readOp.getOperation(), hoistMap)->getResult(0));
+            }
+
+            // Build new scf.for with extra iter_args for all C tiles.
+            SmallVector<Value> iterArgs = forOp.getInitArgs();
+            for (Value v : initVals) iterArgs.push_back(v);
+
+            auto newFor = builder.create<scf::ForOp>(
+                loc, forOp.getLowerBound(), forOp.getUpperBound(),
+                forOp.getStep(), iterArgs);
+
+            IRMapping mapping;
+            mapping.map(forOp.getInductionVar(), newFor.getInductionVar());
+            for (unsigned i = 0; i < forOp.getNumRegionIterArgs(); ++i)
+              mapping.map(forOp.getRegionIterArg(i),
+                          newFor.getRegionIterArg(i));
+
+            unsigned argBase = forOp.getNumRegionIterArgs();
+            for (unsigned i = 0; i < pairReads.size(); ++i)
+              mapping.map(pairReads[i].getResult(),
+                          newFor.getRegionIterArg(argBase + i));
+
+            builder.setInsertionPointToStart(newFor.getBody());
+
+            // Skip pair reads (replaced by iter_arg), capture pair write
+            // vectors for the yield, clone everything else.
+            SmallVector<Value> yieldVals;
+            for (auto &op : bodyOps) {
+              if (pairReadSet.count(&op)) {
+                // Already mapped to iter_arg — skip.
+              } else if (auto tw = dyn_cast<vector::TransferWriteOp>(op)) {
+                if (pairWriteSet.count(tw.getOperation()))
+                  yieldVals.push_back(mapping.lookupOrDefault(tw.getVector()));
+                else
+                  builder.clone(op, mapping);
+              } else if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
+                SmallVector<Value> ys;
+                for (Value v : yieldOp.getOperands())
+                  ys.push_back(mapping.lookupOrDefault(v));
+                for (Value y : yieldVals) ys.push_back(y);
+                builder.create<scf::YieldOp>(loc, ys);
+              } else {
+                builder.clone(op, mapping);
+              }
+            }
+
+            // Write back each final C tile ONCE after the K-loop.
+            builder.setInsertionPointAfter(newFor);
+            unsigned nOrig = forOp.getNumResults();
+            for (unsigned i = 0; i < pairWrites.size(); ++i) {
+              auto writeOp = pairWrites[i];
+              IRMapping wMap;
+              llvm::DenseSet<Value> vis2;
+              auto tryHoist2 = [&](Value v) {
+                (void)hoistDep(v, forOp, builder, wMap, vis2);
+              };
+              tryHoist2(writeOp.getBase());
+              for (Value idx : writeOp.getIndices())
+                tryHoist2(idx);
+              wMap.map(writeOp.getVector(), newFor.getResult(nOrig + i));
+              builder.clone(*writeOp.getOperation(), wMap);
+            }
+
+            // Replace original results and erase old loop.
+            for (unsigned i = 0; i < nOrig; ++i)
+              forOp.getResult(i).replaceAllUsesWith(newFor.getResult(i));
+            forOp.erase();
+          }
+
+          StringRef getArgument() const override {
+            return "nova-c-accumulator-scalarize";
+          }
+        };
+        return std::make_unique<CAccumulatorScalarizePass>();
+      }());
+
       // 35b. vector.contract → nvgpu.mma.sync.
       gpuHwPm.addNestedPass<gpu::GPUFuncOp>(
           createConvertVectorToGPUPass(/*useNvGpu=*/true));
@@ -1169,6 +1460,433 @@ namespace mlir::nova
         return std::make_unique<ScalarizeMMAFragmentStoresPass>();
       }());
       gpuHwPm.addPass(createCanonicalizerPass());
+
+      // DEBUG: Dump IR after VectorToGPU + ScalarizeMMAFragmentStores
+      // to understand the nvgpu.mma.sync C-accumulator pattern.
+      gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
+        struct DumpMmaIRPass
+            : public PassWrapper<DumpMmaIRPass, OperationPass<gpu::GPUFuncOp>> {
+          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DumpMmaIRPass)
+          void runOnOperation() override {
+            gpu::GPUFuncOp func = getOperation();
+            bool hasMma = false;
+            func.walk([&](nvgpu::MmaSyncOp) { hasMma = true; });
+            if (!hasMma) return;
+            // Only dump main_kernel (forward kernel with scf.if guard).
+            bool hasTopLevelIf = false;
+            func.walk([&](scf::IfOp ifOp) {
+              bool innerMma = false;
+              ifOp.walk([&](nvgpu::MmaSyncOp) { innerMma = true; });
+              if (innerMma) hasTopLevelIf = true;
+            });
+            if (!hasTopLevelIf) return;
+            // IR dump disabled — re-enable for debugging if needed.
+            (void)func;
+          }
+          StringRef getArgument() const override {
+            return "nova-dump-post-vectortogpu";
+          }
+        };
+        return std::make_unique<DumpMmaIRPass>();
+      }());
+
+      // 35d.5: Post-VectorToGPU C-accumulator scalarization for the forward kernel.
+      //
+      // After VectorToGPU + ScalarizeMMAFragmentStores + canonicalize, the K-loop
+      // of the forward kernel contains a scf.if (per-thread predicate, constant
+      // across K iterations) that wraps ALL nvgpu.mma.sync ops. Each mma.sync's
+      // C accumulator is assembled from 2 vector.load ops from global memory via
+      // vector.insert chains. The mma.sync results go to vector.extract + memref.store
+      // (write-back to global).
+      //
+      // This pass:
+      //   1. Hoists the 32 C init sequences before the K-loop as new iter_args.
+      //   2. Rebuilds the scf.if to yield the mma.sync results (updated C tiles).
+      //   3. Threads the scf.if results through the K-loop yield as iter_args.
+      //   4. Emits write-back stores once after the K-loop.
+      //
+      // Net effect: eliminates 2×N ld.global + 4×N st.global per K-iteration
+      // (where N = number of mma.sync ops = 32 for the 128×128 tile).
+      gpuHwPm.addNestedPass<gpu::GPUFuncOp>([&]() -> std::unique_ptr<Pass> {
+        struct NvgpuMmaScalarizePass
+            : public PassWrapper<NvgpuMmaScalarizePass,
+                                 OperationPass<gpu::GPUFuncOp>> {
+          MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NvgpuMmaScalarizePass)
+
+          // Recursively hoist val's defining op outside forOp into builder's
+          // current insertion point. Returns false if val depends on the loop IV
+          // or a loop iter_arg (not hoistable). Handles ops inside nested blocks
+          // (e.g., scf.if then-block) by walking the parent-block chain.
+          static bool hoistDep(Value val, scf::ForOp forOp, OpBuilder &builder,
+                               IRMapping &mapping,
+                               llvm::DenseSet<Value> &visited) {
+            if (visited.count(val)) return true;
+            visited.insert(val);
+            if (mapping.contains(val)) return true;
+            if (val == forOp.getInductionVar()) return false;
+            if (auto ba = dyn_cast<BlockArgument>(val)) {
+              if (ba.getOwner() == forOp.getBody()) return false;
+              Block *b = ba.getOwner();
+              while (b) {
+                if (b == forOp.getBody()) return false;
+                Operation *p = b->getParentOp();
+                if (!p) break;
+                b = p->getBlock();
+              }
+              return true; // outside forOp entirely
+            }
+            Operation *def = val.getDefiningOp();
+            if (!def) return true;
+            bool insideForOp = false;
+            Block *b = def->getBlock();
+            while (b) {
+              if (b == forOp.getBody()) { insideForOp = true; break; }
+              Operation *p = b->getParentOp();
+              if (!p) break;
+              b = p->getBlock();
+            }
+            if (!insideForOp) return true; // defined before the loop
+            for (Value operand : def->getOperands())
+              if (!hoistDep(operand, forOp, builder, mapping, visited))
+                return false;
+            builder.clone(*def, mapping);
+            return true;
+          }
+
+          static bool isGlobal(MemRefType mty) {
+            Attribute space = mty.getMemorySpace();
+            if (!space) return true;
+            if (auto ia = dyn_cast<IntegerAttr>(space))
+              return ia.getInt() != 3; // NVVM: 3=shared
+            if (auto ga = dyn_cast<gpu::AddressSpaceAttr>(space))
+              return ga.getValue() !=
+                     gpu::GPUDialect::getWorkgroupAddressSpace();
+            return true;
+          }
+
+          static bool isLoopInvariant(Value val, scf::ForOp forOp) {
+            if (val == forOp.getInductionVar()) return false;
+            if (auto ba = dyn_cast<BlockArgument>(val)) {
+              if (ba.getOwner() == forOp.getBody()) return false;
+              Block *b = ba.getOwner();
+              while (b) {
+                if (b == forOp.getBody()) return false;
+                Operation *p = b->getParentOp();
+                if (!p) break;
+                b = p->getBlock();
+              }
+              return true;
+            }
+            if (auto *def = val.getDefiningOp()) {
+              Block *b = def->getBlock();
+              while (b) {
+                if (b == forOp.getBody()) return false;
+                Operation *p = b->getParentOp();
+                if (!p) break;
+                b = p->getBlock();
+              }
+            }
+            return true;
+          }
+
+          struct AccInfo {
+            nvgpu::MmaSyncOp mmaOp;
+            vector::LoadOp load0;  // first row load (vector<2xf32>)
+            vector::InsertOp ins0; // insert load0 into zero constant
+            vector::LoadOp load1;  // second row load
+            vector::InsertOp ins1; // insert load1 → final C (vector<2x2xf32>)
+            SmallVector<vector::ExtractOp> extracts; // write-back extracts
+            SmallVector<memref::StoreOp> stores;     // write-back global stores
+          };
+
+          // Match the C accumulator pattern for a single mma.sync op:
+          //   matrixC = ins1(load1, ins0(load0, cst_zero))
+          // where load0/load1 are vector.load from global memory.
+          // Also collect write-back pattern:
+          //   mmaResult → vector.extract → memref.store
+          static bool matchAcc(nvgpu::MmaSyncOp mmaOp, scf::ForOp forOp,
+                               AccInfo &info) {
+            Value c = mmaOp.getMatrixC();
+            auto ins1 = c.getDefiningOp<vector::InsertOp>();
+            if (!ins1) {
+              llvm::errs() << "[nvgpu-mma-scalarize] matchAcc fail: C not InsertOp, def=";
+              if (auto *d = c.getDefiningOp()) llvm::errs() << d->getName();
+              else llvm::errs() << "block-arg";
+              llvm::errs() << "\n";
+              return false;
+            }
+            auto load1 =
+                ins1.getValueToStore().getDefiningOp<vector::LoadOp>();
+            if (!load1) {
+              llvm::errs() << "[nvgpu-mma-scalarize] matchAcc fail: ins1.stored not LoadOp\n";
+              return false;
+            }
+            auto rTy1 = dyn_cast<MemRefType>(load1.getBase().getType());
+            if (!rTy1 || !isGlobal(rTy1)) {
+              llvm::errs() << "[nvgpu-mma-scalarize] matchAcc fail: load1 not global\n";
+              return false;
+            }
+            auto ins0 = ins1.getDest().getDefiningOp<vector::InsertOp>();
+            if (!ins0) {
+              llvm::errs() << "[nvgpu-mma-scalarize] matchAcc fail: ins1.dest not InsertOp\n";
+              return false;
+            }
+            auto load0 =
+                ins0.getValueToStore().getDefiningOp<vector::LoadOp>();
+            if (!load0) {
+              llvm::errs() << "[nvgpu-mma-scalarize] matchAcc fail: ins0.stored not LoadOp\n";
+              return false;
+            }
+            auto rTy0 = dyn_cast<MemRefType>(load0.getBase().getType());
+            if (!rTy0 || !isGlobal(rTy0)) {
+              llvm::errs() << "[nvgpu-mma-scalarize] matchAcc fail: load0 not global\n";
+              return false;
+            }
+            // NOTE: we intentionally do NOT check isLoopInvariant on the load
+            // indices here. Indices like %20/%21/%24 are computed inside scf.if
+            // (from gpu.lane_id + constants) so a location-based check wrongly
+            // rejects them. hoistDep will correctly clone them before the loop.
+            // Write-back: mma result → vector.extract → memref.store (global).
+            SmallVector<vector::ExtractOp> extracts;
+            SmallVector<memref::StoreOp> stores;
+            for (auto &use : mmaOp.getResult().getUses()) {
+              auto extractOp = dyn_cast<vector::ExtractOp>(use.getOwner());
+              if (!extractOp) {
+                llvm::errs() << "[nvgpu-mma-scalarize] matchAcc fail: mma use not ExtractOp, use=";
+                llvm::errs() << use.getOwner()->getName() << "\n";
+                return false;
+              }
+              extracts.push_back(extractOp);
+              for (auto &euse : extractOp.getResult().getUses()) {
+                auto storeOp = dyn_cast<memref::StoreOp>(euse.getOwner());
+                if (!storeOp) {
+                  llvm::errs() << "[nvgpu-mma-scalarize] matchAcc fail: extract use not StoreOp\n";
+                  return false;
+                }
+                stores.push_back(storeOp);
+              }
+            }
+            if (extracts.empty()) {
+              llvm::errs() << "[nvgpu-mma-scalarize] matchAcc fail: mma has no uses\n";
+              return false;
+            }
+            info.mmaOp = mmaOp;
+            info.load0 = load0;
+            info.ins0 = ins0;
+            info.load1 = load1;
+            info.ins1 = ins1;
+            info.extracts = extracts;
+            info.stores = stores;
+            return true;
+          }
+
+          void runOnOperation() override {
+            gpu::GPUFuncOp funcOp = getOperation();
+            llvm::errs() << "[nvgpu-mma-scalarize] runOnOperation: "
+                         << funcOp.getName() << "\n";
+
+            // Collect K-loops that contain mma.sync ops.
+            SmallVector<scf::ForOp> kLoops;
+            funcOp.walk([&](scf::ForOp forOp) {
+              bool hasMma = false;
+              forOp.walk([&](nvgpu::MmaSyncOp) { hasMma = true; });
+              if (hasMma) kLoops.push_back(forOp);
+            });
+            llvm::errs() << "[nvgpu-mma-scalarize] found " << kLoops.size()
+                         << " for-loop(s) with mma.sync\n";
+
+            for (scf::ForOp forOp : kLoops) {
+              // Find a direct-child scf.if with no results that contains mma.sync.
+              scf::IfOp mmaIfOp;
+              unsigned nIf = 0, nIfMma = 0;
+              for (auto &op : forOp.getBody()->without_terminator()) {
+                auto ifOp = dyn_cast<scf::IfOp>(op);
+                if (!ifOp) continue;
+                ++nIf;
+                llvm::errs() << "[nvgpu-mma-scalarize]   scf.if nResults="
+                             << ifOp.getNumResults() << " hasElse="
+                             << ifOp.elseBlock() << "\n";
+                if (ifOp.getNumResults() != 0) continue;
+                bool innerMma = false;
+                ifOp.getThenRegion().walk(
+                    [&](nvgpu::MmaSyncOp) { innerMma = true; });
+                if (innerMma) { ++nIfMma; mmaIfOp = ifOp; break; }
+              }
+              llvm::errs() << "[nvgpu-mma-scalarize]   total scf.if direct-children="
+                           << nIf << " mmaIfFound=" << (mmaIfOp ? 1 : 0) << "\n";
+              if (!mmaIfOp) continue;
+              scalarizeKLoopNvgpu(forOp, mmaIfOp);
+            }
+          }
+
+          void scalarizeKLoopNvgpu(scf::ForOp forOp, scf::IfOp mmaIfOp) {
+            // 1. Collect mma.sync ops in program order from the then-block.
+            SmallVector<nvgpu::MmaSyncOp> mmaSyncs;
+            for (auto &op : mmaIfOp.thenBlock()->without_terminator())
+              if (auto mmaOp = dyn_cast<nvgpu::MmaSyncOp>(op))
+                mmaSyncs.push_back(mmaOp);
+            llvm::errs() << "[nvgpu-mma-scalarize] mma.sync count in then-block: "
+                         << mmaSyncs.size() << "\n";
+            if (mmaSyncs.empty()) return;
+
+            // 2. Match C accumulator pattern for each mma.sync.
+            SmallVector<AccInfo> accInfos;
+            for (auto mmaOp : mmaSyncs) {
+              AccInfo info;
+              if (!matchAcc(mmaOp, forOp, info)) {
+                llvm::errs() << "[nvgpu-mma-scalarize] ABORT: C pattern mismatch\n";
+                return;
+              }
+              accInfos.push_back(std::move(info));
+            }
+            llvm::errs() << "[nvgpu-mma-scalarize] scalarizing "
+                         << accInfos.size() << " C tiles in " << "\n";
+
+            OpBuilder builder(forOp);
+            Location loc = forOp.getLoc();
+            unsigned nOrig = forOp.getNumResults();
+            unsigned argBase = forOp.getNumRegionIterArgs();
+
+            // 3. Hoist C init sequences before the K-loop.
+            //    hoistDep(ins1.result) recursively clones load0→ins0→load1→ins1
+            //    before the loop; the cloned ins1 result is the pre-loop C tile.
+            SmallVector<Value> initCVecs;
+            for (auto &info : accInfos) {
+              IRMapping hoistMap;
+              llvm::DenseSet<Value> visited;
+              bool ok = hoistDep(info.ins1->getResult(0), forOp, builder,
+                                 hoistMap, visited);
+              if (!ok) {
+                llvm::errs() << "[nvgpu-mma-scalarize] ABORT: C init IV-dep\n";
+                return;
+              }
+              initCVecs.push_back(
+                  hoistMap.lookupOrDefault(info.ins1->getResult(0)));
+            }
+
+            // 4. Build new K-loop with extra iter_args for C tiles.
+            SmallVector<Value> newIterArgs(forOp.getInitArgs());
+            for (Value v : initCVecs) newIterArgs.push_back(v);
+            auto newFor = builder.create<scf::ForOp>(
+                loc, forOp.getLowerBound(), forOp.getUpperBound(),
+                forOp.getStep(), newIterArgs);
+
+            // 5. Set up clone mapping: old IV/iter_args → new; ins1 results → C iter_args.
+            IRMapping mapping;
+            mapping.map(forOp.getInductionVar(), newFor.getInductionVar());
+            for (unsigned i = 0; i < argBase; ++i)
+              mapping.map(forOp.getRegionIterArg(i),
+                          newFor.getRegionIterArg(i));
+            for (unsigned i = 0; i < accInfos.size(); ++i)
+              mapping.map(accInfos[i].ins1->getResult(0),
+                          newFor.getRegionIterArg(argBase + i));
+
+            // 6. Build set of ops to skip inside the then-block clone:
+            //    C init ops (replaced by iter_arg via mapping) and write-back ops.
+            DenseSet<Operation *> toSkip;
+            for (auto &info : accInfos) {
+              toSkip.insert(info.load0.getOperation());
+              toSkip.insert(info.ins0.getOperation());
+              toSkip.insert(info.load1.getOperation());
+              toSkip.insert(info.ins1.getOperation());
+              for (auto e : info.extracts) toSkip.insert(e.getOperation());
+              for (auto s : info.stores)   toSkip.insert(s.getOperation());
+            }
+
+            // 7. Clone K-loop body into newFor, handling mmaIfOp specially.
+            builder.setInsertionPointToStart(newFor.getBody());
+            SmallVector<Value> mmaIfResults;
+
+            for (auto &op : forOp.getBody()->getOperations()) {
+              if (&op == mmaIfOp.getOperation()) {
+                // Build result types: N × vector<2x2xf32>.
+                unsigned N = (unsigned)accInfos.size();
+                Type cTy = accInfos[0].mmaOp.getResult().getType();
+                SmallVector<Type> resultTypes(N, cTy);
+                Value newCond =
+                    mapping.lookupOrDefault(mmaIfOp.getCondition());
+                auto newMmaIf = builder.create<scf::IfOp>(
+                    loc, resultTypes, newCond, /*withElseRegion=*/true);
+
+                // Then-block: clone all ops except those in toSkip;
+                // capture mma.sync cloned results for the yield.
+                builder.setInsertionPointToStart(newMmaIf.thenBlock());
+                SmallVector<Value> thenYieldVals;
+                for (auto &thenOp :
+                     mmaIfOp.thenBlock()->without_terminator()) {
+                  if (toSkip.count(&thenOp)) continue;
+                  auto *cloned = builder.clone(thenOp, mapping);
+                  if (isa<nvgpu::MmaSyncOp>(thenOp))
+                    thenYieldVals.push_back(cloned->getResult(0));
+                }
+                builder.create<scf::YieldOp>(loc, thenYieldVals);
+
+                // Else-block: pass C iter_args through unchanged.
+                builder.setInsertionPointToStart(newMmaIf.elseBlock());
+                SmallVector<Value> elseYieldVals;
+                for (unsigned i = 0; i < N; ++i)
+                  elseYieldVals.push_back(
+                      newFor.getRegionIterArg(argBase + i));
+                builder.create<scf::YieldOp>(loc, elseYieldVals);
+
+                builder.setInsertionPointAfter(newMmaIf);
+                mmaIfResults.assign(newMmaIf.getResults().begin(),
+                                    newMmaIf.getResults().end());
+
+              } else if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
+                // Append scf.if C tile results to original yield operands.
+                SmallVector<Value> ys;
+                for (Value v : yieldOp.getOperands())
+                  ys.push_back(mapping.lookupOrDefault(v));
+                for (Value v : mmaIfResults) ys.push_back(v);
+                builder.create<scf::YieldOp>(loc, ys);
+
+              } else {
+                builder.clone(op, mapping);
+              }
+            }
+
+            // 8. Emit write-back stores inside scf.if (same guard as mmaIfOp)
+            //    after newFor. The guard preserves the original predication so
+            //    inactive threads (condition false) do not write to global memory.
+            builder.setInsertionPointAfter(newFor);
+            // The condition is defined before the K-loop, so it's accessible here.
+            Value wbCond = mapping.lookupOrDefault(mmaIfOp.getCondition());
+            auto wbIf = builder.create<scf::IfOp>(loc, wbCond,
+                                                  /*withElseRegion=*/false);
+            builder.setInsertionPointToStart(wbIf.thenBlock());
+
+            // Shared hoistDep state across all stores so deps are only cloned once.
+            IRMapping wbMap;
+            llvm::DenseSet<Value> vis;
+            for (unsigned i = 0; i < accInfos.size(); ++i) {
+              Value finalC = newFor.getResult(nOrig + i);
+              auto &info = accInfos[i];
+              // Map old mma result → final K-loop result so hoistDep clones
+              // the vector.extract with finalC as its vector source.
+              wbMap.map(info.mmaOp.getResult(), finalC);
+              for (auto storeOp : info.stores) {
+                (void)hoistDep(storeOp.getValue(), forOp, builder, wbMap, vis);
+                (void)hoistDep(storeOp.getMemref(), forOp, builder, wbMap, vis);
+                for (Value idx : storeOp.getIndices())
+                  (void)hoistDep(idx, forOp, builder, wbMap, vis);
+                builder.clone(*storeOp, wbMap);
+              }
+            }
+
+            // 9. Replace original K-loop results and erase old loop.
+            for (unsigned i = 0; i < nOrig; ++i)
+              forOp.getResult(i).replaceAllUsesWith(newFor.getResult(i));
+            forOp.erase();
+          }
+
+          StringRef getArgument() const override {
+            return "nova-nvgpu-mma-scalarize";
+          }
+        };
+        return std::make_unique<NvgpuMmaScalarizePass>();
+      }());
+      gpuHwPm.addPass(createCanonicalizerPass());
     }
 
     // -------------------------------------------------------------------------
@@ -1272,6 +1990,12 @@ namespace mlir::nova
         return std::make_unique<VectorToSCFOnGPUFuncPass>();
     }());
 
+  {
+    auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
+    gpuPm.addPass(createNovaGPUSwizzleSharedMemoryPass());
+    pm.addNestedPass<func::FuncOp>(createNovaGPUReduceBankConflictsPass());
+    gpuPm.addPass(createCanonicalizerPass());
+  }
     // 38d2. ConvertVectorToLLVM on GPU kernels — BEFORE ConvertGpuOpsToNVVMOps.
     //
     // CRITICAL: The funcPm.nest<gpu::GPUFuncOp>() block below (38j-n) is
@@ -1430,6 +2154,7 @@ namespace mlir::nova
     registerNovaGPUPipeliningPass();
     registerNovaStrideReductionPass();
     registerNovaDirectReductionLoweringPass();
+    registerNovaGPUSwizzleSharedMemoryPass();
 
     // Register the full optimized pipeline as a named pipeline so it can be
     // invoked from mlir-opt with --nova-gpu-optimized-pipeline.

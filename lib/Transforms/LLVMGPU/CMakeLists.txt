@@ -64,8 +64,9 @@ add_mlir_library(NovaLLVMGPUTransforms
   # Eliminate tensor.empty ops pre-bufferization
   Memory/NovaEliminateEmptyTensors.cpp
   Memory/NovaRepositionStore.cpp
-  Memory/NovaGPUApplySwizzle.cpp
+  Memory/NovaGPUSwizzleSharedMemory.cpp
   Memory/NovaGPUReduceBankConflicts.cpp
+
   # ── Loops ─────────────────────────────────────────────────────────────────
   # Unroll scf loops
   Loops/NovaScfLoopUnroll.cpp
