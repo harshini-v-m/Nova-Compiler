@@ -107,35 +107,37 @@ static LogicalResult setContractionAnchor(linalg::LinalgOp contract,
     return contract->emitError(
         "setContractionAnchor: dynamic iteration space");
 
-  // numSubgroups comes from wg_subgroup (non-reduction dims only).
-  // The contraction runs inside a warp forall of shape wg_subgroup, so each
-  // warp tile is bounds[i] / wg_subgroup[i]. DistributeTransferWrite uses
-  // numSubgroups to assign disjoint accumulator regions to each warp; if it
-  // is all-ones the pass incorrectly predicates all writes on warp_id == 0.
-  SmallVector<int64_t> wgSubgroup = getLoweringConfigTileSizes(config, kWgSubgroupKey);
-  wgSubgroup.resize(rank, 1);
-
+  // By the time this pass runs, ApplyTilingLevelSubgroupPass has already
+  // created the warp-level scf.forall. getStaticLoopRanges() returns per-warp
+  // bounds — the workgroup→warp split is already done. The contraction lives
+  // inside a single warp's forall body, so numSubgroups is all-ones: there is
+  // exactly one subgroup (warp) executing this op.
+  //
+  // VectorDistribute computes workgroupSize = sgProd * warpSize from the layout.
+  // With numSubgroups=1, sgProd=1 and workgroupSize=warpSize=32, which is
+  // correct: distributeVectorOps runs on the warp forall body (32 threads).
   SmallVector<int64_t> numSubgroups(rank, 1);
-  for (int64_t i = 0; i < rank; ++i) {
-    if (wgSubgroup[i] > 1 && bounds[i] > 0)
-      numSubgroups[i] = wgSubgroup[i];
-  }
+  SmallVector<int64_t> subgroupStrides(rank, 0);
 
-  // Divide bounds by subgroup count so batchCounts reflects the per-warp tile.
-  for (int64_t i = 0; i < rank; ++i)
-    if (numSubgroups[i] > 1)
-      bounds[i] = llvm::divideCeil(bounds[i], numSubgroups[i]);
-
-  // Row-major subgroup strides: dims with numSubgroups==1 get stride 0.
-  SmallVector<int64_t> subgroupStrides = stridesFromBasis(numSubgroups);
-  for (int64_t i = 0; i < rank; ++i)
-    if (numSubgroups[i] <= 1)
-      subgroupStrides[i] = 0;
-
-  // batchCounts = ceil(bounds[i] / mmaShape[i]): how many MMA tiles each
-  // warp executes per dimension.
+  // batchCounts = ceil(per-warp bounds / MMA tile size): how many MMA tiles
+  // this warp executes per dimension.
+  //
+  // IMPORTANT: only the three innermost MMA dims (M, N, K) contribute tiles
+  // > 1. All other dims — batch dims and any leading M/N dims in batch_matmul
+  // — must keep batchCount = 1 because each warp already owns exactly one
+  // slice along those dimensions (the subgroup forall has tiled them to 1
+  // before this pass runs). Allowing batchCount > 1 for non-MMA dims would
+  // make NVIDIADistributeContract iterate extract positions that exceed the
+  // projected acc vector's leading dimension size (Bug: position [1,0] into
+  // vector<1x...>).
   SmallVector<int64_t> batchCounts(rank, 1);
   for (int64_t i = 0; i < rank; ++i) {
+    // Only compute MMA-tile counts for the three innermost contraction dims.
+    bool isMmaDim = (i == innerMDim || i == innerNDim || i == innerKDim);
+    if (!isMmaDim) {
+      batchCounts[i] = 1;
+      continue;
+    }
     int64_t mmaSize = 1;
     if (i == innerMDim) mmaSize = mnkShape.m;
     else if (i == innerNDim) mmaSize = mnkShape.n;

@@ -1116,9 +1116,18 @@ struct NVIDIADistributeContract final
 
     // Batch counts: from acc layout (result dims) and lhs layout (K dim).
     SmallVector<int64_t> resultBatches(accLayout.getBatchTile());
-    // K batch count: last non-1 batch entry in lhsLayout (the reduction dim).
-    // For rank-3 batch_matmul lhsLayout batch=[B,M,K], K is the last dim.
-    int64_t kBatchCount = lhsLayout.getBatchTile().back();
+
+    // K batch count: look up the batch count for the K iter-dim(s) in the LHS
+    // layout, NOT simply .back(). The LHS indexing map may permute dimensions
+    // (e.g. `(d1, d0)` for a transposed LHS), so .back() would return the
+    // M-batch count instead of the K-batch count.
+    //
+    // We derive kIterDims below from the maps, so we first do a quick scan to
+    // find which LHS result-dim position corresponds to the K iter dim.
+    // For now, identify K-result-dims as those NOT appearing in the ACC map.
+    // We compute the final kBatchCount after kIterDims is built (see below).
+    // Initialise to 1; corrected after kIterDims is populated.
+    int64_t kBatchCount = 1;
 
     // Indexing maps for projecting result/K batch offsets → operand offsets.
     // The contract indexing maps tell us which iteration dims each operand uses.
@@ -1171,6 +1180,28 @@ struct NVIDIADistributeContract final
     }
     // kIterDims should have exactly 1 entry for a standard matmul contraction.
 
+    // Now compute the correct kBatchCount: the batch count for the K-reduction
+    // dim(s) in the LHS layout. We find which LHS result-dim positions carry K
+    // iter dims, then read those from lhsLayout.getBatchTile().
+    //
+    // Example: LHS map `(d1, d0) → [K=d1, M=d0]` with batch_tile=[1, 2]:
+    //   result-dim 0 = d1 (K iter dim) → K-batch = lhsBatchTile[0] = 1 ✓
+    //   result-dim 1 = d0 (M iter dim) → M-batch = lhsBatchTile[1] = 2
+    // Using .back() would have given M-batch=2 as kBatchCount, causing OOB.
+    {
+      DenseSet<int64_t> kIterDimSet(kIterDims.begin(), kIterDims.end());
+      SmallVector<int64_t> lhsBatch(lhsLayout.getBatchTile());
+      for (auto [resultDimIdx, expr] : llvm::enumerate(lhsMap.getResults())) {
+        if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
+          if (kIterDimSet.count(dimExpr.getPosition()) &&
+              resultDimIdx < lhsBatch.size()) {
+            // Take the max in case of multiple K dims (e.g. depth-wise convs).
+            kBatchCount = std::max(kBatchCount, lhsBatch[resultDimIdx]);
+          }
+        }
+      }
+    }
+
     // Helper: given an indexing map, build the operand batch offset vector
     // using the current result batch offsets and the k index.
     auto buildOperandBatchOff =
@@ -1196,8 +1227,38 @@ struct NVIDIADistributeContract final
     // Iterate over result batches (all acc batch dims, e.g. [B, M, N] for rank-3).
     SmallVector<int64_t> resultBatchShape(resultBatches);
     SmallVector<int64_t> resultBatchTile(resultBatches.size(), 1);
+
+    // Helper: validate that a batch-offset vector is in-bounds for a given
+    // distributed vector. Returns failure() with a diagnostic on violation.
+    // This guards against layout/batchCounts mismatches that would otherwise
+    // produce illegal vector.extract ops (e.g. position [1,0] into vector<1x...>).
+    auto validateExtractPos = [&](Value vec, ArrayRef<int64_t> pos,
+                                  StringRef label) -> LogicalResult {
+      auto vecTy = dyn_cast<VectorType>(vec.getType());
+      if (!vecTy)
+        return success(); // scalar — no dimension to check
+      ArrayRef<int64_t> shape = vecTy.getShape();
+      for (auto [i, p] : llvm::enumerate(pos)) {
+        if (i >= shape.size()) break; // extract leaves trailing dims
+        if (p < 0 || p >= shape[i]) {
+          return op.emitOpError()
+              << "NVIDIADistributeContract: " << label
+              << " extract position[" << i << "]= " << p
+              << " is out-of-bounds for dim size " << shape[i]
+              << " (distributed vector " << vecTy << ")."
+              << " Check batchCounts in setContractionAnchor.";
+        }
+      }
+      return success();
+    };
+
     for (auto [batchIdx, resultBatchOffsets] :
          llvm::enumerate(StaticTileOffsetRange(resultBatchShape, resultBatchTile))) {
+
+      // Validate before creating the extract to catch layout mismatches early.
+      if (failed(validateExtractPos(distAcc, resultBatchOffsets, "acc")))
+        return rewriter.notifyMatchFailure(
+            op, "acc extract position out-of-bounds (batchCounts mismatch)");
 
       // Start accumulator slice from distAcc at this batch offset.
       Value accSlice = vector::ExtractOp::create(
@@ -1210,6 +1271,14 @@ struct NVIDIADistributeContract final
             buildOperandBatchOff(lhsMap, resultBatchOffsets, k);
         SmallVector<int64_t> rhsBatchOff =
             buildOperandBatchOff(rhsMap, resultBatchOffsets, k);
+
+        // Validate operand extract positions before creation.
+        if (failed(validateExtractPos(distLhs, lhsBatchOff, "lhs")))
+          return rewriter.notifyMatchFailure(
+              op, "lhs extract position out-of-bounds (batchCounts mismatch)");
+        if (failed(validateExtractPos(distRhs, rhsBatchOff, "rhs")))
+          return rewriter.notifyMatchFailure(
+              op, "rhs extract position out-of-bounds (batchCounts mismatch)");
 
         Value lhsSlice = vector::ExtractOp::create(
             rewriter, loc, distLhs, lhsBatchOff);
