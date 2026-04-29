@@ -165,16 +165,6 @@ void registerNovaConvertSharedMemAllocsPass();
 std::unique_ptr<Pass> createNovaGPUMapForallToGPUPass();
 void registerNovaGPUMapForallToGPUPass();
 
-// Hoists the matmul C accumulator's vector.transfer_read/transfer_write pair
-// out of the K-loop after MapForallToGPU has flattened the warp scf.forall.
-// Without this, bufferization aliased the C iter_arg with a global memref
-// subview and every K-iteration became a load/mma/store round trip to HBM.
-// Runs upstream linalg::hoistRedundantVectorTransfers on each scf.for in the
-// function — must run AFTER MapForallToGPU (so warp foralls are flat scf.if
-// blocks, no longer hiding the read/write inside a parallel region) and
-// BEFORE CreateAsyncCopies / Pipelining / MaterializeDynamicSharedMem.
-std::unique_ptr<Pass> createNovaGPUHoistAccumulatorPass();
-void registerNovaGPUHoistAccumulatorPass();
 
 // Converts #gpu.address_space attributes on memref types to integer address
 // spaces appropriate for NVVM/LLVM lowering.
@@ -259,8 +249,8 @@ void registerNovaMultiConsumerFusion();
 std::unique_ptr<Pass> createNovaGPUReduceBankConflictsPass(
     StringRef arch = "sm_86");
 void registerNovaGPUReduceBankConflictsPass();
-std::unique_ptr<Pass> createNovaGPUApplySwizzlePass();
-void registerNovaGPUApplySwizzlePass();
+std::unique_ptr<Pass> createNovaGPUSwizzleSharedMemoryPass();
+void registerNovaGPUSwizzleSharedMemoryPass();
 
 // ---------------------------------------------------------------------------
 // Vectorization Passes  (Batch 1: declarations; wired into pipeline in Batch 2+)

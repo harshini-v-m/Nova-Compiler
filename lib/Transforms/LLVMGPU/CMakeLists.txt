@@ -66,8 +66,9 @@ add_mlir_library(NovaLLVMGPUTransforms
   # Eliminate tensor.empty ops pre-bufferization
   Memory/NovaEliminateEmptyTensors.cpp
   Memory/NovaRepositionStore.cpp
-  Memory/NovaGPUApplySwizzle.cpp
+  Memory/NovaGPUSwizzleSharedMemory.cpp
   Memory/NovaGPUReduceBankConflicts.cpp
+
   # ── Loops ─────────────────────────────────────────────────────────────────
   # Unroll scf loops
   Loops/NovaScfLoopUnroll.cpp
@@ -83,8 +84,6 @@ add_mlir_library(NovaLLVMGPUTransforms
   Loops/NovaWarpShuffleReduction.cpp
   # Stride-32 parallelization for single-thread reductions
   Loops/NovaStrideReduction.cpp
-  # Hoist matmul C accumulator out of K-loop (post-MapForallToGPU)
-  Loops/NovaGPUHoistAccumulator.cpp
 
   # ── Lowering ──────────────────────────────────────────────────────────────
   # Convert scf.forall → gpu.launch with dynamic block dims

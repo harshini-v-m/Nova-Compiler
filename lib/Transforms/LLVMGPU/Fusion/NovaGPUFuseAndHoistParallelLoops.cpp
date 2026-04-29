@@ -122,11 +122,59 @@ static bool sameGpuMappingKind(scf::ForallOp a, scf::ForallOp b) {
          (isWarpMappedForall(a)   && isWarpMappedForall(b));
 }
 
-// (fuseEquivalent helper removed — making FuseForalls fire for sibling
-//  warp-foralls also needs the fast-path inlining to map producer's
-//  shared_outs through to the consumer's destination, not just to the
-//  producer's tensor.empty init. That's a deeper rewrite — out of scope
-//  for the current change.)
+/// Values `a` (from consumer scope) and `b` (from producer scope) are
+/// "fuse-equivalent" under the per-dim producer→consumer IV mapping, plus a
+/// mapping between the producer's shared_outs region iter args and their
+/// corresponding forall result values.
+///
+/// Needed because FuseForalls's default subset-equivalence check compares
+/// Values by SSA identity: when both foralls compute their per-warp offset
+/// as `affine.apply<(d0) -> (d0 * 64)>(%IV)`, they produce *different* SSA
+/// values because each forall has its own IV, so the strict check rejects
+/// fusion even though the math is identical. Similarly, the producer writes
+/// into its own `%arg_outs` (a block arg of the producer body) while the
+/// consumer reads from the producer forall's *result* %P — semantically the
+/// same tensor but different SSA values. Both equivalences are needed for
+/// sibling-forall fusion (e.g. matmul warp-forall + epilogue warp-forall).
+/// Captured loop-invariants still match by SSA identity.
+static bool fuseEquivalent(Value a, Value b,
+                           ArrayRef<Value> producerIVs,
+                           ArrayRef<Value> consumerIVs,
+                           ArrayRef<Value> producerBodyOuts,
+                           ArrayRef<Value> producerForallResults) {
+  if (a == b) return true;
+  // IV remap: producer IV at position i ≡ consumer IV at same position.
+  for (auto [i, pIV] : llvm::enumerate(producerIVs)) {
+    if (b == pIV) return a == consumerIVs[i];
+  }
+  for (auto [i, cIV] : llvm::enumerate(consumerIVs)) {
+    if (a == cIV) return b == producerIVs[i];
+  }
+  // shared_outs remap: producer body's iter-arg ≡ producer forall's result
+  // when viewed from outside the producer. The consumer reads from the
+  // forall's result; the producer writes to its iter-arg — after fusion these
+  // refer to the same tensor.
+  for (auto [iterArg, result] :
+       llvm::zip_equal(producerBodyOuts, producerForallResults)) {
+    if ((a == result && b == iterArg) ||
+        (a == iterArg && b == result))
+      return true;
+  }
+  // affine.apply: same map with fuse-equivalent operands.
+  auto applyA = a.getDefiningOp<affine::AffineApplyOp>();
+  auto applyB = b.getDefiningOp<affine::AffineApplyOp>();
+  if (!applyA || !applyB) return false;
+  if (applyA.getAffineMap() != applyB.getAffineMap()) return false;
+  if (applyA.getOperands().size() != applyB.getOperands().size())
+    return false;
+  for (auto [oa, ob] :
+       llvm::zip_equal(applyA.getOperands(), applyB.getOperands())) {
+    if (!fuseEquivalent(oa, ob, producerIVs, consumerIVs,
+                        producerBodyOuts, producerForallResults))
+      return false;
+  }
+  return true;
+}
 
 /// Checks whether a forall's flat trip count equals `flatWorkgroupSize`.
 static bool tripCountMatchesWorkgroupSize(scf::ForallOp forallOp,
@@ -360,9 +408,24 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
     // fusion can create invalid IR when the producer and consumer distribute
     // their threads differently over shared dimensions (e.g., layer norm with
     // K-per-thread=4 fused into matmul with K-per-thread=16).
+    //
+    // Use an IV-aware equivalence fn so that two affine.apply ops built from
+    // the producer's and consumer's own IVs — but with the same map and
+    // positionally-matching IVs — count as equivalent. Needed when producer
+    // and consumer are sibling foralls (e.g. matmul warp-forall + bias-add
+    // warp-forall) that each compute their own warp offsets.
+    SmallVector<Value> producerIVs = producerForall.getInductionVars();
+    SmallVector<Value> consumerIVs = consumerForall.getInductionVars();
+    SmallVector<Value> producerBodyOuts(producerForall.getRegionIterArgs().begin(),
+                                        producerForall.getRegionIterArgs().end());
+    SmallVector<Value> producerForallResults(producerForall.getResults().begin(),
+                                             producerForall.getResults().end());
+    auto equivalenceFn = [&](Value v1, Value v2) {
+      return fuseEquivalent(v1, v2, producerIVs, consumerIVs,
+                            producerBodyOuts, producerForallResults);
+    };
     if (!cast<SubsetOpInterface>(*consumerSlice).operatesOnEquivalentSubset(
-            cast<SubsetOpInterface>(*producerInsert),
-            [](Value v1, Value v2) { return v1 == v2; }))
+            cast<SubsetOpInterface>(*producerInsert), equivalenceFn))
       return rewriter.notifyMatchFailure(
           producerForall,
           "producer insert and consumer extract operate on incompatible "
@@ -413,6 +476,24 @@ struct FuseForalls final : OpRewritePattern<scf::ForallOp> {
     if (!emptyOp)
       return rewriter.notifyMatchFailure(
           producerForall, "producer dest is not tensor.empty");
+
+    // Guard: skip barrier-path fusion when the shared buffer would exceed the
+    // conservative 32 KB smem budget reserved for intermediate tiles.
+    // A 128×128×f32 C-tile = 64 KB; fusing it pushes main_kernel over the
+    // sm_86 extended-smem limit of ~97 KB when added to A+B double-buffered
+    // tiles (~36 KB). Let the matmul write to global memory instead.
+    {
+      auto tensorTy = dyn_cast<RankedTensorType>(emptyOp.getResult().getType());
+      if (tensorTy && tensorTy.hasStaticShape()) {
+        int64_t elemBits = tensorTy.getElementTypeBitWidth();
+        int64_t byteSize = (tensorTy.getNumElements() * elemBits + 7) / 8;
+        static constexpr int64_t kMaxFusionSmemBytes = 32 * 1024; // 32 KB
+        if (byteSize > kMaxFusionSmemBytes)
+          return rewriter.notifyMatchFailure(
+              producerForall,
+              "shared-mem buffer too large for barrier-path fusion");
+      }
+    }
 
     rewriter.setInsertionPointToStart(consumerForall.getBody());
     Attribute sharedMemAddrSpace = gpu::AddressSpaceAttr::get(

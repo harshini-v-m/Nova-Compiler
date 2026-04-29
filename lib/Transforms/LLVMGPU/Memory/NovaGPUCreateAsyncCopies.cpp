@@ -266,15 +266,6 @@ struct NovaGPUCreateAsyncCopiesPass
                     vector::VectorDialect, affine::AffineDialect>();
   }
 
-  // Returns the parent Block whose contents are scanned linearly for grouping.
-  // Two transfer pairs are placed in the same cp.async group iff they live in
-  // the same block. (For Nova that's typically the body of one
-  // `scf.forall (thread)` — one A-tile copy per thread, then a separate forall
-  // for B; the result is two groups per K-iteration.)
-  static Block *groupingBlock(vector::TransferWriteOp tw) {
-    return tw->getBlock();
-  }
-
   void runOnOperation() override {
     FunctionOpInterface funcOp = getOperation();
     if (funcOp.getFunctionBody().empty())
@@ -299,7 +290,6 @@ struct NovaGPUCreateAsyncCopiesPass
     size_t i = 0;
     while (i < candidates.size()) {
       scf::ForOp loop = candidates[i]->getParentOfType<scf::ForOp>();
-      Block *loopBody = loop.getBody();
 
       size_t j = i + 1;
       while (j < candidates.size() && candidates[j]->getParentOfType<scf::ForOp>() == loop)
@@ -317,14 +307,14 @@ struct NovaGPUCreateAsyncCopiesPass
           continue;
 
         SmallVector<Value> pairTokens;
-        builder.setInsertionPoint(tw);
         if (failed(convertPairToAsync(tw, tr, pairTokens, builder)))
           continue;
 
-        Operation *stage0Op = tw;
-        if (auto ifOp = tw->getParentOfType<scf::IfOp>())
-          stage0Op = ifOp;
-        stage0Op->setAttr("__pipelining_first_stage__", builder.getUnitAttr());
+        // Tag every cp.async op as Stage 0 so the pipeliner moves them
+        // to the prologue (same stage as the create_group commit).
+        for (Value tok : pairTokens)
+          if (auto copyOp = tok.getDefiningOp<nvgpu::DeviceAsyncCopyOp>())
+            copyOp->setAttr("__pipelining_first_stage__", builder.getUnitAttr());
 
         erasedWrites.push_back(tw);
         erasedReads.push_back(tr);
@@ -332,23 +322,37 @@ struct NovaGPUCreateAsyncCopiesPass
       }
 
       if (!tokens.empty()) {
-        // Find the last Stage 0 operation to insert the sync after it.
-        // This ensures dominance of all tokens.
         Operation *lastOp = erasedWrites.back();
         if (auto ifOp = lastOp->getParentOfType<scf::IfOp>())
           lastOp = ifOp;
 
-        // Single group commit for the whole iteration.
-        // We use an empty operand list to commit ALL pending copies.
+        builder.setInsertionPointAfter(lastOp);
+
+        // Keep ValueRange{} (no explicit token operands). In PTX,
+        // cp.async.commit_group always commits all currently-pending cp.async
+        // operations from the calling thread — including those inside the
+        // scf.if predicated block above — regardless of the MLIR operand list.
+        // Passing the actual tokens would cause a dominance violation because
+        // the tokens are defined inside the scf.if block and cannot be
+        // referenced outside it.
         auto grp = builder.create<nvgpu::DeviceAsyncCreateGroupOp>(
             candidates[i].getLoc(), tokenTy, ValueRange{});
-        // Tag the commit as Stage 0 so it moves to prologue with copies.
+
+        // Stage 0 marker: pipeliner places copies + commit in the prologue.
         grp->setAttr("__pipelining_first_stage__", builder.getUnitAttr());
 
+        // wait(0) gives serial semantics; the pipelining pass rewrites
+        // numGroups → depth-1 to actually overlap copies with compute.
         builder.create<nvgpu::DeviceAsyncWaitOp>(
             candidates[i].getLoc(), grp.getResult(), /*numGroups=*/nullptr);
         builder.create<gpu::BarrierOp>(candidates[i].getLoc());
-        
+
+        // Mark the parent K-loop so the pipeliner can identify it.
+        // IREE's pipelining pass uses kPipeliningLoopMarker (__pipelining_K_loop__)
+        // to select which scf.for loops to software-pipeline.
+        if (loop)
+          loop->setAttr("__pipelining_K_loop__", builder.getUnitAttr());
+
         numGroups++;
         numCopies += tokens.size();
       }
