@@ -222,6 +222,23 @@ struct NovaGPUComprehensiveBufferizePass
       moduleOp.emitOpError("GPU-aware bufferization failed");
       return signalPassFailure();
     }
+
+    // Convert linalg.copy {nova.promote_to_workgroup} on memrefs → memref.copy
+    // so that ConvertMemRefToGpu can match the global→workgroup pattern and emit
+    // nvgpu.device_async_copy. ConvertLinalgToLoops (which runs later) would
+    // otherwise dissolve these into load/store loops that ConvertMemRefToGpu
+    // cannot recognize.
+    SmallVector<linalg::CopyOp> promoteCopies;
+    moduleOp.walk([&](linalg::CopyOp copyOp) {
+      if (copyOp->hasAttr("nova.promote_to_workgroup"))
+        promoteCopies.push_back(copyOp);
+    });
+    IRRewriter rewriter2(moduleOp.getContext());
+    for (linalg::CopyOp copyOp : promoteCopies) {
+      rewriter2.setInsertionPoint(copyOp);
+      rewriter2.replaceOpWithNewOp<memref::CopyOp>(
+          copyOp, copyOp.getInputs()[0], copyOp.getOutputs()[0]);
+    }
   }
 
   StringRef getArgument() const override {

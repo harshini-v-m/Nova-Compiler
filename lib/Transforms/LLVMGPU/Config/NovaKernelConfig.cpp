@@ -526,14 +526,28 @@ getContractionHeuristicSeeds(const ContractProblem &problem,
    if (problem.inBitWidth <= 16)
      return GPUMMAHeuristicSeeds{4, 64, 4, 4,
                                  /*boostMNT=*/std::nullopt, /*util=*/0.80};
-   // f32 / TF32: target a 128x128x8 workgroup tile with a 2x2 warp grid
-   // (matches eager sgemm and NovaToGpu direct-lowering). Keep K-tile
-   // small so the A+B SMEM footprint stays under 48 KB and
-   // fitScheduleInSharedMemory doesn't shrink the MN tile.
-   //   wgM = mSize*MNT*S = 16*4*4 = 256 → reshape to 2x2 warp grid → 128
-   //   wgN = nSize*MNT   = 8*4      =  32 → reshape doubles → 128
-   //   wgK = kSize*Ktiles= 8*1      =   8
-   return GPUMMAHeuristicSeeds{4, 8, 4, 1,
+   // f32 / TF32: target a 128x128x32 workgroup tile with a 2x2 warp grid.
+   //
+   // Seeds: {MNT=4, kElem=8, S=4, kTiles=4}
+   //
+   // Before 2x2 reshape: wgM = 16*4*4 = 256, wgN = 8*4 = 32.
+   // After 2x2 reshape (fires for VeryLarge when nTiles has headroom):
+   //   subgroupCountM=2, subgroupCountN=2, nTileCount=8
+   //   wgM = 16*4*2 = 128,  wgN = 8*8*2 = 128.
+   //
+   // K-step: bestKTileCountPerSubgroup=4 → wgK = 8*4 = 32.
+   // Raises arithmetic intensity from ~1 FLOP/byte (K=8) to ~8 FLOP/byte,
+   // keeping the 3-stage async pipeline full.
+   // SMEM: 2*(128*32*4 + 32*128*4) = ~49 KB; fitScheduleInSharedMemory
+   // clamps wgK to 16 if target is strictly 48 KB.
+   //
+   // Register spill note: per-warp tile is 64x64, FR_M=4, FR_N=8 → 128
+   // acc regs/warp. Resolve this in matmul.cpp by reducing WARP_N to 32
+   // (FR_N=4, 64 regs/warp). The workgroup tile stays 128x128 for occupancy.
+   //
+   // Single canonical tile: all matmul ops in a function share this seed,
+   // so forward/dX/dW all produce the same tile regime regardless of shape.
+   return GPUMMAHeuristicSeeds{4, 8, 4, 4,
                                /*boostMNT=*/std::nullopt, /*util=*/0.80};
  }
  return std::nullopt;
@@ -1513,7 +1527,13 @@ LogicalResult setContractConfig(linalg::LinalgOp op,
 
 
  FusedOpMemoryInfo fusedInfo = analyzeFusedLeadingOp(op, dims);
- bool doCPromotion = readingExistingAccBuffer(op);
+ // C-promotion is never needed for contraction ops: each warp accumulates
+ // into registers and writes directly to global memory in the epilogue.
+ // The promotion pass (NovaGPUPromoteMatmulOperands) already guards against
+ // this — it silently skips result operands for isaContractionOpInterface ops
+ // (see promoteResultToShared guard). Setting doCPromotion=true only adds
+ // wgM*wgN*4 bytes to the SMEM budget, shrinking the tile for no benefit.
+ bool doCPromotion = false;
 
 
  int numLoops = op.getNumLoops();

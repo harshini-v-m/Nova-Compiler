@@ -113,9 +113,15 @@ static LogicalResult setContractionAnchor(linalg::LinalgOp contract,
   // inside a single warp's forall body, so numSubgroups is all-ones: there is
   // exactly one subgroup (warp) executing this op.
   //
-  // VectorDistribute computes workgroupSize = sgProd * warpSize from the layout.
-  // With numSubgroups=1, sgProd=1 and workgroupSize=warpSize=32, which is
-  // correct: distributeVectorOps runs on the warp forall body (32 threads).
+  // DistributeTransferWrite's getNoOverlapCondition uses the layout's
+  // subgroupTile/subgroupStrides to predicate writes. With numSubgroups=1 and
+  // subgroupStrides=0, all warp-level predication collapses to thread-level.
+  // The workgroupSize passed to DistributeTransferWrite (from VectorDistribute)
+  // computes outer = workgroupSize / threadBasis, which correctly spreads the
+  // 128 threads (4 warps × 32) across all 4 warp slots without false predication
+  // — as long as workgroupSize reflects the true MMA thread count (128), not
+  // the non-MMA fill thread count (256). The VectorDistribute MMA-only scan
+  // ensures this.
   SmallVector<int64_t> numSubgroups(rank, 1);
   SmallVector<int64_t> subgroupStrides(rank, 0);
 

@@ -99,9 +99,13 @@ struct ConvertSharedMemAllocOp : public OpRewritePattern<memref::AllocOp> {
       } else if (elType.isIndex()) {
         alignment = 8; // 64-bit index type
       } else {
-        // Alignment must be at least 1 byte and a power of 2.
-        alignment = std::max<uint64_t>(
+        // Use 128-byte alignment to enable v2.b64 vectorized SMEM stores
+        // (ld.global.v2.b64 / st.shared.v2.b64). The PTX ISA only emits
+        // 128-bit vector memory ops when the buffer is 128-byte aligned.
+        // Minimum 1 byte, power-of-2, clamped up to 128 for f32/f16 tiles.
+        uint64_t elemAlign = std::max<uint64_t>(
             llvm::PowerOf2Ceil(elType.getIntOrFloatBitWidth() / 8), 1);
+        alignment = std::max<uint64_t>(elemAlign, 128);
       }
     }
 

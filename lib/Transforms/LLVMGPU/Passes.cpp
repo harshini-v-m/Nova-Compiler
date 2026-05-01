@@ -101,7 +101,7 @@ namespace mlir::nova
 
 
     pm.addNestedPass<mlir::func::FuncOp>(createFuseMatmulBiasPass());
-    pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
+    // pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
@@ -179,10 +179,6 @@ namespace mlir::nova
     // ── Step 6.75: Lower barrier regions ───────────────────────────────────
     pm.addNestedPass<func::FuncOp>(createNovaGPULowerBarrierRegionPass());
 
-    pm.addPass(createLinalgGeneralizeNamedOpsPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
-
     pm.addNestedPass<func::FuncOp>(createNovaVectorizeVectorExtOpsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
@@ -215,23 +211,15 @@ namespace mlir::nova
     pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
     pm.addPass(createCanonicalizerPass());
 
+    // Generalize remaining named linalg ops (linalg.copy {nova.promote_to_workgroup}
+    // is already gone after bufferization, so this is safe here).
+    pm.addPass(createLinalgGeneralizeNamedOpsPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
 
-
-    // ── Step 9: Lower linalg → scf loops (before forall→launch conversion) ──
-    // ConvertLinalgToLoops has no dependency on gpu.launch. Running it here
-    // lets the canonicalizer clean up the IR while constants are still at
-    // function scope (harmless at this stage — no gpu.launch exists yet so
-    // the outliner cannot capture them). After canonicalize the IR is clean
-    // and no new vector constants will be created.
     pm.addPass(createConvertLinalgToLoopsPass());
     pm.addPass(createCanonicalizerPass());
-
-    // ── Step 10: scf.forall → gpu.launch ───────────────────────────────────
-    // Runs on fully-canonicalized IR. MapForallToGPU's post-conversion Step 9
-    // clones function-scope constants / workgroup allocs / gpu.thread_id into
-    // every gpu.launch body that uses them and erases the originals. No
-    // canonicalizer/CSE runs after this — that would re-hoist the constants
-    // back to function scope before the outliner sees them.
+    
     pm.addNestedPass<func::FuncOp>(createNovaGPUMapForallToGPUPass());
 
     // ── Step 11: Insert workgroup barriers ──────────────────────────────────
@@ -347,7 +335,7 @@ namespace mlir::nova
     GpuNVVMAttachTargetOptions nvvmTargetOptions;
     nvvmTargetOptions.triple = "nvptx64-nvidia-cuda";
     nvvmTargetOptions.chip = arch.str();
-    nvvmTargetOptions.features = "+ptx76";
+    nvvmTargetOptions.features = "+ptx86";
     nvvmTargetOptions.optLevel = 3;
     nvvmTargetOptions.fastFlag = true;
     nvvmTargetOptions.ftzFlag = true;
