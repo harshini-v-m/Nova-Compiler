@@ -618,6 +618,102 @@ struct SplitTransferReadExtract
 };
 
 //===----------------------------------------------------------------------===//
+// §4b  FoldExtractFromInsertStridedSliceChain
+//
+// Fold vector.extract(vector.insert_strided_slice chain) → tile source value.
+//
+// The VectorDistribute pass builds an N-D aggregate by chaining inserts:
+//
+//   %a = vector.insert_strided_slice %tile0, %init  {offsets=[0,0,0,...]}
+//   %b = vector.insert_strided_slice %tile1, %a     {offsets=[0,1,0,...]}
+//   ...
+//   %z = vector.insert_strided_slice %tileK, %prev  {offsets=[i,j,0,...]}
+//
+//   %out = vector.extract %z[i, j] : vector<TxUxVxWxf32> from vector<NxMxTxUxVxWxf32>
+//
+// Each tile has shape matching the trailing dimensions of the aggregate; the
+// extract selects one tile by its leading [i, j] position. We walk the chain,
+// find the insert whose leading offsets equal [i, j] and whose trailing
+// offsets are all zero, and replace the extract directly with that tile value
+// (inserting a shape_cast if necessary).
+//
+// This eliminates all 160 insert_strided_slice + extract pairs that survive
+// after vector distribute; they are never needed after MMA distribution.
+//===----------------------------------------------------------------------===//
+struct FoldExtractFromInsertStridedSliceChain
+    : public OpRewritePattern<vector::ExtractOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::ExtractOp extractOp,
+                                PatternRewriter &rewriter) const override {
+    // Only handle static-position extracts.
+    if (!extractOp.hasDynamicPosition())
+      ; // static — OK
+    else
+      return failure();
+
+    auto staticPos = extractOp.getStaticPosition();
+    if (staticPos.empty())
+      return failure();
+
+    int64_t numExtractDims = (int64_t)staticPos.size();
+
+    // Walk the insert_strided_slice chain rooted at the extract source.
+    Value current = extractOp.getVector();
+    while (auto insertOp =
+               current.getDefiningOp<vector::InsertStridedSliceOp>()) {
+      auto offsetAttrs = insertOp.getOffsets().getAsValueRange<IntegerAttr>();
+      SmallVector<int64_t> offsets;
+      for (auto a : offsetAttrs)
+        offsets.push_back(a.getSExtValue());
+
+      // The insert offsets cover all dims of the aggregate. The leading
+      // numExtractDims must match the extract position; the rest must be 0.
+      if ((int64_t)offsets.size() < numExtractDims)
+        return failure();
+
+      bool leadMatch = true;
+      for (int64_t d = 0; d < numExtractDims; ++d) {
+        if (offsets[d] != staticPos[d]) {
+          leadMatch = false;
+          break;
+        }
+      }
+      bool trailZero = true;
+      for (int64_t d = numExtractDims; d < (int64_t)offsets.size(); ++d) {
+        if (offsets[d] != 0) {
+          trailZero = false;
+          break;
+        }
+      }
+
+      if (leadMatch && trailZero) {
+        // Element counts must match before substituting (a shape_cast handles
+        // same-count but different-shape tiles like <1x2> vs <2x1>).
+        Value tile = insertOp.getValueToStore();
+        Type resultTy = extractOp.getResult().getType();
+        auto tileVecTy = dyn_cast<VectorType>(tile.getType());
+        auto resultVecTy = dyn_cast<VectorType>(resultTy);
+        if (!tileVecTy || !resultVecTy)
+          return failure();
+        if (tileVecTy.getNumElements() != resultVecTy.getNumElements())
+          return failure();
+        if (tile.getType() == resultTy)
+          rewriter.replaceOp(extractOp, tile);
+        else
+          rewriter.replaceOpWithNewOp<vector::ShapeCastOp>(
+              extractOp, resultVecTy, tile);
+        return success();
+      }
+
+      // This insert is for a different tile; keep walking toward the base.
+      current = insertOp.getDest();
+    }
+    return failure();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // §5  The pass
 //===----------------------------------------------------------------------===//
 
@@ -1002,6 +1098,9 @@ LLVM_DEBUG(llvm::dbgs()
     patterns.add<VectorExtractStridedFolder>(ctx);
     patterns.add<VectorInsertStridedFolder>(ctx);
 
+    // Fold vector.extract(insert_strided_slice chain) → tile source.
+    patterns.add<FoldExtractFromInsertStridedSliceChain>(ctx);
+
     // Standard canonicalization.
     scf::ForOp::getCanonicalizationPatterns(patterns, ctx);
     vector::TransferWriteOp::getCanonicalizationPatterns(patterns, ctx);
@@ -1033,7 +1132,8 @@ void populateGpuHardwareMappingStridedSlicePatterns(
     RewritePatternSet &patterns) {
   patterns.add<FoldExtractStridedSliceFromTransferRead,
                FoldInsertStridedSliceIntoTransferWrite,
-               SplitTransferReadExtract>(patterns.getContext());
+               SplitTransferReadExtract,
+               FoldExtractFromInsertStridedSliceChain>(patterns.getContext());
 }
 
 std::unique_ptr<Pass> createNovaGPUHoistVectorExtractInsertSlicePass() {

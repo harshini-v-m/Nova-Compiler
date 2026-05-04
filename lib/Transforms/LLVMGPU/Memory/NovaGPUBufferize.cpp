@@ -6,9 +6,11 @@
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Transforms.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
@@ -64,7 +66,10 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
 
   if (memSpace && cast<gpu::AddressSpaceAttr>(memSpace).getValue() ==
                       gpu::GPUDialect::getWorkgroupAddressSpace()) {
-    // Hoist above any enclosing scf.for to avoid per-iteration reallocation.
+    // Workgroup (shared) memory must be a module-level global in NVPTX —
+    // use AllocOp (not AllocaOp) so ConvertSharedMemAllocs can hoist it to
+    // a global symbol later. Hoist above any enclosing scf.for to avoid
+    // per-iteration re-allocation.
     auto allocType = MemRefType::get(memRefType.getShape(),
                                      memRefType.getElementType(),
                                      AffineMap(), wkgpSpace);
@@ -108,10 +113,162 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
 }
 
 // ---------------------------------------------------------------------------
+// GPU copy function helpers
+// ---------------------------------------------------------------------------
+
+// Peel SubViewOp/CastOp chains to find the root alloc or block argument.
+static Value getRootBuffer(Value v) {
+  while (true) {
+    if (auto sv = v.getDefiningOp<memref::SubViewOp>()) { v = sv.getSource(); continue; }
+    if (auto cv = v.getDefiningOp<memref::CastOp>())    { v = cv.getSource(); continue; }
+    break;
+  }
+  return v;
+}
+
+// Returns true when `from` and `to` refer to the same memory location.
+// Handles: identical SSA values, scf.for iter_args, and subviews of the same
+// root buffer at identical offsets (both constant and dynamic SSA values).
+static bool isSelfCopy(Value from, Value to) {
+  if (from == to) return true;
+
+  // An scf.for iter_arg (block arg) and the corresponding loop result both
+  // alias the same initial buffer — peel both back to the init value.
+  auto peelForAlias = [](Value v) -> Value {
+    // Block argument of scf.for body → initial value
+    if (auto bbArg = dyn_cast<BlockArgument>(v))
+      if (auto forOp = dyn_cast<scf::ForOp>(bbArg.getOwner()->getParentOp()))
+        return forOp.getInitArgs()[bbArg.getArgNumber() -
+                                   forOp.getNumInductionVars()];
+    // scf.for result → initial value of the corresponding iter_arg
+    if (auto forResult = dyn_cast<OpResult>(v))
+      if (auto forOp = dyn_cast<scf::ForOp>(forResult.getOwner()))
+        return forOp.getInitArgs()[forResult.getResultNumber()];
+    return v;
+  };
+  from = peelForAlias(from);
+  to   = peelForAlias(to);
+  if (from == to) return true;
+
+  if (getRootBuffer(from) != getRootBuffer(to)) return false;
+
+  // Same root — offsets must also match element-by-element.
+  auto getOffsets = [](Value v) -> SmallVector<OpFoldResult> {
+    if (auto sv = v.getDefiningOp<memref::SubViewOp>())
+      return SmallVector<OpFoldResult>(sv.getMixedOffsets());
+    return {};
+  };
+  SmallVector<OpFoldResult> offsFrom = getOffsets(from);
+  SmallVector<OpFoldResult> offsTo   = getOffsets(to);
+  if (offsFrom.empty() && offsTo.empty()) return true;
+  if (offsFrom.size() != offsTo.size()) return false;
+  for (auto [a, b] : llvm::zip(offsFrom, offsTo)) {
+    auto ca = getConstantIntValue(a), cb = getConstantIntValue(b);
+    if (ca && cb) { if (*ca != *cb) return false; continue; }
+    auto va = dyn_cast<Value>(a), vb = dyn_cast<Value>(b);
+    if (!va || !vb || va != vb) return false;
+  }
+  return true;
+}
+
+// Emit nvgpu.device_async_copy for a global→workgroup tile copy.
+//
+// Each cp.async instruction copies one contiguous row (innerVec elements).
+// All row copies are issued first (fully unrolled — no scf.for), then a single
+// commit.group + wait.group 0 completes the entire tile.  This matches the
+// hardware model: cp.async is non-blocking; the commit/wait is the barrier.
+//
+// The subview passed in is already the per-thread tile (e.g. 8×4 or 4×4), so
+// the outer dimensions are statically known small integers that we unroll.
+static void emitAsyncTileCopy(OpBuilder &builder, Location loc,
+                              Value srcBuf, Value dstBuf) {
+  MLIRContext *ctx = builder.getContext();
+  auto dstType = cast<MemRefType>(dstBuf.getType());
+  ArrayRef<int64_t> shape = dstType.getShape();
+  int64_t rank = shape.size();
+
+  int64_t innerVec  = rank > 0 ? shape[rank - 1] : 1;
+  int64_t elemBytes = dstType.getElementTypeBitWidth() / 8;
+  bool useBypassL1  = (innerVec * elemBytes >= 16);
+  auto srcType = cast<MemRefType>(srcBuf.getType());
+
+  // Compute the total number of rows = product of all dims except the last.
+  int64_t numRows = 1;
+  for (int64_t d = 0; d < rank - 1; ++d)
+    numRows *= shape[d];
+
+  // Emit one cp.async per row, all back-to-back with no loop.
+  // Row index is a static constant — fully unrolled.
+  for (int64_t row = 0; row < numRows; ++row) {
+    // Build multi-dim index for this row: decompose flat row index into
+    // per-dimension indices for all dims except the last.
+    SmallVector<Value> dstIdx, srcIdx;
+    int64_t rem = row;
+    for (int64_t d = rank - 2; d >= 0; --d) {
+      int64_t dimSize = shape[d];
+      int64_t idx = rem % dimSize;
+      rem /= dimSize;
+      dstIdx.insert(dstIdx.begin(),
+                    builder.create<arith::ConstantIndexOp>(loc, idx));
+    }
+    // column offset is always 0 — cp.async reads innerVec contiguous elements
+    Value c0col = builder.create<arith::ConstantIndexOp>(loc, 0);
+    dstIdx.push_back(c0col);
+    srcIdx = dstIdx;
+    // Pad src indices to its rank in case source has higher rank.
+    while ((int64_t)srcIdx.size() < srcType.getRank())
+      srcIdx.insert(srcIdx.begin(),
+                    builder.create<arith::ConstantIndexOp>(loc, 0));
+
+    builder.create<nvgpu::DeviceAsyncCopyOp>(
+        loc,
+        nvgpu::DeviceAsyncTokenType::get(ctx),
+        dstBuf, dstIdx,
+        srcBuf, srcIdx,
+        builder.getIndexAttr(innerVec),
+        /*srcElements=*/Value{},
+        /*bypassL1=*/useBypassL1 ? builder.getUnitAttr() : UnitAttr());
+  }
+
+  // One commit + wait after all row copies — the whole tile lands atomically.
+  builder.create<NVVM::CpAsyncCommitGroupOp>(loc);
+  builder.create<NVVM::CpAsyncWaitGroupOp>(loc, builder.getI32IntegerAttr(0));
+}
+
+// ---------------------------------------------------------------------------
 // GPU copy function
 // ---------------------------------------------------------------------------
 static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc,
                                Value from, Value to) {
+  // Elide copies where source and destination are the same buffer location.
+  // This eliminates:
+  //   Bug 2 — warp forall linalg.copy after vector.transfer_write
+  //   Bug 3 — outer block-level copies produced by materialize_in_destination
+  if (isSelfCopy(from, to))
+    return success();
+
+  auto fromType = cast<MemRefType>(from.getType());
+  auto toType   = cast<MemRefType>(to.getType());
+
+  // Global → workgroup: emit cp.async directly instead of going through
+  // memref.copy → ConvertMemRefToGpu. This is Bug 1 / Fix A.
+  // "Global" here means either: untagged, gpu::AddressSpace::Global, or the
+  // integer address space 1 that InferMemorySpacePass uses for device tensors.
+  auto isGlobalMemref = [](MemRefType t) -> bool {
+    Attribute space = t.getMemorySpace();
+    if (!space) return true;
+    if (auto intSpace = dyn_cast<IntegerAttr>(space))
+      return intSpace.getInt() == 1;
+    if (auto gpuSpace = dyn_cast<gpu::AddressSpaceAttr>(space))
+      return gpuSpace.getValue() == gpu::AddressSpace::Global;
+    return false;
+  };
+  bool toWorkgroup = isWorkgroupMemref(toType);
+  if (isGlobalMemref(fromType) && toWorkgroup && fromType.hasStaticShape()) {
+    emitAsyncTileCopy(builder, loc, from, to);
+    return success();
+  }
+
   Operation *parent = builder.getInsertionBlock()->getParentOp();
   bool insideForall = false;
   while (parent) {
@@ -120,17 +277,13 @@ static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc,
   }
 
   if (insideForall) {
-    auto fromType = cast<MemRefType>(from.getType());
     if (fromType.getRank() == 0) {
-      // Rank-0: load from source (hoisted outside forall if defined there).
       bool definedOutside = true;
       if (Operation *def = from.getDefiningOp())
         if (parent->isAncestor(def)) definedOutside = false;
       if (auto arg = dyn_cast<BlockArgument>(from))
         if (parent->isAncestor(arg.getOwner()->getParentOp()))
           definedOutside = false;
-      // Also check that `to` is not defined inside the forall — if it is,
-      // placing the store after the forall would violate dominance.
       bool toDefinedOutside = true;
       if (Operation *toDef = to.getDefiningOp())
         if (parent->isAncestor(toDef)) toDefinedOutside = false;
@@ -148,8 +301,7 @@ static LogicalResult gpuCopyFn(OpBuilder &builder, Location loc,
       }
     }
 
-    // Fix shape mismatch: static alloca source vs dynamic subview dest.
-    auto toType = cast<MemRefType>(to.getType());
+    // Fix shape mismatch: static source vs dynamic subview dest.
     if (fromType.getRank() == toType.getRank() && fromType.getRank() > 0) {
       int rank = fromType.getRank();
       bool needsSubview = false;
@@ -189,9 +341,12 @@ struct NovaGPUComprehensiveBufferizePass
   NovaGPUComprehensiveBufferizePass(const NovaGPUComprehensiveBufferizePass &) = default;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<affine::AffineDialect, bufferization::BufferizationDialect,
+    registry.insert<affine::AffineDialect, arith::ArithDialect,
+                    bufferization::BufferizationDialect,
                     gpu::GPUDialect, linalg::LinalgDialect,
-                    memref::MemRefDialect, nova::NovaDialect, scf::SCFDialect>();
+                    memref::MemRefDialect, nova::NovaDialect,
+                    nvgpu::NVGPUDialect, NVVM::NVVMDialect,
+                    scf::SCFDialect>();
   }
 
   void runOnOperation() override {
@@ -223,22 +378,52 @@ struct NovaGPUComprehensiveBufferizePass
       return signalPassFailure();
     }
 
-    // Convert linalg.copy {nova.promote_to_workgroup} on memrefs → memref.copy
-    // so that ConvertMemRefToGpu can match the global→workgroup pattern and emit
-    // nvgpu.device_async_copy. ConvertLinalgToLoops (which runs later) would
-    // otherwise dissolve these into load/store loops that ConvertMemRefToGpu
-    // cannot recognize.
-    SmallVector<linalg::CopyOp> promoteCopies;
-    moduleOp.walk([&](linalg::CopyOp copyOp) {
-      if (copyOp->hasAttr("nova.promote_to_workgroup"))
-        promoteCopies.push_back(copyOp);
-    });
-    IRRewriter rewriter2(moduleOp.getContext());
-    for (linalg::CopyOp copyOp : promoteCopies) {
-      rewriter2.setInsertionPoint(copyOp);
-      rewriter2.replaceOpWithNewOp<memref::CopyOp>(
-          copyOp, copyOp.getInputs()[0], copyOp.getOutputs()[0]);
+    // Post-bufferize fixups on the memref-level IR.
+    IRRewriter rw(moduleOp.getContext());
+
+    // Fix A: linalg.copy {nova.promote_to_workgroup} global→workgroup
+    //        → nvgpu.device_async_copy + commit + wait
+    // Fix B/C: any linalg.copy or memref.copy where src aliases dst → erase
+    {
+      SmallVector<linalg::CopyOp>  linalgCopies;
+      SmallVector<memref::CopyOp>  memrefSelfCopies;
+      moduleOp.walk([&](linalg::CopyOp cp) { linalgCopies.push_back(cp); });
+      moduleOp.walk([&](memref::CopyOp  cp) { memrefSelfCopies.push_back(cp); });
+
+      for (linalg::CopyOp cp : linalgCopies) {
+        Value src = cp.getInputs()[0];
+        Value dst = cp.getOutputs()[0];
+        auto srcType = cast<MemRefType>(src.getType());
+        auto dstType = cast<MemRefType>(dst.getType());
+
+        // Self-copy (Bug 1b, Bug 2): same buffer, same offsets → erase.
+        if (isSelfCopy(src, dst)) { cp.erase(); continue; }
+
+        // Fix A: global→workgroup with promote_to_workgroup attr → async copy.
+        auto isGlobalSpace = [](MemRefType t) {
+          Attribute s = t.getMemorySpace();
+          if (!s) return true;
+          if (auto ia = dyn_cast<IntegerAttr>(s)) return ia.getInt() == 1;
+          if (auto ga = dyn_cast<gpu::AddressSpaceAttr>(s))
+            return false; // workgroup/private are never global
+          return false;
+        };
+        if (cp->hasAttr("nova.promote_to_workgroup") &&
+            isGlobalSpace(srcType) && isWorkgroupMemref(dstType) &&
+            srcType.hasStaticShape()) {
+          rw.setInsertionPoint(cp);
+          emitAsyncTileCopy(rw, cp.getLoc(), src, dst);
+          cp.erase();
+          continue;
+        }
+      }
+
+      // Fix C: memref.copy %x, %x → erase (Bug 3, module-level self-copies).
+      for (memref::CopyOp cp : memrefSelfCopies)
+        if (isSelfCopy(cp.getSource(), cp.getTarget()))
+          cp.erase();
     }
+
   }
 
   StringRef getArgument() const override {
@@ -269,8 +454,10 @@ void addNovaPostBufferizationPasses(OpPassManager &pm) {
   pm.addPass(memref::createFoldMemRefAliasOpsPass());
   pm.addPass(createCSEPass());
   pm.addPass(bufferization::createDropEquivalentBufferResultsPass());
-  bufferization::BufferDeallocationPipelineOptions deallocOpts;
-  bufferization::buildBufferDeallocationPipeline(pm, deallocOpts);
+  // Skip OwnershipBasedBufferDeallocation: GPU kernels contain nvvm/nvgpu ops
+  // that don't implement MemoryEffectOpInterface, causing the pass to fail.
+  // Workgroup alloca and private alloca are stack-scoped (no dealloc needed);
+  // function-scope heap allocs are managed by the JIT runtime externally.
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 }
@@ -328,6 +515,10 @@ static bool hasWorkgroupStores(Operation *op) {
           { found = true; return WalkResult::interrupt(); }
     if (auto c = dyn_cast<memref::CopyOp>(inner))
       if (isWorkgroupValue(c.getTarget()) || isKernelLocalStaging(c.getTarget()))
+        { found = true; return WalkResult::interrupt(); }
+    // nvgpu.device_async_copy writes to workgroup (shared) memory.
+    if (auto acp = dyn_cast<nvgpu::DeviceAsyncCopyOp>(inner))
+      if (isWorkgroupValue(acp.getDst()) || isKernelLocalStaging(acp.getDst()))
         { found = true; return WalkResult::interrupt(); }
     return WalkResult::advance();
   });
@@ -479,7 +670,7 @@ struct NovaGPUInsertWorkgroupBarriersPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect,
-                    NVVM::NVVMDialect, vector::VectorDialect,
+                    NVVM::NVVMDialect, nvgpu::NVGPUDialect, vector::VectorDialect,
                     linalg::LinalgDialect, affine::AffineDialect>();
   }
 

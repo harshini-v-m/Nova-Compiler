@@ -762,9 +762,27 @@ def Nova_NotOp : Nova_UnaryOp<"not", [Commutative,DeclareOpInterfaceMethods<Infe
 def Nova_MatmulOp : Op<Nova_Dialect,"matmul", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,NoComplexOperands]> {
   let arguments = (ins Nova_Tensor:$lhs, Nova_Tensor:$rhs);
   let results = (outs Nova_Tensor:$result);
-  let hasVerifier=1;  
+  let hasVerifier=1;
   let assemblyFormat = [{
-    $lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) 
+    $lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs)
+  }];
+}
+
+def Nova_MatmulBackwardOp : Op<Nova_Dialect, "matmul_backward",
+    [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>, NoComplexOperands]> {
+  let summary = "Matmul backward computing grad_a = grad x Bᵀ and grad_b = Aᵀ x grad";
+  let arguments = (ins
+    Nova_Tensor:$grad_out,  // [M, N]
+    Nova_Tensor:$a,         // [M, K]
+    Nova_Tensor:$b          // [K, N]
+  );
+  let results = (outs
+    Nova_Tensor:$grad_a,    // [M, K]
+    Nova_Tensor:$grad_b     // [K, N]
+  );
+  let assemblyFormat = [{
+    $grad_out `,` $a `,` $b attr-dict `:`
+    type($grad_out) `,` type($a) `,` type($b)
   }];
 }
 

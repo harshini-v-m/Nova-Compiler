@@ -42,6 +42,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include <map>
 #include <numeric>
 
 namespace mlir::nova {
@@ -89,12 +90,52 @@ getDistributedTransferOffsets(ArrayRef<int64_t> offsets,
   return result;
 }
 
+/// Cache key for a linearize_index op: SSA values + integer constants + sizes.
+/// Allows getTransferIndices to reuse identical linearizations across tile
+/// iterations instead of emitting a fresh op each time.
+struct LinearizeKey {
+  Value warp, thread, base;
+  int64_t batchOff, outerOff;
+  SmallVector<int64_t, 5> sizes;
+  bool operator==(const LinearizeKey &o) const {
+    return warp == o.warp && thread == o.thread && base == o.base &&
+           batchOff == o.batchOff && outerOff == o.outerOff &&
+           sizes == o.sizes;
+  }
+};
+struct LinearizeKeyInfo : llvm::DenseMapInfo<LinearizeKey> {
+  static LinearizeKey getEmptyKey() {
+    return {llvm::DenseMapInfo<Value>::getEmptyKey(),
+            llvm::DenseMapInfo<Value>::getEmptyKey(),
+            llvm::DenseMapInfo<Value>::getEmptyKey(), -1, -1, {}};
+  }
+  static LinearizeKey getTombstoneKey() {
+    return {llvm::DenseMapInfo<Value>::getTombstoneKey(),
+            llvm::DenseMapInfo<Value>::getTombstoneKey(),
+            llvm::DenseMapInfo<Value>::getTombstoneKey(), -2, -2, {}};
+  }
+  static unsigned getHashValue(const LinearizeKey &k) {
+    unsigned h = llvm::hash_combine(k.warp, k.thread, k.base,
+                                    k.batchOff, k.outerOff);
+    for (int64_t s : k.sizes) h = llvm::hash_combine(h, s);
+    return h;
+  }
+  static bool isEqual(const LinearizeKey &a, const LinearizeKey &b) {
+    return a == b;
+  }
+};
+using LinearizeCache = llvm::DenseMap<LinearizeKey, Value, LinearizeKeyInfo>;
+
 /// Compute the memory indices for one tile of a transfer_read/write.
+/// \p cache is shared across all tile iterations of the same read/write op so
+/// duplicate linearize_index ops (same warp/thread/base/offsets/sizes) are
+/// emitted only once and reused.
 static SmallVector<Value>
 getTransferIndices(OpBuilder &b, ValueRange indices, ArrayRef<int64_t> offsets,
                    NestedLayoutAttr layout, AffineMap permMap,
                    ArrayRef<Value> warpIndices,
-                   ArrayRef<Value> threadIndices) {
+                   ArrayRef<Value> threadIndices,
+                   LinearizeCache &cache) {
   int64_t rank = layout.getRank();
   ArrayRef<int64_t> batchOffsets(offsets.begin(), rank);
   ArrayRef<int64_t> outerOffsets(offsets.begin() + rank, rank);
@@ -107,19 +148,25 @@ getTransferIndices(OpBuilder &b, ValueRange indices, ArrayRef<int64_t> offsets,
     Value base = indices[pos];
     int64_t elems = layout.getElementTile()[i];
     Location loc = base.getLoc();
-    Value batchConst = b.create<arith::ConstantIndexOp>(loc, batchOffsets[i]);
-    Value outerConst = b.create<arith::ConstantIndexOp>(loc, outerOffsets[i]);
-    SmallVector<Value> ids = {warpIndices[i], batchConst, outerConst,
-                               threadIndices[i], base};
-    SmallVector<int64_t> sizes = {layout.getSubgroupTile()[i],
-                                   layout.getBatchTile()[i],
-                                   layout.getOuterTile()[i],
-                                   layout.getThreadTile()[i], elems};
-    bool disjoint = false;
-    if (auto c = getConstantIntValue(base))
-      disjoint = *c < elems;
-    sliced[pos] = affine::AffineLinearizeIndexOp::create(b, loc, ids, sizes,
-                                                          disjoint);
+    SmallVector<int64_t, 5> sizes = {layout.getSubgroupTile()[i],
+                                      layout.getBatchTile()[i],
+                                      layout.getOuterTile()[i],
+                                      layout.getThreadTile()[i], elems};
+    LinearizeKey key{warpIndices[i], threadIndices[i], base,
+                     batchOffsets[i], outerOffsets[i], sizes};
+    auto [it, inserted] = cache.try_emplace(key, Value{});
+    if (inserted) {
+      Value batchConst = b.create<arith::ConstantIndexOp>(loc, batchOffsets[i]);
+      Value outerConst = b.create<arith::ConstantIndexOp>(loc, outerOffsets[i]);
+      SmallVector<Value> ids = {warpIndices[i], batchConst, outerConst,
+                                 threadIndices[i], base};
+      bool disjoint = false;
+      if (auto c = getConstantIntValue(base))
+        disjoint = *c < elems;
+      it->second = affine::AffineLinearizeIndexOp::create(b, loc, ids, sizes,
+                                                           disjoint);
+    }
+    sliced[pos] = it->second;
   }
   return sliced;
 }
@@ -459,11 +506,12 @@ struct DistributeTransferRead final
     }
 
     SmallVector<int64_t> strides(rank, 1);
+    LinearizeCache linCache;
     for (auto [idx, offsets] :
          llvm::enumerate(StaticTileOffsetRange(distShape, tileShape))) {
       SmallVector<Value> slicedIndices = getTransferIndices(
           rewriter, readOp.getIndices(), offsets, layout,
-          readOp.getPermutationMap(), warpIdx, threadIdx);
+          readOp.getPermutationMap(), warpIdx, threadIdx, linCache);
 
       VectorValue slicedMask = nullptr;
       if (mask) {
@@ -615,11 +663,12 @@ struct DistributeTransferWrite final
       allMaskOffsets = llvm::to_vector(StaticTileOffsetRange(mds, mts));
     }
 
+    LinearizeCache linCache;
     for (auto [idx, offsets] :
          llvm::enumerate(StaticTileOffsetRange(distShape, tileShape))) {
       SmallVector<Value> slicedIndices = getTransferIndices(
           rewriter, writeOp.getIndices(), offsets, layout,
-          writeOp.getPermutationMap(), warpIdx, threadIdx);
+          writeOp.getPermutationMap(), warpIdx, threadIdx, linCache);
       ArrayRef<int64_t> oArr(offsets);
       VectorValue tile = extractSliceAsVector(rewriter, loc, distVec,
                                                oArr.take_front(rank * 2));
@@ -1252,6 +1301,44 @@ struct NVIDIADistributeContract final
       return success();
     };
 
+    // Precompute LHS slices (extract + shuffle) keyed on lhsBatchOff.
+    //
+    // lhsBatchOff = [k, m_batch, ...] — it depends on k and the M-result dims
+    // but NOT on the N-result dims. For a standard 4×4 result tile with 4
+    // K-batches, each (k, m) pair is reused across all 4 N-columns, so the
+    // extract+shuffle chain would otherwise be emitted 4× per (k,m).
+    // Precomputing here reduces 64 chains → 16 chains per kernel (4× reduction).
+    std::map<SmallVector<int64_t>, Value> lhsSliceCache;
+    for (auto resultBatchOffsets :
+         StaticTileOffsetRange(resultBatchShape, resultBatchTile)) {
+      for (int64_t k = 0; k < kBatchCount; ++k) {
+        SmallVector<int64_t> lhsBatchOff =
+            buildOperandBatchOff(lhsMap, resultBatchOffsets, k);
+        if (lhsSliceCache.count(lhsBatchOff))
+          continue;
+        Value lhsSlice = vector::ExtractOp::create(
+            rewriter, loc, distLhs, lhsBatchOff);
+        if (lhsSlice.getType() != lhsSliceTy)
+          lhsSlice = vector::ShapeCastOp::create(
+              rewriter, loc, lhsSliceTy, lhsSlice);
+        if (kind == V::MMA_SYNC_F16_16x8x16 ||
+            kind == V::MMA_SYNC_BF16_16x8x16) {
+          auto flat1D = VectorType::get({8}, lhsSliceTy.getElementType());
+          Value flat = vector::ShapeCastOp::create(rewriter, loc, flat1D, lhsSlice);
+          Value shuffled = vector::ShuffleOp::create(rewriter, loc, flat, flat,
+              ArrayRef<int64_t>{2, 3, 0, 1, 6, 7, 4, 5});
+          lhsSlice = vector::ShapeCastOp::create(rewriter, loc, lhsSliceTy, shuffled);
+        } else if (kind == V::MMA_SYNC_TF32_16x8x8) {
+          auto flat1D = VectorType::get({4}, lhsSliceTy.getElementType());
+          Value flat = vector::ShapeCastOp::create(rewriter, loc, flat1D, lhsSlice);
+          Value shuffled = vector::ShuffleOp::create(rewriter, loc, flat, flat,
+              ArrayRef<int64_t>{0, 2, 1, 3});
+          lhsSlice = vector::ShapeCastOp::create(rewriter, loc, lhsSliceTy, shuffled);
+        }
+        lhsSliceCache[lhsBatchOff] = lhsSlice;
+      }
+    }
+
     for (auto [batchIdx, resultBatchOffsets] :
          llvm::enumerate(StaticTileOffsetRange(resultBatchShape, resultBatchTile))) {
 
@@ -1263,6 +1350,19 @@ struct NVIDIADistributeContract final
       // Start accumulator slice from distAcc at this batch offset.
       Value accSlice = vector::ExtractOp::create(
           rewriter, loc, distAcc, resultBatchOffsets);
+
+      // batchSliceTy: the shape that vector.insert expects at these batch offsets.
+      // Computed once per result-batch, used after all K steps.
+      SmallVector<int64_t> batchSliceShape;
+      for (int64_t v : accLayout.getOuterTile())   batchSliceShape.push_back(v);
+      for (int64_t v : accLayout.getElementTile()) batchSliceShape.push_back(v);
+      VectorType batchSliceTy = VectorType::get(batchSliceShape, accElemTy);
+
+      // Cast accSlice to accSliceTy once before the K loop so we stay in the
+      // mma fragment shape across all K steps (avoids a cast-in + cast-out per
+      // K iteration that otherwise round-trips through batchSliceTy every step).
+      if (accSlice.getType() != accSliceTy)
+        accSlice = vector::ShapeCastOp::create(rewriter, loc, accSliceTy, accSlice);
 
       // Accumulate over K batches.
       for (int64_t k = 0; k < kBatchCount; ++k) {
@@ -1280,48 +1380,15 @@ struct NVIDIADistributeContract final
           return rewriter.notifyMatchFailure(
               op, "rhs extract position out-of-bounds (batchCounts mismatch)");
 
-        Value lhsSlice = vector::ExtractOp::create(
-            rewriter, loc, distLhs, lhsBatchOff);
+        // Reuse precomputed LHS slice (extract + shuffle done above).
+        Value lhsSlice = lhsSliceCache[lhsBatchOff];
+
         Value rhsSlice = vector::ExtractOp::create(
             rewriter, loc, distRhs, rhsBatchOff);
 
-        // Fix A-operand register order for nvgpu.mma.sync. PTX expects lane
-        // registers {a0,a1,a2,a3} at rows {gID, gID+8, gID, gID+8}, but the
-        // NestedLayout's row-major flatten of [outer_M, outer_K, elem_M,
-        // elem_K] produces {a0,a2,a1,a3}. Transpose outer_M ↔ outer_K (or for
-        // TF32 where outer_K=1, outer_M ↔ elem_K). Mirrors IREE's fix in
-        // MMAAttr::buildMmaOperation (IREEGPUAttrs.cpp).
-        Type lhsElemTy =
-            mlir::cast<VectorType>(lhsSlice.getType()).getElementType();
-        if (kind == V::MMA_SYNC_F16_16x8x16 ||
-            kind == V::MMA_SYNC_BF16_16x8x16) {
-          auto nonUnitTy = VectorType::get({2, 2, 2}, lhsElemTy);
-          Value reshaped = vector::ShapeCastOp::create(
-              rewriter, loc, nonUnitTy, lhsSlice);
-          Value transposed = vector::TransposeOp::create(
-              rewriter, loc, reshaped, ArrayRef<int64_t>{1, 0, 2});
-          lhsSlice = vector::ShapeCastOp::create(
-              rewriter, loc, lhsSlice.getType(), transposed);
-        } else if (kind == V::MMA_SYNC_TF32_16x8x8) {
-          auto nonUnitTy = VectorType::get({2, 2}, lhsElemTy);
-          Value reshaped = vector::ShapeCastOp::create(
-              rewriter, loc, nonUnitTy, lhsSlice);
-          Value transposed = vector::TransposeOp::create(
-              rewriter, loc, reshaped, ArrayRef<int64_t>{1, 0});
-          lhsSlice = vector::ShapeCastOp::create(
-              rewriter, loc, lhsSlice.getType(), transposed);
-        }
-
-        // Cast slices to expected vector types if needed.
-        if (lhsSlice.getType() != lhsSliceTy)
-          lhsSlice = vector::ShapeCastOp::create(
-              rewriter, loc, lhsSliceTy, lhsSlice);
         if (rhsSlice.getType() != rhsSliceTy)
           rhsSlice = vector::ShapeCastOp::create(
               rewriter, loc, rhsSliceTy, rhsSlice);
-        if (accSlice.getType() != accSliceTy)
-          accSlice = vector::ShapeCastOp::create(
-              rewriter, loc, accSliceTy, accSlice);
 
         bool tf32 = (kind == V::MMA_SYNC_TF32_16x8x8);
         accSlice = nvgpu::MmaSyncOp::create(
@@ -1329,14 +1396,7 @@ struct NVIDIADistributeContract final
             mmaShape, tf32);
       }
 
-      // After nvgpu.mma.sync the result has the flat nvgpu shape (e.g. <2x2>).
-      // vector.insert requires position_rank + source_rank == dest_rank, so
-      // shape-cast back to the batch-extract slice shape [outer..., element...]
-      // before inserting at the batch offsets.
-      SmallVector<int64_t> batchSliceShape;
-      for (int64_t v : accLayout.getOuterTile())   batchSliceShape.push_back(v);
-      for (int64_t v : accLayout.getElementTile()) batchSliceShape.push_back(v);
-      VectorType batchSliceTy = VectorType::get(batchSliceShape, accElemTy);
+      // Cast mma result from accSliceTy back to batchSliceTy for vector.insert.
       if (accSlice.getType() != batchSliceTy)
         accSlice = vector::ShapeCastOp::create(rewriter, loc, batchSliceTy, accSlice);
 

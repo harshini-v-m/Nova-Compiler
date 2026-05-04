@@ -305,8 +305,8 @@ struct NovaGPUPromoteMatmulOperandsPass
         }
       }
 
-      llvm::errs() << "[" DEBUG_TYPE "] Promoted " << numPromoted
-                   << " input operands for: " << op->getName() << "\n";
+      // llvm::errs() << "[" DEBUG_TYPE "] Promoted " << numPromoted
+      //              << " input operands for: " << op->getName() << "\n";
 
       for (int64_t idx : resultOperands) {
         unsigned resultIdx = idx - numInputs;

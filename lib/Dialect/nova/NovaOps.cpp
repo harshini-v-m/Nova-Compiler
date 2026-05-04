@@ -1283,6 +1283,25 @@ LogicalResult MatmulOp::inferReturnTypes(
   inferredReturnTypes.push_back(RankedTensorType::get(resultShape, resultType));
   return success();
 }
+
+LogicalResult MatmulBackwardOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  // operands: grad_out[M,N], a[M,K], b[K,N]
+  auto aType = llvm::dyn_cast<RankedTensorType>(operands[1].getType());
+  auto bType = llvm::dyn_cast<RankedTensorType>(operands[2].getType());
+  if (!aType || !bType)
+    return failure();
+  // grad_a has the same shape/type as a [M,K]
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(aType.getShape(), aType.getElementType()));
+  // grad_b has the same shape/type as b [K,N]
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(bType.getShape(), bType.getElementType()));
+  return success();
+}
+
 //---------------------------------reduce
 // op----------------------------------------------------
 

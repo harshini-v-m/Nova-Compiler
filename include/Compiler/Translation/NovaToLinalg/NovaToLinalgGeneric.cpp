@@ -9,6 +9,8 @@
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/TypeRange.h"
+#include "mlir/IR/ValueRange.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -146,33 +148,90 @@ struct NovaCastOpLowering : public OpConversionPattern<mlir::nova::CastOp> {
 //   }
 // };
 
-// struct NovaMatmulBackwardPattern : public OpConversionPattern<mlir::nova::MatmulBackwardOp> {
-//   using OpConversionPattern<mlir::nova::MatmulBackwardOp>::OpConversionPattern;
-//   LogicalResult matchAndRewrite(mlir::nova::MatmulBackwardOp op, OpAdaptor adaptor,
-//                                 ConversionPatternRewriter &rewriter) const override {
-//     Location loc = op.getLoc();
-//     Value g = adaptor.getGradOut();
-//     Value x = adaptor.getX();
-//     Value y = adaptor.getY();
-//     auto xType = llvm::cast<mlir::RankedTensorType>(x.getType());
-//     auto yType = llvm::cast<mlir::RankedTensorType>(y.getType());
+// nova.matmul_backward(grad[M,N], A[M,K], B[K,N]) lowers to two linalg.generic ops:
+//
+//   grad_a[M,K] = grad x Bᵀ
+//     loops: (d0=M, d1=K, d2=N)  grad[d0,d2] * B[d1,d2] -> grad_a[d0,d1]
+//     maps:  grad=(d0,d2), B=(d1,d2), grad_a=(d0,d1)   iters: par,par,red
+//
+//   grad_b[K,N] = Aᵀ x grad
+//     loops: (d0=K, d1=N, d2=M)  A[d2,d0] * grad[d2,d1] -> grad_b[d0,d1]
+//     maps:  A=(d2,d0), grad=(d2,d1), grad_b=(d0,d1)   iters: par,par,red
+struct NovaMatmulBackwardPattern
+    : public OpConversionPattern<mlir::nova::MatmulBackwardOp> {
+  using OpConversionPattern<mlir::nova::MatmulBackwardOp>::OpConversionPattern;
 
-//     auto xShape = xType.getShape().vec();
-//     if (xShape.size() >= 2) std::swap(xShape.back(), xShape[xShape.size()-2]);
-//     auto xtType = mlir::RankedTensorType::get(xShape, xType.getElementType());
-//     Value xt = rewriter.create<mlir::nova::TransposeOp>(loc, xtType, x, rewriter.getI32IntegerAttr(-1), rewriter.getI32IntegerAttr(-2)).getResult();
+  LogicalResult
+  matchAndRewrite(mlir::nova::MatmulBackwardOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value grad = adaptor.getGradOut(); // [M, N]
+    Value a    = adaptor.getA();       // [M, K]
+    Value b    = adaptor.getB();       // [K, N]
 
-//     auto yShape = yType.getShape().vec();
-//     if (yShape.size() >= 2) std::swap(yShape.back(), yShape[yShape.size()-2]);
-//     auto ytType = mlir::RankedTensorType::get(yShape, yType.getElementType());
-//     Value yt = rewriter.create<mlir::nova::TransposeOp>(loc, ytType, y, rewriter.getI32IntegerAttr(-1), rewriter.getI32IntegerAttr(-2)).getResult();
+    auto aType    = llvm::cast<RankedTensorType>(a.getType());
+    auto bType    = llvm::cast<RankedTensorType>(b.getType());
+    auto gradType = llvm::cast<RankedTensorType>(grad.getType());
+    auto elemTy   = aType.getElementType();
+    MLIRContext *ctx = rewriter.getContext();
 
-//     Value da = rewriter.create<mlir::nova::MatmulOp>(loc, xType, g, yt).getResult();
-//     Value db = rewriter.create<mlir::nova::MatmulOp>(loc, yType, xt, g).getResult();
-//     rewriter.replaceOp(op, {da, db});
-//     return success();
-//   }
-// };
+    int64_t M = aType.getShape()[0];
+    int64_t K = aType.getShape()[1];
+    int64_t N = bType.getShape()[1];
+
+    auto makeZeroFill = [&](ArrayRef<int64_t> shape) -> Value {
+      Value empty = rewriter.create<tensor::EmptyOp>(loc, shape, elemTy);
+      Value zero  = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getZeroAttr(elemTy));
+      return rewriter.create<linalg::FillOp>(loc, zero, empty).getResult(0);
+    };
+
+    auto mulAddBody = [](OpBuilder &b, Location l, ValueRange args) {
+      Value mul = b.create<arith::MulFOp>(l, args[0], args[1]);
+      Value add = b.create<arith::AddFOp>(l, mul, args[2]);
+      b.create<linalg::YieldOp>(l, add);
+    };
+
+    // ── grad_a = grad x Bᵀ  ──────────────────────────────────────────────
+    // loops (d0=M, d1=K, d2=N): grad[d0,d2] * B[d1,d2] -> grad_a[d0,d1]
+    {
+      auto d = [&](int i) { return getAffineDimExpr(i, ctx); };
+      SmallVector<AffineMap> maps = {
+          AffineMap::get(3, 0, {d(0), d(2)}, ctx), // grad  [M, N]
+          AffineMap::get(3, 0, {d(1), d(2)}, ctx), // B     [K, N]
+          AffineMap::get(3, 0, {d(0), d(1)}, ctx), // grad_a[M, K]
+      };
+      SmallVector<utils::IteratorType> iters = {
+          utils::IteratorType::parallel,
+          utils::IteratorType::parallel,
+          utils::IteratorType::reduction,
+      };
+      Value out = makeZeroFill({M, K});
+      auto gradA = rewriter.create<linalg::GenericOp>(
+          loc, TypeRange{aType}, ValueRange{grad, b}, ValueRange{out},
+          maps, iters, mulAddBody);
+      // ── grad_b = Aᵀ x grad  ──────────────────────────────────────────
+      // loops (d0=K, d1=N, d2=M): A[d2,d0] * grad[d2,d1] -> grad_b[d0,d1]
+      SmallVector<AffineMap> maps2 = {
+          AffineMap::get(3, 0, {d(2), d(0)}, ctx), // A     [M, K]
+          AffineMap::get(3, 0, {d(2), d(1)}, ctx), // grad  [M, N]
+          AffineMap::get(3, 0, {d(0), d(1)}, ctx), // grad_b[K, N]
+      };
+      SmallVector<utils::IteratorType> iters2 = {
+          utils::IteratorType::parallel,
+          utils::IteratorType::parallel,
+          utils::IteratorType::reduction,
+      };
+      Value out2 = makeZeroFill({K, N});
+      auto gradB = rewriter.create<linalg::GenericOp>(
+          loc, TypeRange{bType}, ValueRange{a, grad}, ValueRange{out2},
+          maps2, iters2, mulAddBody);
+
+      rewriter.replaceOp(op, {gradA.getResult(0), gradB.getResult(0)});
+    }
+    return success();
+  }
+};
 
 //===--------------------------------------------------------------------------------------------===//
 // Loss forward and backward operations: mae, mse, cce, bce, sce
@@ -2942,6 +3001,7 @@ struct NovaToLinalgGenericLoweringPass : public PassWrapper<NovaToLinalgGenericL
     target.addIllegalOp<nova::SoftmaxOp>();
 
     target.addIllegalOp<nova::LinearOp>();
+    target.addIllegalOp<nova::MatmulBackwardOp>();
     target.addIllegalOp<nova::LinearBackwardOp>();
     target.addIllegalOp<nova::GatherOp>();
 
@@ -2998,6 +3058,7 @@ void populateNovaToLinalgGenericConversionPatterns(RewritePatternSet &patterns) 
       NovaGeluForwardPattern, NovaGeluBackwardPattern, 
       NovaSoftmaxForwardPattern, 
       NovaLinearOpLowering, NovaLinearBackwardPattern,
+      NovaMatmulBackwardPattern,
       NovaLayerNormPattern, NovaLayerNormBackwardPattern,
       NovaExp2LoweringPattern, NovaLog2LoweringPattern, NovaLog10LoweringPattern,
       NovaSinLoweringPattern, NovaCosLoweringPattern, NovaTanLoweringPattern, 
