@@ -47,10 +47,10 @@ static bool isBlockLevelForall(scf::ForallOp op) {
 // GPU allocation function
 // ---------------------------------------------------------------------------
 static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
-                                                        Location loc,
-                                                        MemRefType memRefType,
-                                                        ValueRange dynamicSizes,
-                                                        unsigned alignment) {
+                                                       Location loc,
+                                                       MemRefType memRefType,
+                                                       ValueRange dynamicSizes,
+                                                       unsigned alignment) {
   Attribute memSpace = memRefType.getMemorySpace();
 
   // NovaVectorizeVectorExtOpsPass emits alloc_tensor with memory_space as
@@ -72,7 +72,7 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
     // per-iteration re-allocation.
     auto allocType = MemRefType::get(memRefType.getShape(),
                                      memRefType.getElementType(),
-                                     AffineMap(), wkgpSpace);
+                        AffineMap(), wkgpSpace);
     OpBuilder::InsertionGuard guard(builder);
     Operation *hoistTarget = nullptr;
     Operation *cur = builder.getInsertionBlock()->getParentOp();
@@ -102,7 +102,7 @@ static FailureOr<Value> gpuRequireMemSpaceAllocationFn(OpBuilder &builder,
   if (insideKernel) {
     auto allocType = MemRefType::get(memRefType.getShape(),
                                      memRefType.getElementType(),
-                                     AffineMap(), privateSpace);
+                        AffineMap(), privateSpace);
     return memref::AllocaOp::create(builder, loc, allocType, dynamicSizes)
         .getResult();
   }
@@ -479,6 +479,19 @@ static bool isWorkgroupValue(Value v) {
   return mt && isWorkgroupMemref(mt);
 }
 
+static bool isWorkgroupOrGlobalValue(Value v) {
+  auto mt = dyn_cast<MemRefType>(v.getType());
+  if (!mt)
+    return false;
+  if (isWorkgroupMemref(mt))
+    return true;
+  // Also treat global memory (address space 1) as workgroup-like for barrier
+  // insertion purposes if it's used for intra-kernel accumulation (e.g. matmul
+  // output initialization followed by loads).
+  auto space = dyn_cast_or_null<IntegerAttr>(mt.getMemorySpace());
+  return space && space.getInt() == 1;
+}
+
 static bool isKernelLocalStaging(Value v) {
   auto mt = dyn_cast<MemRefType>(v.getType());
   if (!mt || mt.getMemorySpace()) return false;
@@ -498,28 +511,48 @@ static bool hasWorkgroupStores(Operation *op) {
   bool found = false;
   op->walk([&](Operation *inner) -> WalkResult {
     if (auto w = dyn_cast<vector::TransferWriteOp>(inner))
-      if (isWorkgroupValue(w.getBase()) || isKernelLocalStaging(w.getBase()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(w.getBase()) ||
+          isKernelLocalStaging(w.getBase())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     if (auto w = dyn_cast<vector::StoreOp>(inner))
-      if (isWorkgroupValue(w.getBase()) || isKernelLocalStaging(w.getBase()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(w.getBase()) ||
+          isKernelLocalStaging(w.getBase())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     if (auto w = dyn_cast<memref::StoreOp>(inner))
-      if (isWorkgroupValue(w.getMemref()) || isKernelLocalStaging(w.getMemref()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(w.getMemref()) ||
+          isKernelLocalStaging(w.getMemref())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     if (auto w = dyn_cast<affine::AffineStoreOp>(inner))
-      if (isWorkgroupValue(w.getMemref()) || isKernelLocalStaging(w.getMemref()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(w.getMemref()) ||
+          isKernelLocalStaging(w.getMemref())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     if (auto c = dyn_cast<linalg::CopyOp>(inner))
       for (Value out : c.getDpsInits())
-        if (isWorkgroupValue(out) || isKernelLocalStaging(out))
-          { found = true; return WalkResult::interrupt(); }
+        if (isWorkgroupOrGlobalValue(out) || isKernelLocalStaging(out)) {
+          found = true;
+          return WalkResult::interrupt();
+        }
     if (auto c = dyn_cast<memref::CopyOp>(inner))
-      if (isWorkgroupValue(c.getTarget()) || isKernelLocalStaging(c.getTarget()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(c.getTarget()) ||
+          isKernelLocalStaging(c.getTarget())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     // nvgpu.device_async_copy writes to workgroup (shared) memory.
     if (auto acp = dyn_cast<nvgpu::DeviceAsyncCopyOp>(inner))
-      if (isWorkgroupValue(acp.getDst()) || isKernelLocalStaging(acp.getDst()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(acp.getDst()) ||
+          isKernelLocalStaging(acp.getDst())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     return WalkResult::advance();
   });
   return found;
@@ -529,24 +562,41 @@ static bool hasWorkgroupLoads(Operation *op) {
   bool found = false;
   op->walk([&](Operation *inner) -> WalkResult {
     if (auto r = dyn_cast<vector::TransferReadOp>(inner))
-      if (isWorkgroupValue(r.getBase()) || isKernelLocalStaging(r.getBase()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(r.getBase()) ||
+          isKernelLocalStaging(r.getBase())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     if (auto r = dyn_cast<vector::LoadOp>(inner))
-      if (isWorkgroupValue(r.getBase()) || isKernelLocalStaging(r.getBase()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(r.getBase()) ||
+          isKernelLocalStaging(r.getBase())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     if (auto r = dyn_cast<memref::LoadOp>(inner))
-      if (isWorkgroupValue(r.getMemref()) || isKernelLocalStaging(r.getMemref()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(r.getMemref()) ||
+          isKernelLocalStaging(r.getMemref())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     if (auto r = dyn_cast<affine::AffineLoadOp>(inner))
-      if (isWorkgroupValue(r.getMemref()) || isKernelLocalStaging(r.getMemref()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(r.getMemref()) ||
+          isKernelLocalStaging(r.getMemref())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     if (auto c = dyn_cast<linalg::CopyOp>(inner))
       for (Value in : c.getDpsInputs())
-        if (isWorkgroupValue(in) || isKernelLocalStaging(in))
-          { found = true; return WalkResult::interrupt(); }
+        if (isWorkgroupOrGlobalValue(in) || isKernelLocalStaging(in)) {
+          found = true;
+          return WalkResult::interrupt();
+        }
     if (auto c = dyn_cast<memref::CopyOp>(inner))
-      if (isWorkgroupValue(c.getSource()) || isKernelLocalStaging(c.getSource()))
-        { found = true; return WalkResult::interrupt(); }
+      if (isWorkgroupOrGlobalValue(c.getSource()) ||
+          isKernelLocalStaging(c.getSource())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     return WalkResult::advance();
   });
   return found;
@@ -587,10 +637,15 @@ static void insertBarriersInBlock(OpBuilder &builder, Block *block) {
   // If this for-body opens with stores before any loads, barrier at top.
   if (isUnconditionalForBody(block)) {
     for (Operation &op : *block) {
-      if (isa<scf::YieldOp, gpu::TerminatorOp, NVVM::Barrier0Op, gpu::BarrierOp>(op))
+      if (isa<scf::YieldOp, gpu::TerminatorOp, NVVM::Barrier0Op,
+              gpu::BarrierOp>(op))
         break;
-      if (hasWorkgroupLoads(&op)) break;
-      if (hasWorkgroupStores(&op)) { barrierPoints.push_back(&block->front()); break; }
+      if (hasWorkgroupLoads(&op))
+        break;
+      if (hasWorkgroupStores(&op)) {
+        barrierPoints.push_back(&block->front());
+        break;
+      }
     }
   }
 
@@ -670,8 +725,8 @@ struct NovaGPUInsertWorkgroupBarriersPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect,
-                    NVVM::NVVMDialect, nvgpu::NVGPUDialect, vector::VectorDialect,
-                    linalg::LinalgDialect, affine::AffineDialect>();
+                NVVM::NVVMDialect, nvgpu::NVGPUDialect, vector::VectorDialect,
+                linalg::LinalgDialect, affine::AffineDialect>();
   }
 
   void runOnOperation() override {

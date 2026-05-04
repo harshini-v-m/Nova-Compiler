@@ -87,6 +87,116 @@ static bool isLinearBlockMapping(scf::ForallOp forall) {
   return false;
 }
 
+// ===== Dynamic shared memory materialisation ================================
+
+/// Static SMEM cap. Allocations whose summed bytes fit within this stay on the
+/// static `memref.global` path (NovaConvertSharedMemAllocsPass). When the sum
+/// exceeds it, the only way to actually allocate that much SMEM on sm_86/sm_89
+/// is `gpu.dynamic_shared_memory` + `cudaFuncSetAttribute(...)` at launch.
+static constexpr int64_t kStaticSharedMemBudgetBytes = 48 * 1024;
+
+/// True when `t` carries #gpu.address_space<workgroup>.
+static bool hasWorkgroupAddressSpace(MemRefType t) {
+  auto as = dyn_cast_if_present<gpu::AddressSpaceAttr>(t.getMemorySpace());
+  return as && as.getValue() == gpu::GPUDialect::getWorkgroupAddressSpace();
+}
+
+/// If the workgroup `memref.alloc` ops in `launch.getBody()` together exceed
+/// 48 KB, replace them with views over a single `gpu.dynamic_shared_memory`
+/// buffer and set `launch.dynamicSharedMemorySize`. Otherwise leave them
+/// alone — the static memref.global path handles them within the 48 KB cap.
+///
+/// The byte threshold matches the per-kernel budget enforced by
+/// NovaConvertSharedMemAllocsPass; below it we keep the simpler static path
+/// (one memref.global per alloc), above it we must use dynamic SMEM because
+/// PTX caps a single static workgroup allocation at 48 KB on sm_86/sm_89.
+static void maybeMaterializeDynamicSharedMemory(gpu::LaunchOp launch) {
+  MLIRContext *ctx = launch.getContext();
+  Block &body = launch.getBody().front();
+  Location loc = launch.getLoc();
+
+  // Collect static workgroup allocs (preserving program order).
+  SmallVector<memref::AllocOp> wgAllocs;
+  for (Operation &op : body) {
+    if (auto alloc = dyn_cast<memref::AllocOp>(&op)) {
+      auto mrTy = alloc.getType();
+      if (hasWorkgroupAddressSpace(mrTy) && mrTy.hasStaticShape())
+        wgAllocs.push_back(alloc);
+    }
+  }
+  if (wgAllocs.empty())
+    return;
+
+  // Compute per-alloc byte size (rounded up to 16 B for cp.async.cg alignment)
+  // and the cumulative offset table.
+  SmallVector<int64_t> byteOffsets(wgAllocs.size(), 0);
+  SmallVector<int64_t> byteSizes(wgAllocs.size(), 0);
+  int64_t running = 0;
+  for (auto [i, alloc] : llvm::enumerate(wgAllocs)) {
+    MemRefType ty = alloc.getType();
+    int64_t elemBits = ty.getElementTypeBitWidth();
+    int64_t elems    = ty.getNumElements();
+    int64_t bytes    = (elems * elemBits + 7) / 8;
+    bytes = llvm::alignTo(bytes, (int64_t)16);
+    byteOffsets[i] = running;
+    byteSizes[i]   = bytes;
+    running += bytes;
+  }
+  int64_t totalBytes = running;
+
+  // GATE: only switch to dynamic SMEM when the static path can't fit.
+  // if (totalBytes <= kStaticSharedMemBudgetBytes) {
+  //   LLVM_DEBUG(llvm::dbgs() << "[nova-gpu-map-forall] keeping static SMEM path: "
+  //                           << wgAllocs.size() << " alloc(s), " << totalBytes
+  //                           << " bytes (<= " << kStaticSharedMemBudgetBytes
+  //                           << ")\n");
+  //   return;
+  // }
+
+  // ── Attach dynamic_shared_memory_size to the gpu.launch op ───────────────
+  OpBuilder hostBuilder(launch);
+  Value dynSmemSize = hostBuilder.create<arith::ConstantIntOp>(
+      loc, /*value=*/totalBytes, /*bitwidth=*/32);
+  launch.getDynamicSharedMemorySizeMutable().assign(dynSmemSize);
+
+  // ── Emit a single gpu.dynamic_shared_memory at top of the launch body ───
+  OpBuilder inBody(ctx);
+  inBody.setInsertionPointToStart(&body);
+  auto workgroupAS = gpu::AddressSpaceAttr::get(
+      ctx, gpu::GPUDialect::getWorkgroupAddressSpace());
+  auto i8DynTy = MemRefType::get(
+      {ShapedType::kDynamic}, inBody.getIntegerType(8),
+      MemRefLayoutAttrInterface{}, workgroupAS);
+  Value dynBase =
+      inBody.create<gpu::DynamicSharedMemoryOp>(loc, i8DynTy).getResult();
+
+  // ── Replace each alloc with a memref.view ───────────────────────────────
+  for (auto [i, alloc] : llvm::enumerate(wgAllocs)) {
+    OpBuilder b(alloc);
+    Value offset = b.create<arith::ConstantIndexOp>(loc, byteOffsets[i]);
+    MemRefType viewTy = alloc.getType();
+    auto view = b.create<memref::ViewOp>(
+        loc, viewTy, dynBase, offset, /*sizes=*/ValueRange{});
+    alloc.getResult().replaceAllUsesWith(view.getResult());
+    alloc.erase();
+  }
+
+  // ── Drop any matching memref.dealloc ops (shared memory auto-frees) ──────
+  SmallVector<memref::DeallocOp> staleDeallocs;
+  body.walk([&](memref::DeallocOp d) {
+    auto mrTy = dyn_cast<MemRefType>(d.getMemref().getType());
+    if (mrTy && hasWorkgroupAddressSpace(mrTy))
+      staleDeallocs.push_back(d);
+  });
+  for (memref::DeallocOp d : staleDeallocs)
+    d.erase();
+
+  LLVM_DEBUG(llvm::dbgs() << "[nova-gpu-map-forall] switched to dynamic SMEM: "
+                          << wgAllocs.size() << " alloc(s), "
+                          << totalBytes << " bytes total (> "
+                          << kStaticSharedMemBudgetBytes << ")\n");
+}
+
 // ===== Core conversion =====================================================
 
 /// Convert a single outermost block-mapped scf.forall to gpu.launch.
@@ -100,23 +210,22 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   int64_t gridDims[3] = {1, 1, 1};
   bool linearBlock = isLinearBlockMapping(blockForall);
 
+  int64_t totalBlocks = 1;
+  for (auto ub : blockUBs) {
+    auto cst = getConstantIntValue(ub);
+    if (!cst)
+      return blockForall.emitError("non-static block forall upper bound");
+    totalBlocks *= *cst;
+  }
+
   if (linearBlock) {
     // Linear block mapping: product of all bounds → gridDim.x.
-    int64_t totalBlocks = 1;
-    for (auto ub : blockUBs) {
-      auto cst = getConstantIntValue(ub);
-      if (!cst)
-        return blockForall.emitError("non-static block forall upper bound");
-      totalBlocks *= *cst;
-    }
     gridDims[0] = totalBlocks;
   } else {
     // 3D block mapping: getMappingId() returns DimX=0, DimY=1, DimZ=2.
     for (auto [idx, attr] : llvm::enumerate(blockMapping)) {
       auto blockAttr = cast<gpu::GPUBlockMappingAttr>(attr);
       auto dimCst = getConstantIntValue(blockUBs[idx]);
-      if (!dimCst)
-        return blockForall.emitError("non-static block forall upper bound");
       int64_t mid = blockAttr.getMappingId();
       if (mid < 3)
         gridDims[mid] = *dimCst;
@@ -251,7 +360,6 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
       cstIdx(blockDims[0]), cstIdx(blockDims[1]), cstIdx(blockDims[2]));
 
   // gpu.launch body is created with block args but NO terminator.
-  // We must add one explicitly.
   Block &launchBody = launchOp.getBody().front();
   {
     OpBuilder::InsertionGuard guard(rewriter);
@@ -268,6 +376,13 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
       // Linear block: linearize block_id and decompose.
       auto bidX = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::x);
       Value linearBid = bidX.getResult();
+
+      if (gridDims[1] > 1) {
+        auto bidY = rewriter.create<gpu::BlockIdOp>(loc, gpu::Dimension::y);
+        auto dimX = rewriter.create<gpu::GridDimOp>(loc, gpu::Dimension::x);
+        Value mul = rewriter.create<arith::MulIOp>(loc, bidY, dimX);
+        linearBid = rewriter.create<arith::AddIOp>(loc, mul, linearBid);
+      }
 
       SmallVector<std::pair<int64_t, unsigned>> dimOrder;
       for (auto [idx, attr] : llvm::enumerate(blockMapping)) {
@@ -288,6 +403,19 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
         blockForall.getInductionVar(forallIvIdx).replaceAllUsesWith(iv);
         stride *= bound;
       }
+
+      // Predicate the whole body if the linearized grid is larger than totalBlocks.
+      // This happens when overflow-splitting created a 2D grid that isn't a perfect multiple.
+      rewriter.setInsertionPointToEnd(&launchBody);
+      Value totalBlocksVal = cstIdx(totalBlocks);
+      Value isBlockActive = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ult, linearBid, totalBlocksVal);
+
+      auto ifOp = rewriter.create<scf::IfOp>(loc, isBlockActive, /*withElseRegion=*/false);
+      rewriter.eraseOp(blockForall.getTerminator());
+      ifOp.thenBlock()->getOperations().splice(ifOp.thenBlock()->begin(),
+                                              blockForall.getBody()->getOperations());
+
     } else {
       // 3D block mapping.
       for (auto [idx, attr] : llvm::enumerate(blockMapping)) {
@@ -297,16 +425,11 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
         auto blockIdOp = rewriter.create<gpu::BlockIdOp>(loc, dim);
         blockForall.getInductionVar(idx).replaceAllUsesWith(blockIdOp);
       }
+      rewriter.eraseOp(blockForall.getTerminator());
+      launchBody.getOperations().splice(launchBody.without_terminator().end(),
+                                        blockForall.getBody()->getOperations());
     }
   }
-
-  // ---- ALGORITHM STEP 6: Erase block forall terminator; move body to launch ----
-  // The in_parallel terminator (empty after bufferization) must be erased.
-  rewriter.eraseOp(blockForall.getTerminator());
-
-  Block *forallBody = blockForall.getBody();
-  auto insertPt = launchBody.without_terminator().end();
-  launchBody.getOperations().splice(insertPt, forallBody->getOperations());
 
   // ---- ALGORITHM STEP 7a: Convert thread foralls inside the launch body ----
   for (auto threadForall : threadForalls) {
@@ -492,6 +615,11 @@ static LogicalResult convertBlockForallToLaunch(IRRewriter &rewriter,
   // ---- ALGORITHM STEP 8: Erase original block forall ----
   rewriter.eraseOp(blockForall);
 
+  // ---- ALGORITHM STEP 9: Materialise workgroup allocs as dynamic SMEM ----
+  // Only when the per-launch total exceeds the 48 KB static cap. Within budget
+  // we keep the static memref.global path (NovaConvertSharedMemAllocsPass).
+  maybeMaterializeDynamicSharedMemory(launchOp);
+
   return success();
 }
 
@@ -654,3 +782,5 @@ void registerNovaGPUMapForallToGPUPass() {
 }
 
 } // namespace mlir::nova
+
+

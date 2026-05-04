@@ -76,7 +76,18 @@ struct NVIDIATargetInfo {
   std::string archName;             // e.g. "sm_80"
   int32_t smCount;                  // Streaming multiprocessor count on chip
   int32_t maxThreadsPerWorkgroup;   // Max threads per block (1024 usually)
-  int32_t maxWorkgroupMemBytes;     // Max shared memory per block in bytes
+
+  /// Static shared memory limit per block, in bytes (the default cap).
+  /// Corresponds to sharedMemPerBlock in CUDA device properties.
+  int32_t maxWorkgroupMemBytes;
+
+  /// Dynamic shared memory limit per block achievable via
+  /// cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, N).
+  /// On sm_86/89 this is 99 KB; on sm_80/90 it's much larger. Equals
+  /// maxWorkgroupMemBytes on architectures where the two are the same
+  /// (Volta, Turing).
+  int32_t maxWorkgroupDynamicMemBytes;
+
   int32_t preferredSubgroupSize;    // Warp size (32 for all NVIDIA GPUs)
   llvm::SmallVector<NVMMAIntrinsicInfo> mmaIntrinsics;
 

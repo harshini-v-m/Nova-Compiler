@@ -569,8 +569,16 @@ static int64_t computeSharedMemory(int64_t wgM, int64_t wgN, int64_t wgK,
  int64_t lhsBytes = elemBytes(lhsKind);
  int64_t rhsBytes = elemBytes(rhsKind);
  int64_t accBytes = 4;
- // A tile + B tile, double-buffered
- int64_t smem = 2 * (wgM * wgK * lhsBytes + wgK * wgN * rhsBytes);
+ // Bank-conflict avoidance pads the contiguous (K) dimension by 4 elements
+ // for both A (KxN-major) and B (MxK-major) tiles. Without modeling this in
+ // the SMEM estimate the fitter will accept a tile whose actual allocation
+ // exceeds the dynamic-SMEM cap (~12% bigger than the unpadded estimate),
+ // and the kernel launches with insufficient SMEM → wrong values / illegal
+ // memory access. See NovaGPUReduceBankConflicts.cpp for the padding pass.
+ constexpr int64_t kBankPadElems = 4;
+ int64_t paddedK = wgK + kBankPadElems;
+ // A tile + B tile, 3-buffered for the cp.async pipeline.
+ int64_t smem = 3 * (wgM * paddedK * lhsBytes + paddedK * wgN * rhsBytes);
  if (doCPromotion)
    smem += wgM * wgN * accBytes;
  // [Fix6] Add shared memory cost of fused leading op:
@@ -1039,10 +1047,16 @@ deduceMMASchedule(const ContractProblem &problem,
    }
 
 
-   // [Fix6] Pass fusedInfo so fitScheduleInSharedMemory uses the real budget.
+   // Use the dynamic SMEM budget here. The 3-stage matmul pipeline emits
+   // gpu.dynamic_shared_memory + view (NovaGPUMapForallToGPU) and the launcher
+   // calls cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) to opt into the
+   // larger carve-out. With static-only budget (48 KB) the heuristic would
+   // shrink (128, 64, 32) tiles unnecessarily even though they fit dynamically
+   // (~72 KB at depth=3). fusedInfo is still passed so the fitter accounts for
+   // any extra fused-op SMEM staging.
    std::optional<GPUMMASchedule> fitted =
        fitScheduleInSharedMemory(sched, intrinsic,
-                                 target.maxWorkgroupMemBytes,
+                                 target.maxWorkgroupDynamicMemBytes,
                                  doCPromotion, fusedInfo);
    if (!fitted) continue;
    sched = *fitted;
