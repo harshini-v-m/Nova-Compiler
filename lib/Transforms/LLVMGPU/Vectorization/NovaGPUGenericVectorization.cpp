@@ -503,6 +503,126 @@ static bool tryHoistLabelDrivenExtract(IRRewriter &rewriter,
   return true;
 }
 
+// Fix the dBeta undercount caused by LinalgElementwiseOpFusionPass.
+//
+// Background:
+//   NovaLinalgHorizontalFusionPass creates a dual-output reduction generic
+//   for dgamma+dbeta with gy (dense<1.0>) as an explicit tensor input:
+//       ins(..., gy : tensor<4x4x2xf32>)   map (d0,d1,d2)->(d0,d1,d2)
+//       body: dbeta_acc += %in_gy           ← correct: 16 values per tile
+//
+//   LinalgElementwiseOpFusionPass then folds the constant tensor producer
+//   into the body, removing gy from `ins` and capturing a scalar 1.0f:
+//       ins(...)                            ← gy input GONE
+//       body: dbeta_acc += %cst_1.0f        ← wrong: adds 1 once per tile
+//
+//   linalg::vectorize() then generates:
+//       %v = arith.addf %acc<2>, dense<1.0> : vector<2xf32>
+//   This adds 1.0 per tile call, giving 512×1=512 instead of 512×16=8192.
+//
+// Fix:
+//   Before vectorizing, identify captured float constants that are directly
+//   accumulated into a reduction output block arg via addf, and scale each
+//   such constant by the product of the reduction tile sizes (4×4=16 here).
+static bool tryScaleDirectlyAccumulatedConstants(IRRewriter &rewriter,
+                                                  linalg::GenericOp op) {
+  // Only apply to generics with at least one reduction iterator.
+  auto iterTypes = op.getIteratorTypesArray();
+  if (llvm::none_of(iterTypes, [](utils::IteratorType t) {
+        return t == utils::IteratorType::reduction;
+      }))
+    return false;
+
+  Block &body = op.getRegion().front();
+  unsigned numIns = op.getNumDpsInputs();
+
+  // Collect captured float constants that are DIRECTLY accumulated into a
+  // reduction output block arg via addf.  Skip constants used only in mulf
+  // or other non-accumulation ops (e.g. scale/epsilon in variance).
+  SmallVector<Value> capturedConsts;
+  for (Operation &innerOp : body) {
+    if (!isa<arith::AddFOp>(innerOp))
+      continue;
+    Value capturedCandidate;
+    bool hasReductionOutputArg = false;
+    for (Value v : innerOp.getOperands()) {
+      if (auto ba = dyn_cast<BlockArgument>(v)) {
+        if (ba.getOwner() == &body && ba.getArgNumber() >= numIns) {
+          unsigned outIdx = ba.getArgNumber() - numIns;
+          AffineMap outMap = op.getIndexingMapsArray()[numIns + outIdx];
+          // Output map has fewer results than loops → this dim is reduced.
+          if (outMap.getNumResults() < op.getNumLoops())
+            hasReductionOutputArg = true;
+        }
+      } else {
+        auto *defOp = v.getDefiningOp();
+        if (defOp && isa<arith::ConstantOp>(defOp) &&
+            isa<FloatType>(v.getType()))
+          capturedCandidate = v;
+      }
+    }
+    if (hasReductionOutputArg && capturedCandidate &&
+        !llvm::is_contained(capturedConsts, capturedCandidate))
+      capturedConsts.push_back(capturedCandidate);
+  }
+  if (capturedConsts.empty())
+    return false;
+
+  // Infer the iteration-space tile shape from operand shapes + affine maps.
+  unsigned numLoops = op.getNumLoops();
+  SmallVector<int64_t> iterShape(numLoops, ShapedType::kDynamic);
+  {
+    auto allMaps = op.getIndexingMapsArray();
+    SmallVector<Value> allOperands;
+    llvm::append_range(allOperands, op.getDpsInputs());
+    llvm::append_range(allOperands, op.getDpsInits());
+    for (auto [operand, map] : llvm::zip(allOperands, allMaps)) {
+      auto tensorTy = dyn_cast<RankedTensorType>(operand.getType());
+      if (!tensorTy) continue;
+      for (auto [resultIdx, result] : llvm::enumerate(map.getResults())) {
+        auto dimExpr = dyn_cast<AffineDimExpr>(result);
+        if (!dimExpr) continue;
+        unsigned dim = dimExpr.getPosition();
+        if (dim < numLoops && iterShape[dim] == ShapedType::kDynamic)
+          iterShape[dim] = tensorTy.getShape()[resultIdx];
+      }
+    }
+  }
+  if (llvm::any_of(iterShape,
+                   [](int64_t d) { return d == ShapedType::kDynamic; }))
+    return false;
+
+  // Total reduction elements per tile = product of all reduction dim sizes.
+  // For [red=4, red=4, par=2]: 4×4 = 16.  Each tile should contribute
+  // (original_val × 16) to the accumulator, not original_val × 1.
+  int64_t totalRedElems = 1;
+  for (unsigned i = 0; i < numLoops; ++i)
+    if (iterTypes[i] == utils::IteratorType::reduction)
+      totalRedElems *= iterShape[i];
+
+  if (totalRedElems == 1)
+    return false; // Nothing to scale.
+
+  // For each captured constant, create a new scalar = original_val * totalRedElems
+  // and replace all its uses inside this linalg body.
+  rewriter.setInsertionPoint(op);
+  Location loc = op.getLoc();
+  for (Value captured : capturedConsts) {
+    auto floatTy = cast<FloatType>(captured.getType());
+    auto constOp = cast<arith::ConstantOp>(captured.getDefiningOp());
+    auto floatAttr = cast<FloatAttr>(constOp.getValue());
+    double scaledVal =
+        floatAttr.getValueAsDouble() * static_cast<double>(totalRedElems);
+    Value scaledConst = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(floatTy, scaledVal));
+
+    // Replace uses of the captured constant inside the linalg body only.
+    for (Operation &innerOp : body)
+      innerOp.replaceUsesOfWith(captured, scaledConst);
+  }
+  return true;
+}
+
 static LogicalResult vectorizeMmaOp(IRRewriter &rewriter, Operation *op) {
   // Park layout attrs on the parent scf.forall before linalg::vectorize erases op.
   // The forall is stable across Phase 2 while the linalg op is not.
@@ -638,6 +758,9 @@ void NovaGenericVectorizationPass::runOnOperation() {
       if (tryRewriteContiguousExtract(rewriter, linalgOp)) continue;
       if (tryHoistLabelDrivenExtract(rewriter, linalgOp)) continue;
 
+      if (auto genericOp = dyn_cast<linalg::GenericOp>(op))
+        tryScaleDirectlyAccumulatedConstants(rewriter, genericOp);
+
       FailureOr<linalg::VectorizationResult> result =
           linalg::vectorize(rewriter, op, {}, {}, /*vectorizeNDExtract=*/true);
       if (succeeded(result))
@@ -653,6 +776,10 @@ void NovaGenericVectorizationPass::runOnOperation() {
                                    maybeSizes->vectorSizes.end(),
                                    int64_t(1), std::multiplies<int64_t>{});
     if (flat >= kMaxVectorSize) continue;
+
+    if (auto genericOp = dyn_cast<linalg::GenericOp>(op))
+      tryScaleDirectlyAccumulatedConstants(rewriter, genericOp);
+
     FailureOr<linalg::VectorizationResult> result =
         linalg::vectorize(rewriter, op, maybeSizes->vectorSizes,
                           maybeSizes->vectorScalableFlags, true);

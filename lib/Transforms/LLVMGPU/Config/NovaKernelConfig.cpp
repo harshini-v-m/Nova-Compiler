@@ -1658,25 +1658,41 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
 
  } else if (!reductionDims.empty() && parallelDims.size() >= 2 &&
             reductionDims.back() == (unsigned)(numLoops - 1)) {
-   // Row-reduction: tile inner parallel dim; reduction is sequential.
-   unsigned innerParallelDim = parallelDims.back();
-   int64_t innerSize = loopBounds[innerParallelDim];
-   int64_t innerTile = std::min(innerSize, (int64_t)kWorkgroupThreads);
-   while (innerTile > 1 && innerSize % innerTile != 0) innerTile /= 2;
-   workgroupTiles[innerParallelDim] = innerTile;
-   threadTiles[innerParallelDim]    = 1;
-   for (unsigned dim : parallelDims)
-     if (dim != innerParallelDim)
-       workgroupTiles[dim] = 1;
-   // DO NOT set threadTiles on reduction dims.
-   for (unsigned dim : reductionDims) {
-     int64_t bound = loopBounds[dim];
-     reductionTiles[dim] = (bound % 4 == 0) ? 4 :
-                           (bound % 2 == 0) ? 2 : 1;
-   }
+    // Row-reduction: tile inner parallel dim; reduction is sequential.
+    unsigned innerParallelDim = parallelDims.back();
+    int64_t innerSize = loopBounds[innerParallelDim];
+    int64_t innerTile = std::min(innerSize, (int64_t)kWorkgroupThreads);
+    while (innerTile > 1 && innerSize % innerTile != 0) innerTile /= 2;
+    workgroupTiles[innerParallelDim] = innerTile;
+    threadTiles[innerParallelDim]   = 1;
+    // Distribute remaining thread budget to outer parallel dims (inward→outward),
+    // mirroring the general-purpose else branch below.  Without this, a
+    // [par, par, red] op with innerTile=64 only uses 64/256 threads.
+    {
+      int64_t remainingBudget = kWorkgroupThreads / innerTile;
+      for (int i = (int)parallelDims.size() - 2; i >= 0; --i) {
+        unsigned dim = parallelDims[i];
+        int64_t dimSize = loopBounds[dim];
+        if (remainingBudget > 1 && dimSize > 1) {
+          int64_t tile = std::min(dimSize, remainingBudget);
+          while (tile > 1 && dimSize % tile != 0) tile /= 2;
+          workgroupTiles[dim] = tile;
+          threadTiles[dim]    = 1;
+          remainingBudget    /= tile;
+        } else {
+          workgroupTiles[dim] = 1;
+          threadTiles[dim]    = 0;
+        }
+      }
+    }
+    // DO NOT set threadTiles on reduction dims.
+    for (unsigned dim : reductionDims) {
+      int64_t bound = loopBounds[dim];
+      reductionTiles[dim] = (bound % 4 == 0) ? 4 :
+                            (bound % 2 == 0) ? 2 : 1;
+    }
 
-
- } else {
+  } else {
    // Has parallel dims — distribute across workgroup.
    unsigned innerParallelDim = parallelDims.back();
    int64_t innerSize = loopBounds[innerParallelDim];
