@@ -360,6 +360,13 @@ namespace mlir::nova
   pm.addPass(nova::createConvertMemRefToGpuPass());
   pm.addPass(createCanonicalizerPass());
 
+  // {
+  //   auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
+  //   gpuPm.addPass(createNovaGPUSwizzleSharedMemoryPass());
+  //   pm.addNestedPass<func::FuncOp>(createNovaGPUReduceBankConflictsPass());
+  //   // gpuPm.addPass(createCanonicalizerPass());
+  // }
+
   // ── Step 13: NVVM lowering ──────────────────────────────────────────────
   GpuNVVMAttachTargetOptions nvvmTargetOptions;
   nvvmTargetOptions.triple = "nvptx64-nvidia-cuda";

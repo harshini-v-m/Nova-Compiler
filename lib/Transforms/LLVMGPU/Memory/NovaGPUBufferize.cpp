@@ -602,17 +602,81 @@ static bool hasWorkgroupLoads(Operation *op) {
   return found;
 }
 
+// True when `forOp`'s body is one of the "trivially per-thread, no cross-warp
+// data dependence" copy patterns:
+//
+//   (A) 1 workgroup load + 1 workgroup store + 0 other ops
+//       (smem→smem swap path)
+//
+//   (B) 1 non-workgroup (gmem) load + 1 workgroup store + 0 other ops
+//       (gmem→smem prologue copy emitted by promotion when cp.async hasn't
+//       lowered the linalg.copy yet — each thread writes its own SMEM slot
+//       and reads its own gmem location, so no cross-thread aliasing inside
+//       the loop. Barriers inside this loop are zero-utility; the producer-
+//       consumer fence happens at the K-loop boundary, not per element.)
+//
+//   (C) Body is a single nested `scf.for` (with literal index bounds) whose
+//       body matches (A) or (B) recursively, plus 0 other ops.
+//       This catches the unrolled prologue shape that promotion+linalg-to-
+//       loops emits for matmul A-tile loads:
+//
+//           scf.for outer = 0 to 4 step 1 {
+//             scf.for inner = 0 to 8 step 1 {
+//               %v = memref.load gmem[outer, inner]
+//               memref.store %v, smem[inner, outer]
+//             }
+//           }
+//
+//       Without classifying the outer as a simple copy too, the trailing-
+//       store-before-yield logic in insertBarriersInBlock inserts a barrier
+//       at the outer loop's yield (4× per K iteration), which Nsight reports
+//       as a ~3× spike in Stall Barrier.
+//
+// Both inner and outer per-thread copies are race-free across warps: each
+// thread reads/writes its own gmem/smem locations. The producer→consumer
+// fence is enforced at the K-loop boundary by the existing top-of-iter
+// barrier and by the post-wait_group barrier added in
+// NovaGPUPipelining::mergeAsyncCommitsInKLoop.
 static bool isSimplePerThreadCopy(scf::ForOp forOp) {
-  unsigned loads = 0, stores = 0, other = 0;
+  unsigned wgLoads = 0, nonWgLoads = 0;
+  unsigned wgStores = 0, nonWgStores = 0;
+  unsigned other = 0;
+  scf::ForOp nestedFor;
   for (Operation &op : *forOp.getBody()) {
     if (isa<scf::YieldOp>(op)) continue;
-    if (auto r = dyn_cast<memref::LoadOp>(op))
-      { (isWorkgroupValue(r.getMemref()) ? loads : other)++; continue; }
-    if (auto w = dyn_cast<memref::StoreOp>(op))
-      { (isWorkgroupValue(w.getMemref()) ? stores : other)++; continue; }
+    if (auto r = dyn_cast<memref::LoadOp>(op)) {
+      (isWorkgroupValue(r.getMemref()) ? wgLoads : nonWgLoads)++;
+      continue;
+    }
+    if (auto w = dyn_cast<memref::StoreOp>(op)) {
+      (isWorkgroupValue(w.getMemref()) ? wgStores : nonWgStores)++;
+      continue;
+    }
+    if (auto inner = dyn_cast<scf::ForOp>(op)) {
+      if (nestedFor) {
+        // More than one nested loop — not a simple copy.
+        return false;
+      }
+      nestedFor = inner;
+      continue;
+    }
     other++;
   }
-  return loads == 1 && stores == 1 && other == 0;
+  if (other != 0)
+    return false;
+  // Pattern (C): single nested simple-copy loop, no scalar ops at this level.
+  if (nestedFor) {
+    if (wgLoads != 0 || nonWgLoads != 0 || wgStores != 0 || nonWgStores != 0)
+      return false;
+    return isSimplePerThreadCopy(nestedFor);
+  }
+  // Pattern (A): smem load + smem store
+  if (wgLoads == 1 && wgStores == 1 && nonWgLoads == 0 && nonWgStores == 0)
+    return true;
+  // Pattern (B): gmem load + smem store (per-thread prologue)
+  if (nonWgLoads == 1 && wgStores == 1 && wgLoads == 0 && nonWgStores == 0)
+    return true;
+  return false;
 }
 
 static bool isUnconditionalForBody(Block *block) {

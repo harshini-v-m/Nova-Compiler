@@ -1970,4 +1970,3 @@ void initNovaGPULaunchConfig(mlir::func::FuncOp funcOp,
 
 
 } // namespace mlir::nova
-
