@@ -11,11 +11,20 @@
 #ifndef NOVA_TRANSFORMS_LLVMGPU_PASSES_H_
 #define NOVA_TRANSFORMS_LLVMGPU_PASSES_H_
 
-#include "mlir/Pass/Pass.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Pass/Pass.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace mlir {
 namespace nova {
+
+// Marker attribute set by NovaGPUMultiBuffering on every scf.for whose
+// workgroup buffers were successfully widened. NovaGPUPipelining only
+// time-shifts loops carrying this attribute: pipelining a non-multibuffered
+// loop would race on shared memory because successive cp.async groups would
+// alias the same buffer.
+inline constexpr llvm::StringLiteral kNovaMultiBufferedLoopMarker =
+    "__nova_multibuffered__";
 
 //===----------------------------------------------------------------------===//
 // Pipeline builders
@@ -28,7 +37,7 @@ namespace nova {
 // |cudaArch|: CUDA SM arch string forwarded to the strategy pass, e.g. "sm_86".
 // Defaults to "sm_86" (Ampere / RTX 3060) when empty.
 void addNovaGPUOptimizedPipeline(OpPassManager &pm,
-                                  StringRef cudaArch = "sm_86");
+                                 StringRef cudaArch = "sm_86");
 
 // GPU-aware bufferization helper — mirrors IREE's addGPUBufferizePasses().
 // Called internally by addNovaGPUOptimizedPipeline (Step 8).
@@ -52,8 +61,8 @@ void registerNovaConfigTrackingCanonicalizerPass();
 // attaches a #nova.lowering_config dict attribute to each linalg matmul op.
 // Mirrors IREE's LLVMGPUSelectLoweringStrategy pass.
 // |cudaArch|: SM architecture string, e.g. "sm_80", "sm_75", "ampere".
-std::unique_ptr<Pass> createNovaGPUSelectLoweringStrategyPass(
-    StringRef cudaArch = "sm_86");
+std::unique_ptr<Pass>
+createNovaGPUSelectLoweringStrategyPass(StringRef cudaArch = "sm_86");
 void registerNovaGPUSelectLoweringStrategyPass();
 
 // Tiles compute operations and distributes them to workgroups using scf.forall.
@@ -68,7 +77,8 @@ std::unique_ptr<Pass> createNovaGPUPadOperandsPass();
 void registerNovaGPUPadOperandsPass();
 
 // Promotes matmul A/B operands to GPU shared memory (workgroup address space).
-// Uses a two-stage copy pattern (global→shared linalg.copy + nova.fusion_barrier
+// Uses a two-stage copy pattern (global→shared linalg.copy +
+// nova.fusion_barrier
 // + per-thread linalg.copy). Ported from IREE's GPUPromoteMatmulOperands.cpp.
 std::unique_ptr<Pass> createNovaGPUPromoteMatmulOperandsPass();
 void registerNovaGPUPromoteMatmulOperandsPass();
@@ -173,8 +183,21 @@ void registerNovaGPUMapForallToGPUPass();
 std::unique_ptr<Pass> createNovaGPULowerMemorySpacePass();
 void registerNovaGPULowerMemorySpacePass();
 
+// Multi-buffers workgroup-memory allocations whose uses live inside an scf.for,
+// to enable cp.async software pipelining. Widens `memref<TxSxf32, #ws>` →
+// `memref<NxTxSxf32, #ws>` and indexes per iteration with `(iv mod N)`.
+// Tags the rewritten scf.for with a marker attribute so the downstream
+// pipelining pass only operates on loops whose buffers were actually widened.
+std::unique_ptr<Pass> createNovaGPUMultiBufferingPass(unsigned numBuffers = 3);
+void registerNovaGPUMultiBufferingPass();
 
-
+// Software-pipelines K-loops containing nvgpu.device_async_copy ops. Time-
+// shifts the cp.async ops by `depth-1` iterations (Stage 0 = transfers,
+// Stage `depth-1` = compute) and rewrites the wait_group count from
+// wait-all to `depth-1`. Only operates on loops marked by NovaGPUMultiBuffering
+// — pipelining a loop without widened buffers would race on shared memory.
+std::unique_ptr<Pass> createNovaGPUPipeliningPass(unsigned depth = 3);
+void registerNovaGPUPipeliningPass();
 
 std::unique_ptr<Pass> createNovaWarpShuffleReductionPass();
 void registerNovaWarpShuffleReductionPass();
@@ -185,7 +208,6 @@ void registerNovaWarpShuffleReductionPass();
 // vector.reduction; this pass is the extensibility hook for that future work.
 // Shared utilities (buildShuffleReductionTree, emitTypedShuffleXOR, etc.) live
 // in NovaVectorReduction.cpp and are also used by NovaWarpShuffleReduction.
-
 
 std::unique_ptr<Pass> createNovaGPUFillCopyForwardingPass();
 void registerNovaGPUFillCopyForwardingPass();
@@ -207,14 +229,15 @@ void registerNovaMultiConsumerFusion();
 std::unique_ptr<Pass> createNovaGPUConfigureTensorLayoutsPass();
 void registerNovaGPUConfigureTensorLayoutsPass();
 
-std::unique_ptr<Pass> createNovaGPUReduceBankConflictsPass(
-    StringRef arch = "sm_86");
+std::unique_ptr<Pass>
+createNovaGPUReduceBankConflictsPass(StringRef arch = "sm_86");
 void registerNovaGPUReduceBankConflictsPass();
 std::unique_ptr<Pass> createNovaGPUApplySwizzlePass();
 void registerNovaGPUApplySwizzlePass();
 
 // ---------------------------------------------------------------------------
-// Vectorization Passes  (Batch 1: declarations; wired into pipeline in Batch 2+)
+// Vectorization Passes  (Batch 1: declarations; wired into pipeline in Batch
+// 2+)
 // ---------------------------------------------------------------------------
 
 /// Vectorizes linalg ops to vector.contract / vector.transfer_*.
@@ -254,13 +277,14 @@ void registerNovaGPUHoistVectorExtractInsertSlicePass();
 /// vector.transfer_read/write ops.  Used by GpuHardwareMappingPass (Stage 35)
 /// so the patterns are not re-implemented inline in Passes.cpp:
 ///   • FoldExtractStridedSliceFromTransferRead  — rank-2 extract fold
-///   • FoldInsertStridedSliceIntoTransferWrite  — insert chain → per-tile writes
-///   • SplitTransferReadExtract                 — general minor-identity extract fold
+///   • FoldInsertStridedSliceIntoTransferWrite  — insert chain → per-tile
+///   writes • SplitTransferReadExtract                 — general minor-identity
+///   extract fold
 void populateGpuHardwareMappingStridedSlicePatterns(
     mlir::RewritePatternSet &patterns);
 
-/// Normalizes strided-memref indices for WMMA load/store ops before NVVM legalization.
-/// No-op for the nvgpu.mma.sync (Ampere native) path.
+/// Normalizes strided-memref indices for WMMA load/store ops before NVVM
+/// legalization. No-op for the nvgpu.mma.sync (Ampere native) path.
 std::unique_ptr<Pass> createNovaGPUCastTypeToFitMMAPass();
 void registerNovaGPUCastTypeToFitMMAPass();
 
@@ -285,13 +309,16 @@ void registerNovaStrideReductionPass();
 std::unique_ptr<Pass> createNovaVectorizeVectorExtOpsPass();
 void registerNovaVectorizeVectorExtOpsPass();
 
-// Pipeline helpers — declared here so Passes.cpp and external callers can use them.
+// Pipeline helpers — declared here so Passes.cpp and external callers can use
+// them.
 void addNovaPostBufferizationPasses(OpPassManager &pm);
 void addNovaComprehensiveBufferizePasses(OpPassManager &pm);
 
 // Registers BufferizableOpInterface external model on nova::ValueBarrierOp.
-// Must be called during dialect registry setup (before any bufferization pass runs).
-void registerNovaValueBarrierBufferizationInterface(mlir::DialectRegistry &registry);
+// Must be called during dialect registry setup (before any bufferization pass
+// runs).
+void registerNovaValueBarrierBufferizationInterface(
+    mlir::DialectRegistry &registry);
 
 } // namespace nova
 } // namespace mlir

@@ -237,13 +237,20 @@ struct NovaGPULowerMemorySpacePass
 
     AttrTypeReplacer replacer;
 
-    // Map #gpu.address_space<private> → IntegerAttr(64, 0) (generic AS).
-    // Workgroup and global are left as-is for downstream passes.
+    // Map all #gpu.address_space tokens to integer address spaces. Workgroup
+    // memrefs MUST be rewritten to AS 3 here so that finalize-memref-to-llvm
+    // can lower them — leaving them as symbolic gpu::AddressSpaceAttr makes
+    // that pass emit "conversion of memref memory space ... failed".
     replacer.addReplacement(
         [&](gpu::AddressSpaceAttr attr) -> std::optional<Attribute> {
-          if (attr.getValue() == gpu::AddressSpace::Private)
-            return IntegerAttr::get(IntegerType::get(ctx, 64), /*generic=*/0);
-          return std::nullopt;
+          unsigned as = 0;
+          switch (attr.getValue()) {
+          case gpu::AddressSpace::Private:   as = 0; break;
+          case gpu::AddressSpace::Global:    as = 1; break;
+          case gpu::AddressSpace::Workgroup: as = 3; break;
+          default: return std::nullopt;
+          }
+          return IntegerAttr::get(IntegerType::get(ctx, 64), as);
         });
 
     // Also remap the MemRefType itself so structural type equality is maintained
@@ -255,14 +262,12 @@ struct NovaGPULowerMemorySpacePass
         return std::nullopt;
 
       unsigned as = 0;
-      if (space.getValue() == gpu::AddressSpace::Private)
-        as = 0;
-      else if (space.getValue() == gpu::AddressSpace::Workgroup)
-        as = 3;
-      else if (space.getValue() == gpu::AddressSpace::Global)
-        as = 1;
-      else
-        return std::nullopt;
+      switch (space.getValue()) {
+      case gpu::AddressSpace::Private:   as = 0; break;
+      case gpu::AddressSpace::Global:    as = 1; break;
+      case gpu::AddressSpace::Workgroup: as = 3; break;
+      default: return std::nullopt;
+      }
 
       return MemRefType::get(type.getShape(), type.getElementType(),
                              type.getLayout(),
@@ -272,6 +277,40 @@ struct NovaGPULowerMemorySpacePass
     replacer.recursivelyReplaceElementsIn(op, /*replaceAttrs=*/true,
                                           /*replaceLocs=*/false,
                                           /*replaceTypes=*/true);
+
+    // ── Fix verifier for gpu.dynamic_shared_memory ─────────────────────────
+    // After the bulk remap above, gpu.dynamic_shared_memory's result type
+    // carries integer AS 3 — but the op's ODS verifier requires the symbolic
+    // gpu::AddressSpaceAttr<workgroup>. Restore the symbolic type on the
+    // result and bridge to its AS-3 consumers via unrealized_conversion_cast.
+    // gpu-to-nvvm later folds the cast away when lowering.
+    op->walk([&](gpu::DynamicSharedMemoryOp smemOp) {
+      Value result = smemOp.getResult();
+      auto currentTy = dyn_cast<MemRefType>(result.getType());
+      if (!currentTy)
+        return;
+      // Only fix if the result is currently in integer AS 3.
+      auto space = currentTy.getMemorySpace();
+      auto intSpace = dyn_cast_if_present<IntegerAttr>(space);
+      if (!intSpace || intSpace.getInt() != 3)
+        return;
+
+      auto workgroupAS = gpu::AddressSpaceAttr::get(
+          ctx, gpu::GPUDialect::getWorkgroupAddressSpace());
+      auto symbolicTy = MemRefType::get(
+          currentTy.getShape(), currentTy.getElementType(),
+          currentTy.getLayout(), workgroupAS);
+
+      // CRITICAL: insert the cast and replace consumer uses BEFORE changing
+      // the producer's type, otherwise the producer/consumer types disagree
+      // mid-rewrite and the verifier fires inside the walk.
+      OpBuilder b(smemOp);
+      b.setInsertionPointAfter(smemOp);
+      auto castOp = b.create<UnrealizedConversionCastOp>(
+          smemOp.getLoc(), currentTy, result);
+      result.replaceAllUsesExcept(castOp.getResult(0), castOp);
+      result.setType(symbolicTy);
+    });
   }
 
   StringRef getArgument() const override {

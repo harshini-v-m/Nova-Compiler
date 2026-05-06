@@ -139,6 +139,7 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
     info.archName = "sm_100";
     info.smCount  = 132; // B100 SXM5 has 132 SMs (same die count as H100 SXM)
     info.maxWorkgroupMemBytes = 228 * 1024; // same as Hopper shared-mem limit
+    info.maxWorkgroupDynamicMemBytes = 228 * 1024;
     info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
                           kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
@@ -148,15 +149,18 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
     info.archName = "sm_90";
     info.smCount  = 132; // H100 SXM5
     info.maxWorkgroupMemBytes = 228 * 1024;
+    info.maxWorkgroupDynamicMemBytes = 228 * 1024;
     info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
                           kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 89) {
     // Ada Lovelace (RTX 4090 = 128 SMs, L40S = 142 SMs, L4 = 58 SMs)
     // smCount=128 targets RTX 4090 as the reference device.
+    // Static cap is 48 KB; dynamic-SMEM opt-in raises it to 99 KB.
     info.archName = "sm_89";
     info.smCount  = 128;
     info.maxWorkgroupMemBytes = 48 * 1024;
+    info.maxWorkgroupDynamicMemBytes = 99 * 1024;
     info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
                           kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
@@ -164,9 +168,11 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
     // Ampere GA10B — Jetson AGX Orin / Orin NX (16 SMs, 64 KB shared mem)
     // sm_87 is the embedded Ampere variant; shares mma.sync intrinsics with
     // sm_86 but has far fewer SMs and a smaller shared-mem limit per block.
+    // Embedded Ampere has the same 163 KB dynamic carve-out as A100.
     info.archName = "sm_87";
     info.smCount  = 16; // Jetson AGX Orin has 16 SMs
     info.maxWorkgroupMemBytes = 48 * 1024;
+    info.maxWorkgroupDynamicMemBytes = 163 * 1024;
     info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
                           kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
@@ -177,9 +183,14 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
     // We use 46 SMs as a middle-ground representative; the adjustSeedsForTarget
     // CU-fill pass will tune tiles for the actual SM count at runtime if a more
     // accurate count is supplied by the user.
+    // Static cap is 48 KB; the dynamic-SMEM opt-in raises it to 99 KB. The
+    // 3-stage matmul pipeline needs ~72 KB and only fits via the dynamic path
+    // (see NovaGPUMapForallToGPU::maybeMaterializeDynamicSharedMemory and the
+    // cuFuncSetAttribute call in mgpuLaunchKernel).
     info.archName = "sm_86";
     info.smCount  = 46;
     info.maxWorkgroupMemBytes = 48 * 1024;
+    info.maxWorkgroupDynamicMemBytes = 99 * 1024;
     info.mmaIntrinsics = {kMmaSyncTf32_16x8x8};
   } else if (sm >= 80) {
     // Ampere GA100 (A100 SXM4/SXM5 = 108 SMs, A100 PCIe = 108 SMs,
@@ -188,6 +199,7 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
     info.archName = "sm_80";
     info.smCount  = 108;
     info.maxWorkgroupMemBytes = 164 * 1024;
+    info.maxWorkgroupDynamicMemBytes = 164 * 1024;
     info.mmaIntrinsics = {kMmaSyncTf32_16x8x8,
                           kMmaSyncF16_16x8x16, kMmaSyncBf16_16x8x16,
                           kWmmaF32_16x16x16, kWmmaF16_16x16x16};
@@ -198,6 +210,7 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
     info.archName = "sm_75";
     info.smCount  = 68;
     info.maxWorkgroupMemBytes = 64 * 1024;
+    info.maxWorkgroupDynamicMemBytes = 64 * 1024;
     info.mmaIntrinsics = {kWmmaF32_16x16x16, kWmmaF16_16x16x16};
   } else if (sm >= 70) {
     // Volta (V100 SXM2 = 80 SMs, V100 PCIe = 80 SMs, 96 KB shared mem)
@@ -205,6 +218,7 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
     info.archName = "sm_70";
     info.smCount  = 80;
     info.maxWorkgroupMemBytes = 96 * 1024;
+    info.maxWorkgroupDynamicMemBytes = 96 * 1024;
     info.mmaIntrinsics = {kWmmaF32_16x16x16};
   } else {
     // Pre-Volta (Pascal and older): no Tensor Core / MMA intrinsics.
@@ -212,6 +226,7 @@ NVIDIATargetInfo getNVIDIATargetInfo(llvm::StringRef smArch) {
     info.archName = "sm_60";
     info.smCount  = 60;
     info.maxWorkgroupMemBytes = 48 * 1024;
+    info.maxWorkgroupDynamicMemBytes = 48 * 1024;
   }
   return info;
 }
