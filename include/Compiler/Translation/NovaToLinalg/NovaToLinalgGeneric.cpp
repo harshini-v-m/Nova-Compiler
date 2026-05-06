@@ -1936,6 +1936,7 @@ struct NovaLinearBackwardPattern : public OpConversionPattern<mlir::nova::Linear
     }
   }
 };
+
 struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
   using OpConversionPattern<nova::LayerNormOp>::OpConversionPattern;
 
@@ -2066,6 +2067,7 @@ struct NovaLayerNormPattern : public OpConversionPattern<nova::LayerNormOp> {
     return success();
   }
 };
+
 struct NovaLayerNormBackwardPattern : public OpConversionPattern<nova::LayerNormBackwardOp> {
  using OpConversionPattern<nova::LayerNormBackwardOp>::OpConversionPattern;
 
@@ -2309,6 +2311,7 @@ struct NovaLayerNormBackwardPattern : public OpConversionPattern<nova::LayerNorm
    return success();
  }
 };
+
 struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
   using OpConversionPattern<nova::GatherOp>::OpConversionPattern;
   LogicalResult
@@ -2410,6 +2413,7 @@ struct NovaGatherOpLowering : public OpConversionPattern<nova::GatherOp> {
     return success();
   }
 };
+
 //===-----------------------------------------------------------------------------------------===//
 // Exponents and logarithms lowering patterns: exp2, log2, log10
 //===-----------------------------------------------------------------------------------------===//

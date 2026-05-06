@@ -236,6 +236,8 @@ void registerNovaGPUReduceBankConflictsPass();
 std::unique_ptr<Pass> createNovaGPUSwizzleSharedMemoryPass();
 void registerNovaGPUSwizzleSharedMemoryPass();
 
+std::unique_ptr<Pass> createNovaGPUSwizzleSharedMemoryPass();
+void registerNovaGPUSwizzleSharedMemoryPass();
 // ---------------------------------------------------------------------------
 // Vectorization Passes  (Batch 1: declarations; wired into pipeline in Batch
 // 2+)
