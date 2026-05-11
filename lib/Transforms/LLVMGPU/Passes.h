@@ -229,15 +229,14 @@ void registerNovaMultiConsumerFusion();
 std::unique_ptr<Pass> createNovaGPUConfigureTensorLayoutsPass();
 void registerNovaGPUConfigureTensorLayoutsPass();
 
+// For each workgroup memref.alloc, decides between an XOR swizzle (zero
+// SMEM cost; matmul-tile case) and a 16-byte padding fallback (narrow tiles
+// or bulk vector transfers).  Replaces the previous separate
+// NovaGPUReduceBankConflicts and opt-in-only swizzle passes.
 std::unique_ptr<Pass>
-createNovaGPUReduceBankConflictsPass(StringRef arch = "sm_86");
-void registerNovaGPUReduceBankConflictsPass();
-
-std::unique_ptr<Pass> createNovaGPUSwizzleSharedMemoryPass();
+createNovaGPUSwizzleSharedMemoryPass(StringRef arch = "sm_86");
 void registerNovaGPUSwizzleSharedMemoryPass();
 
-std::unique_ptr<Pass> createNovaGPUSwizzleSharedMemoryPass();
-void registerNovaGPUSwizzleSharedMemoryPass();
 // ---------------------------------------------------------------------------
 // Vectorization Passes  (Batch 1: declarations; wired into pipeline in Batch
 // 2+)

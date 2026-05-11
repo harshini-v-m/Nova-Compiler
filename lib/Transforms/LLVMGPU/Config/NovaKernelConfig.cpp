@@ -1831,8 +1831,10 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
    }
    return vol * elemBytes;
  };
-
+ bool isFullReduction = parallelDims.empty() && !reductionDims.empty();
  for (unsigned i = 0; i < numInputs; ++i) {
+  if (isFullReduction)
+     break; // no operand promotion for full reductions
    if (maps[i].getNumResults() < (unsigned)numLoops) {
      // Broadcast input — always promote regardless of budget.
      promotedOps.push_back(i);

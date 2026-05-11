@@ -209,7 +209,17 @@ namespace mlir::nova
   pm.addNestedPass<func::FuncOp>(createNovaGPUVectorDistributePass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
-  pm.addNestedPass<func::FuncOp>(createNovaGPUReduceBankConflictsPass());
+
+  // Decide swizzle vs. padding per workgroup alloc.  Runs at func scope BEFORE
+  // multi-buffering (which only adds a leading stage dim and reuses the same
+  // (row, col) SSA values for cp.async/ldmatrix indices, so the XOR survives
+  // unchanged) and BEFORE NovaConvertSharedMemAllocs (so the rewrite root is
+  // a memref.alloc, not a memref.global).  Replaces the old separate
+  // NovaGPUReduceBankConflicts + swizzle-by-attribute passes.
+  pm.addNestedPass<func::FuncOp>(createNovaGPUSwizzleSharedMemoryPass(arch));
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+
   // ── Step 8.5: Eliminate degenerate single-iteration foralls ────────────
   pm.addNestedPass<func::FuncOp>(createNovaNormalizeLoopBoundsPass());
   pm.addPass(createCanonicalizerPass());
@@ -230,7 +240,7 @@ namespace mlir::nova
   // Must run before MapForallToGPU because the alloc still has its original
   // shape and uses (forall lowering would obscure the loop containment
   // pattern multiBuffer relies on).
-  pm.addNestedPass<func::FuncOp>(createNovaGPUMultiBufferingPass(3));
+  // pm.addNestedPass<func::FuncOp>(createNovaGPUMultiBufferingPass(3));
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 
@@ -350,7 +360,7 @@ namespace mlir::nova
   // prevent SMEM aliasing across pipeline stages.
   {
     auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
-    gpuPm.addNestedPass<gpu::GPUFuncOp>(createNovaGPUPipeliningPass(3));
+    // gpuPm.addNestedPass<gpu::GPUFuncOp>(createNovaGPUPipeliningPass(3));
     gpuPm.addPass(createCanonicalizerPass());
     gpuPm.addPass(createCSEPass());
   }
@@ -358,13 +368,6 @@ namespace mlir::nova
   // ── Step 12.75: Convert host allocs → gpu.alloc ─────────────────────────
   pm.addPass(nova::createConvertMemRefToGpuPass());
   pm.addPass(createCanonicalizerPass());
-
-  // {
-  //   auto &gpuPm = pm.nest<gpu::GPUModuleOp>();
-  //   gpuPm.addPass(createNovaGPUSwizzleSharedMemoryPass());
-  //   pm.addNestedPass<func::FuncOp>(createNovaGPUReduceBankConflictsPass());
-  //   // gpuPm.addPass(createCanonicalizerPass());
-  // }
 
   // ── Step 13: NVVM lowering ──────────────────────────────────────────────
   GpuNVVMAttachTargetOptions nvvmTargetOptions;
