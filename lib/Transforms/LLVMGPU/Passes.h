@@ -233,8 +233,7 @@ void registerNovaGPUConfigureTensorLayoutsPass();
 // SMEM cost; matmul-tile case) and a 16-byte padding fallback (narrow tiles
 // or bulk vector transfers).  Replaces the previous separate
 // NovaGPUReduceBankConflicts and opt-in-only swizzle passes.
-std::unique_ptr<Pass>
-createNovaGPUSwizzleSharedMemoryPass(StringRef arch = "sm_86");
+std::unique_ptr<Pass> createNovaGPUSwizzleSharedMemoryPass(StringRef arch = "sm_86");
 void registerNovaGPUSwizzleSharedMemoryPass();
 
 // ---------------------------------------------------------------------------

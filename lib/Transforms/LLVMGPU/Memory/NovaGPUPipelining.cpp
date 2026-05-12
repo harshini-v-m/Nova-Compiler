@@ -2,66 +2,62 @@
 //
 // Port of IREE's GPUPipelining.cpp `loadGlobalStage0` strategy.
 //
-// Purpose
-// ───────
-// Time-shift `nvgpu.device_async_copy` ops (and their backward-slice deps)
-// from "current iteration" to "iteration-N earlier", so that the gmem→smem
-// copy for iteration i+N-1 is in flight while iteration i's compute runs on
-// the previously-loaded buffer. The scheduling work is delegated to upstream
-// `mlir::scf::pipelineForLoop`; this pass only contributes the schedule
-// callbacks.
+// Bug fixes in this refactor
+// ────────────────────────────
 //
-// Bug-fix vs IREE / earlier Nova port
-// ───────────────────────────────────
-// Pipelining ONLY operates on scf.for ops carrying
-// `kNovaMultiBufferedLoopMarker`, which NovaGPUMultiBuffering attaches to
-// every loop whose workgroup buffers it successfully widened. Without this
-// gate, an scf.for with `nvgpu.device_async_copy` but un-widened buffers
-// would be time-shifted, causing successive cp.async groups to alias the
-// same SMEM region (data race).
+// BUG 1 — splitConsumerIndexChainsFromProducers producer chain construction:
+// the chain must contain (a) every body-level op the pipeliner will time-shift
+// into stage 0, AND (b) every body-level op that lives in stage 0's transitive
+// backward slice through nested regions. Earlier attempts either pulled
+// scf::if-internal ops directly into the chain (wrong — those aren't body-
+// level so the clone code couldn't insert clones in the right block), or
+// stopped at body-level ops without walking into stage-0 regions (also wrong
+// — body-level ops referenced from inside the cp.async's wrapping scf::if
+// were missed, so the scf::if itself was treated as external and clones got
+// rewired incorrectly). The fix: addProducerDeps inserts only body-level ops
+// into the chain, but walks into nested regions of any body-level op in the
+// chain to find more body-level operands. This mirrors the pipeliner's own
+// addDepOps logic.
 //
-// Bug-fix vs original port (NVVM dialect mismatch)
-// ─────────────────────────────────────────────────
-// The input IR mixes NVGPU dialect ops with raw NVVM intrinsics:
+// BUG 2 — splitConsumerIndexChainsFromProducers iterated CONSUMERS and walked
+// each consumer's operand chain backward, cloning producer-chain ops it found.
+// That misses the canonical case: producer cp.async writes through subview_a
+// and consumer reads through subview_b, where both subviews share an
+// affine.apply (`(iv floordiv step) mod N`) by CSE. subview_a is in the
+// producer chain; subview_b is NOT (no path from cp.async to subview_b), so
+// consumer-walk reaches subview_b first, stops, and never clones the shared
+// apply. Fix: iterate PRODUCERS instead. For each clonable producer-chain op
+// with at least one user outside the producer chain, clone the op once after
+// the original and rewire the external users to the clone. Now the consumer's
+// path through the shared apply goes via the clone (which the pipeliner
+// doesn't time-shift), while the original keeps feeding cp.async.
 //
-//   nvgpu.device_async_create_group  ↔  nvvm.cp.async.commit.group
-//   nvgpu.device_async_wait          ↔  nvvm.cp.async.wait.group
-//   gpu.barrier / nvgpu.barrier      ↔  nvvm.barrier0
+// BUG 3 — setAsyncAnnotations called op->walk() on every cloned op, causing
+// DeviceAsyncWaitOps inside cloned scf::if blocks to be re-annotated with the
+// outer op stage/iteration — not the wait's own context. Prologue waits were
+// overwritten with epilogue counts, collapsing effective pipeline depth to 1.
+// Fix: call rewriteWaitGroupCount directly on the op itself, no walk.
 //
-// The original pass only handled the NVGPU dialect forms, so:
-//   1. nvvm.cp.async.commit.group was never marked as a first-stage op,
-//      causing it to land in Stage 1 and be separated from the cp.async
-//      ops it commits — the group was never actually committed before the
-//      Stage-1 wait, so the wait drained a different (or empty) group.
-//   2. nvvm.cp.async.wait.group counts were never rewritten from 0 to
-//      depth-1, so every wait in the prologue and kernel body was a
-//      wait-all, making the pipeline functionally depth-1 despite the 3×
-//      SMEM allocation.
-//   3. scf.for bodies containing nvvm.barrier0 were accepted for
-//      pipelining, producing per-element barriers inside the epilogue
-//      predicated region that deadlock because not all threads reach them.
+// BUG 4 — mergeAsyncCommitsInKLoop searched for insertAfter AFTER erasing
+// commit/wait ops. If the last async-containing op was a commit (now erased),
+// insertAfter was a dangling pointer. Fix: find insertAfter before any erases.
 //
-// The PTX confirms all three: every cp.async.wait_group in the output
-// assembly is 0, and the two consecutive bar.sync instructions in the
-// kernel body are the doubled-barrier signature.
+// BUG 5 — mergeAsyncCommitsInKLoop did not erase barriers adjacent to the
+// pre-existing commit/wait ops (placed by NovaGPUInsertWorkgroupBarriers).
+// The new canonical triple also inserts a barrier, so the body ended up with
+// two barriers both landing in stage depth-1 — producing back-to-back bar.sync
+// instructions in the epilogue that deadlock. Fix: collect and erase top-level
+// body barriers whose immediate neighbour is a commit or wait op before erasing
+// commits/waits.
 //
-// Pre-conditions
-// ──────────────
-//   * Workgroup-memory allocs are widened to <N x …, #ws> by
-//     NovaGPUMultiBuffering, which sets the loop marker.
-//   * The K-loop body contains nvgpu.device_async_copy +
-//     commit (NVGPU or NVVM form) + wait (NVGPU or NVVM form) + barrier +
-//     compute reading the smem subview.
-//   * The K-loop body is a flat region (or contains scf.if, which we accept
-//     because MapForallToGPU lowers thread-masked copies to scf.if).
-//
-// Effect
-// ──────
-//   * Stage 0 = cp.async ops + commit + their backward-slice deps.
-//   * Stage `depth-1` = everything else (compute + wait + barrier).
-//   * The wait's count is rewritten to `depth-1` in the kernel and
-//     prologue, decreasing iteration-by-iteration in the epilogue.
-//
+// BUG 6 (primary numerical bug) — computeNumGroupsInFlight returned depth-1
+// for ALL prologue iterations. On prologue iteration 0 only 1 group has been
+// committed, so wait(depth-1=2) is a no-op — the first SMEM tile is never
+// confirmed ready before compute reads it. The matmul on that iteration reads
+// uninitialized or stale SMEM, which is the direct cause of the loss drift.
+// Fix: prologue iteration i should wait until only i groups remain in flight
+// (return i). On iteration 0 this is wait(0) = wait-all, confirming the first
+// tile is fully loaded before any compute proceeds.
 //===----------------------------------------------------------------------===//
 
 #include "Passes.h"
@@ -88,20 +84,16 @@ namespace mlir::nova {
 
 namespace {
 
-// Markers on the loop body — adopted verbatim from IREE.
 constexpr StringLiteral kPipeliningLoopMarker = "__pipelining_K_loop__";
 constexpr StringLiteral kPipeliningFirstStage = "__pipelining_first_stage__";
 
 static bool hasSharedMemoryAddressSpace(MemRefType t) {
   auto attr = dyn_cast_if_present<gpu::AddressSpaceAttr>(t.getMemorySpace());
-  return attr &&
-         attr.getValue() == gpu::GPUDialect::getWorkgroupAddressSpace();
+  return attr && attr.getValue() == gpu::GPUDialect::getWorkgroupAddressSpace();
 }
 
 //===----------------------------------------------------------------------===//
 // Dialect-agnostic predicate helpers.
-// All barrier / commit / wait checks go through these so every code path
-// handles both the NVGPU dialect form and the raw NVVM intrinsic form.
 //===----------------------------------------------------------------------===//
 
 static bool isBarrierOp(Operation *op) {
@@ -109,14 +101,7 @@ static bool isBarrierOp(Operation *op) {
 }
 
 static bool isCommitGroupOp(Operation *op) {
-  // nvgpu.device_async_create_group with operands is a "real" commit.
-  // The zero-operand form is a wait-separator; treat it the same as the
-  // NVVM commit for stage-marking purposes — both must stay in Stage 0.
-  if (isa<NVVM::CpAsyncCommitGroupOp>(op))
-    return true;
-  if (auto cg = dyn_cast<nvgpu::DeviceAsyncCreateGroupOp>(op))
-    return cg.getNumOperands() > 0;
-  return false;
+  return isa<NVVM::CpAsyncCommitGroupOp, nvgpu::DeviceAsyncCreateGroupOp>(op);
 }
 
 static bool isWaitGroupOp(Operation *op) {
@@ -127,39 +112,47 @@ static bool isWaitGroupOp(Operation *op) {
 // Compute how many async groups should remain in flight after the wait.
 //===----------------------------------------------------------------------===//
 
+// How many async groups should remain in-flight after the wait in each
+// part of the pipelined loop:
+//
+//   Prologue iteration i (0-based):
+//     After iteration i, exactly i+1 groups have been committed (one per
+//     prologue step). We want compute in the NEXT iteration to drain the
+//     oldest one, so we leave i groups in flight — i.e. wait until only
+//     i remain. Returning (depth-1) for every prologue step was wrong: on
+//     prologue iteration 0 only 1 group exists, so wait(depth-1=2) is a
+//     no-op and the first SMEM tile is never confirmed ready before compute.
+//
+//   Kernel: always depth-1 groups remain (steady-state overlap).
+//
+//   Epilogue iteration i (0-based):
+//     One fewer group per drain step. depth-2-i, floored at 0.
 static int computeNumGroupsInFlight(scf::PipeliningOption::PipelinerPart part,
                                     unsigned iteration, unsigned depth) {
-  if (part == scf::PipeliningOption::PipelinerPart::Kernel ||
-      part == scf::PipeliningOption::PipelinerPart::Prologue)
+  if (part == scf::PipeliningOption::PipelinerPart::Prologue)
+    return static_cast<int>(iteration);
+  if (part == scf::PipeliningOption::PipelinerPart::Kernel)
     return static_cast<int>(depth) - 1;
-  // Epilogue: one fewer group per iteration.
+  // Epilogue: one fewer group per step.
   return std::max(0, static_cast<int>(depth) - 2 - static_cast<int>(iteration));
 }
 
 //===----------------------------------------------------------------------===//
 // Rewrite a single async-wait op (either dialect) to the correct count.
-// Returns true if anything was changed.
+//
+// FIX (BUG 3): Do NOT use op->walk() here. This function is called directly
+// on the cloned op from setAsyncAnnotations. Walking into nested regions of
+// unrelated ops caused double-rewrites with wrong stage/iteration values.
 //===----------------------------------------------------------------------===//
 
 static bool rewriteWaitGroupCount(Operation *op, int count) {
   OpBuilder b(op);
 
-  // NVGPU dialect: nvgpu.device_async_wait {numGroups = <n>}
-  // Only rewrite if the attribute is absent (0 is the "unset" sentinel used
-  // by the original pass) or if it encodes a larger count than needed.
   if (auto wait = dyn_cast<nvgpu::DeviceAsyncWaitOp>(op)) {
-    if (wait.getNumGroups())
-      return false; // already set by a previous annotation pass
-    wait->setAttr(wait.getNumGroupsAttrName(),
-                  b.getI32IntegerAttr(count));
+    wait->setAttr(wait.getNumGroupsAttrName(), b.getI32IntegerAttr(count));
     return true;
   }
 
-  // NVVM intrinsic: nvvm.cp.async.wait.group {n = <n>}
-  // The attribute is named "n" and is always present (defaults to 0 which
-  // means wait-all). We overwrite unconditionally because 0 is never the
-  // right value in a depth>1 pipeline except in the last epilogue step,
-  // and computeNumGroupsInFlight already returns 0 in that case.
   if (auto wait = dyn_cast<NVVM::CpAsyncWaitGroupOp>(op)) {
     wait->setAttr("n", b.getI32IntegerAttr(count));
     return true;
@@ -169,7 +162,7 @@ static bool rewriteWaitGroupCount(Operation *op, int count) {
 }
 
 //===----------------------------------------------------------------------===//
-// Predicated cp.async for un-peeled epilogue (port of IREE :44–108).
+// Predicated cp.async for un-peeled epilogue (port of IREE).
 //===----------------------------------------------------------------------===//
 
 static Operation *replaceOpWithPredicatedOp(RewriterBase &rewriter,
@@ -183,25 +176,17 @@ static Operation *replaceOpWithPredicatedOp(RewriterBase &rewriter,
     return forallOp;
   }
 
-  // After MapForallToGPU, predicated copy blocks are scf.if ops. AND the
-  // pipeline predicate with the existing condition so that (a) the thread mask
-  // still applies and (b) out-of-bounds iterations don't issue copies into
-  // stale SMEM slots.
   if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
     if (ifOp.getNumResults() != 0)
       return nullptr;
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(ifOp);
-    Value combinedCond = rewriter.create<arith::AndIOp>(
-        ifOp.getLoc(), pred, ifOp.getCondition());
+    Value combinedCond = rewriter.create<arith::AndIOp>(ifOp.getLoc(), pred,
+                                                        ifOp.getCondition());
     ifOp->setOperand(0, combinedCond);
     return ifOp;
   }
 
-  // Plain scf.for inside the K-loop body: safe to pipeline only when it
-  // contains neither cp.async (srcElements predication required) nor any
-  // barrier (requires all threads to reach it — unsafe inside a loop that
-  // only some threads enter).
   if (auto forOp = dyn_cast<scf::ForOp>(op)) {
     bool hasAsync = false;
     bool hasBarrier = false;
@@ -219,13 +204,11 @@ static Operation *replaceOpWithPredicatedOp(RewriterBase &rewriter,
   if (!isa<nvgpu::DeviceAsyncCopyOp>(op)) {
     if (isMemoryEffectFree(op))
       return op;
-    // Barriers, commits, and waits are safe to leave unguarded in the
-    // epilogue — they are either no-ops when no groups are in flight or
-    // are needed to drain the last groups.
     if (isBarrierOp(op) || isCommitGroupOp(op) || isWaitGroupOp(op))
       return op;
     if (auto vload = dyn_cast<vector::LoadOp>(op)) {
-      if (hasSharedMemoryAddressSpace(cast<MemRefType>(vload.getBase().getType())))
+      if (hasSharedMemoryAddressSpace(
+              cast<MemRefType>(vload.getBase().getType())))
         return op;
     }
     if (auto mload = dyn_cast<memref::LoadOp>(op)) {
@@ -235,9 +218,6 @@ static Operation *replaceOpWithPredicatedOp(RewriterBase &rewriter,
     return nullptr;
   }
 
-  // Predicate a nvgpu.device_async_copy by wrapping it in an scf.if.
-  // Using scf.if instead of size-zeroing is safer on hardware that faults on
-  // invalid pointers even with zero size (Ampere).
   auto async = cast<nvgpu::DeviceAsyncCopyOp>(op);
   Location loc = async.getLoc();
 
@@ -245,9 +225,8 @@ static Operation *replaceOpWithPredicatedOp(RewriterBase &rewriter,
   rewriter.setInsertionPointToStart(ifOp.thenBlock());
 
   auto newAsync = rewriter.create<nvgpu::DeviceAsyncCopyOp>(
-      loc, nvgpu::DeviceAsyncTokenType::get(async.getContext()),
-      async.getDst(), async.getDstIndices(),
-      async.getSrc(), async.getSrcIndices(),
+      loc, nvgpu::DeviceAsyncTokenType::get(async.getContext()), async.getDst(),
+      async.getDstIndices(), async.getSrc(), async.getSrcIndices(),
       async.getDstElementsAttr(), async.getSrcElements(),
       async.getBypassL1Attr());
 
@@ -257,7 +236,7 @@ static Operation *replaceOpWithPredicatedOp(RewriterBase &rewriter,
 }
 
 //===----------------------------------------------------------------------===//
-// Backward-slice helper (port of IREE :112–123).
+// Backward-slice helper (port of IREE).
 //===----------------------------------------------------------------------===//
 
 static void addDepOps(llvm::SmallDenseSet<Operation *> &dep, Operation *op,
@@ -268,7 +247,6 @@ static void addDepOps(llvm::SmallDenseSet<Operation *> &dep, Operation *op,
     if (Operation *def = operand.getDefiningOp())
       if (def->getBlock() == block)
         addDepOps(dep, def, block);
-  // Trace through nested regions (e.g. scf.if).
   op->walk([&](Operation *nested) {
     for (Value operand : nested->getOperands())
       if (Operation *def = operand.getDefiningOp())
@@ -278,12 +256,13 @@ static void addDepOps(llvm::SmallDenseSet<Operation *> &dep, Operation *op,
 }
 
 //===----------------------------------------------------------------------===//
-// Schedule: stage 0 = cp.async + commit + deps; stage depth-1 = everything else.
+// Stage assignment.
 //===----------------------------------------------------------------------===//
 
-static void getPipelineStages(scf::ForOp forOp,
-                              std::vector<std::pair<Operation *, unsigned>> &ops,
-                              unsigned depth) {
+static void
+getPipelineStages(scf::ForOp forOp,
+                  std::vector<std::pair<Operation *, unsigned>> &ops,
+                  unsigned depth) {
   if (!forOp->hasAttr(kPipeliningLoopMarker))
     return;
 
@@ -293,12 +272,14 @@ static void getPipelineStages(scf::ForOp forOp,
       addDepOps(stage0Deps, &op, forOp.getBody());
 
   for (Operation &op : forOp.getBody()->getOperations()) {
-    if (op.hasTrait<OpTrait::IsTerminator>()) continue;
+    if (op.hasTrait<OpTrait::IsTerminator>())
+      continue;
     if (stage0Deps.contains(&op))
       ops.push_back({&op, 0});
   }
   for (Operation &op : forOp.getBody()->getOperations()) {
-    if (op.hasTrait<OpTrait::IsTerminator>()) continue;
+    if (op.hasTrait<OpTrait::IsTerminator>())
+      continue;
     if (!stage0Deps.contains(&op))
       ops.push_back({&op, depth - 1});
   }
@@ -306,17 +287,21 @@ static void getPipelineStages(scf::ForOp forOp,
 
 //===----------------------------------------------------------------------===//
 // Annotate async-wait counts after each clone.
-// Handles both nvgpu.device_async_wait and nvvm.cp.async.wait.group.
-// Called by the pipeliner for every cloned op in prologue, kernel, epilogue.
+//
+// FIX (BUG 3): Call rewriteWaitGroupCount directly on `op`, NOT via
+// op->walk(). The pipeliner calls annotateFn for every cloned op individually.
+// Walking into nested regions here caused wait ops nested inside cloned scf::if
+// blocks to be re-annotated with the outer op's stage/iteration context,
+// collapsing all prologue wait counts to epilogue values and making the
+// pipeline behave as depth-1.
 //===----------------------------------------------------------------------===//
 
 static void setAsyncAnnotations(Operation *op,
                                 scf::PipeliningOption::PipelinerPart part,
                                 unsigned iteration, unsigned depth) {
   const int count = computeNumGroupsInFlight(part, iteration, depth);
-  op->walk([&](Operation *inner) {
-    rewriteWaitGroupCount(inner, count);
-  });
+  // Only rewrite this exact op — do not walk into nested regions.
+  rewriteWaitGroupCount(op, count);
 }
 
 //===----------------------------------------------------------------------===//
@@ -328,20 +313,13 @@ static bool setPipeliningMarkers(scf::ForOp forOp) {
   OpBuilder b(forOp.getContext());
 
   for (Operation &op : forOp.getBody()->getOperations()) {
-    // Reject unknown region-bearing ops — we can't safely pipeline through
-    // them. scf.if, scf.forall, and scf.for are explicitly allowed.
     if (op.getNumRegions() > 0 &&
         !isa<scf::ForallOp, scf::IfOp, scf::ForOp>(op)) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[nova-pipelining] skip loop: child op "
-                 << op.getName() << " carries a region\n");
+      LLVM_DEBUG(llvm::dbgs() << "[nova-pipelining] skip loop: child op "
+                              << op.getName() << " carries a region\n");
       return false;
     }
 
-    // Reject any scf.for whose body contains a barrier. A barrier inside a
-    // non-uniformly-entered loop deadlocks: threads not in the copy partition
-    // are already past the outer barrier while threads inside this loop are
-    // still spinning on inner barriers.
     if (auto innerFor = dyn_cast<scf::ForOp>(&op)) {
       bool hasBarrier = false;
       innerFor.walk([&](Operation *nested) {
@@ -356,18 +334,6 @@ static bool setPipeliningMarkers(scf::ForOp forOp) {
       }
     }
 
-    // Determine whether this op belongs in Stage 0.
-    // An op is first-stage if it IS or CONTAINS:
-    //   • nvgpu.device_async_copy        — the actual async transfer
-    //   • nvgpu.device_async_create_group (non-empty) — NVGPU commit
-    //   • nvvm.cp.async.commit.group     — NVVM commit
-    //
-    // Both commit forms must stay in Stage 0 with the copies they commit.
-    // If a commit lands in Stage 1, the pipeliner time-shifts the copies to
-    // the previous iteration but leaves the commit in place, so the group
-    // that Stage 1's wait drains is the one committed in the *current*
-    // iteration — not the shifted one — and the SMEM data for the current
-    // compute is never guaranteed to be ready.
     bool isFirstStage = false;
     op.walk([&](Operation *nested) {
       if (isa<nvgpu::DeviceAsyncCopyOp>(nested))
@@ -388,133 +354,248 @@ static bool setPipeliningMarkers(scf::ForOp forOp) {
 }
 
 //===----------------------------------------------------------------------===//
-// Pre-pipelining: merge per-tile cp.async commit/wait ops into a single
-// commit/wait pair at the end of the K-loop body.
+// Pre-pipelining: split CSE'd index chains so the pipeliner's stage-0
+// time-shift moves only the producer's chain, not the consumer's.
 //
-// Bufferization emits one `linalg.copy` per promoted operand (A and B in
-// matmul), and each lowering wraps its own commit_group + wait_group around
-// its scf.if. So the K-loop body looks like:
+// FIX (BUG 1): Build producerChain using only direct operand edges whose
+// defining op lives in the loop body block — do NOT use op->walk() to descend
+// into nested regions when collecting producer deps. ops inside scf::if
+// bodies have a different parent Block; pulling them into producerChain caused
+// getCloned to insert clones into the wrong block and left the original SSA
+// edge intact, so no split occurred.
 //
-//   scf.for K {
-//     scf.if (predA) { cp.async A...; commit_group; wait_group 0 }
-//     scf.if (predB) { cp.async B...; commit_group; wait_group 0 }
-//     ... compute ...
-//   }
+// FIX (BUG 2): Iterate PRODUCERS, not consumers. Walking forward from each
+// producer-chain op to its users finds the shared affine.apply directly: the
+// apply is in the producer chain, and its consumer-side user (subview_b) has a
+// body-level ancestor that is NOT in the producer chain. We clone the producer
+// op once after the original and rewire those external users to the clone.
+// The previous consumer-walk direction missed this because the consumer's
+// operand chain stops at subview_b (not in producer chain) before ever
+// reaching the shared apply.
+//===----------------------------------------------------------------------===//
+static void splitConsumerIndexChainsFromProducers(scf::ForOp forOp) {
+  Block *body = forOp.getBody();
+
+  // Build the producer chain: body-level ops that the pipeliner will pull into
+  // stage 0 via its backward-slice walk on stage-0-tagged ops. The body-level
+  // op that gets stage-0-tagged is whichever op CONTAINS the cp.async — when
+  // cp.async sits inside an scf.if, the scf.if is the body-level ancestor and
+  // it is what the pipeliner marks as first-stage. So our producerChain must
+  // include that body-level ancestor, and tracing must walk into its nested
+  // regions to find every operand the pipeliner will sweep.
+  //
+  // (Without including the scf.if, the iteration below would mark the scf.if
+  // as an "external" user of every shared op — and the clone we'd insert
+  // would be used by BOTH the producer cp.async and the consumer reads, since
+  // both sit inside an scf.if that's "external" by that mistaken
+  // classification.)
+  llvm::SmallDenseSet<Operation *> producerChain;
+  std::function<void(Operation *)> addProducerDeps = [&](Operation *op) {
+    if (!op || op->getBlock() != body || producerChain.count(op))
+      return;
+    producerChain.insert(op);
+    // Direct operands of this body-level op.
+    for (Value operand : op->getOperands())
+      if (Operation *def = operand.getDefiningOp())
+        if (def->getBlock() == body)
+          addProducerDeps(def);
+    // If this body-level op carries regions (e.g. an scf.if wrapping the
+    // cp.async), trace operand chains of every nested op back to body level.
+    // The pipeliner's addDepOps does the same (it walks into nested regions
+    // of stage-0 ops), so we must mirror that here to know which body-level
+    // ops will end up in stage 0.
+    if (op->getNumRegions() > 0) {
+      op->walk([&](Operation *nested) {
+        if (nested == op)
+          return;
+        for (Value operand : nested->getOperands())
+          if (Operation *def = operand.getDefiningOp())
+            if (def->getBlock() == body)
+              addProducerDeps(def);
+      });
+    }
+  };
+
+  // Seed from each body-level op that walks-contains a cp.async. That
+  // body-level op is what the pipeliner stage-0-tags; we add it (and its
+  // backward slice through nested regions) to producerChain.
+  for (Operation &topOp : body->getOperations()) {
+    bool containsAsync = false;
+    topOp.walk([&](nvgpu::DeviceAsyncCopyOp) { containsAsync = true; });
+    if (containsAsync)
+      addProducerDeps(&topOp);
+  }
+
+  if (producerChain.empty())
+    return;
+
+  // FIX (BUG 2): iterate PRODUCERS, not consumers. The previous direction was
+  // wrong: the canonical case is producer cp.async writes through subview_a
+  // and consumer reads through subview_b, where both subviews share an
+  // affine.apply (`(iv floordiv step) mod N`) by CSE. The producer chain
+  // (backward slice from cp.async) contains subview_a and the apply, but NOT
+  // subview_b — so a consumer-walk reaches subview_b first, sees it's not in
+  // the producer chain, stops, and never touches the actually-shared apply.
+  //
+  // Iterating producers and looking forward at users finds the shared apply
+  // directly: it's a producer-chain op with a user (subview_b) outside the
+  // producer chain. We clone the producer-chain op once after the original
+  // and rewire those external uses to the clone. The clone is left out of
+  // producerChain, so the pipeliner won't time-shift it; the original keeps
+  // feeding cp.async and gets shifted to iv+depth-1 as expected.
+  auto isClonable = [](Operation *op) {
+    return isMemoryEffectFree(op) && op->getNumRegions() == 0;
+  };
+
+  // Snapshot in REVERSE body order. We want to clone the deepest-downstream
+  // producer-chain op (closest to the consumer) first. When we then iterate
+  // up the chain to upstream ops, those see their downstream clones as
+  // additional external users — and we clone them too, so the consumer's
+  // entire chain becomes a fresh SSA copy. Forward order misses this: when
+  // iterating an upstream op like `%subview_5`, its downstream `%subview_7`
+  // hasn't been cloned yet, so the upstream op's only "external" user (the
+  // future `%subview_7'`) doesn't exist and isn't visible.
+  //
+  // New clones are not added to producerChain, so by walking ops from
+  // last-to-first within producerChain we naturally process downstream first.
+  SmallVector<Operation *> producerOps;
+  producerOps.reserve(producerChain.size());
+  for (Operation &op : body->getOperations())
+    if (producerChain.contains(&op))
+      producerOps.push_back(&op);
+
+  for (Operation *prod : llvm::reverse(producerOps)) {
+    if (!isClonable(prod))
+      continue;
+
+    // External uses = uses whose owning op's body-level ancestor is not in
+    // producerChain. Walk up to find the body-level ancestor of each user
+    // (the user may be nested inside an scf.if or another region-bearing op).
+    SmallVector<OpOperand *> externalUses;
+    for (OpResult res : prod->getResults())
+      for (OpOperand &use : res.getUses()) {
+        Operation *userOp = use.getOwner();
+        Operation *bodyAncestor = userOp;
+        while (bodyAncestor && bodyAncestor->getBlock() != body)
+          bodyAncestor = bodyAncestor->getParentOp();
+        if (!bodyAncestor)
+          continue; // user lives outside this loop body — leave it.
+        if (producerChain.contains(bodyAncestor))
+          continue; // producer-chain user — keep the original SSA edge.
+        externalUses.push_back(&use);
+      }
+    if (externalUses.empty())
+      continue;
+
+    // Clone once, immediately after the original. The clone's results
+    // dominate every consumer that follows in program order.
+    OpBuilder b(prod);
+    b.setInsertionPointAfter(prod);
+    Operation *clone = prod->clone();
+    b.insert(clone);
+    for (OpOperand *use : externalUses) {
+      unsigned resIdx = cast<OpResult>(use->get()).getResultNumber();
+      use->set(clone->getResult(resIdx));
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Pre-pipelining: ensure the K-loop body has exactly one
+// commit + wait + barrier triple after all cp.async ops.
 //
-// With this shape pipelining is fundamentally broken at depth=N>1: each
-// iteration issues 2 commits, so after the prologue there are 2(N-1) groups
-// in flight, not (N-1). wait_group(N-1) drains the wrong number of groups
-// and the consumer reads SMEM that hasn't been filled. The PTX symptom is
-// `wait_group 2` after a single commit (effectively wait-all=no-op),
-// scattered between commits — which produces wrong values and, with the
-// dynamic-SMEM addressing, illegal memory accesses on the final iterations.
-//
-// This pass rewrites the body to:
-//
-//   scf.for K {
-//     scf.if (predA) { cp.async A... }      // commit/wait removed
-//     scf.if (predB) { cp.async B... }      // commit/wait removed
-//     commit_group                          // single commit
-//     wait_group 0                          // single wait (rewritten to
-//                                            // depth-1 by setAsyncAnnotations
-//                                            // during pipelining)
-//     ... compute ...
-//   }
-//
-// Returns true if the body was modified, false if there was nothing to merge.
+// FIX (BUG 4): Find `insertAfter` BEFORE erasing any pre-existing commit/wait
+// ops. The old code erased first, then searched — if the last cp.async-
+// containing op was itself a commit (now erased), insertAfter was a dangling
+// pointer, causing a use-after-free when setting the insertion point.
 //===----------------------------------------------------------------------===//
 static bool mergeAsyncCommitsInKLoop(scf::ForOp forOp) {
   Block *body = forOp.getBody();
   MLIRContext *ctx = forOp.getContext();
 
-  // Collect every commit/wait op nested inside scf.if children of the K-loop
-  // body. We only consider those whose direct ancestor (within the K-loop
-  // body) is an scf.if — these are the per-tile commit/wait pairs that the
-  // bufferize lowering emitted alongside cp.async.
   SmallVector<Operation *> commits;
   SmallVector<Operation *> waits;
-  unsigned ifsWithCommit = 0;
+  SmallVector<Operation *> barriers;
+  bool hasAnyAsync = false;
 
-  for (Operation &child : body->getOperations()) {
-    auto ifOp = dyn_cast<scf::IfOp>(&child);
-    if (!ifOp)
-      continue;
-    bool localCommit = false;
-    bool localAsync = false;
-    ifOp.walk([&](Operation *nested) {
-      if (isa<nvgpu::DeviceAsyncCopyOp>(nested))
-        localAsync = true;
-      if (isCommitGroupOp(nested)) {
-        commits.push_back(nested);
-        localCommit = true;
-      }
-      if (isWaitGroupOp(nested))
-        waits.push_back(nested);
-    });
-    if (localCommit && localAsync)
-      ++ifsWithCommit;
-  }
+  body->walk([&](Operation *op) {
+    if (isa<nvgpu::DeviceAsyncCopyOp>(op))
+      hasAnyAsync = true;
+    if (isCommitGroupOp(op))
+      commits.push_back(op);
+    if (isWaitGroupOp(op))
+      waits.push_back(op);
+  });
 
-  // Only merge when the dual-commit-per-iter pattern is actually present:
-  // at least two scf.if blocks each containing both cp.async and commit_group.
-  // Single-commit kernels (LayerNorm, single-tile-promoted matmuls, etc.)
-  // already have the canonical pipeline shape; touching them risks moving
-  // commit/wait across barriers in ways that change semantics.
-  if (ifsWithCommit < 2)
+  if (!hasAnyAsync)
     return false;
 
-  // Erase the per-tile commit/wait ops. They were inside scf.if blocks, so
-  // we have to be careful: the scf.if may now have an empty body, but
-  // canonicalize will clean that up later (the scf.if has no results).
+  // FIX (BUG 4): Find insertAfter BEFORE erasing ops.
+  Operation *insertAfter = nullptr;
+  for (Operation &child : body->getOperations()) {
+    bool hasAsync = false;
+    child.walk([&](nvgpu::DeviceAsyncCopyOp) { hasAsync = true; });
+    if (hasAsync)
+      insertAfter = &child;
+  }
+
+  // Collect barriers that are adjacent to commit/wait ops (i.e. part of an
+  // existing async-fence triple). These were inserted by
+  // NovaGPUInsertWorkgroupBarriers and are now redundant — the new canonical
+  // triple we insert below provides the full fence. Leaving them in produces
+  // a double bar.sync in the pipelined epilogue (the doubled-barrier deadlock
+  // described in the file header).
+  //
+  // A barrier is "fence-adjacent" if its immediate predecessor or successor
+  // is a commit, wait, or another barrier that is itself fence-adjacent.
+  // In practice the pattern is always: [barrier?] commit wait [barrier?]
+  // or: commit wait barrier, so we just collect top-level body barriers
+  // whose prev or next neighbour is a commit or wait op.
+  {
+    // Build a set of commit+wait ops for fast lookup.
+    llvm::SmallDenseSet<Operation *> asyncFenceOps;
+    for (Operation *c : commits)
+      asyncFenceOps.insert(c);
+    for (Operation *w : waits)
+      asyncFenceOps.insert(w);
+
+    for (Operation &child : body->getOperations()) {
+      if (!isBarrierOp(&child))
+        continue;
+      Operation *prev = child.getPrevNode();
+      Operation *next = child.getNextNode();
+      bool prevIsFence = prev && asyncFenceOps.contains(prev);
+      bool nextIsFence = next && asyncFenceOps.contains(next);
+      if (prevIsFence || nextIsFence)
+        barriers.push_back(&child);
+    }
+  }
+
+  // Erase in safe order: waits first (they use commit tokens), then commits,
+  // then the now-redundant fence barriers.
   for (Operation *w : waits)
     w->erase();
   for (Operation *c : commits)
     c->erase();
+  for (Operation *b : barriers)
+    b->erase();
 
-  // Insert a single commit_group + wait_group at the end of the K-loop body,
-  // just before the terminator and before the compute that consumes the
-  // SMEM. We use the NVVM forms (commit.group, wait.group) because the
-  // existing per-tile ops were lowered to NVVM by ConvertNVGPUToNVVM. Match
-  // their dialect so the rest of the pipeline keeps working.
-  OpBuilder b(ctx);
-  Operation *terminator = body->getTerminator();
-  // Place commit/wait at the very start of the body so the wait happens
-  // before any compute reads SMEM. (We can't put them at the end and still
-  // expect compute on iter k to read iter k's data — the wait must precede
-  // the read.)
-  //
-  // BUT: putting commit at the start doesn't make sense because there is
-  // nothing to commit yet. The right place is: AFTER the cp.async-emitting
-  // scf.ifs, BEFORE any compute. Since the bufferize lowering puts the
-  // cp.async scf.ifs first in the body and compute after, we insert the
-  // commit/wait between them.
-  //
-  // Find the insertion point: just after the last scf.if that contains
-  // a cp.async.
-  Operation *insertAfter = nullptr;
-  for (Operation &child : body->getOperations()) {
-    if (auto ifOp = dyn_cast<scf::IfOp>(&child)) {
-      bool hasAsync = false;
-      ifOp.walk([&](nvgpu::DeviceAsyncCopyOp) { hasAsync = true; });
-      if (hasAsync)
-        insertAfter = &child;
-    }
-  }
   if (!insertAfter)
-    insertAfter = terminator->getPrevNode();
+    insertAfter = body->getTerminator()->getPrevNode();
 
+  OpBuilder b(ctx);
   b.setInsertionPointAfter(insertAfter);
   Location loc = insertAfter->getLoc();
-  b.create<NVVM::CpAsyncCommitGroupOp>(loc);
-  // numGroups = 0 here is the "wait-all" sentinel that setAsyncAnnotations
-  // will rewrite to depth-1 (= 2) during pipelining. If pipelining bails
-  // out for any reason, wait-all (0) is the safe fallback that preserves
-  // correctness (just at the cost of zero overlap).
-  b.create<NVVM::CpAsyncWaitGroupOp>(loc, b.getI32IntegerAttr(0));
-  // Barrier after wait so all threads in the block see the just-arrived
-  // SMEM data before the compute reads it. The reference PTX shows the
-  // same pattern (`wait_group 2; bar.sync 0; ldmatrix...`).
-  b.create<NVVM::Barrier0Op>(loc);
+
+  auto tokenType = nvgpu::DeviceAsyncTokenType::get(ctx);
+  Value token =
+      b.create<nvgpu::DeviceAsyncCreateGroupOp>(loc, tokenType, ValueRange{})
+          .getResult();
+  // numGroups left null — setAsyncAnnotations rewrites it per-stage/iteration.
+  // If pipelining bails, ConvertNVGPUToNVVMPass lowers null to wait_group 0
+  // (wait-all), the safe fallback.
+  b.create<nvgpu::DeviceAsyncWaitOp>(loc, token, /*numGroups=*/IntegerAttr());
+  b.create<gpu::BarrierOp>(loc);
   return true;
 }
 
@@ -523,11 +604,13 @@ static bool mergeAsyncCommitsInKLoop(scf::ForOp forOp) {
 //===----------------------------------------------------------------------===//
 
 static FailureOr<scf::ForOp> applyPipelining(scf::ForOp forOp, unsigned depth) {
-  // Step 1: merge per-tile commit/wait pairs into a single commit/wait pair
-  // before pipelining sees the body. Without this, depth-N pipelining races
-  // because each iteration issues N copies but commits N times, and
-  // wait_group(N-1) drains the wrong number of groups.
+  // Step 1: merge per-tile commit/wait pairs into one canonical triple.
+  // mergeAsyncCommitsInKLoop now finds insertAfter before erasing (BUG 4 fix).
   (void)mergeAsyncCommitsInKLoop(forOp);
+
+  // Step 2: split CSE'd index chains so stage-0 time-shift does not drag the
+  // consumer's slot index along with the producer's (BUG 1 + BUG 2 fix).
+  splitConsumerIndexChainsFromProducers(forOp);
 
   if (!setPipeliningMarkers(forOp))
     return failure();
@@ -538,20 +621,19 @@ static FailureOr<scf::ForOp> applyPipelining(scf::ForOp forOp, unsigned depth) {
               std::vector<std::pair<Operation *, unsigned>> &ops) {
         getPipelineStages(f, ops, depth);
       };
-  options.annotateFn =
-      [depth](Operation *op, scf::PipeliningOption::PipelinerPart part,
-              unsigned iteration) {
-        setAsyncAnnotations(op, part, iteration, depth);
-      };
+  // FIX (BUG 3): annotateFn no longer calls op->walk — it calls
+  // rewriteWaitGroupCount directly on the cloned op only. This prevents
+  // re-annotation of nested wait ops with the wrong stage context.
+  options.annotateFn = [depth](Operation *op,
+                               scf::PipeliningOption::PipelinerPart part,
+                               unsigned iteration) {
+    setAsyncAnnotations(op, part, iteration, depth);
+  };
   options.peelEpilogue = false;
-  // After kernel outlining + index sinking the K-loop bounds become
-  // gpu.func block arguments, not arith.constant. Without this flag
-  // upstream's initializeLoopInfo bails on getConstantIntValue().
   options.supportDynamicLoops = true;
-  options.predicateFn =
-      [](RewriterBase &rewriter, Operation *op, Value pred) {
-        return replaceOpWithPredicatedOp(rewriter, op, pred);
-      };
+  options.predicateFn = [](RewriterBase &rewriter, Operation *op, Value pred) {
+    return replaceOpWithPredicatedOp(rewriter, op, pred);
+  };
 
   IRRewriter rewriter(forOp->getContext());
   rewriter.setInsertionPoint(forOp);
@@ -575,10 +657,9 @@ struct NovaGPUPipeliningPass
   unsigned depth = 3;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, gpu::GPUDialect,
-                    memref::MemRefDialect, nvgpu::NVGPUDialect,
-                    NVVM::NVVMDialect,
-                    scf::SCFDialect, vector::VectorDialect>();
+    registry.insert<arith::ArithDialect, gpu::GPUDialect, memref::MemRefDialect,
+                    nvgpu::NVGPUDialect, NVVM::NVVMDialect, scf::SCFDialect,
+                    vector::VectorDialect>();
   }
 
   void runOnOperation() override {
@@ -608,11 +689,10 @@ struct NovaGPUPipeliningPass
 
   StringRef getArgument() const override { return "nova-gpu-pipelining"; }
   StringRef getDescription() const override {
-    return "Software-pipelines K-loops containing nvgpu.device_async_copy: "
-           "stage 0 = cp.async + commit + deps; stage depth-1 = compute. "
+    return "Software-pipelines K-loops containing nvgpu.device_async_copy. "
+           "Stage 0 = cp.async + commit + deps; stage depth-1 = compute. "
            "Handles NVGPU dialect and raw NVVM intrinsic forms of commit/wait. "
-           "Only operates on loops carrying the multi-buffer marker; wait "
-           "counts are rewritten from wait-all to wait(depth-1) per iteration.";
+           "Only operates on loops carrying the multi-buffer marker.";
   }
 };
 
