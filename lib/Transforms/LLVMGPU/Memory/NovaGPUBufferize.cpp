@@ -597,6 +597,12 @@ static bool hasWorkgroupLoads(Operation *op) {
         found = true;
         return WalkResult::interrupt();
       }
+    if (auto ldm = dyn_cast<nvgpu::LdMatrixOp>(inner))
+      if (isWorkgroupOrGlobalValue(ldm.getSrcMemref()) ||
+          isKernelLocalStaging(ldm.getSrcMemref())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
     return WalkResult::advance();
   });
   return found;

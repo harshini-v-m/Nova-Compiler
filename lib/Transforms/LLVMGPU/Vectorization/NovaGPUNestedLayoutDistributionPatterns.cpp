@@ -544,11 +544,12 @@ static bool isTf32MmaLhsRead(vector::TransferReadOp readOp) {
 //   After this redistribution, per thread T:
 //     n0 = A[T_hi,   2*T_lo  ]   n1 = A[T_hi,   2*T_lo+1]
 //     n2 = A[T_hi+8, 2*T_lo  ]   n3 = A[T_hi+8, 2*T_lo+1]
-//   stored in linear order [n0, n1, n2, n3] inside the returned vector<4x1xf32>,
-//   matching the NestedLayout's (O0, O1, E0, E1) → (M_outer, K_outer, M_elem,
-//   K_elem) traversal. The caller's shape_cast to vector<2x1x1x2xf32> then
-//   places elements into the slots DistributeContract's {0,2,1,3} shuffle
-//   expects, so mma.sync receives the standard PTX A-fragment.
+//   stored in linear order [n0, n1, n2, n3] inside the returned
+//   vector<4x1xf32>, matching the NestedLayout's (O0, O1, E0, E1) → (M_outer,
+//   K_outer, M_elem, K_elem) traversal. The caller's shape_cast to
+//   vector<2x1x1x2xf32> then places elements into the slots
+//   DistributeContract's {0,2,1,3} shuffle expects, so mma.sync receives the
+//   standard PTX A-fragment.
 //
 // Cost: 8 gpu.shuffle idx + 4 selects per fragment. Each shuffle is 1 SASS
 // instruction (shfl.sync.idx); the alternative scalar-load path issues 4
@@ -580,8 +581,7 @@ static Value redistributeLdMatrixToNestedLayout(RewriterBase &rewriter,
   // lane-quad addressing.
   Value laneIdx =
       gpu::LaneIdOp::create(rewriter, loc, /*upperBound=*/IntegerAttr{});
-  Value laneI32 =
-      arith::IndexCastOp::create(rewriter, loc, i32, laneIdx);
+  Value laneI32 = arith::IndexCastOp::create(rewriter, loc, i32, laneIdx);
   Value c1 = arith::ConstantOp::create(rewriter, loc, i32,
                                        rewriter.getI32IntegerAttr(1));
   Value c2 = arith::ConstantOp::create(rewriter, loc, i32,
@@ -600,14 +600,14 @@ static Value redistributeLdMatrixToNestedLayout(RewriterBase &rewriter,
   // src_lane_for_2T_lo   = quad_base + 2 * (T_lo & 1)
   Value tLoLow = arith::AndIOp::create(rewriter, loc, tLo, c1);
   Value srcOffsetEven = arith::ShLIOp::create(rewriter, loc, tLoLow, c1);
-  Value srcLaneEven = arith::AddIOp::create(rewriter, loc, quadBase,
-                                            srcOffsetEven);
+  Value srcLaneEven =
+      arith::AddIOp::create(rewriter, loc, quadBase, srcOffsetEven);
   // src_lane_for_2T_lo+1 = src_lane_for_2T_lo + 1
   Value srcLaneOdd = arith::AddIOp::create(rewriter, loc, srcLaneEven, c1);
 
   // is_high = T_lo >= 2  (selects r2/r3 contributions when true).
-  Value isHigh = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::uge,
-                                       tLo, c2);
+  Value isHigh =
+      arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::uge, tLo, c2);
 
   auto emitShuffle = [&](Value v, Value srcLane) -> Value {
     auto shuf = gpu::ShuffleOp::create(rewriter, loc, v, srcLane, cWidth,
@@ -618,18 +618,20 @@ static Value redistributeLdMatrixToNestedLayout(RewriterBase &rewriter,
   // Row T_hi (cols 2*T_lo, 2*T_lo+1) — choose between r0 and r2 by T_lo<2.
   Value s_r0_even = emitShuffle(r0, srcLaneEven);
   Value s_r2_even = emitShuffle(r2, srcLaneEven);
-  Value s_r0_odd  = emitShuffle(r0, srcLaneOdd);
-  Value s_r2_odd  = emitShuffle(r2, srcLaneOdd);
+  Value s_r0_odd = emitShuffle(r0, srcLaneOdd);
+  Value s_r2_odd = emitShuffle(r2, srcLaneOdd);
   // Row T_hi+8 (cols 2*T_lo, 2*T_lo+1) — choose between r1 and r3 by T_lo<2.
   Value s_r1_even = emitShuffle(r1, srcLaneEven);
   Value s_r3_even = emitShuffle(r3, srcLaneEven);
-  Value s_r1_odd  = emitShuffle(r1, srcLaneOdd);
-  Value s_r3_odd  = emitShuffle(r3, srcLaneOdd);
+  Value s_r1_odd = emitShuffle(r1, srcLaneOdd);
+  Value s_r3_odd = emitShuffle(r3, srcLaneOdd);
 
-  Value n0 = arith::SelectOp::create(rewriter, loc, isHigh, s_r2_even, s_r0_even);
-  Value n1 = arith::SelectOp::create(rewriter, loc, isHigh, s_r2_odd,  s_r0_odd);
-  Value n2 = arith::SelectOp::create(rewriter, loc, isHigh, s_r3_even, s_r1_even);
-  Value n3 = arith::SelectOp::create(rewriter, loc, isHigh, s_r3_odd,  s_r1_odd);
+  Value n0 =
+      arith::SelectOp::create(rewriter, loc, isHigh, s_r2_even, s_r0_even);
+  Value n1 = arith::SelectOp::create(rewriter, loc, isHigh, s_r2_odd, s_r0_odd);
+  Value n2 =
+      arith::SelectOp::create(rewriter, loc, isHigh, s_r3_even, s_r1_even);
+  Value n3 = arith::SelectOp::create(rewriter, loc, isHigh, s_r3_odd, s_r1_odd);
 
   // Pack back into vector<4x1xf32> in NestedLayout linear order
   // [n0, n1, n2, n3] = [(M=T_hi,K=2T_lo), (M=T_hi,K=2T_lo+1),
@@ -637,14 +639,14 @@ static Value redistributeLdMatrixToNestedLayout(RewriterBase &rewriter,
   auto fragTy = VectorType::get({4, 1}, f32);
   Value out = arith::ConstantOp::create(rewriter, loc, fragTy,
                                         rewriter.getZeroAttr(fragTy));
-  out = vector::InsertOp::create(rewriter, loc, n0, out,
-                                 ArrayRef<int64_t>{0, 0});
-  out = vector::InsertOp::create(rewriter, loc, n1, out,
-                                 ArrayRef<int64_t>{1, 0});
-  out = vector::InsertOp::create(rewriter, loc, n2, out,
-                                 ArrayRef<int64_t>{2, 0});
-  out = vector::InsertOp::create(rewriter, loc, n3, out,
-                                 ArrayRef<int64_t>{3, 0});
+  out =
+      vector::InsertOp::create(rewriter, loc, n0, out, ArrayRef<int64_t>{0, 0});
+  out =
+      vector::InsertOp::create(rewriter, loc, n1, out, ArrayRef<int64_t>{1, 0});
+  out =
+      vector::InsertOp::create(rewriter, loc, n2, out, ArrayRef<int64_t>{2, 0});
+  out =
+      vector::InsertOp::create(rewriter, loc, n3, out, ArrayRef<int64_t>{3, 0});
   return out;
 }
 
@@ -962,8 +964,7 @@ tryEmitTf32RhsLoad(RewriterBase &rewriter, vector::TransferReadOp readOp,
   // Only fire for forward reads (B stored K×N, contiguous K). Backward reads
   // with transposed permutation maps use the generic scalar fallback.
   if (!readOp.getPermutationMap().isMinorIdentity()) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "[rhs-load] reject: non-identity permutation\n");
+    LLVM_DEBUG(llvm::dbgs() << "[rhs-load] reject: non-identity permutation\n");
     return nullptr;
   }
 
@@ -998,8 +999,8 @@ tryEmitTf32RhsLoad(RewriterBase &rewriter, vector::TransferReadOp readOp,
   // K-offsets matching the PTX B-fragment layout: {2*(T%4), 2*(T%4)+1}.
   Value twoLaneMod4 =
       affine::makeComposedAffineApply(rewriter, loc, (d0 % 4) * 2, {laneId});
-  Value twoLaneMod4Plus1 =
-      affine::makeComposedAffineApply(rewriter, loc, (d0 % 4) * 2 + 1, {laneId});
+  Value twoLaneMod4Plus1 = affine::makeComposedAffineApply(
+      rewriter, loc, (d0 % 4) * 2 + 1, {laneId});
   Value laneDiv4 =
       affine::makeComposedAffineApply(rewriter, loc, d0.floorDiv(4), {laneId});
 

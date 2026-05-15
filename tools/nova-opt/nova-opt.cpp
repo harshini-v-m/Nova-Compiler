@@ -29,7 +29,6 @@
 #include "Compiler/Pipeline/Gpupipeline.h"
 #include "Compiler/Pipeline/Pipeline.h"
 #include "Compiler/Transforms/Affine/DependencyAnalysisTestPass.h"
-#include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
@@ -90,9 +89,6 @@ int main(int argc, char **argv) {
     return mlir::nova::createAddGpuMemoryCopiesPass();
   });
 
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
-    return mlir::nova::createNovaToGpuPass();
-  });
 
   // Register the ViewOpGraph pass specifically
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
@@ -122,7 +118,6 @@ int main(int argc, char **argv) {
 
   mlir::nova::registerNovaToLinalgGenericLoweringPass();
   mlir::nova::registerNovaToLinalgNamedPass();
-  mlir::nova::registerNovaFusionKernelEmitterPass();
   mlir::registerDependencyAnalysisTestPass();
 
   mlir::arith::registerConvertArithToLLVMInterface(registry);

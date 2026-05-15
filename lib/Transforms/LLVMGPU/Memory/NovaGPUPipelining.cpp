@@ -584,6 +584,19 @@ static bool mergeAsyncCommitsInKLoop(scf::ForOp forOp) {
     insertAfter = body->getTerminator()->getPrevNode();
 
   OpBuilder b(ctx);
+  // 1. WAR protection: Barrier at the very top of the loop ensures all threads
+  //    finished reading the PREVIOUS iteration's SMEM before any thread starts
+  //    loading the NEXT iteration's tile. Tagged as first-stage so it stays
+  //    at the top of the pipelined body.
+  //    Using NVVM::Barrier0Op with a unique attribute to prevent CSE from
+  //    merging it with the RAW barrier or erasing it.
+  b.setInsertionPointToStart(body);
+  auto warBarrier = b.create<NVVM::Barrier0Op>(insertAfter->getLoc());
+  warBarrier->setAttr(kPipeliningFirstStage, b.getUnitAttr());
+  warBarrier->setAttr("war_hazard_barrier", b.getUnitAttr());
+
+  // 2. RAW protection: Wait + Barrier after the last cp.async ensures the
+  //    CURRENT iteration's tile is fully loaded before compute reads it.
   b.setInsertionPointAfter(insertAfter);
   Location loc = insertAfter->getLoc();
 
@@ -592,10 +605,9 @@ static bool mergeAsyncCommitsInKLoop(scf::ForOp forOp) {
       b.create<nvgpu::DeviceAsyncCreateGroupOp>(loc, tokenType, ValueRange{})
           .getResult();
   // numGroups left null — setAsyncAnnotations rewrites it per-stage/iteration.
-  // If pipelining bails, ConvertNVGPUToNVVMPass lowers null to wait_group 0
-  // (wait-all), the safe fallback.
   b.create<nvgpu::DeviceAsyncWaitOp>(loc, token, /*numGroups=*/IntegerAttr());
-  b.create<gpu::BarrierOp>(loc);
+  auto rawBarrier = b.create<NVVM::Barrier0Op>(loc);
+  rawBarrier->setAttr("raw_hazard_barrier", b.getUnitAttr());
   return true;
 }
 

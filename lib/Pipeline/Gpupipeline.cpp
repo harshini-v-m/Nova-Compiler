@@ -58,17 +58,15 @@
 #include "mlir/Dialect/SparseTensor/Transforms/Passes.h"
 
 // lowering passes
-#include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/PatternMatch.h"
 
 // header of this file
 #include "Compiler/Pipeline/Gpupipeline.h"
-#include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 
 using namespace mlir;
-
+//THIS PIPELINE IS NOT TRIGGERED NOW AND THIS WON'T WORK IN THIS BRANCH
 namespace mlir {
 namespace nova {
 namespace {
@@ -79,9 +77,6 @@ void createNovaGPUPipelines(mlir::OpPassManager &pm) {
   pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createRemDevAttrPass());
 
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgGenericLoweringPass());
-    pm.addNestedPass<mlir::func::FuncOp>(
-      mlir::nova::createNovaFusionKernelEmitterPass());
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToGpuPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::nova::createNovaToLinalgNamedPass());
 
 

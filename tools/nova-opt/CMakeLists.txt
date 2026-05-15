@@ -22,7 +22,6 @@ target_link_libraries(nova-opt PRIVATE
   MLIRAffineTransformPasses
   
   MLIRNovaToLinalgTransforms
-  MLIRNovaToGpu
   
   # Dependencies ordered by usage: NovaPipelines depends on CompilerTransforms
   NovaPipelines

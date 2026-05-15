@@ -804,44 +804,56 @@ struct NovaSceForwardLowering : public OpConversionPattern<mlir::nova::SceOp> {
   LogicalResult
   matchAndRewrite(mlir::nova::SceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Generic 1 : maxVal   = max(logits, axis=lastDim)               [reduction]
-    // Generic 2 : sumExp   = sum(exp(logits - maxVal), axis=lastDim)  [fused reduction]
-    // Generic 3 : softmax  = exp(logits - maxVal) / clamp(sumExp,eps) [all-parallel]
-    // nova.gather(softmax, targets, axis=lastDim) -> [batchShape]
-    // Generic 4 : psl      = -log(clamp(gathered, eps, 1))            [all-parallel]
-    // nova.reduce MEAN over batchShape -> {1}
+    // Generic 1 : maxVal   = max(logits, axis=lastDim) [reduction] Generic 2 :
+    // sumExp   = sum(exp(logits - maxVal), axis=lastDim)  [fused reduction]
+    // Generic 3 : softmax  = exp(logits - maxVal) / clamp(sumExp,eps)
+    // [all-parallel] nova.gather(softmax, targets, axis=lastDim) ->
+    // [batchShape] Generic 4 : psl      = -log(clamp(gathered, eps, 1))
+    // [all-parallel] nova.reduce MEAN over batchShape -> {1}
     Location loc = op.getLoc();
-    Value logits  = adaptor.getLogits();
+    Value logits = adaptor.getLogits();
     Value targets = adaptor.getTargets();
 
     auto softmaxResultType = cast<RankedTensorType>(op.getSoftmax().getType());
-    auto lossResultType    = cast<RankedTensorType>(op.getResult().getType());
-    auto elemType          = softmaxResultType.getElementType();
+    auto lossResultType = cast<RankedTensorType>(op.getResult().getType());
+    auto elemType = softmaxResultType.getElementType();
 
     auto targetsType = cast<RankedTensorType>(targets.getType());
     if (!targetsType.getElementType().isInteger(32)) {
-      auto i32Type = RankedTensorType::get(targetsType.getShape(),
-                                           rewriter.getI32Type());
-      targets     = rewriter.create<tosa::CastOp>(loc, i32Type, targets);
+      auto i32Type = rewriter.getI32Type();
+      auto i32TensorType = RankedTensorType::get(targetsType.getShape(), i32Type);
+      Value emptyTargets = rewriter.create<tensor::EmptyOp>(loc, targetsType.getShape(), i32Type);
+      auto identityMap = mlir::AffineMap::getMultiDimIdentityMap(targetsType.getRank(), rewriter.getContext());
+      SmallVector<utils::IteratorType> iters(targetsType.getRank(), utils::IteratorType::parallel);
+      
+      targets = rewriter.create<linalg::GenericOp>(
+          loc, i32TensorType, targets, emptyTargets,
+          ArrayRef<AffineMap>{identityMap, identityMap}, iters,
+          [&](OpBuilder &b, Location l, ValueRange args) {
+            Value t = args[0];
+            Value t32 = b.create<arith::ExtUIOp>(l, i32Type, t);
+            b.create<linalg::YieldOp>(l, t32);
+          }).getResult(0);
       targetsType = cast<RankedTensorType>(targets.getType());
     }
 
     auto logitsType = cast<RankedTensorType>(logits.getType());
     if (logitsType.getElementType() != elemType) {
       auto castType = RankedTensorType::get(logitsType.getShape(), elemType);
-      logits    = rewriter.create<tosa::CastOp>(loc, castType, logits);
+      logits = rewriter.create<tosa::CastOp>(loc, castType, logits);
       logitsType = cast<RankedTensorType>(logits.getType());
     }
 
     MLIRContext *ctx = rewriter.getContext();
-    int64_t rank     = logitsType.getRank();
-    int64_t lastDim  = rank - 1;
+    int64_t rank = logitsType.getRank();
+    int64_t lastDim = rank - 1;
 
     SmallVector<AffineExpr> inputExprs, statsExprs;
     for (int64_t i = 0; i < rank; ++i)
       inputExprs.push_back(rewriter.getAffineDimExpr(i));
     for (int64_t i = 0; i < rank; ++i)
-      if (i != lastDim) statsExprs.push_back(rewriter.getAffineDimExpr(i));
+      if (i != lastDim)
+        statsExprs.push_back(rewriter.getAffineDimExpr(i));
 
     auto inputMap = AffineMap::get(rank, 0, inputExprs, ctx);
     auto statsMap = AffineMap::get(rank, 0, statsExprs, ctx);
@@ -850,100 +862,126 @@ struct NovaSceForwardLowering : public OpConversionPattern<mlir::nova::SceOp> {
     for (int64_t i = 0; i < rank; ++i)
       redIters.push_back(i == lastDim ? utils::IteratorType::reduction
                                       : utils::IteratorType::parallel);
-    SmallVector<utils::IteratorType> parIters(rank, utils::IteratorType::parallel);
+    SmallVector<utils::IteratorType> parIters(rank,
+                                              utils::IteratorType::parallel);
 
     SmallVector<int64_t> statsShape;
     for (int64_t i = 0; i < rank; ++i)
-      if (i != lastDim) statsShape.push_back(logitsType.getDimSize(i));
+      if (i != lastDim)
+        statsShape.push_back(logitsType.getDimSize(i));
     auto statsType = RankedTensorType::get(statsShape, elemType);
     int64_t batchRank = static_cast<int64_t>(statsShape.size());
 
     Value negInf = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getFloatAttr(
-                 elemType, -std::numeric_limits<float>::infinity()));
-    Value fZero  = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getZeroAttr(elemType));
+        loc, rewriter.getFloatAttr(elemType,
+                                   -std::numeric_limits<float>::infinity()));
+    Value fZero =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(elemType));
     Value epsVal = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getFloatAttr(elemType, 1.0e-7f));
 
-    Value maxEmpty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
-    Value maxInit  = rewriter.create<linalg::FillOp>(loc, negInf, maxEmpty).result();
-    Value maxVal   = rewriter.create<linalg::GenericOp>(
-        loc, statsType,
-        /*inputs=*/logits, /*outputs=*/maxInit,
-        SmallVector<AffineMap>{inputMap, statsMap},
-        redIters,
-        [](OpBuilder &b, Location nl, ValueRange args) {
-          Value bb= b.create<arith::MaximumFOp>(nl, args[0], args[1]);
-          b.create<linalg::YieldOp>(nl, bb);
-        }).getResult(0);
+    Value maxEmpty =
+        rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
+    Value maxInit =
+        rewriter.create<linalg::FillOp>(loc, negInf, maxEmpty).result();
+    Value maxVal =
+        rewriter
+            .create<linalg::GenericOp>(
+                loc, statsType,
+                /*inputs=*/logits, /*outputs=*/maxInit,
+                SmallVector<AffineMap>{inputMap, statsMap}, redIters,
+                [](OpBuilder &b, Location nl, ValueRange args) {
+                  Value bb = b.create<arith::MaximumFOp>(nl, args[0], args[1]);
+                  b.create<linalg::YieldOp>(nl, bb);
+                })
+            .getResult(0);
 
-    Value sumEmpty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
-    Value sumInit  = rewriter.create<linalg::FillOp>(loc, fZero, sumEmpty).result();
-    Value sumExp   = rewriter.create<linalg::GenericOp>(
-        loc, statsType,
-        /*inputs=*/ValueRange{logits, maxVal},
-        /*outputs=*/sumInit,
-        SmallVector<AffineMap>{inputMap, statsMap, statsMap},
-        redIters,
-        [](OpBuilder &b, Location nl, ValueRange args) {
-          Value shifted = b.create<arith::SubFOp>(nl, args[0], args[1]);
-          Value expV    = b.create<math::ExpOp>(nl, shifted);
-          Value sumV    = b.create<arith::AddFOp>(nl, args[2], expV);
-          b.create<linalg::YieldOp>(nl, sumV);
-        }).getResult(0);
+    Value sumEmpty =
+        rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
+    Value sumInit =
+        rewriter.create<linalg::FillOp>(loc, fZero, sumEmpty).result();
+    Value sumExp =
+        rewriter
+            .create<linalg::GenericOp>(
+                loc, statsType,
+                /*inputs=*/ValueRange{logits, maxVal},
+                /*outputs=*/sumInit,
+                SmallVector<AffineMap>{inputMap, statsMap, statsMap}, redIters,
+                [](OpBuilder &b, Location nl, ValueRange args) {
+                  Value shifted = b.create<arith::SubFOp>(nl, args[0], args[1]);
+                  Value expV = b.create<math::ExpOp>(nl, shifted);
+                  Value sumV = b.create<arith::AddFOp>(nl, args[2], expV);
+                  b.create<linalg::YieldOp>(nl, sumV);
+                })
+            .getResult(0);
 
     // Generic 3: logSumExp = log(max(sumExp, eps))
     auto batchIdentity = AffineMap::getMultiDimIdentityMap(batchRank, ctx);
     SmallVector<utils::IteratorType> batchParallel(
         batchRank, utils::IteratorType::parallel);
-    Value logSumExp = rewriter.create<linalg::GenericOp>(
-        loc, statsType,
-        /*inputs=*/sumExp,
-        /*outputs=*/rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType).getResult(),
-        SmallVector<AffineMap>{batchIdentity, batchIdentity},
-        batchParallel,
-        [&](OpBuilder &b, Location nl, ValueRange args) {
-          Value safeSum = b.create<arith::MaximumFOp>(nl, args[0], epsVal);
-          Value logSum  = b.create<math::LogOp>(nl, safeSum);
-          b.create<linalg::YieldOp>(nl, logSum);
-        }).getResult(0);
+    Value logSumExp =
+        rewriter
+            .create<linalg::GenericOp>(
+                loc, statsType,
+                /*inputs=*/sumExp,
+                /*outputs=*/
+                rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType)
+                    .getResult(),
+                SmallVector<AffineMap>{batchIdentity, batchIdentity},
+                batchParallel,
+                [&](OpBuilder &b, Location nl, ValueRange args) {
+                  Value safeSum =
+                      b.create<arith::MaximumFOp>(nl, args[0], epsVal);
+                  Value logSum = b.create<math::LogOp>(nl, safeSum);
+                  b.create<linalg::YieldOp>(nl, logSum);
+                })
+            .getResult(0);
 
     // Generic 4: softmax = exp(logits - maxVal) / sumExp
     Value smEmpty = rewriter.create<tensor::EmptyOp>(
         loc, softmaxResultType.getShape(), elemType);
-    Value softmax = rewriter.create<linalg::GenericOp>(
-        loc, softmaxResultType,
-        /*inputs=*/ValueRange{logits, maxVal, sumExp},
-        /*outputs=*/smEmpty,
-        SmallVector<AffineMap>{inputMap, statsMap, statsMap, inputMap},
-        parIters,
-        [&](OpBuilder &b, Location nl, ValueRange args) {
-          Value shifted = b.create<arith::SubFOp>(nl, args[0], args[1]);
-          Value expV    = b.create<math::ExpOp>(nl, shifted);
-          Value safeSum = b.create<arith::MaximumFOp>(nl, args[2], epsVal);
-          Value divV    = b.create<arith::DivFOp>(nl, expV, safeSum);
-          b.create<linalg::YieldOp>(nl, divV);
-        }).getResult(0);
+    Value softmax =
+        rewriter
+            .create<linalg::GenericOp>(
+                loc, softmaxResultType,
+                /*inputs=*/ValueRange{logits, maxVal, sumExp},
+                /*outputs=*/smEmpty,
+                SmallVector<AffineMap>{inputMap, statsMap, statsMap, inputMap},
+                parIters,
+                [&](OpBuilder &b, Location nl, ValueRange args) {
+                  Value shifted = b.create<arith::SubFOp>(nl, args[0], args[1]);
+                  Value expV = b.create<math::ExpOp>(nl, shifted);
+                  Value safeSum =
+                      b.create<arith::MaximumFOp>(nl, args[2], epsVal);
+                  Value divV = b.create<arith::DivFOp>(nl, expV, safeSum);
+                  b.create<linalg::YieldOp>(nl, divV);
+                })
+            .getResult(0);
 
     // Stable Loss Calculation:
     // loss = logSumExp - (gatheredLogits - gatheredMaxVal)
-    Value gatheredLogits = rewriter.create<nova::GatherOp>(
-        loc, logits, targets, lastDim).getResult();
+    Value gatheredLogits =
+        rewriter.create<nova::GatherOp>(loc, logits, targets, lastDim)
+            .getResult();
 
-    Value pslEmpty = rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
-    Value perSampleLoss = rewriter.create<linalg::GenericOp>(
-        loc, statsType,
-        /*inputs=*/ValueRange{gatheredLogits, maxVal, logSumExp},
-        /*outputs=*/pslEmpty,
-        SmallVector<AffineMap>{batchIdentity, batchIdentity, batchIdentity, batchIdentity},
-        batchParallel,
-        [&](OpBuilder &b, Location nl, ValueRange args) {
-          // loss = logSumExp - (logits - maxVal)
-          Value shifted = b.create<arith::SubFOp>(nl, args[0], args[1]);
-          Value loss    = b.create<arith::SubFOp>(nl, args[2], shifted);
-          b.create<linalg::YieldOp>(nl, loss);
-        }).getResult(0);
+    Value pslEmpty =
+        rewriter.create<tensor::EmptyOp>(loc, statsShape, elemType);
+    Value perSampleLoss =
+        rewriter
+            .create<linalg::GenericOp>(
+                loc, statsType,
+                /*inputs=*/ValueRange{gatheredLogits, maxVal, logSumExp},
+                /*outputs=*/pslEmpty,
+                SmallVector<AffineMap>{batchIdentity, batchIdentity,
+                                       batchIdentity, batchIdentity},
+                batchParallel,
+                [&](OpBuilder &b, Location nl, ValueRange args) {
+                  // loss = logSumExp - (logits - maxVal)
+                  Value shifted = b.create<arith::SubFOp>(nl, args[0], args[1]);
+                  Value loss = b.create<arith::SubFOp>(nl, args[2], shifted);
+                  b.create<linalg::YieldOp>(nl, loss);
+                })
+            .getResult(0);
 
     llvm::SmallVector<int64_t> allDims;
     for (int64_t i = 0; i < batchRank; ++i)
@@ -951,27 +989,28 @@ struct NovaSceForwardLowering : public OpConversionPattern<mlir::nova::SceOp> {
 
     auto scalarType = RankedTensorType::get({1}, elemType);
     Value reducedLoss = rewriter.create<nova::ReduceOp>(
-        loc, nova::ReductionKind::MEAN, perSampleLoss,
-        scalarType, /*keepdims=*/false, allDims, /*ignore_nan=*/false);
+        loc, nova::ReductionKind::MEAN, perSampleLoss, scalarType,
+        /*keepdims=*/false, allDims, /*ignore_nan=*/false);
 
     Value finalLoss = reducedLoss;
     if (cast<RankedTensorType>(reducedLoss.getType()) != lossResultType) {
-      auto shapeAttrType = RankedTensorType::get(
-          {lossResultType.getRank()}, rewriter.getIndexType());
+      auto shapeAttrType = RankedTensorType::get({lossResultType.getRank()},
+                                                 rewriter.getIndexType());
       auto shapeConst = rewriter.create<tosa::ConstShapeOp>(
           loc,
           mlir::tosa::shapeType::get(rewriter.getContext(),
                                      lossResultType.getRank()),
           DenseIntElementsAttr::get(shapeAttrType, lossResultType.getShape()));
-      finalLoss = rewriter.create<tosa::ReshapeOp>(
-          loc, lossResultType, reducedLoss, shapeConst);
+      finalLoss = rewriter.create<tosa::ReshapeOp>(loc, lossResultType,
+                                                   reducedLoss, shapeConst);
     }
 
     rewriter.replaceOp(op, {softmax, finalLoss});
     return success();
   }
 };
-struct NovaSceBackwardLowering : public OpConversionPattern<mlir::nova::SceBackwardOp> {
+struct NovaSceBackwardLowering
+    : public OpConversionPattern<mlir::nova::SceBackwardOp> {
   using OpConversionPattern<mlir::nova::SceBackwardOp>::OpConversionPattern;
   LogicalResult
   matchAndRewrite(mlir::nova::SceBackwardOp op, OpAdaptor adaptor,
@@ -995,11 +1034,13 @@ struct NovaSceBackwardLowering : public OpConversionPattern<mlir::nova::SceBackw
     // 2. Flattened Probabilities
     int64_t totalel = 1;
     for (auto s : logitsType.getShape()) {
-      if (s == ShapedType::kDynamic) return failure();
+      if (s == ShapedType::kDynamic)
+        return failure();
       totalel *= s;
     }
     auto flatProbType = RankedTensorType::get({totalel}, resultElemType);
-    auto probFlatOp = rewriter.create<mlir::nova::ReshapeOp>(loc, flatProbType, softmaxRes);
+    auto probFlatOp =
+        rewriter.create<mlir::nova::ReshapeOp>(loc, flatProbType, softmaxRes);
     Value probFlat = probFlatOp.getResult();
 
     // 3. Calculate N and flattened offsets
@@ -1012,69 +1053,85 @@ struct NovaSceBackwardLowering : public OpConversionPattern<mlir::nova::SceBackw
 
     int64_t N = 1;
     for (int64_t i = 0; i < rank; ++i) {
-      if (i != dim) N *= logitsType.getDimSize(i);
+      if (i != dim) {
+        int64_t d = logitsType.getDimSize(i);
+        if (d != mlir::ShapedType::kDynamic) {
+          N *= d;
+        }
+      }
     }
 
-    // Force i64 indices throughout
+    // 3. Compute flattened indices: indices[i] = targets[i] + i * C
+    // We use a single linalg.generic to perform zero-extension and offset calculation on scalars.
+    // This avoids tensor-level arith.extui which can cause lowering issues in some pipelines.
     auto i64Type = rewriter.getI64Type();
-    auto offsetsType = RankedTensorType::get({B}, i64Type);
+    auto targetFlatTypeOriginal = RankedTensorType::get({B}, targetIdxElemType);
+    Value targetsFlatOriginal = rewriter.create<mlir::nova::ReshapeOp>(
+        loc, targetFlatTypeOriginal, targets).getResult();
 
-    // Compute row offsets at runtime via linalg.generic: offsets[i] = i * C
-    // Avoids embedding a large (B-element) compile-time constant in the IR.
-    Value offsetsEmpty = rewriter.create<mlir::tensor::EmptyOp>(loc, llvm::ArrayRef<int64_t>{B}, i64Type);
-    Value cConst = rewriter.create<mlir::arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(C));
-    auto offsetsMap = mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext());
-    Value offsetsConst = rewriter.create<mlir::linalg::GenericOp>(
-        loc, TypeRange{offsetsType}, ValueRange{}, ValueRange{offsetsEmpty},
-        ArrayRef<mlir::AffineMap>{offsetsMap},
+    auto indicesFlatType = RankedTensorType::get({B}, i64Type);
+    Value indicesEmpty = rewriter.create<mlir::tensor::EmptyOp>(
+        loc, llvm::ArrayRef<int64_t>{B}, i64Type);
+    Value cConst = rewriter.create<mlir::arith::ConstantOp>(
+        loc, rewriter.getI64IntegerAttr(C));
+    auto identityMap = mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext());
+
+    Value indicesFlat = rewriter.create<mlir::linalg::GenericOp>(
+        loc, TypeRange{indicesFlatType}, ValueRange{targetsFlatOriginal},
+        ValueRange{indicesEmpty}, ArrayRef<mlir::AffineMap>{identityMap, identityMap},
         ArrayRef<mlir::utils::IteratorType>{mlir::utils::IteratorType::parallel},
         [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
+          Value t = args[0];
+          // Zero-extend target index to i64
+          Value tI64;
+          if (targetIdxElemType.isInteger(64)) {
+            tI64 = t;
+          } else {
+            tI64 = b.create<mlir::arith::ExtUIOp>(l, i64Type, t);
+          }
+          // Compute row offset: i * C
           Value idx = b.create<mlir::linalg::IndexOp>(l, 0);
           Value idxI64 = b.create<mlir::arith::IndexCastOp>(l, i64Type, idx);
           Value offset = b.create<mlir::arith::MulIOp>(l, idxI64, cConst);
-          b.create<mlir::linalg::YieldOp>(l, offset);
+          // Result index = t + offset
+          Value resultIdx = b.create<mlir::arith::AddIOp>(l, tI64, offset);
+          b.create<mlir::linalg::YieldOp>(l, resultIdx);
         }).getResult(0);
-
-    Value targetsI64 = targets;
-    if (!targetIdxElemType.isInteger(64)) {
-       auto targetsI64Type = RankedTensorType::get(targetsType.getShape(), i64Type);
-       targetsI64 = rewriter.create<mlir::tosa::CastOp>(loc, targetsI64Type, targets);
-    }
-
-    auto targetFlatType = RankedTensorType::get({B}, i64Type);
-    auto targetFlatOp = rewriter.create<mlir::nova::ReshapeOp>(loc, targetFlatType, targetsI64);
-    Value targetFlat = targetFlatOp.getResult();
-
-    auto indicesFlatOp = rewriter.create<mlir::nova::AddOp>(loc, targetFlatType, targetFlat, offsetsConst);
-    Value indicesFlat = indicesFlatOp.getResult();
 
     // 4. -1.0 values to add
     auto negOnesType = RankedTensorType::get({B}, resultElemType);
-    auto negOnesAttr = DenseElementsAttr::get(negOnesType, rewriter.getFloatAttr(resultElemType, -1.0));
-    auto negOnesConstOp = rewriter.create<mlir::nova::ConstantOp>(loc, negOnesType, negOnesAttr);
+    auto negOnesAttr = DenseElementsAttr::get(
+        negOnesType, rewriter.getFloatAttr(resultElemType, -1.0));
+    auto negOnesConstOp =
+        rewriter.create<mlir::nova::ConstantOp>(loc, negOnesType, negOnesAttr);
     Value negOnesConst = negOnesConstOp.getResult();
 
     // 5. Scatter Add
     auto scatterAddOp = rewriter.create<mlir::nova::ScatterAddOp>(
-        loc, flatProbType, probFlat, indicesFlat, negOnesConst, rewriter.getI64IntegerAttr(0));
+        loc, flatProbType, probFlat, indicesFlat, negOnesConst,
+        rewriter.getI64IntegerAttr(0));
     Value diffFlat = scatterAddOp.getResult();
 
     // 6. Reshape back
-    auto diffOp = rewriter.create<mlir::nova::ReshapeOp>(loc, logitsType, diffFlat);
+    auto diffOp =
+        rewriter.create<mlir::nova::ReshapeOp>(loc, logitsType, diffFlat);
     Value diff = diffOp.getResult();
-
 
     // 7. Normalization (divide by N)
     auto nInvConstType = RankedTensorType::get({}, resultElemType);
-    auto nInvConstAttr = DenseElementsAttr::get(nInvConstType, rewriter.getFloatAttr(resultElemType, 1.0 / N));
-    Value nInvConst = rewriter.create<mlir::nova::ConstantOp>(loc, nInvConstType, nInvConstAttr);
+    auto nInvConstAttr = DenseElementsAttr::get(
+        nInvConstType, rewriter.getFloatAttr(resultElemType, 1.0 / N));
+    Value nInvConst = rewriter.create<mlir::nova::ConstantOp>(
+        loc, nInvConstType, nInvConstAttr);
 
-    Value finalGrad = rewriter.create<mlir::nova::MulOp>(loc, resultType, diff, nInvConst);
+    Value finalGrad =
+        rewriter.create<mlir::nova::MulOp>(loc, resultType, diff, nInvConst);
 
     rewriter.replaceOp(op, finalGrad);
     return success();
   }
 };
+
 //===--------------------------------------------------------------------------------------------===//
 // Activation forward and backward lowerings: Sigmoid, Tanh, Gelu, Softmax
 //===--------------------------------------------------------------------------------------------===//

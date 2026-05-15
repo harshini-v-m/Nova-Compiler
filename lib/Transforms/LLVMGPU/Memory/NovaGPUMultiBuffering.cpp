@@ -242,9 +242,9 @@ static LogicalResult novaMultiBuffer(memref::AllocOp allocOp,
   // the alloc directly) means the alloc isn't in a shape we can cleanly widen,
   // so we leave the IR alone for that alloc.
   for (Operation *user : allocOp->getUsers()) {
-    if (!isa<memref::SubViewOp, memref::LoadOp, memref::StoreOp,
+    if (!isa<memref::SubViewOp, memref::ViewOp, memref::LoadOp, memref::StoreOp,
              vector::TransferReadOp, vector::TransferWriteOp,
-             nvgpu::DeviceAsyncCopyOp>(user)) {
+             nvgpu::DeviceAsyncCopyOp, nvgpu::LdMatrixOp>(user)) {
       LLVM_DEBUG(llvm::dbgs()
                  << "[nova-multi-buf] novaMultiBuffer: unhandled user '"
                  << user->getName() << "' on " << allocOp << "\n");
@@ -279,9 +279,13 @@ static LogicalResult novaMultiBuffer(memref::AllocOp allocOp,
   // Collect into a local vector first to avoid iterator invalidation while
   // erasing subviews.
   SmallVector<memref::SubViewOp> subviews;
-  for (Operation *user : allocOp->getUsers())
+  SmallVector<memref::ViewOp> views;
+  for (Operation *user : allocOp->getUsers()) {
     if (auto sv = dyn_cast<memref::SubViewOp>(user))
       subviews.push_back(sv);
+    if (auto v = dyn_cast<memref::ViewOp>(user))
+      views.push_back(v);
+  }
 
   for (memref::SubViewOp sv : subviews) {
     b.setInsertionPoint(sv);
@@ -314,6 +318,27 @@ static LogicalResult novaMultiBuffer(memref::AllocOp allocOp,
                                               strides);
     sv.replaceAllUsesWith(newSv.getResult());
     sv.erase();
+  }
+  for (auto v : views) {
+    b.setInsertionPoint(v);
+    // Create a subview of the widened buffer to isolate the current slot.
+    // offsets=[slotIdx, 0], sizes=[1, -1], strides=[1, 1]
+    SmallVector<OpFoldResult> offsets{slotIdx, b.getIndexAttr(0)};
+    SmallVector<OpFoldResult> sizes{b.getIndexAttr(1),
+                                    b.getIndexAttr(ShapedType::kDynamic)};
+    SmallVector<OpFoldResult> strides{b.getIndexAttr(1), b.getIndexAttr(1)};
+
+    auto subviewType = memref::SubViewOp::inferRankReducedResultType(
+        v.getSource().getType().getShape(), widenedAlloc.getType(), offsets,
+        sizes, strides);
+
+    auto sub = b.create<memref::SubViewOp>(v.getLoc(), cast<MemRefType>(subviewType),
+                                           widenedAlloc, offsets, sizes,
+                                           strides);
+    auto newView = b.create<memref::ViewOp>(v.getLoc(), v.getType(), sub,
+                                            v.getByteShift(), v.getSizes());
+    v.replaceAllUsesWith(newView.getResult());
+    v.erase();
   }
 
   // ── 5. Rewrite remaining direct users ────────────────────────────────────
@@ -428,6 +453,16 @@ static LogicalResult novaMultiBuffer(memref::AllocOp allocOp,
           cp.getBypassL1Attr());
       cp.replaceAllUsesWith(newCp.getResult());
       cp.erase();
+      continue;
+    }
+    if (auto ldm = dyn_cast<nvgpu::LdMatrixOp>(user)) {
+      SmallVector<Value> indices{slotIdx};
+      indices.append(ldm.getIndices().begin(), ldm.getIndices().end());
+      auto newLdm = b.create<nvgpu::LdMatrixOp>(
+          ldm.getLoc(), ldm.getRes().getType(), widenedAlloc, indices,
+          ldm.getTranspose(), ldm.getNumTiles());
+      ldm.replaceAllUsesWith(newLdm.getRes());
+      ldm.erase();
       continue;
     }
     // No else-branch: the pre-check above guarantees no other kinds reach

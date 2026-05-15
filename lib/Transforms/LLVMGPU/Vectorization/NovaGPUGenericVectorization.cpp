@@ -337,14 +337,29 @@ static bool tryHoistLabelDrivenExtract(IRRewriter &rewriter,
   unsigned numIns = linalgOp.getNumDpsInputs();
 
   // Extract scalar from original input tensor at [0,..,lane] for each input.
+  // For an input dim of size 1, broadcast (index 0) instead of using `lane`,
+  // otherwise lanes > 0 would read out of bounds. This is the size-1 sliced
+  // input pattern that arises when an upstream pass per-thread-slices an
+  // outer dim by a tile of 1 (e.g. cached_pos<1xi64> per-thread slice from
+  // <4xi64> outer slice — without this clamp the gather emits OOB reads).
   auto extractScalarInput = [&](unsigned inputIdx, int64_t lane) -> Value {
     Value inTensor = linalgOp.getDpsInputOperand(inputIdx)->get();
     auto inTy = dyn_cast<RankedTensorType>(inTensor.getType());
     if (!inTy) return {};
     SmallVector<Value> idxVals;
-    for (int d = 0; d < (int)inTy.getRank(); ++d)
-      idxVals.push_back(rewriter.create<arith::ConstantIndexOp>(
-          loc, d == (int)inTy.getRank() - 1 ? lane : 0));
+    int64_t innermost = (int)inTy.getRank() - 1;
+    for (int d = 0; d < (int)inTy.getRank(); ++d) {
+      int64_t coord = 0;
+      if (d == innermost) {
+        int64_t dimSize = inTy.getDimSize(d);
+        // Size-1 (or dynamic): broadcast; otherwise use lane (clamped by size).
+        if (dimSize == 1 || dimSize == ShapedType::kDynamic)
+          coord = 0;
+        else
+          coord = lane % dimSize;
+      }
+      idxVals.push_back(rewriter.create<arith::ConstantIndexOp>(loc, coord));
+    }
     return rewriter.create<tensor::ExtractOp>(loc, inTensor, idxVals);
   };
 
@@ -696,6 +711,36 @@ struct NovaGenericVectorizationPass
   void runOnOperation() override;
 };
 
+// Returns true when the op's body contains a tensor.extract (a "free gather"
+// into a tensor that is NOT one of the op's DPS inputs) AND at least one DPS
+// input operand has a size-1 dim. This is the gather-with-broadcast-index
+// pattern: a per-thread size-1 index slice is consumed by tensor.extract into
+// a global table. With vectorizeNDExtract=true, upstream linalg::vectorize
+// unrolls the extract by the iteration-domain factor of an unrelated parallel
+// dim, reading offsets {0, 1, 2, ...} from the size-1 index slice — out of
+// bounds at the boundary tile (e.g. position 1024 of cached_pos<1x1024xi64>
+// at the last block). In this case fall back to vectorizeNDExtract=false so
+// the extract stays scalar and each thread performs one in-bounds lookup.
+static bool hasSizeOneSlicedExtract(linalg::LinalgOp linalgOp) {
+  Block &body = linalgOp->getRegion(0).front();
+  bool hasFreeExtract = false;
+  for (Operation &op : body) {
+    if (isa<tensor::ExtractOp>(&op)) {
+      hasFreeExtract = true;
+      break;
+    }
+  }
+  if (!hasFreeExtract)
+    return false;
+  for (Value input : linalgOp.getDpsInputs()) {
+    auto tt = dyn_cast<RankedTensorType>(input.getType());
+    if (!tt) continue;
+    for (int64_t s : tt.getShape())
+      if (s == 1) return true;
+  }
+  return false;
+}
+
 void NovaGenericVectorizationPass::runOnOperation() {
   func::FuncOp funcOp = getOperation();
   MLIRContext *ctx = funcOp.getContext();
@@ -761,8 +806,10 @@ void NovaGenericVectorizationPass::runOnOperation() {
       if (auto genericOp = dyn_cast<linalg::GenericOp>(op))
         tryScaleDirectlyAccumulatedConstants(rewriter, genericOp);
 
-      FailureOr<linalg::VectorizationResult> result =
-          linalg::vectorize(rewriter, op, {}, {}, /*vectorizeNDExtract=*/true);
+      bool ndExtractSafe = !hasSizeOneSlicedExtract(linalgOp);
+
+      FailureOr<linalg::VectorizationResult> result = linalg::vectorize(
+          rewriter, op, {}, {}, /*vectorizeNDExtract=*/ndExtractSafe);
       if (succeeded(result))
         rewriter.replaceOp(op, result->replacements);
       continue;

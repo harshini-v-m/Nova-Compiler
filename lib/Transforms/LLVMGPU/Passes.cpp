@@ -29,7 +29,6 @@
 #include "mlir/Conversion/BufferizationToMemRef/BufferizationToMemRef.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
-#include "Compiler/Translation/NovaToGpu/NovaToGpu.h"
 #include "Compiler/Translation/NovaToLinalg/NovaToLinalg.h"
 #include "mlir/Conversion/TosaToLinalg/TosaToLinalg.h"
 #include "mlir/Conversion/TosaToArith/TosaToArith.h"
@@ -105,8 +104,8 @@ namespace mlir::nova
   pm.addNestedPass<mlir::func::FuncOp>(createNovaCheckInsParallelFuse());
   pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgHorizontalFusionPass());
   pm.addNestedPass<mlir::func::FuncOp>(createNovaMultiConsumerFusion());
-  pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(createCSEPass());
+  pm.addPass(mlir::createCanonicalizerPass());
 
   // ── Step -0.5: Fold unit-extent dims ───────────────────────────────────
   pm.addNestedPass<func::FuncOp>(createLinalgFoldUnitExtentDimsPass());
