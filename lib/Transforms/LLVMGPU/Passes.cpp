@@ -100,10 +100,10 @@ namespace mlir::nova
 
 
   pm.addNestedPass<mlir::func::FuncOp>(createFuseMatmulBiasPass());
-  pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
-  pm.addNestedPass<mlir::func::FuncOp>(createNovaCheckInsParallelFuse());
-  pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgHorizontalFusionPass());
-  pm.addNestedPass<mlir::func::FuncOp>(createNovaMultiConsumerFusion());
+  // pm.addNestedPass<mlir::func::FuncOp>(createNovaElementwiseOpFusionPass());
+  // pm.addNestedPass<mlir::func::FuncOp>(createNovaCheckInsParallelFuse());
+  // pm.addNestedPass<mlir::func::FuncOp>(createNovaLinalgHorizontalFusionPass());
+  // pm.addNestedPass<mlir::func::FuncOp>(createNovaMultiConsumerFusion());
   pm.addPass(createCSEPass());
   pm.addPass(mlir::createCanonicalizerPass());
 
@@ -155,6 +155,12 @@ namespace mlir::nova
         createNovaConfigTrackingCanonicalizerPass());
   pm.addPass(createCSEPass());
 
+
+  pm.addNestedPass<func::FuncOp>(
+        createNovaGPUFuseAndHoistParallelLoopsPass());
+    pm.addNestedPass<func::FuncOp>(
+        createNovaConfigTrackingCanonicalizerPass());
+    pm.addPass(createCSEPass());
   // Fold unit dims first so ConfigureTensorLayouts wraps already-rank-reduced
   // tensors. If ConfigureTensorLayouts ran first, FoldUnitExtentDims would
   // insert extract_slice + empty + insert_slice around to_layout ops,

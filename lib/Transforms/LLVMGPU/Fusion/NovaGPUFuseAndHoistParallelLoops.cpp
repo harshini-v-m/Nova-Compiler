@@ -947,27 +947,35 @@ struct HoistForallFromFor final : OpRewritePattern<scf::ForOp> {
           loop, "terminator does not yield a single-result scf.forall");
 
     // (4) Verify & collect the other ops in the for body.
-    //     They must not have regions, not be tilable, not depend on the
-    //     for-loop iter arg, and not be used by the forall op directly.
+    //     They must not depend on the for-loop iter arg and must not be used
+    //     directly by the forall op we are hoisting.
+    //
+    //     Nova's pipeline places sibling scf.forall ops (copy_A and copy_B,
+    //     mapped to #gpu.thread) in the same scf.for K body alongside the
+    //     compute forall (mapped to #gpu.warp).  These sibling foralls perform
+    //     cooperative global→shared memory loads; they are independent of the
+    //     for-loop's iter arg and safe to move inside the new outer forall body
+    //     (they execute before the inner scf.for on each iteration, reusing the
+    //     warp/thread mapping of the outer forall).  We collect them in
+    //     operationsToMove along with all other non-loop-like non-terminator ops.
     Block *loopBody = loop.getBody();
     Value forIterArg = loop.getRegionIterArg(0);
     SmallVector<Operation *> operationsToMove;
     for (Operation &op : loopBody->getOperations()) {
       if (&op == forallOp.getOperation() || &op == loopBody->getTerminator())
         continue;
-      // Reject other scf.forall or loop-like ops (we need exactly one forall
-      // to hoist).  Allow TilingInterface ops with regions (e.g. linalg.copy
-      // from shared memory promotion) — they get moved into the forall body.
-      if (isa<scf::ForallOp>(&op))
+      // Reject non-forall loop-like ops (scf.for, scf.while, etc.) inside
+      // the body — we cannot safely interchange them.
+      if (isa<LoopLikeOpInterface>(&op) && !isa<scf::ForallOp>(&op))
         return rewriter.notifyMatchFailure(
-            loop, "for body contains another scf.forall besides the target");
-      if (isa<LoopLikeOpInterface>(&op))
-        return rewriter.notifyMatchFailure(
-            loop, "for body contains a loop-like op");
+            loop, "for body contains a non-forall loop-like op");
+      // Sibling scf.forall ops (e.g., copy_A / copy_B cooperative loads) must
+      // not depend on the for-loop iter arg.
       for (Value operand : op.getOperands())
         if (operand == forIterArg)
           return rewriter.notifyMatchFailure(
               loop, "for body op uses iter arg");
+      // The op must not feed directly into the hoisted forall's operands.
       for (Operation *user : op.getUsers())
         if (user == forallOp.getOperation())
           return rewriter.notifyMatchFailure(

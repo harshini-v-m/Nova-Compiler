@@ -1376,7 +1376,8 @@ struct DistributeTransferWrite final
 // DistributeBroadcast
 //===----------------------------------------------------------------------===//
 
-struct DistributeBroadcast final : OpDistributionPattern<vector::BroadcastOp> {
+struct DistributeBroadcast final
+    : OpDistributionPattern<vector::BroadcastOp> {
   using OpDistributionPattern::OpDistributionPattern;
 
   LogicalResult matchAndRewrite(vector::BroadcastOp broadcastOp,
@@ -1391,7 +1392,7 @@ struct DistributeBroadcast final : OpDistributionPattern<vector::BroadcastOp> {
     SmallVector<bool> broadcastedDims(distShape.size(), false);
 
     VectorValue srcVec = dyn_cast<VectorValue>(broadcastOp.getSource());
-    int64_t bcastRank = layout.getRank();
+    int64_t bcastRank  = layout.getRank();
     if (srcVec)
       bcastRank -= srcVec.getType().getRank();
 
@@ -1404,13 +1405,19 @@ struct DistributeBroadcast final : OpDistributionPattern<vector::BroadcastOp> {
     if (srcVec) {
       auto srcLayout = dyn_cast<NestedLayoutAttr>(signature[srcVec]);
       if (!srcLayout)
+        return rewriter.notifyMatchFailure(broadcastOp, "non-nested src layout");
+      // Refuse to fire if the source is still undistributed (no enclosing
+      // to_simd). Synthesizing a to_simt here would leave it stranded with a
+      // plain vector.broadcast user, failing verifyConversion. The
+      // DistributeTransferRead pattern must fire first to distribute the source.
+      if (!srcVec.getDefiningOp<vec_ext::ToSIMDOp>() &&
+          !srcVec.getDefiningOp<vec_ext::ToSIMTOp>())
         return rewriter.notifyMatchFailure(broadcastOp,
-                                           "non-nested src layout");
+                                           "source not yet distributed");
       distSrc = getDistributed(rewriter, srcVec, srcLayout);
     }
 
-    VectorValue result =
-        broadcastToShape(rewriter, distSrc, distShape, broadcastedDims);
+    VectorValue result = broadcastToShape(rewriter, distSrc, distShape, broadcastedDims);
     replaceOpWithDistributedValues(rewriter, broadcastOp, result);
     return success();
   }

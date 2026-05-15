@@ -684,6 +684,24 @@ static void transferParkedLayoutAttrs(func::FuncOp funcOp) {
   });
 }
 
+
+struct FoldTransferReadOfSplatTensorConstant
+    : public OpRewritePattern<vector::TransferReadOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::TransferReadOp op,
+                                PatternRewriter &rw) const override {
+    auto cst = op.getSource().getDefiningOp<arith::ConstantOp>();
+    if (!cst) return failure();
+    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+    if (!dense || !dense.isSplat()) return failure();
+    VectorType vecTy = op.getVectorType();
+    auto splatVec =
+        DenseElementsAttr::get(vecTy, dense.getSplatValue<Attribute>());
+    rw.replaceOpWithNewOp<arith::ConstantOp>(op, vecTy, splatVec);
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // The pass
 //===----------------------------------------------------------------------===//
@@ -843,6 +861,7 @@ void NovaGenericVectorizationPass::runOnOperation() {
   // Phase 2a: multi_reduction → vector.contract (must be alone so it wins)
   {
     RewritePatternSet contractPatterns(ctx);
+    contractPatterns.add<FoldTransferReadOfSplatTensorConstant>(ctx);
     vector::populateVectorTransferPermutationMapLoweringPatterns(contractPatterns);
     vector::populateVectorReductionToContractPatterns(contractPatterns);
     if (failed(applyPatternsGreedily(funcOp, std::move(contractPatterns))))

@@ -4,10 +4,12 @@
 #include "Compiler/Transforms/LLVMGPU/NovaKernelConfig.h"
 #include "Compiler/Transforms/LLVMGPU/NVIDIATargetUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -83,6 +85,14 @@ static bool verifyComputeOpsAfterDistribution(func::FuncOp funcOp) {
 
 /// Returns true if any value produced by `producer` is used as an init value
 /// for the DPS `user`.
+static bool isAllParallelLinalg(Operation *op) {
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  return linalgOp && llvm::all_of(linalgOp.getIteratorTypesArray(),
+                                   [](utils::IteratorType t) {
+                                     return t == utils::IteratorType::parallel;
+                                   });
+}
+
 static bool isUsedAsInit(Operation *producer, Operation *user) {
   auto dpsIface = dyn_cast<DestinationStyleOpInterface>(user);
   if (!dpsIface)
@@ -93,25 +103,23 @@ static bool isUsedAsInit(Operation *producer, Operation *user) {
   });
 }
 
+static bool isNonZeroTile(OpFoldResult ofr) {
+  std::optional<int64_t> cst = getConstantIntValue(ofr);
+  return !cst || *cst != 0;
+}
+
 /// Creates GPU block mapping attributes for non-zero tile dimensions.
 /// For ≤3 active dims: uses DimX/DimY/DimZ (innermost first).
 /// For >3 active dims: uses LinearDim0..N (innermost first, reversed).
 static SmallVector<Attribute> getMapping(MLIRContext *context,
                                           ArrayRef<OpFoldResult> tileSizes) {
-  int numActiveDims = 0;
-  for (auto tileSize : tileSizes) {
-    std::optional<int64_t> cst = getConstantIntValue(tileSize);
-    if (!cst || *cst != 0)
-      numActiveDims++;
-  }
-
+  int numActiveDims = llvm::count_if(tileSizes, isNonZeroTile);
   SmallVector<Attribute> mapping;
 
   if (numActiveDims > 3) {
     unsigned idx = 0;
     for (auto tileSize : tileSizes) {
-      std::optional<int64_t> cst = getConstantIntValue(tileSize);
-      if (cst && *cst == 0)
+      if (!isNonZeroTile(tileSize))
         continue;
       unsigned mappingId =
           static_cast<unsigned>(gpu::MappingId::LinearDim0) + idx++;
@@ -122,28 +130,15 @@ static SmallVector<Attribute> getMapping(MLIRContext *context,
   }
 
   // ≤3 active dimensions: use 3D block mapping (x, y, z).
+  static const gpu::MappingId kDims[] = {gpu::MappingId::DimX,
+                                          gpu::MappingId::DimY,
+                                          gpu::MappingId::DimZ};
   int dim = 0;
   for (auto tileSize : llvm::reverse(tileSizes)) {
-    std::optional<int64_t> cst = getConstantIntValue(tileSize);
-    if (cst && *cst == 0)
+    if (!isNonZeroTile(tileSize))
       continue;
-    switch (dim) {
-    case 0:
-      mapping.push_back(gpu::GPUBlockMappingAttr::get(
-          context, gpu::MappingId::DimX));
-      break;
-    case 1:
-      mapping.push_back(gpu::GPUBlockMappingAttr::get(
-          context, gpu::MappingId::DimY));
-      break;
-    case 2:
-      mapping.push_back(gpu::GPUBlockMappingAttr::get(
-          context, gpu::MappingId::DimZ));
-      break;
-    default:
-      break;
-    }
-    dim++;
+    mapping.push_back(
+        gpu::GPUBlockMappingAttr::get(context, kDims[dim++]));
   }
   return llvm::to_vector(llvm::reverse(mapping));
 }
@@ -155,7 +150,43 @@ static SmallVector<Attribute> getMapping(MLIRContext *context,
 struct TilingInfo {
   Operation *tilableOp;
   SmallVector<OpFoldResult> tileSizes;
+  // TODO(nova): add SmallVector<int64_t> interchange once kInterchangeKey
+  // exists in NovaGPULoweringConfigUtils.h and wire into tilingOptions.
 };
+
+/// Returns true if the scf.forall has all-static lower bounds, upper bounds
+/// and steps. Mirrors IREE's `areAllStaticLoopBounds` precondition for
+/// workgroup transpose.
+static bool areAllStaticLoopBounds(scf::ForallOp forallOp) {
+  for (auto [lb, ub, step] :
+       llvm::zip_equal(forallOp.getMixedLowerBound(),
+                       forallOp.getMixedUpperBound(),
+                       forallOp.getMixedStep())) {
+    if (!getConstantIntValue(lb) || !getConstantIntValue(ub) ||
+        !getConstantIntValue(step))
+      return false;
+  }
+  return true;
+}
+
+/// Swaps the last two mapping attributes on a workgroup-mapped scf.forall to
+/// transpose the X/Y block IDs. Mirrors IREE's transposeWorkgroup behavior in
+/// TileDispatchUsingForall.cpp. Only applied when:
+///   * all forall bounds/steps are static, AND
+///   * the mapping has at least 2 entries.
+static void maybeTransposeWorkgroupMapping(scf::ForallOp forallOp) {
+  auto mappingAttr = forallOp.getMappingAttr();
+  if (!mappingAttr)
+    return;
+  SmallVector<Attribute> mapping(mappingAttr.getValue());
+  int64_t mappingSize = mapping.size();
+  if (mappingSize < 2)
+    return;
+  if (!areAllStaticLoopBounds(forallOp))
+    return;
+  std::swap(mapping[mappingSize - 1], mapping[mappingSize - 2]);
+  forallOp.setMappingAttr(ArrayAttr::get(forallOp.getContext(), mapping));
+}
 
 /// Reads workgroup tile sizes from the lowering_config attribute.
 /// Zeros out reduction dims (workgroup tiling is parallel-only).
@@ -167,20 +198,20 @@ static FailureOr<TilingInfo> getTiledAndDistributionInfo(
     return failure();
 
   int numLoops = linalgOp.getNumLoops();
-  SmallVector<OpFoldResult> tileSizes(numLoops, rewriter.getIndexAttr(0));
 
-  // Read workgroup tile sizes from lowering_config.
   auto config = getLoweringConfig(op);
   if (!config)
-    return failure(); // No config → can't tile.
+    return failure();
 
   SmallVector<int64_t> wgTiles =
       getLoweringConfigTileSizes(config, kWorkgroupKey);
   if (wgTiles.size() != static_cast<size_t>(numLoops))
     return failure();
 
-  for (int i = 0; i < numLoops; ++i)
-    tileSizes[i] = rewriter.getIndexAttr(wgTiles[i]);
+  SmallVector<OpFoldResult> tileSizes;
+  tileSizes.reserve(numLoops);
+  for (int64_t t : wgTiles)
+    tileSizes.push_back(rewriter.getIndexAttr(t));
 
   // Zero out non-parallel (reduction) dims at workgroup level.
   for (int i = 0; i < numLoops; ++i) {
@@ -223,7 +254,7 @@ static FailureOr<TilingInfo> getTiledAndDistributionInfo(
     }
   }
 
-  return TilingInfo{op, tileSizes, };
+  return TilingInfo{op, tileSizes};
 }
 
 //===----------------------------------------------------------------------===//
@@ -238,6 +269,21 @@ struct NovaTileAndDistributePass
   NovaTileAndDistributePass() = default;
   NovaTileAndDistributePass(const NovaTileAndDistributePass &pass)
       : PassWrapper(pass) {}
+  explicit NovaTileAndDistributePass(bool transposeWorkgroup) {
+    this->transposeWorkgroup = transposeWorkgroup;
+  }
+
+  /// Mirrors IREE's TileAndDistributeToWorkgroupsUsingForallOpPass option of
+  /// the same name. When true, swaps the last two block-mapping attrs on each
+  /// workgroup-mapped scf.forall whose bounds are fully static and whose
+  /// mapping has rank >= 2. Useful for getting better L2 locality when the
+  /// natural fastest-varying dim is not the desired blockIdx.x.
+  Option<bool> transposeWorkgroup{
+      *this, "transpose-workgroup",
+      llvm::cl::desc(
+          "Swap the last two block-mapping attrs on each workgroup-mapped "
+          "scf.forall (mirrors IREE's transposeWorkgroup)."),
+      llvm::cl::init(false)};
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<gpu::GPUDialect, scf::SCFDialect, linalg::LinalgDialect,
@@ -281,22 +327,10 @@ struct NovaTileAndDistributePass
         return success(); // Skip non-tilable ops gracefully.
       TilingInfo info = *infoOr;
 
-      // Check if all tile sizes are zero (full reduction, no parallel dims).
-      // These are handled by Phase 2.
-      bool allZero = true;
-      for (auto &ts : info.tileSizes) {
-        if (auto cst = getConstantIntValue(ts)) {
-          if (*cst != 0) {
-            allZero = false;
-            break;
-          }
-        } else {
-          allZero = false;
-          break;
-        }
-      }
+      // All-zero tile sizes → full reduction with no parallel dims; defer to Phase 2.
+      bool allZero = llvm::none_of(info.tileSizes, isNonZeroTile);
       if (allZero)
-        return success(); // Defer to Phase 2.
+        return success();
 
       auto tilingInterface = cast<TilingInterface>(rootOp);
 
@@ -327,6 +361,7 @@ struct NovaTileAndDistributePass
       auto mapping = getMapping(&getContext(), info.tileSizes);
       tilingOptions.setMapping(mapping);
       tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
+      // TODO(nova): tilingOptions.setInterchange(...) once kInterchangeKey exists.
 
       // Fusion control: fuse producers except pad ops and contractions.
       scf::SCFTileAndFuseOptions tileAndFuseOptions;
@@ -487,16 +522,9 @@ struct NovaTileAndDistributePass
         handledOps.insert(rootOp);
         for (auto op : result->tiledAndFusedOps) {
           handledOps.insert(op);
-          // Strip lowering_config from fused non-root ops (defense-in-depth).
-          // Only roots should retain configs for thread tiling.
-          // Check by op type: all-parallel ops are non-roots that fused in.
-          if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
-            bool isAllParallel = llvm::all_of(
-                linalgOp.getIteratorTypesArray(),
-                [](auto t) { return t == utils::IteratorType::parallel; });
-            if (isAllParallel && getLoweringConfig(op))
-              removeLoweringConfig(op);
-          }
+          // Strip lowering_config from fused non-root (all-parallel) ops.
+          if (isAllParallelLinalg(op) && getLoweringConfig(op))
+            removeLoweringConfig(op);
         }
       } else {
         return failure();
@@ -531,18 +559,10 @@ struct NovaTileAndDistributePass
             fuseProducersOfSlices(rewriter, *newFusionOpportunities,
                                  tileAndFuseOptions, loops);
           }
-          // Strip configs from fused all-parallel consumer ops (they are now
-          // inside the root's forall and should not get independent thread
-          // foralls). Root ops (contractions/reductions) keep their configs.
-          for (auto op : result->tiledAndFusedOps) {
-            if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
-              bool isAllParallel = llvm::all_of(
-                  linalgOp.getIteratorTypesArray(),
-                  [](auto t) { return t == utils::IteratorType::parallel; });
-              if (isAllParallel && getLoweringConfig(op))
-                removeLoweringConfig(op);
-            }
-          }
+          // Strip configs from fused all-parallel consumer ops.
+          for (auto op : result->tiledAndFusedOps)
+            if (isAllParallelLinalg(op) && getLoweringConfig(op))
+              removeLoweringConfig(op);
         }
       }
       return success();
@@ -650,22 +670,19 @@ struct NovaTileAndDistributePass
       });
 
       for (auto forall : contractionForalls) {
-        // Check if this forall already has non-contraction consumers fused.
-        // If so, consumer fusion was already done in Phase 1a (safe path).
+        // Collect all tilable ops inside this forall in one walk.
+        // If any non-contraction tilable op is present, consumer fusion was
+        // already done in Phase 1a — skip.
+        SmallVector<Operation *> tiledOps;
         bool hasEpilogue = false;
         forall.walk([&](Operation *op) {
-          if (isa<TilingInterface>(op) && !isContractionOp(op))
+          if (!isa<TilingInterface>(op))
+            return;
+          tiledOps.push_back(op);
+          if (!isContractionOp(op))
             hasEpilogue = true;
         });
-        if (hasEpilogue)
-          continue; // Already fused in Phase 1a.
-
-        SmallVector<Operation *> tiledOps;
-        forall.walk([&](Operation *op) {
-          if (isa<TilingInterface>(op))
-            tiledOps.push_back(op);
-        });
-        if (tiledOps.empty())
+        if (hasEpilogue || tiledOps.empty())
           continue;
 
         SmallVector<LoopLikeOpInterface> loops = {
@@ -695,15 +712,10 @@ struct NovaTileAndDistributePass
           fuseProducersOfSlices(rewriter, *newFusionOpportunities,
                                fakeOptions, loops);
         }
-        // Strip configs from all-parallel ops inside the forall
-        // (they are now fused and should not get independent thread foralls).
-        // Root ops (contractions/reductions) keep their configs.
-        forall.walk([&](linalg::LinalgOp linalgOp) {
-          bool isAllParallel = llvm::all_of(
-              linalgOp.getIteratorTypesArray(),
-              [](auto t) { return t == utils::IteratorType::parallel; });
-          if (isAllParallel && getLoweringConfig(linalgOp.getOperation()))
-            removeLoweringConfig(linalgOp.getOperation());
+        // Strip configs from fused all-parallel ops inside the forall.
+        forall.walk([&](Operation *op) {
+          if (isAllParallelLinalg(op) && getLoweringConfig(op))
+            removeLoweringConfig(op);
         });
       }
     }
@@ -820,15 +832,17 @@ struct NovaTileAndDistributePass
         if (resultTypes.empty())
           continue;
 
-        RankedTensorType resultType = resultTypes[0];
-
-        // Warn if a large op is being serialized to a single workgroup.
-        // This usually indicates a bug in SelectLoweringStrategy (op should
-        // have received a lowering_config but didn't).
-        int64_t numElements = 1;
-        for (int64_t dim : resultType.getShape()) {
-          if (!ShapedType::isDynamic(dim))
-            numElements *= dim;
+        // Count total static elements across all results for the size warning.
+        int64_t numElements = 0;
+        for (RankedTensorType rt : resultTypes) {
+          int64_t n = 1;
+          bool dynamic = false;
+          for (int64_t dim : rt.getShape()) {
+            if (ShapedType::isDynamic(dim)) { dynamic = true; break; }
+            n *= dim;
+          }
+          if (!dynamic)
+            numElements += n;
         }
         if (numElements > 1024) {
           LLVM_DEBUG(llvm::dbgs()
@@ -853,8 +867,17 @@ struct NovaTileAndDistributePass
         SmallVector<Value> emptyTensors;
         for (RankedTensorType rt : resultTypes) {
           SmallVector<OpFoldResult> emptySizes;
-          for (int64_t dim = 0; dim < rt.getRank(); ++dim)
-            emptySizes.push_back(rewriter.getIndexAttr(rt.getDimSize(dim)));
+          for (int64_t d = 0; d < rt.getRank(); ++d) {
+            int64_t dim = rt.getDimSize(d);
+            if (ShapedType::isDynamic(dim)) {
+              Value idx = rewriter.create<arith::ConstantIndexOp>(loc, d);
+              emptySizes.push_back(
+                  rewriter.create<tensor::DimOp>(loc, op->getResult(0), idx)
+                      .getResult());
+            } else {
+              emptySizes.push_back(rewriter.getIndexAttr(dim));
+            }
+          }
           emptyTensors.push_back(tensor::EmptyOp::create(
               rewriter, loc, emptySizes, rt.getElementType()));
         }
@@ -899,6 +922,25 @@ struct NovaTileAndDistributePass
       }
     }
 
+    // --- Optional workgroup transpose ---------------------------------------
+    // Mirrors IREE's TileDispatchUsingForall behavior: after tiling, when the
+    // user requests it, swap the last two mapping attrs on every workgroup-
+    // mapped scf.forall (provided bounds are static and rank >= 2). Nova
+    // produces one forall per root op (Phase 1a / 1b / Phase 2), so apply to
+    // each of them rather than to a single top-level forall.
+    if (transposeWorkgroup) {
+      funcOp.walk([&](scf::ForallOp forallOp) {
+        auto mappingAttr = forallOp.getMappingAttr();
+        if (!mappingAttr)
+          return;
+        if (!llvm::any_of(mappingAttr.getValue(), [](Attribute attr) {
+              return isa<gpu::GPUBlockMappingAttr>(attr);
+            }))
+          return;
+        maybeTransposeWorkgroupMapping(forallOp);
+      });
+    }
+
     // --- Cleanup patterns after tiling ---
     {
       MLIRContext *context = &getContext();
@@ -909,10 +951,15 @@ struct NovaTileAndDistributePass
       linalg::populateLinalgTilingCanonicalizationPatterns(patterns);
       tensor::populateFoldTensorEmptyPatterns(patterns);
       tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
-      tensor::ExtractSliceOp::getCanonicalizationPatterns(patterns, context);
-      tensor::DimOp::getCanonicalizationPatterns(patterns, context);
-      // NOTE: scf::ForallOp canonicalization is intentionally OMITTED.
-      // The upstream pattern inlines single-trip foralls, which would pull
+      // Load all tensor dialect canonicalization patterns (folds extract_slice
+      // of broadcast, collapse_shape, etc.). Mirrors IREE's:
+      //   context->getOrLoadDialect<tensor::TensorDialect>()
+      //           ->getCanonicalizationPatterns(patterns);
+      context->getOrLoadDialect<tensor::TensorDialect>()
+          ->getCanonicalizationPatterns(patterns);
+      memref::populateResolveRankedShapedTypeResultDimsPatterns(patterns);
+      // NOTE: scf::ForallOp canonicalization is intentionally OMITTED —
+      // the upstream pattern inlines single-trip foralls, which would pull
       // reduction ops out of their block-mapped forall.
 
       if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
@@ -938,8 +985,9 @@ struct NovaTileAndDistributePass
   }
 };
 
-std::unique_ptr<Pass> createNovaTileAndDistributeToWorkgroupsPass() {
-  return std::make_unique<NovaTileAndDistributePass>();
+std::unique_ptr<Pass>
+createNovaTileAndDistributeToWorkgroupsPass(bool transposeWorkgroup) {
+  return std::make_unique<NovaTileAndDistributePass>(transposeWorkgroup);
 }
 
 void registerNovaTileAndDistributePass() {

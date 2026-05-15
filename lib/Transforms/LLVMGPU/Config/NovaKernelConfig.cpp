@@ -526,27 +526,7 @@ getContractionHeuristicSeeds(const ContractProblem &problem,
    if (problem.inBitWidth <= 16)
      return GPUMMAHeuristicSeeds{4, 64, 4, 4,
                                  /*boostMNT=*/std::nullopt, /*util=*/0.80};
-   // f32 / TF32: target a 128x128x32 workgroup tile with a 2x2 warp grid.
-   //
-   // Seeds: {MNT=4, kElem=8, S=4, kTiles=4}
-   //
-   // Before 2x2 reshape: wgM = 16*4*4 = 256, wgN = 8*4 = 32.
-   // After 2x2 reshape (fires for VeryLarge when nTiles has headroom):
-   //   subgroupCountM=2, subgroupCountN=2, nTileCount=8
-   //   wgM = 16*4*2 = 128,  wgN = 8*8*2 = 128.
-   //
-   // K-step: bestKTileCountPerSubgroup=4 → wgK = 8*4 = 32.
-   // Raises arithmetic intensity from ~1 FLOP/byte (K=8) to ~8 FLOP/byte,
-   // keeping the 3-stage async pipeline full.
-   // SMEM: 2*(128*32*4 + 32*128*4) = ~49 KB; fitScheduleInSharedMemory
-   // clamps wgK to 16 if target is strictly 48 KB.
-   //
-   // Register spill note: per-warp tile is 64x64, FR_M=4, FR_N=8 → 128
-   // acc regs/warp. Resolve this in matmul.cpp by reducing WARP_N to 32
-   // (FR_N=4, 64 regs/warp). The workgroup tile stays 128x128 for occupancy.
-   //
-   // Single canonical tile: all matmul ops in a function share this seed,
-   // so forward/dX/dW all produce the same tile regime regardless of shape.
+
    return GPUMMAHeuristicSeeds{4, 8, 4, 4,
                                /*boostMNT=*/std::nullopt, /*util=*/0.80};
  }
@@ -1749,7 +1729,7 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
      unsigned dim = parallelDims[i];
      int64_t dimSize = loopBounds[dim];
      if (remainingBudget > 1 && dimSize > 1) {
-       int64_t tile = std::min(dimSize, remainingBudget);
+       int64_t tile = (i == 0) ? 1 : std::min(dimSize, remainingBudget);
        while (tile > 1 && dimSize % tile != 0) tile /= 2;
        workgroupTiles[dim] = tile;
        threadTiles[dim]    = 1;

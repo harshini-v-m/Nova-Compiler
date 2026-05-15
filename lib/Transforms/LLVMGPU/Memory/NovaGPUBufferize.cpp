@@ -507,49 +507,76 @@ static bool isKernelLocalStaging(Value v) {
   return false;
 }
 
+// Function-scope device-global scratch buffers — plain memref.alloc at func
+// level (no address space) or address-space-1 memrefs, including those passed
+// into a gpu.launch as block arguments. These are the inter-phase
+// communication buffers (e.g. the linear output read by GeLU) that the
+// barrier pass must also guard: writes to them from one thread distribution
+// inside a launch can race with reads from a different distribution in the
+// same launch (matmul+GELU epilogue case).
+static bool isFunctionScopeDeviceBuffer(Value v) {
+  auto mt = dyn_cast<MemRefType>(v.getType());
+  if (!mt) return false;
+  if (Attribute space = mt.getMemorySpace()) {
+    auto ia = dyn_cast<IntegerAttr>(space);
+    return ia && ia.getInt() == 1;
+  }
+  Value base = v;
+  while (auto sv = base.getDefiningOp<memref::SubViewOp>())
+    base = sv.getSource();
+  if (auto bbArg = dyn_cast<BlockArgument>(base))
+    return isa<gpu::LaunchOp>(bbArg.getOwner()->getParentOp());
+  if (!base.getDefiningOp<memref::AllocOp>()) return false;
+  for (Operation *p = base.getDefiningOp()->getParentOp(); p;
+       p = p->getParentOp()) {
+    if (isa<gpu::LaunchOp>(p)) return false; // inside kernel = local staging
+    if (isa<func::FuncOp>(p)) return true;   // function scope = global scratch
+  }
+  return false;
+}
+
+static bool isBarrierTrackedStore(Value v) {
+  return isWorkgroupOrGlobalValue(v) || isKernelLocalStaging(v) ||
+         isFunctionScopeDeviceBuffer(v);
+}
+
 static bool hasWorkgroupStores(Operation *op) {
   bool found = false;
   op->walk([&](Operation *inner) -> WalkResult {
     if (auto w = dyn_cast<vector::TransferWriteOp>(inner))
-      if (isWorkgroupOrGlobalValue(w.getBase()) ||
-          isKernelLocalStaging(w.getBase())) {
+      if (isBarrierTrackedStore(w.getBase())) {
         found = true;
         return WalkResult::interrupt();
       }
     if (auto w = dyn_cast<vector::StoreOp>(inner))
-      if (isWorkgroupOrGlobalValue(w.getBase()) ||
-          isKernelLocalStaging(w.getBase())) {
+      if (isBarrierTrackedStore(w.getBase())) {
         found = true;
         return WalkResult::interrupt();
       }
     if (auto w = dyn_cast<memref::StoreOp>(inner))
-      if (isWorkgroupOrGlobalValue(w.getMemref()) ||
-          isKernelLocalStaging(w.getMemref())) {
+      if (isBarrierTrackedStore(w.getMemref())) {
         found = true;
         return WalkResult::interrupt();
       }
     if (auto w = dyn_cast<affine::AffineStoreOp>(inner))
-      if (isWorkgroupOrGlobalValue(w.getMemref()) ||
-          isKernelLocalStaging(w.getMemref())) {
+      if (isBarrierTrackedStore(w.getMemref())) {
         found = true;
         return WalkResult::interrupt();
       }
     if (auto c = dyn_cast<linalg::CopyOp>(inner))
       for (Value out : c.getDpsInits())
-        if (isWorkgroupOrGlobalValue(out) || isKernelLocalStaging(out)) {
+        if (isBarrierTrackedStore(out)) {
           found = true;
           return WalkResult::interrupt();
         }
     if (auto c = dyn_cast<memref::CopyOp>(inner))
-      if (isWorkgroupOrGlobalValue(c.getTarget()) ||
-          isKernelLocalStaging(c.getTarget())) {
+      if (isBarrierTrackedStore(c.getTarget())) {
         found = true;
         return WalkResult::interrupt();
       }
     // nvgpu.device_async_copy writes to workgroup (shared) memory.
     if (auto acp = dyn_cast<nvgpu::DeviceAsyncCopyOp>(inner))
-      if (isWorkgroupOrGlobalValue(acp.getDst()) ||
-          isKernelLocalStaging(acp.getDst())) {
+      if (isBarrierTrackedStore(acp.getDst())) {
         found = true;
         return WalkResult::interrupt();
       }
@@ -558,48 +585,47 @@ static bool hasWorkgroupStores(Operation *op) {
   return found;
 }
 
+static bool isBarrierTrackedLoad(Value v) {
+  return isWorkgroupOrGlobalValue(v) || isKernelLocalStaging(v) ||
+         isFunctionScopeDeviceBuffer(v);
+}
+
 static bool hasWorkgroupLoads(Operation *op) {
   bool found = false;
   op->walk([&](Operation *inner) -> WalkResult {
     if (auto r = dyn_cast<vector::TransferReadOp>(inner))
-      if (isWorkgroupOrGlobalValue(r.getBase()) ||
-          isKernelLocalStaging(r.getBase())) {
+      if (isBarrierTrackedLoad(r.getBase())) {
         found = true;
         return WalkResult::interrupt();
       }
     if (auto r = dyn_cast<vector::LoadOp>(inner))
-      if (isWorkgroupOrGlobalValue(r.getBase()) ||
-          isKernelLocalStaging(r.getBase())) {
+      if (isBarrierTrackedLoad(r.getBase())) {
         found = true;
         return WalkResult::interrupt();
       }
     if (auto r = dyn_cast<memref::LoadOp>(inner))
-      if (isWorkgroupOrGlobalValue(r.getMemref()) ||
-          isKernelLocalStaging(r.getMemref())) {
+      if (isBarrierTrackedLoad(r.getMemref())) {
         found = true;
         return WalkResult::interrupt();
       }
     if (auto r = dyn_cast<affine::AffineLoadOp>(inner))
-      if (isWorkgroupOrGlobalValue(r.getMemref()) ||
-          isKernelLocalStaging(r.getMemref())) {
+      if (isBarrierTrackedLoad(r.getMemref())) {
         found = true;
         return WalkResult::interrupt();
       }
     if (auto c = dyn_cast<linalg::CopyOp>(inner))
       for (Value in : c.getDpsInputs())
-        if (isWorkgroupOrGlobalValue(in) || isKernelLocalStaging(in)) {
+        if (isBarrierTrackedLoad(in)) {
           found = true;
           return WalkResult::interrupt();
         }
     if (auto c = dyn_cast<memref::CopyOp>(inner))
-      if (isWorkgroupOrGlobalValue(c.getSource()) ||
-          isKernelLocalStaging(c.getSource())) {
+      if (isBarrierTrackedLoad(c.getSource())) {
         found = true;
         return WalkResult::interrupt();
       }
     if (auto ldm = dyn_cast<nvgpu::LdMatrixOp>(inner))
-      if (isWorkgroupOrGlobalValue(ldm.getSrcMemref()) ||
-          isKernelLocalStaging(ldm.getSrcMemref())) {
+      if (isBarrierTrackedLoad(ldm.getSrcMemref())) {
         found = true;
         return WalkResult::interrupt();
       }
@@ -747,6 +773,16 @@ static void insertBarriersInBlock(OpBuilder &builder, Block *block) {
                      isConstIdx(forOp.getStep());
       if (uniform && !isSimplePerThreadCopy(forOp))
         insertBarriersInBlock(builder, forOp.getBody());
+      // Conservative re-arm: if the loop body had workgroup stores, the
+      // launch-level scan can't tell them apart from the loop's own internal
+      // writes once we've returned to the parent. Force seenStore=true so
+      // the very next workgroup-load after the loop triggers a barrier.
+      // This catches the matmul+GELU epilogue race: matmul k-loop with
+      // shared-mem writes, followed by scattered tile-writes to a func-scope
+      // scratch buffer, followed by an in-place epilogue read of that
+      // buffer by a different thread distribution.
+      if (hasWorkgroupStores(&op))
+        seenStore = seenNonAtomicStore = true;
     }
     if (auto forallOp = dyn_cast<scf::ForallOp>(op)) {
       bool uniform = true;
@@ -755,6 +791,8 @@ static void insertBarriersInBlock(OpBuilder &builder, Block *block) {
       if (uniform)
         for (Block &inner : forallOp.getRegion())
           insertBarriersInBlock(builder, &inner);
+      if (hasWorkgroupStores(&op))
+        seenStore = seenNonAtomicStore = true;
     }
   }
 

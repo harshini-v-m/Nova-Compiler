@@ -49,6 +49,48 @@ bool isThreadOrWarpMapped(scf::ForallOp forall) {
   return false;
 }
 
+
+/// Helper to find the maximum thread count already mapped in the parent block.
+static int64_t getTargetThreadsForOp(Operation *op) {
+  int64_t target = kDefaultTargetThreads;
+  auto parentForall = op->getParentOfType<scf::ForallOp>();
+  while (parentForall) {
+    bool isBlock = false;
+    if (auto mapping = parentForall.getMappingAttr()) {
+      if (!mapping.empty() && isa<gpu::GPUBlockMappingAttr>(mapping.getValue().front()))
+        isBlock = true;
+    }
+    if (isBlock) {
+      int64_t maxThreads = 0;
+      parentForall.walk([&](scf::ForallOp inner) {
+        if (auto mapping = inner.getMappingAttr()) {
+          if (mapping.empty()) return;
+          auto attr = mapping.getValue().front();
+          if (isa<gpu::GPUWarpMappingAttr>(attr)) {
+            int64_t warps = 1;
+            for (auto ub : inner.getMixedUpperBound()) {
+              if (auto cst = getConstantIntValue(ub))
+                warps *= *cst;
+            }
+            maxThreads = std::max(maxThreads, warps * 32);
+          } else if (isa<gpu::GPUThreadMappingAttr>(attr)) {
+            int64_t threads = 1;
+            for (auto ub : inner.getMixedUpperBound()) {
+              if (auto cst = getConstantIntValue(ub))
+                threads *= *cst;
+            }
+            maxThreads = std::max(maxThreads, threads);
+          }
+        }
+      });
+      if (maxThreads > 0)
+        return maxThreads;
+      break;
+    }
+    parentForall = parentForall->getParentOfType<scf::ForallOp>();
+  }
+  return target;
+}
 /// Tile `tilingInterfaceOp` into a thread-mapped scf.forall using derived
 /// thread tile sizes.  Greedily fuses all producers.  If tiling fails,
 /// returns silently (best-effort — later verification catches failures).
@@ -110,7 +152,9 @@ void tileToThreads(RewriterBase &rewriter,
   for (int64_t r : parallelRanges)
     flatTrips *= r;
 
-  for (int64_t target = kDefaultTargetThreads; target >= 32;
+  int64_t targetThreads = getTargetThreadsForOp(tilingInterfaceOp);
+
+  for (int64_t target = targetThreads; target >= 32;
        target /= 2) {
     parallelTiles =
         nova::deriveThreadTileSizes(parallelRanges, target, elemBits);
@@ -120,7 +164,7 @@ void tileToThreads(RewriterBase &rewriter,
     for (int i = 0; i < (int)parallelRanges.size(); ++i)
       actualThreads *= (parallelRanges[i] / parallelTiles[i]);
 
-    if (actualThreads <= kMaxThreads && actualThreads > 1) {
+    if (actualThreads <= kMaxThreads && actualThreads >= 1) {
       foundValidTiling = true;
       break;
     }

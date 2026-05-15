@@ -216,12 +216,11 @@ struct NovaGPUVectorDistributePass
     // -----------------------------------------------------------------------
     llvm::DenseMap<Block *, Value> threadIdMap;
 
-    funcOp.walk([&](scf::ForallOp forallOp) {
-      auto mapping = forallOp.getMappingAttr();
-      if (!mapping || mapping.empty() ||
-          !isa<gpu::GPUWarpMappingAttr>(mapping.getValue().front()))
+    // Helper: build a linearized gpu.thread_id at the top of a forall body
+    // and record it in threadIdMap.
+    auto registerThreadId = [&](scf::ForallOp forallOp) {
+      if (threadIdMap.count(forallOp.getBody()))
         return;
-
       OpBuilder builder(ctx);
       builder.setInsertionPointToStart(forallOp.getBody());
       Location loc = forallOp.getLoc();
@@ -247,6 +246,26 @@ struct NovaGPUVectorDistributePass
             builder, loc, tidVec, wgSizes, /*disjoint=*/true);
       }
       threadIdMap[forallOp.getBody()] = linearThreadId;
+    };
+
+    // Register thread IDs for warp-mapped foralls (primary distribution scope).
+    funcOp.walk([&](scf::ForallOp forallOp) {
+      auto mapping = forallOp.getMappingAttr();
+      if (!mapping || mapping.empty() ||
+          !isa<gpu::GPUWarpMappingAttr>(mapping.getValue().front()))
+        return;
+      registerThreadId(forallOp);
+    });
+
+    // Also register thread IDs for block-mapped foralls. Vector ops hoisted
+    // above the warp forall (e.g. bias transfer_reads whose result is an
+    // iter_arg) live in these blocks and need a thread ID to be distributed.
+    funcOp.walk([&](scf::ForallOp forallOp) {
+      auto mapping = forallOp.getMappingAttr();
+      if (!mapping || mapping.empty() ||
+          !isa<gpu::GPUBlockMappingAttr>(mapping.getValue().front()))
+        return;
+      registerThreadId(forallOp);
     });
 
     NovaContractionVectorLayoutOptions options(funcOp, threadIdMap,

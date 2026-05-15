@@ -66,7 +66,8 @@ createNovaGPUSelectLoweringStrategyPass(StringRef cudaArch = "sm_86");
 void registerNovaGPUSelectLoweringStrategyPass();
 
 // Tiles compute operations and distributes them to workgroups using scf.forall.
-std::unique_ptr<Pass> createNovaTileAndDistributeToWorkgroupsPass();
+std::unique_ptr<Pass>
+createNovaTileAndDistributeToWorkgroupsPass(bool transposeWorkgroup = false);
 void registerNovaTileAndDistributePass();
 
 // Pads linalg operands to static multiples of tile sizes.
