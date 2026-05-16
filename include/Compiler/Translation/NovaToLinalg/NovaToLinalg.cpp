@@ -815,6 +815,62 @@ Value broadcastTensor(ConversionPatternRewriter &rewriter, Location loc,
   return genericOp.getResult(0);
 }
 
+// Fuses nova.transpose(A) + nova.matmul(A^T, B) → linalg.matmul_transpose_a(A, B).
+// This prevents the explicit linalg.generic transpose from being created, so the
+// K-tiling pass sees A in [K,M] layout and the shared-memory promotion copy reads
+// M-contiguous rows — enabling cp.async.16 instead of scalar ld.global.b32.
+// Only fires for 2D matmul where the LHS is exclusively consumed by this matmul
+// (hasOneUse guard), which is always true for the backward dB = A^T × grad case.
+struct NovaMatmulTransposeAFusionLowering
+    : public OpConversionPattern<nova::MatmulOp> {
+  NovaMatmulTransposeAFusionLowering(MLIRContext *ctx)
+      : OpConversionPattern<nova::MatmulOp>(ctx, /*benefit=*/2) {}
+
+  LogicalResult
+  matchAndRewrite(nova::MatmulOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!resultType || resultType.getRank() != 2)
+      return failure();
+
+    // LHS must be nova.transpose with a last-two-dims swap
+    auto transpOp = op.getOperand(0).getDefiningOp<nova::TransposeOp>();
+    if (!transpOp || !transpOp->hasOneUse())
+      return failure();
+
+    auto inputType = cast<RankedTensorType>(transpOp.getInput().getType());
+    int64_t rank = inputType.getRank();
+    int64_t ax1 = rank - 1, ax2 = rank - 2;
+    if (auto a = transpOp->getAttrOfType<IntegerAttr>("axes1"))
+      ax1 = a.getInt() < 0 ? a.getInt() + rank : a.getInt();
+    if (auto a = transpOp->getAttrOfType<IntegerAttr>("axes2"))
+      ax2 = a.getInt() < 0 ? a.getInt() + rank : a.getInt();
+    if (!((ax1 == rank - 1 && ax2 == rank - 2) ||
+          (ax1 == rank - 2 && ax2 == rank - 1)))
+      return failure();
+
+    Location loc = op.getLoc();
+    // origA is A in [K, M] layout — keep it un-transposed.
+    // Use the remapped form in case origA is itself a converted Nova op result.
+    Value origA = transpOp.getInput();
+    if (Value remapped = rewriter.getRemappedValue(origA))
+      origA = remapped;
+    Value rhs = adaptor.getOperands()[1];
+
+    Value cst = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getZeroAttr(resultType.getElementType()));
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+    Value outputTensor =
+        rewriter.create<linalg::FillOp>(loc, cst, emptyTensor).getResult(0);
+
+    // linalg.matmul_transpose_a: A[K,M], B[K,N] → C[M,N] = A^T × B
+    rewriter.replaceOpWithNewOp<linalg::MatmulTransposeAOp>(
+        op, ValueRange{origA, rhs}, outputTensor);
+    return success();
+  }
+};
+
 struct NovaMatmulOpLowering : public OpConversionPattern<nova::MatmulOp> {
   using OpConversionPattern<nova::MatmulOp>::OpConversionPattern;
 
@@ -2404,7 +2460,7 @@ void populateNovaToLinalgPatterns(RewritePatternSet &patterns) {
   AdamOpConverter,ArgMaxConverter,
   ArgMinConverter,NovaBroadcastInDimOpLowering,NovaConstantToArithConstPattern,
   NovaDivOpLowering,NovaExpOpLowering,
-  NovaLogOpLowering,NovaMatmulOpLowering,
+  NovaLogOpLowering,NovaMatmulTransposeAFusionLowering,NovaMatmulOpLowering,
   NovaMaxOpLowering,NovaMinOpLowering,
   NovaMulOpLowering,NovaNegOpLowering,
   NovaPowOpLowering,NovaRandomOpLowering,

@@ -520,6 +520,31 @@ static bool isTf32MmaLhsRead(vector::TransferReadOp readOp) {
   return false;
 }
 
+// Finds the vector.contract that directly consumes the LHS transfer_read,
+// walking through to_layout / insert / shape_cast wrappers. Returns nullptr
+// when not found. Used to stamp nova.gpu.lhs_from_ldmatrix on the contract
+// when ldmatrix is selected for the LHS.
+static vector::ContractionOp
+findContractForLhsRead(vector::TransferReadOp readOp) {
+  llvm::SmallPtrSet<Operation *, 8> seen;
+  llvm::SmallVector<Value> stack = {readOp.getResult()};
+  while (!stack.empty()) {
+    Value v = stack.pop_back_val();
+    for (Operation *user : v.getUsers()) {
+      if (!seen.insert(user).second)
+        continue;
+      if (auto contract = dyn_cast<vector::ContractionOp>(user))
+        if (contract.getLhs() == v)
+          return contract;
+      if (isa<ToLayoutOp, vector::InsertOp, vector::InsertStridedSliceOp,
+              vector::ShapeCastOp>(user))
+        for (Value r : user->getResults())
+          stack.push_back(r);
+    }
+  }
+  return nullptr;
+}
+
 // Redistribute the 4 f32 elements an ldmatrix.x4.b16 lands per thread so the
 // result matches the NestedLayoutAttr-encoded LHS A-fragment for
 // mma.sync.m16n8k8.tf32.
@@ -699,11 +724,13 @@ static Value emitOneLdMatrixForLhsTf32(RewriterBase &rewriter, Location loc,
                                       /*transpose=*/false,
                                       /*numTiles=*/4);
 
-  // ldmatrix output is in K-partition {T_lo, T_lo+4} per thread; redistribute
-  // to the NestedLayout-encoded {2*T_lo, 2*T_lo+1} partition so it composes
-  // with the rest of the pipeline (including the scalar RHS fallback used by
-  // backward-pass matmuls with non-identity permutation_maps).
-  return redistributeLdMatrixToNestedLayout(rewriter, loc, ld.getResult());
+  // ldmatrix output [r0,r1,r2,r3] is already in PTX A-fragment register order
+  // for mma.sync.m16n8k8.tf32: r0=A[T_hi][T_lo], r1=A[T_hi+8][T_lo],
+  // r2=A[T_hi][T_lo+4], r3=A[T_hi+8][T_lo+4] with K-partition {T_lo,T_lo+4}.
+  // The caller sets nova.gpu.lhs_from_ldmatrix on the consuming contract so
+  // NVIDIADistributeContract bypasses the {0,2,1,3} shuffle. tryEmitTf32RhsLoad
+  // detects this and uses matching K-offsets {T_lo, T_lo+4} for B.
+  return ld.getResult();
 }
 
 // Top-level helper invoked from DistributeTransferRead. Returns a fully
@@ -728,22 +755,18 @@ tryEmitLdMatrixForLhs(RewriterBase &rewriter, vector::TransferReadOp readOp,
   (void)tileShape;
   // ── eligibility ─────────────────────────────────────────────────────────
   //
-  // ldmatrix.x4.b16 on 16×8 f32 delivers per-thread K-cols { T_lo, T_lo+4 },
-  // which is NOT the partition the NestedLayout / DistributeContract pipeline
-  // is built around ({ 2*T_lo, 2*T_lo+1 }). Both partitions are correct for
-  // mma.sync.m16n8k8.tf32 *in isolation* (the row-quad sum is invariant to
-  // K-partition), but mixing them across A and B contracts mis-aligned K
-  // pairs — which is what made the scalar-RHS fallback (used by backward
-  // matmuls whose LHS has a non-identity permutation_map) silently corrupt
-  // training in the prior patch.
-  //
-  // Fix: emitOneLdMatrixForLhsTf32 redistributes ldmatrix output into the
-  // NestedLayout partition via 8 gpu.shuffle idx + 4 selects, so this fast
-  // path is layout-compatible with the rest of the pipeline. The
-  // {0,2,1,3} per-thread shuffle in DistributeContract still fires (we
-  // don't set nova.gpu.lhs_from_ldmatrix any more) to convert the
-  // NestedLayout linear order into mma.sync's PTX A-fragment register
-  // order.
+  // ldmatrix.x4.b16 on 16×8 f32 delivers per-thread K-cols {T_lo, T_lo+4},
+  // which is already in PTX A-fragment register order for mma.sync.m16n8k8:
+  //   r0=A[T_hi][T_lo], r1=A[T_hi+8][T_lo], r2=A[T_hi][T_lo+4], r3=A[T_hi+8][T_lo+4]
+  // The caller stamps nova.gpu.lhs_from_ldmatrix on the consuming contract so
+  // NVIDIADistributeContract skips the {0,2,1,3} shuffle (which is only
+  // needed for the NestedLayout scalar-load path). tryEmitTf32RhsLoad detects
+  // the attribute and uses matching B K-offsets {T_lo, T_lo+4} so A and B
+  // contract on the same K elements. For backward TN matmuls (matmul_transpose_a)
+  // where A is in [K,M] smem, ldmatrix is rejected by the K-not-last guard below:
+  // M is the fast smem dim so ldmatrix would give M-consecutive values, which is
+  // wrong for mma "row" layout (needs K-consecutive). Both A and B fall back to
+  // scalar loads with the NestedLayout partition {2*T_lo, 2*T_lo+1}.
   if (!isTf32MmaLhsRead(readOp)) {
     LLVM_DEBUG(llvm::dbgs() << "[ldmatrix] reject: not tf32 mma LHS read\n");
     return nullptr;
@@ -773,6 +796,33 @@ tryEmitLdMatrixForLhs(RewriterBase &rewriter, vector::TransferReadOp readOp,
   if (!readOp.getPermutationMap().isMinorIdentity()) {
     LLVM_DEBUG(llvm::dbgs() << "[ldmatrix] reject: non-identity permutation\n");
     return nullptr;
+  }
+
+  // ldmatrix.x4 reads consecutive elements along the smem row (the last/fast
+  // dimension). For mma.sync.m16n8k8 "row" layout, A must be [M, K] in smem
+  // so K is fast. If the consuming contract has A's K-dim mapped to the FIRST
+  // operand dimension (e.g. linalg.matmul_transpose_a: A-map (m,n,k)->(k,m)),
+  // then M is fast instead — ldmatrix would give M-consecutive values, which
+  // is wrong for the mma A-fragment. Reject in that case.
+  if (auto contract = findContractForLhsRead(readOp)) {
+    auto indexingMaps = contract.getIndexingMaps();
+    if (indexingMaps.size() >= 2) {
+      AffineMap aMap = cast<AffineMapAttr>(indexingMaps[0]).getValue();
+      AffineMap bMap = cast<AffineMapAttr>(indexingMaps[1]).getValue();
+      // B-map's first result is the K-dim expr (reduction iter) for any
+      // standard matmul variant: (m,n,k)->(k,n) or (m,n,k)->(k,n).
+      // A's last result must equal that K-expr for ldmatrix to be valid.
+      if (aMap.getNumResults() >= 1 && bMap.getNumResults() >= 1) {
+        AffineExpr aLast = aMap.getResult(aMap.getNumResults() - 1);
+        AffineExpr bFirst = bMap.getResult(0);
+        if (aLast != bFirst) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[ldmatrix] reject: K not last in A operand map "
+                        "(e.g. matmul_transpose_a)\n");
+          return nullptr;
+        }
+      }
+    }
   }
 
   // Per-warp coverage of the read along (M, K) must be exactly 16 × 8 for
@@ -903,6 +953,224 @@ tryEmitLdMatrixForLhs(RewriterBase &rewriter, vector::TransferReadOp readOp,
   return acc;
 }
 
+// Emits 4 scalar SMEM loads per mma fragment for matmul_transpose_a A operand.
+//
+// For matmul_transpose_a the A operand's contract indexing map is
+// (m, n, k) -> (k, m), so the A vector and A SMEM are both stored [K, M]
+// (K as the slow/outer dim, M as the fast/inner dim) — opposite of the
+// standard linalg.matmul where vector/smem are [M, K]. The NestedLayout
+// reflects this: layout dim 0 corresponds to K (per-warp = 8), layout dim 1
+// corresponds to M (per-warp = 16). threadIdx[0] is therefore the K-stripe
+// (lane%4 = 0..3) and threadIdx[1] is the M-group (lane/4 = 0..7), reversing
+// the assignment used by the standard matmul ldmatrix path.
+//
+// mma.sync.m16n8k8 "row" A-fragment layout (4 regs per thread):
+//   r0 = A^T[m][k0]      = A_original[k0][m]     = smem[k0, m]
+//   r1 = A^T[m+8][k0]    = A_original[k0][m+8]   = smem[k0, m+8]
+//   r2 = A^T[m][k0+4]    = A_original[k0+4][m]   = smem[k0+4, m]
+//   r3 = A^T[m+8][k0+4]  = A_original[k0+4][m+8] = smem[k0+4, m+8]
+//   where k0 = K_warp_base + t_sh,  m = M_warp_base + g_sh
+//
+// This is the exact same pattern as load_frA in Sgemm_backward_tn_SM86.cu:
+//   ga(k0, row); ga(k0, row+8); ga(k4, row); ga(k4, row+8)
+// and uses the mma-native stride-4 K-partition {t_sh, t_sh+4}, avoiding the
+// {0,2,1,3} register shuffle that the generic NestedLayout scalar path requires.
+// Caller must set nova.gpu.lhs_from_ldmatrix on the contract so:
+//   (1) NVIDIADistributeContract skips the {0,2,1,3} per-thread shuffle, and
+//   (2) tryEmitTf32RhsLoad uses matching {T_lo, T_lo+4} K-offsets for B.
+//
+// The XOR swizzle is NOT inlined here: NovaGPUSwizzleSharedMemoryPass rewrites
+// all workgroup-memref loads after this pass, so the bank-conflict elimination
+// is handled centrally.
+static Value
+tryEmitScalarReadForTransposeALhs(RewriterBase &rewriter,
+                                   vector::TransferReadOp readOp,
+                                   NestedLayoutAttr layout,
+                                   ArrayRef<Value> warpIdx,
+                                   ArrayRef<Value> threadIdx,
+                                   ArrayRef<int64_t> distShape,
+                                   ArrayRef<int64_t> tileShape) {
+  if (!isTf32MmaLhsRead(readOp))
+    return nullptr;
+
+  // Only fire when K-not-last in A's operand map (matmul_transpose_a).
+  // Derive (kDimIdx, mDimIdx) so the rest of the function is dim-agnostic.
+  auto contract = findContractForLhsRead(readOp);
+  if (!contract)
+    return nullptr;
+  unsigned kDimIdx = 0, mDimIdx = 1;
+  {
+    auto indexingMaps = contract.getIndexingMaps();
+    if (indexingMaps.size() < 2)
+      return nullptr;
+    AffineMap aMap = cast<AffineMapAttr>(indexingMaps[0]).getValue();
+    AffineMap bMap = cast<AffineMapAttr>(indexingMaps[1]).getValue();
+    if (aMap.getNumResults() != 2 || bMap.getNumResults() < 1)
+      return nullptr;
+    AffineExpr aLast = aMap.getResult(1);
+    AffineExpr aFirst = aMap.getResult(0);
+    AffineExpr bFirst = bMap.getResult(0);
+    if (aLast == bFirst)
+      return nullptr; // K-last (standard matmul): handled by ldmatrix path
+    if (aFirst != bFirst)
+      return nullptr; // not the matmul_transpose_a pattern (k, m)
+    // A-map is (m,n,k) -> (k, m): vector dim 0 = K, vector dim 1 = M.
+    kDimIdx = 0;
+    mDimIdx = 1;
+  }
+
+  // Same structural guards as tryEmitLdMatrixForLhs.
+  if (layout.getRank() != 2)
+    return nullptr;
+  ArrayRef<int64_t> outerT   = layout.getOuterTile();
+  ArrayRef<int64_t> threadT  = layout.getThreadTile();
+  ArrayRef<int64_t> elementT = layout.getElementTile();
+  ArrayRef<int64_t> batchT   = layout.getBatchTile();
+  ArrayRef<int64_t> sgT      = layout.getSubgroupTile();
+  if (outerT.size() < 2 || threadT.size() < 2 ||
+      elementT.size() < 2 || batchT.size() < 2)
+    return nullptr;
+  if (!sgT.empty() && sgT.size() >= 2 && (sgT[0] != 1 || sgT[1] != 1))
+    return nullptr;
+  // perWarp counts indexed by vector dim — convert via kDimIdx/mDimIdx.
+  int64_t perWarpK =
+      outerT[kDimIdx] * threadT[kDimIdx] * elementT[kDimIdx];
+  int64_t perWarpM =
+      outerT[mDimIdx] * threadT[mDimIdx] * elementT[mDimIdx];
+  if (perWarpM != 16 || perWarpK != 8) {
+    LLVM_DEBUG(llvm::dbgs() << "[transposeA-scalar] reject: perWarp(M,K)=("
+                            << perWarpM << "," << perWarpK
+                            << ") != (16,8)\n");
+    return nullptr;
+  }
+  if (outerT[0] * outerT[1] * elementT[0] * elementT[1] != 4)
+    return nullptr;
+  if (distShape.size() != 6)
+    return nullptr;
+  // mma.sync.m16n8k8 row layout requires:
+  //   K-thread count = 4 (t_sh ∈ {0..3}, stride-4 K-partition)
+  //   M-thread count = 8 (g_sh ∈ {0..7}, stride-8 M-partition with elem[m, m+8])
+  //   K-element count = 2 (the two K-strides at t_sh and t_sh+4)
+  //   M-element count = 1 (M is covered by outer={1 or 2} × thread=8)
+  if (threadT[kDimIdx] != 4 || threadT[mDimIdx] != 8)
+    return nullptr;
+  if (elementT[kDimIdx] != 2 || elementT[mDimIdx] != 1)
+    return nullptr;
+
+  // A smem must be 2D in workgroup address space.
+  auto srcTy = dyn_cast<MemRefType>(readOp.getBase().getType());
+  if (!srcTy || srcTy.getRank() != 2)
+    return nullptr;
+  auto space = dyn_cast_or_null<gpu::AddressSpaceAttr>(srcTy.getMemorySpace());
+  if (!space || space.getValue() != gpu::GPUDialect::getWorkgroupAddressSpace())
+    return nullptr;
+  // The transfer_read must be a plain minor-identity read from smem (vector
+  // dims align with smem dims). Non-identity permutations would mean the
+  // vector and smem layouts differ; out of scope for this fast path.
+  if (!readOp.getPermutationMap().isMinorIdentity())
+    return nullptr;
+
+  Location loc = readOp.getLoc();
+  Type f32 = Float32Type::get(rewriter.getContext());
+  auto distTy = VectorType::get(distShape, f32);
+  Value acc = arith::ConstantOp::create(rewriter, loc, distTy,
+                                         rewriter.getZeroAttr(distTy));
+
+  // Map vector dims to "K-thread" and "M-thread" indices. For matmul_transpose_a,
+  // kDimIdx=0, mDimIdx=1 — threadIdx[0] is t_sh (K-stripe), threadIdx[1] is g_sh.
+  Value tSh  = threadIdx[kDimIdx]; // K-stripe (0..3)
+  Value gSh  = threadIdx[mDimIdx]; // M-group  (0..7)
+  Value four = rewriter.create<arith::ConstantIndexOp>(loc, 4);
+  Value eight= rewriter.create<arith::ConstantIndexOp>(loc, 8);
+
+  // Smem indices align with vector dims (minor identity). For matmul_transpose_a,
+  // readOp.getIndices()[kDimIdx]=0 is the K-base and [mDimIdx]=1 is the M-base.
+  Value kBase = readOp.getIndices()[kDimIdx];
+  Value mBase = readOp.getIndices()[mDimIdx];
+
+  int64_t kBatches = batchT[kDimIdx];
+  int64_t mBatches = batchT[mDimIdx];
+  SmallVector<int64_t> strides(2 * layout.getRank(), 1);
+
+  for (int64_t kb = 0; kb < kBatches; ++kb) {
+    for (int64_t mb = 0; mb < mBatches; ++mb) {
+      // K-base for this mma fragment: advance by kb*8.
+      Value kFrag = kBase;
+      if (kb != 0) {
+        Value kAdv = rewriter.create<arith::ConstantIndexOp>(loc, kb * 8);
+        kFrag = rewriter.create<arith::AddIOp>(loc, kFrag, kAdv);
+      }
+      // M-base for this mma fragment: advance by mb*16.
+      Value mFrag = mBase;
+      if (mb != 0) {
+        Value mAdv = rewriter.create<arith::ConstantIndexOp>(loc, mb * 16);
+        mFrag = rewriter.create<arith::AddIOp>(loc, mFrag, mAdv);
+      }
+
+      // k0 = kFrag + t_sh,  k4 = k0 + 4  (stride-4 K-partition)
+      Value k0   = rewriter.create<arith::AddIOp>(loc, kFrag, tSh);
+      Value k4   = rewriter.create<arith::AddIOp>(loc, k0, four);
+      // m  = mFrag + g_sh,  m8 = m + 8   (stride-8 M-partition)
+      Value mRow = rewriter.create<arith::AddIOp>(loc, mFrag, gSh);
+      Value mRo8 = rewriter.create<arith::AddIOp>(loc, mRow, eight);
+
+      // Build smem indices in (dim0, dim1) order based on which dim is K vs M.
+      // For matmul_transpose_a (kDimIdx=0): smem is [K, M], so loads are
+      //   smem[k0, mRow], smem[k0, mRo8], smem[k4, mRow], smem[k4, mRo8].
+      auto smemIdx = [&](Value k, Value m) -> SmallVector<Value, 2> {
+        SmallVector<Value, 2> idx(2);
+        idx[kDimIdx] = k;
+        idx[mDimIdx] = m;
+        return idx;
+      };
+
+      // 4 scalar loads matching load_frA in Sgemm_backward_tn_SM86.cu.
+      // NovaGPUSwizzleSharedMemoryPass will XOR-rewrite the smem column
+      // (innermost) index based on the row to eliminate bank conflicts —
+      // no inline swizzle needed.
+      Value r0 = memref::LoadOp::create(rewriter, loc, readOp.getBase(),
+                                         ValueRange(smemIdx(k0, mRow)));
+      Value r1 = memref::LoadOp::create(rewriter, loc, readOp.getBase(),
+                                         ValueRange(smemIdx(k0, mRo8)));
+      Value r2 = memref::LoadOp::create(rewriter, loc, readOp.getBase(),
+                                         ValueRange(smemIdx(k4, mRow)));
+      Value r3 = memref::LoadOp::create(rewriter, loc, readOp.getBase(),
+                                         ValueRange(smemIdx(k4, mRo8)));
+
+      // Pack 4 scalars into vector<4x1xf32> in PTX A-fragment register
+      // order [r0, r1, r2, r3] — matches the layout that ldmatrix.x4 produces,
+      // so the consuming contract op (marked nova.gpu.lhs_from_ldmatrix) reads
+      // the values as already-ordered mma fragment registers.
+      auto rawTy = VectorType::get({4, 1}, f32);
+      Value frag = arith::ConstantOp::create(rewriter, loc, rawTy,
+                                              rewriter.getZeroAttr(rawTy));
+      frag = rewriter.create<vector::InsertOp>(loc, r0, frag,
+                                               ArrayRef<int64_t>{0, 0});
+      frag = rewriter.create<vector::InsertOp>(loc, r1, frag,
+                                               ArrayRef<int64_t>{1, 0});
+      frag = rewriter.create<vector::InsertOp>(loc, r2, frag,
+                                               ArrayRef<int64_t>{2, 0});
+      frag = rewriter.create<vector::InsertOp>(loc, r3, frag,
+                                               ArrayRef<int64_t>{3, 0});
+
+      // Shape-cast to the layout's per-fragment shape vector<O0xO1xE0xE1xf32>.
+      auto subTy = VectorType::get(
+          {outerT[0], outerT[1], elementT[0], elementT[1]}, f32);
+      Value reshaped = vector::ShapeCastOp::create(rewriter, loc, subTy, frag);
+
+      // Place into the distributed accumulator at the right batch position.
+      // distShape order is (B0, B1, O0, O1, E0, E1), so insertOffsets[0]/[1]
+      // are the kDimIdx-th / mDimIdx-th batch indices.
+      SmallVector<int64_t> insertOffsets(distShape.size(), 0);
+      insertOffsets[kDimIdx] = kb;
+      insertOffsets[mDimIdx] = mb;
+      acc = vector::InsertStridedSliceOp::create(rewriter, loc, reshaped, acc,
+                                                  insertOffsets, strides);
+    }
+  }
+  return acc;
+}
+
 namespace {
 
 // Check if this transfer_read produces the RHS (B matrix) for a TF32 mma.sync.
@@ -930,18 +1198,81 @@ static bool isTf32MmaRhsRead(vector::TransferReadOp readOp) {
   return false;
 }
 
+// Returns true when the LHS (A) of the contract consuming this RHS (B) read
+// uses nvgpu.ldmatrix, meaning A's K-partition is the ldmatrix-native
+// {T_lo, T_lo+4} rather than NestedLayout's {2*T_lo, 2*T_lo+1}.
+//
+// Two cases are handled to be robust against pattern application order:
+//   1. A already distributed: nova.gpu.lhs_from_ldmatrix set on the contract.
+//   2. A not yet distributed: trace back through LHS def-chain to find the
+//      original transfer_read and check ldmatrix eligibility (minor-identity
+//      permutation is the gate that tryEmitLdMatrixForLhs checks first).
+//
+// For backward TN matmuls (matmul_transpose_a), A's K-dim is not last in the
+// A operand map so tryEmitLdMatrixForLhs rejects ldmatrix (K-not-last guard).
+// This returns false and B uses the NestedLayout partition — keeping consistent.
+static bool rhsLhsUsesLdmatrix(vector::TransferReadOp rhsRead) {
+  // Step 1: trace the RHS read to its consuming vector.contract.
+  vector::ContractionOp theContract;
+  {
+    llvm::SmallPtrSet<Operation *, 4> seen;
+    llvm::SmallVector<Value> stack = {rhsRead.getResult()};
+    while (!stack.empty() && !theContract) {
+      Value v = stack.pop_back_val();
+      for (Operation *user : v.getUsers()) {
+        if (!seen.insert(user).second)
+          continue;
+        if (auto c = dyn_cast<vector::ContractionOp>(user)) {
+          auto ka = c->getAttrOfType<IntegerAttr>("nova.gpu.mma");
+          if (ka && ka.getInt() == 5 && c.getRhs() == v) {
+            theContract = c;
+            break;
+          }
+        }
+        if (isa<ToLayoutOp, vector::InsertOp, vector::InsertStridedSliceOp,
+                vector::ShapeCastOp>(user))
+          for (Value r : user->getResults())
+            stack.push_back(r);
+      }
+    }
+  }
+  if (!theContract)
+    return false;
+
+  // Case 1: A was already distributed and marked.
+  if (theContract->hasAttr("nova.gpu.lhs_from_ldmatrix"))
+    return true;
+
+  // Case 2: A is not yet distributed — walk back through the LHS def-chain
+  // to find the original transfer_read and check ldmatrix eligibility.
+  // Minor-identity permutation is the primary gate in tryEmitLdMatrixForLhs.
+  llvm::SmallVector<Value> lhsStack = {theContract.getLhs()};
+  llvm::SmallPtrSet<Value, 8> lhsSeen;
+  while (!lhsStack.empty()) {
+    Value v = lhsStack.pop_back_val();
+    if (!lhsSeen.insert(v).second)
+      continue;
+    if (auto read = v.getDefiningOp<vector::TransferReadOp>())
+      return isTf32MmaLhsRead(read) &&
+             read.getPermutationMap().isMinorIdentity();
+    if (Operation *def = v.getDefiningOp())
+      if (isa<ToLayoutOp, vector::ShapeCastOp, vector::InsertOp,
+              vector::InsertStridedSliceOp, vector::ExtractOp>(def))
+        for (Value o : def->getOperands())
+          lhsStack.push_back(o);
+  }
+  return false;
+}
+
 // Emits two scalar loads per fragment for the TF32 mma.sync B matrix (8×8).
 //
-// PTX B-fragment layout for m16n8k8.tf32: thread T holds
-//   b0 = B[2*(T%4)  ][T/4]   (K-col = 2*T_lo,   N-row = T_hi)
-//   b1 = B[2*(T%4)+1][T/4]   (K-col = 2*T_lo+1, N-row = T_hi)
-// This is exactly the NestedLayout K-partition {2*T_lo, 2*T_lo+1}, so
-// NVIDIADistributeContract passes the B-slice directly to nvgpu.mma.sync
-// WITHOUT any register-level shuffle (cf. the {0,2,1,3} shuffle for A).
-//
-// Prior code incorrectly used {T%4, T%4+4} — matching the ldmatrix.x4 A
-// partition rather than the PTX B-fragment layout — which caused K-element
-// mismatch and ~0.4–1% relative error in mma.sync output.
+// K-offset selection depends on what A (LHS) uses:
+//   ldmatrix path (A has minor-identity perm): K-partition {T_lo, T_lo+4},
+//     matching ldmatrix's native output so A and B contract the same K pairs.
+//   scalar path (A has non-identity perm, e.g. backward TN): NestedLayout
+//     K-partition {2*T_lo, 2*T_lo+1}, consistent with scalar LHS loads.
+// Both partitions cover all 8 K-elements; mma.sync correctness only requires
+// that A and B agree on which K-elements each thread contributes.
 //
 // Eligibility: minor-identity permutation map only (B stored K×N, contiguous
 // K dimension). Backward reads with non-identity perm fall through to the
@@ -996,11 +1327,17 @@ tryEmitTf32RhsLoad(RewriterBase &rewriter, vector::TransferReadOp readOp,
   AffineMap permMap = readOp.getPermutationMap();
   Value laneId = rewriter.create<gpu::LaneIdOp>(loc, IntegerAttr{});
   AffineExpr d0 = rewriter.getAffineDimExpr(0);
-  // K-offsets matching the PTX B-fragment layout: {2*(T%4), 2*(T%4)+1}.
-  Value twoLaneMod4 =
-      affine::makeComposedAffineApply(rewriter, loc, (d0 % 4) * 2, {laneId});
-  Value twoLaneMod4Plus1 = affine::makeComposedAffineApply(
-      rewriter, loc, (d0 % 4) * 2 + 1, {laneId});
+  // Choose K-offsets to match the LHS (A) K-partition. When A uses ldmatrix
+  // the native partition is {T_lo, T_lo+4}; when A uses scalar loads the
+  // NestedLayout partition is {2*T_lo, 2*T_lo+1}. A and B must agree.
+  bool lhsLdmatrix = rhsLhsUsesLdmatrix(readOp);
+  Value kOff0 = lhsLdmatrix
+      ? affine::makeComposedAffineApply(rewriter, loc, d0 % 4, {laneId})
+      : affine::makeComposedAffineApply(rewriter, loc, (d0 % 4) * 2, {laneId});
+  Value kOff1 = lhsLdmatrix
+      ? affine::makeComposedAffineApply(rewriter, loc, (d0 % 4) + 4, {laneId})
+      : affine::makeComposedAffineApply(rewriter, loc, (d0 % 4) * 2 + 1,
+                                        {laneId});
   Value laneDiv4 =
       affine::makeComposedAffineApply(rewriter, loc, d0.floorDiv(4), {laneId});
 
@@ -1048,8 +1385,8 @@ tryEmitTf32RhsLoad(RewriterBase &rewriter, vector::TransferReadOp readOp,
       return rewriter.create<memref::LoadOp>(loc, readOp.getBase(), indices);
     };
 
-    Value elem0 = loadElement(twoLaneMod4, laneDiv4);
-    Value elem1 = loadElement(twoLaneMod4Plus1, laneDiv4);
+    Value elem0 = loadElement(kOff0, laneDiv4);
+    Value elem1 = loadElement(kOff1, laneDiv4);
 
     auto fragTy = VectorType::get({2, 1}, elemTy);
     Value frag = rewriter.create<arith::ConstantOp>(
@@ -1152,12 +1489,28 @@ struct DistributeTransferRead final
       if (Value lifted =
               tryEmitLdMatrixForLhs(rewriter, readOp, layout, warpIdx,
                                     threadIdx, distShape, tileShape)) {
-        // The ldmatrix path now redistributes output into NestedLayout-
-        // encoded linear order (see redistributeLdMatrixToNestedLayout), so
-        // the consuming contract's {0,2,1,3} per-thread shuffle MUST still
-        // fire — we do NOT set nova.gpu.lhs_from_ldmatrix here. The shuffle
-        // converts (M_outer, M_elem, K_outer, K_elem) traversal order into
-        // the PTX A-fragment register order mma.sync.m16n8k8.tf32 consumes.
+        // ldmatrix output is already in PTX A-fragment register order — no
+        // redistribution needed. Mark the consuming contract so
+        // NVIDIADistributeContract skips the {0,2,1,3} per-thread shuffle,
+        // and tryEmitTf32RhsLoad uses matching K-offsets {T_lo, T_lo+4} for B.
+        if (auto contract = findContractForLhsRead(readOp))
+          contract->setAttr("nova.gpu.lhs_from_ldmatrix",
+                            rewriter.getUnitAttr());
+        replaceOpWithDistributedValues(rewriter, readOp, lifted);
+        return success();
+      }
+      // Scalar fast path for matmul_transpose_a A (K-not-last, A stored [K,M]).
+      // Emits exactly 4 ld.shared per mma fragment using mma-native stride-4
+      // K-partition {t_sh, t_sh+4} — matches load_frA in Sgemm_backward_tn_SM86.cu.
+      // Mark the contract identical to the ldmatrix case so NVIDIADistributeContract
+      // skips the {0,2,1,3} shuffle and tryEmitTf32RhsLoad uses {T_lo, T_lo+4} for B.
+      if (Value lifted =
+              tryEmitScalarReadForTransposeALhs(rewriter, readOp, layout,
+                                                warpIdx, threadIdx,
+                                                distShape, tileShape)) {
+        if (auto contract = findContractForLhsRead(readOp))
+          contract->setAttr("nova.gpu.lhs_from_ldmatrix",
+                            rewriter.getUnitAttr());
         replaceOpWithDistributedValues(rewriter, readOp, lifted);
         return success();
       }

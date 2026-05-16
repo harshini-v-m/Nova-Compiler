@@ -193,7 +193,24 @@ static LogicalResult fuseMatmulBias(Operation *matmulOp,
 }
 
 //===----------------------------------------------------------------------===//
-// Pattern for named matmul ops (MatmulOp, BatchMatmulOp)
+// Pattern for named matmul ops.
+//
+// fuseMatmulBias() above is op-agnostic — it only uses
+// DestinationStyleOpInterface::getDpsInitOperand(0) and never inspects the
+// matmul's indexing maps. The same template therefore works unchanged for
+// every linalg-named matmul-style op:
+//   MatmulOp, BatchMatmulOp,
+//   MatmulTransposeAOp / MatmulTransposeBOp,
+//   BatchMatmulTransposeAOp / BatchMatmulTransposeBOp.
+//
+// All of these must be registered below, otherwise the bias/residual add
+// is left as a separate linalg.generic. Bufferization then materialises the
+// matmul output to a fresh tensor.empty (which becomes a workgroup memref
+// C-smem after bufferization), introducing a 32 KB smem round-trip in the
+// epilogue. Registering every matmul-named-op keeps the destination chain
+// connected to the residual, so the warp scf.forall's shared_outs stays a
+// slice of the global output and the K-loop accumulator is initialised from
+// the residual — no extra smem, no extra thread forall, no barrier.
 //===----------------------------------------------------------------------===//
 
 template <typename MatmulOpTy>
@@ -238,6 +255,10 @@ struct FuseMatmulBiasPass
     RewritePatternSet patterns(&getContext());
     patterns.add<FuseMatmulBiasIntoOuts<linalg::MatmulOp>,
                  FuseMatmulBiasIntoOuts<linalg::BatchMatmulOp>,
+                 FuseMatmulBiasIntoOuts<linalg::MatmulTransposeAOp>,
+                 FuseMatmulBiasIntoOuts<linalg::MatmulTransposeBOp>,
+                 FuseMatmulBiasIntoOuts<linalg::BatchMatmulTransposeAOp>,
+                 FuseMatmulBiasIntoOuts<linalg::BatchMatmulTransposeBOp>,
                  FuseGenericContractionBias>(&getContext());
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       signalPassFailure();

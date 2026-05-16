@@ -558,7 +558,15 @@ struct NovaGPUMultiBufferingPass
       // ENTIRE kernel — none of its allocs are widened, and no scf.for
       // gets the marker. Pipelining skips it; correctness preserved, just
       // no overlap.
-      constexpr int64_t kSMEMCapBytes = 99 * 1024; // 101376 B
+      // 49 KB = floor(99 KB / 2). Forces ≥2 CTAs/SM after widening so that
+      // pipelining doesn't collapse occupancy. Empirically: at 1 CTA/SM the
+      // synchronous (single-buffer) path beats the pipelined path because
+      // 4 warps can't hide the per-iter commit/wait/barrier overhead. With
+      // ≥2 CTAs/SM the warp pool is large enough that overlap pays for the
+      // overhead. Kernels whose widened SMEM > 49 KB skip multi-buffering
+      // here; the loop stays unmarked and PipeliningPass leaves it alone,
+      // so the kernel falls back to synchronous SMEM access.
+      constexpr int64_t kSMEMCapBytes = 49 * 1024;
       int64_t widenedBytesTotal = 0;
       for (memref::AllocOp alloc : workgroupAllocs) {
         MemRefType ty = alloc.getType();

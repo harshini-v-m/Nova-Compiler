@@ -1844,8 +1844,8 @@ LogicalResult setDefaultConfig(linalg::LinalgOp op,
 
 
 static bool isTrueContraction(Operation *op) {
- if (isa<linalg::BatchMatmulOp, linalg::MatmulOp, linalg::MatvecOp,
-         linalg::VecmatOp, linalg::BatchMatvecOp>(op))
+ if (isa<linalg::BatchMatmulOp, linalg::MatmulOp, linalg::MatmulTransposeAOp,
+         linalg::MatvecOp, linalg::VecmatOp, linalg::BatchMatvecOp>(op))
    return true;
  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
  if (!linalgOp || !linalg::isaContractionOpInterface(linalgOp)) return false;

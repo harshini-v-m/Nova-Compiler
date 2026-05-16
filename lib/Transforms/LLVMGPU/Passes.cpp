@@ -246,7 +246,7 @@ namespace mlir::nova
   // Must run before MapForallToGPU because the alloc still has its original
   // shape and uses (forall lowering would obscure the loop containment
   // pattern multiBuffer relies on).
-  pm.addNestedPass<func::FuncOp>(createNovaGPUMultiBufferingPass(2));
+  pm.addNestedPass<func::FuncOp>(createNovaGPUMultiBufferingPass(3));
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 
